@@ -4,6 +4,50 @@
 
 ### Fixed
 
+- Fixed Autonomous Memory phase 1/phase 2 failing with `Thinking effort low is not supported by <provider>/<model>` on models whose supported reasoning efforts exclude `low`/`medium` (e.g. `deepseek/deepseek-v4-pro`). Both stage1 (`Effort.Low`) and consolidation (`Effort.Medium`) call sites in `packages/coding-agent/src/memories/index.ts` now route through `clampThinkingLevelForModel`, lifting the requested effort to the model's lowest supported level instead of letting `requireSupportedEffort` throw ([#1480](https://github.com/can1357/oh-my-pi/issues/1480)).
+
+## [15.5.10] - 2026-05-28
+
+### Added
+
+- Added `/drop-images` slash command that strips every `ImageContent` block from the current session's branch — `user`/`developer`/`custom`/`hookMessage`/`toolResult` content arrays plus `toolResult.details.images` and `fileMention.files[].image` — rewrites the session JSONL, rebuilds the agent's in-memory message list, tears down Codex Responses provider sessions, and rebuilds the TUI chat container so the change is visible immediately. ACP clients receive the same handler (returns `"Dropped N images …"` / `"No images found …"` through `runtime.output`). Stripping content that would leave a `toolResult` or `user` message with zero blocks inserts a single `[image removed]` placeholder so providers do not reject empty content arrays.
+
+### Fixed
+
+- Fixed compaction surfacing raw HTTP 401/403 envelopes (e.g. `Compaction failed: 401 {"type":"error","error":{"type":"authentication_error",…}}`) instead of routing to an authenticated fallback model. The compaction layer now attaches the provider-reported HTTP status onto the thrown error, and `AgentSession`'s auth-failure detector branches on `error.status === 401 || 403` in addition to the existing `auth_unavailable` regex. When a fallback model role (e.g. `modelRoles.smol`) is configured, compaction retries it transparently; otherwise the user sees the actionable "Compaction requires usable credentials for …" hint instead of the raw provider envelope.
+
+## [15.5.8] - 2026-05-28
+
+### Breaking Changes
+
+- Changed hashline edit parsing to require wrapped hunk headers such as `@@ A..B @@` (including `@@ BOF @@` and `@@ EOF @@`), with empty `@@ A..B @@` blocks deleting the anchored range and legacy inline payload forms treated as malformed
+
+### Added
+
+- Added `vault.enabled` setting (Tools → Obsidian Vault, default `false`) gating the `vault://` internal URL. When disabled, `VaultProtocolHandler.resolve` / `write`, `resolveVaultUrlToPath`, and `hasObsidian()` all refuse — the latter hides the `vault://` entry from the system prompt's Handlebars `{{#if hasObsidian}}` block. Tests can opt in via `vi.spyOn(vaultProtocol, "isVaultEnabled").mockReturnValue(true)`.
+
+- Added support for `vault://` URLs in path resolution utilities, including plan mode and internal selector parsing so `read` and edit paths can target Obsidian vault files directly
+- Added `vault://` internal URLs for editable Obsidian vault files, with filesystem-backed read/write/listing and CLI-backed vault index operations.
+- Added strict-mode indicators to `omp auth-gateway check` output by appending `[strict]` to strict-mode text headers and adding a top-level `strict` field in `--json` output
+- `omp auth-gateway check --strict` exercises each broker-supplied credential against its provider's chat-completion endpoint (cheapest bundled chat model per provider, with 15s/attempt timeout and up to 4 catalog fall-throughs on "model not found / invalid model" errors). Surfaces failures where the usage endpoint reports 200 but the chat endpoint 401s the same bearer (revoked OAuth scope, mislabeled provider row, …). Output gains a `[chat: ok|FAIL|skip]` column in text mode and a `completion` field on each credential in `--json` mode; the chat-failed count contributes to the non-zero exit code.
+
+### Changed
+
+- Changed hashline apply behavior to preserve duplicated boundary and context lines in replacement and insert payloads instead of auto-absorbing or dropping them
+- Updated hashline syntax: replaced `↑`/`↓` payload sigils with `^` repeat syntax and `|` literal rows for clearer edit semantics
+- Changed hashline delete syntax from bare `A:` or `A-B:` to explicit `A-B:-` inline delete marker
+- Modified hashline anchor syntax to require explicit range notation `A-B:` instead of shorthand `A:` for single-line operations
+- Updated hashline description in settings to clarify pure insert context behavior without arrow notation
+
+### Removed
+
+- Removed the `edit.hashlineAutoDropPureInsertDuplicates` setting
+- Removed the `edit.hashlineAutoDropPureInsertDuplicates` setting from configuration and execution paths
+- Removed the `edit.hashlineAutoDropPureInsertDuplicates` setting
+- Removed the `edit.hashlineAutoDropPureInsertDuplicates` setting from configuration and execution paths
+
+### Fixed
+
 - Fixed built-in slash commands skipping editor history; `/settings` and other built-ins now participate in up-arrow recall, with `tui.slashHistory: false` as an opt-out. ([#3148](https://github.com/can1357/oh-my-pi/issues/3148))
 
 ## [16.1.7] - 2026-06-20
