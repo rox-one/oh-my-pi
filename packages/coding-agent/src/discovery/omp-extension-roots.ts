@@ -142,26 +142,32 @@ function scopeDirs(ctx: LoadContext): ScopeDirs {
 	};
 }
 
-async function readSettingsExtensions(settingsPath: string): Promise<string[]> {
-	const content = await readFile(settingsPath);
-	if (!content) return [];
-	const parsed = tryParseJson<{ extensions?: unknown }>(content);
-	const raw = parsed?.extensions;
-	if (!Array.isArray(raw)) return [];
+function readExtensionsArray(raw: unknown): string[] | null {
+	if (!Array.isArray(raw)) return null;
 	return raw.filter((entry): entry is string => typeof entry === "string" && entry.length > 0);
 }
 
-async function readConfigYamlExtensions(configPath: string): Promise<string[]> {
+async function readSettingsExtensions(settingsPath: string): Promise<string[] | null> {
+	const content = await readFile(settingsPath);
+	if (!content) return null;
+	const parsed = tryParseJson<{ extensions?: unknown }>(content);
+	return readExtensionsArray(parsed?.extensions);
+}
+
+interface ConfigYamlExtensions {
+	exists: boolean;
+	extensions: string[] | null;
+}
+
+async function readConfigYamlExtensions(configPath: string): Promise<ConfigYamlExtensions> {
 	const content = await readFile(configPath);
-	if (!content) return [];
+	if (content === null) return { exists: false, extensions: null };
 	try {
 		const parsed = YAML.parse(content);
-		if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return [];
-		const raw = (parsed as Record<string, unknown>).extensions;
-		if (!Array.isArray(raw)) return [];
-		return raw.filter((entry): entry is string => typeof entry === "string" && entry.length > 0);
+		if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return { exists: true, extensions: null };
+		return { exists: true, extensions: readExtensionsArray((parsed as Record<string, unknown>).extensions) };
 	} catch {
-		return [];
+		return { exists: true, extensions: null };
 	}
 }
 
@@ -187,13 +193,13 @@ async function isDirectory(p: string): Promise<boolean> {
 /**
  * Resolve every configured extension package directory for the given context.
  *
- * Sources, in order of precedence (later entries with the same absolute path
- * are dropped):
+ * Sources, in order of precedence:
  *
  * 1. CLI roots injected via {@link injectOmpExtensionCliRoots}
- * 2. Project `<cwd>/.omp/config.yml#extensions` and legacy `settings.json#extensions`
- * 3. User `~/.omp/agent/config.yml#extensions` and legacy `settings.json#extensions`
- * 4. Enabled plugins installed under `<plugins>/node_modules/` (e.g. via
+ * 2. The highest-precedence configured `extensions` array, matching
+ *    `Settings` array-replacement semantics (project `config.yml`, project
+ *    `settings.json`, user `config.yml`, then legacy user `settings.json`)
+ * 3. Enabled plugins installed under `<plugins>/node_modules/` (e.g. via
  *    `omp install <pkg>` / `omp plugin install` / `omp plugin link`)
  *
  * Only entries that resolve to a directory on disk are returned; file
@@ -217,10 +223,28 @@ export async function listOmpExtensionRoots(ctx: LoadContext): Promise<OmpExtens
 		readConfigYamlExtensions(path.join(user, "config.yml")),
 		listInstalledPluginRoots(ctx),
 	]);
-	const projectExtensions = [...projectSettingsExtensions, ...projectConfigExtensions];
-	const userExtensions = [...userSettingsExtensions, ...userConfigExtensions];
+	const configuredExtensions =
+		projectConfigExtensions.extensions !== null
+			? { entries: projectConfigExtensions.extensions, level: "project" as const }
+			: projectSettingsExtensions !== null
+				? { entries: projectSettingsExtensions, level: "project" as const }
+				: userConfigExtensions.extensions !== null
+					? { entries: userConfigExtensions.extensions, level: "user" as const }
+					: userConfigExtensions.exists
+						? null
+						: userSettingsExtensions !== null
+							? { entries: userSettingsExtensions, level: "user" as const }
+							: null;
 
-	// First-seen-wins dedup preserves invocation/CLI > project-settings > user-settings > installed precedence.
+	const candidates: InjectedRoot[] = [
+		...injectedCliRoots,
+		...(configuredExtensions?.entries.map(
+			(raw): InjectedRoot => ({ path: resolveAgainst(raw, ctx), level: configuredExtensions.level }),
+		) ?? []),
+		...installedPlugins,
+	];
+
+	// First-seen-wins dedup preserves CLI > configured-settings > installed precedence.
 	const seen = new Set<string>();
 	const unique: InjectedRoot[] = [];
 	for (const candidate of candidates) {
