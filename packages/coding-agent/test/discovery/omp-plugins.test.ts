@@ -12,7 +12,7 @@
  * `home` instead of `os.homedir()`. Module-level CLI injection state is
  * reset between cases so they cannot poison each other.
  */
-import { afterEach, beforeEach, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, beforeEach, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -26,6 +26,7 @@ import { skillCapability } from "@oh-my-pi/pi-coding-agent/capability/skill";
 import { slashCommandCapability } from "@oh-my-pi/pi-coding-agent/capability/slash-command";
 import { toolCapability } from "@oh-my-pi/pi-coding-agent/capability/tool";
 import type { LoadContext, Provider } from "@oh-my-pi/pi-coding-agent/capability/types";
+import { getAgentDir, setAgentDir } from "@oh-my-pi/pi-utils";
 import { YAML } from "bun";
 // Register all discovery providers as a side effect.
 import "@oh-my-pi/pi-coding-agent/discovery";
@@ -44,6 +45,7 @@ let tempDir: string;
 let home: string;
 let project: string;
 let ext: string;
+let originalAgentDir: string;
 
 const originalAgentDirEnv = process.env.PI_CODING_AGENT_DIR;
 const fallbackAgentDir = path.join(getConfigRootDir(), "agent");
@@ -90,6 +92,14 @@ function buildExtensionPackage(packageDir: string, skillName = "my-skill"): void
 	);
 }
 
+beforeAll(() => {
+	originalAgentDir = getAgentDir();
+});
+
+afterAll(() => {
+	setAgentDir(originalAgentDir);
+});
+
 beforeEach(() => {
 	clearCache();
 	clearOmpExtensionCliRoots();
@@ -100,6 +110,9 @@ beforeEach(() => {
 	fs.mkdirSync(home, { recursive: true });
 	fs.mkdirSync(project, { recursive: true });
 	fs.mkdirSync(path.join(project, ".git"), { recursive: true });
+	// Point `getAgentDir()` at the test home so user-scope reads (now sourced
+	// from the canonical agent dir, matching `Settings`) land in the temp tree.
+	setAgentDir(path.join(home, ".omp", "agent"));
 	buildExtensionPackage(ext);
 	setAgentDir(path.join(home, ".omp", "agent"));
 });
@@ -162,6 +175,19 @@ test("user settings.json#extensions also feeds sub-discovery", async () => {
 
 test("user config.yml#extensions also feeds sub-discovery", async () => {
 	writeFile(path.join(home, ".omp", "agent", "config.yml"), YAML.stringify({ extensions: [ext] }, null, 2));
+
+	const skills = await loadFromPlugin<{ name: string }>(skillCapability.id, ctx());
+	expect(skills.map(s => s.name)).toContain("my-skill");
+});
+
+test("user config.yml is sourced from getAgentDir() so PI_CODING_AGENT_DIR redirects sub-discovery", async () => {
+	// Mirrors a user with `PI_CODING_AGENT_DIR` (or `PI_CONFIG_DIR`) pointing the
+	// canonical user config elsewhere than `<home>/.omp/agent`. The discovery
+	// must follow the configured agent dir, not the literal `ctx.home` path.
+	const customAgentDir = path.join(tempDir, "custom-agent");
+	fs.mkdirSync(customAgentDir, { recursive: true });
+	setAgentDir(customAgentDir);
+	writeFile(path.join(customAgentDir, "config.yml"), YAML.stringify({ extensions: [ext] }, null, 2));
 
 	const skills = await loadFromPlugin<{ name: string }>(skillCapability.id, ctx());
 	expect(skills.map(s => s.name)).toContain("my-skill");
