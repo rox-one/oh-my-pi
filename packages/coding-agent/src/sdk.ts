@@ -789,12 +789,13 @@ export async function loadCliExtensionProviders(
  */
 export async function discoverSkills(
 	cwd?: string,
-	_agentDir?: string,
+	agentDir?: string,
 	settings?: SkillsSettings,
 ): Promise<{ skills: Skill[]; warnings: SkillWarning[] }> {
 	return await loadSkillsInternal({
 		...settings,
 		cwd: cwd ?? getProjectDir(),
+		agentDir,
 	});
 }
 
@@ -804,12 +805,11 @@ export async function discoverSkills(
  */
 export async function discoverContextFiles(
 	cwd?: string,
-	_agentDir?: string,
-	disabledExtensions?: string[],
+	agentDir?: string,
 ): Promise<Array<{ path: string; content: string; depth?: number }>> {
 	return await loadContextFilesInternal({
 		cwd: cwd ?? getProjectDir(),
-		disabledExtensions,
+		agentDir,
 	});
 }
 
@@ -826,8 +826,8 @@ export async function discoverPromptTemplates(cwd?: string, agentDir?: string): 
 /**
  * Discover file-based slash commands from commands/ directories.
  */
-export async function discoverSlashCommands(cwd?: string): Promise<FileSlashCommand[]> {
-	return loadSlashCommandsInternal({ cwd: cwd ?? getProjectDir() });
+export async function discoverSlashCommands(cwd?: string, agentDir?: string): Promise<FileSlashCommand[]> {
+	return loadSlashCommandsInternal({ cwd: cwd ?? getProjectDir(), agentDir });
 }
 
 /**
@@ -1344,7 +1344,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 	promptTemplatesPromise.catch(() => {});
 	const slashCommandsPromise = options.slashCommands
 		? Promise.resolve(options.slashCommands)
-		: logger.time("discoverSlashCommands", discoverSlashCommands, cwd);
+		: logger.time("discoverSlashCommands", discoverSlashCommands, cwd, agentDir);
 	slashCommandsPromise.catch(() => {});
 	const customCommandsPromise =
 		options.disableExtensionDiscovery || options.restrictToolNames === true
@@ -1567,22 +1567,19 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 	}
 
 	// Discover rules and bucket them in one pass to avoid repeated scans over large rule sets.
-	const { ttsrManager, rulebookRules, alwaysApplyRules, allRules } = await logger.time(
-		"discoverTtsrRules",
-		async () => {
-			const { TtsrManager } = await import("./export/ttsr");
-			const ttsrSettings = settings.getGroup("ttsr");
-			const ttsrManager = new TtsrManager(ttsrSettings);
-			const rulesResult =
-				options.rules !== undefined
-					? { items: options.rules, warnings: undefined }
-					: await loadCapability<Rule>(ruleCapability.id, { cwd });
-			const { rulebookRules, alwaysApplyRules } = bucketRules(rulesResult.items, ttsrManager, {
-				builtinRules: ttsrSettings.builtinRules,
-				disabledRules: ttsrSettings.disabledRules,
-			});
-			if (existingSession.injectedTtsrRules.length > 0) {
-				ttsrManager.restoreInjected(existingSession.injectedTtsrRules);
+	const { ttsrManager, rulebookRules, alwaysApplyRules } = await logger.time("discoverTtsrRules", async () => {
+		const ttsrSettings = settings.getGroup("ttsr");
+		const ttsrManager = new TtsrManager(ttsrSettings);
+		const rulesResult =
+			options.rules !== undefined
+				? { items: options.rules, warnings: undefined }
+				: await loadCapability<Rule>(ruleCapability.id, { cwd, agentDir });
+		const rulebookRules: Rule[] = [];
+		const alwaysApplyRules: Rule[] = [];
+		for (const rule of rulesResult.items) {
+			const isTtsrRule = rule.condition && rule.condition.length > 0 ? ttsrManager.addRule(rule) : false;
+			if (isTtsrRule) {
+				continue;
 			}
 			return { ttsrManager, rulebookRules, alwaysApplyRules, allRules: rulesResult.items };
 		},
@@ -1889,11 +1886,22 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			filterBrowser: settings.get("browser.enabled") ?? false,
 		};
 		if (enableMCP && !mcpManager) {
-			if (deferMCPDiscoveryForUI) {
-				const cacheStorage = settings.getStorage();
-				mcpManager = new MCPManager(cwd, cacheStorage ? new MCPToolCache(cacheStorage) : null);
-				mcpManager.setAuthStorage(authStorage);
-				toolSession.mcpManager = mcpManager;
+			const mcpResult = await logger.time("discoverAndLoadMCPTools", discoverAndLoadMCPTools, cwd, {
+				onConnecting: serverNames => {
+					if (options.hasUI && serverNames.length > 0) {
+						process.stderr.write(`${chalk.gray(`Connecting to MCP servers: ${serverNames.join(", ")}…`)}\n`);
+					}
+				},
+				enableProjectConfig: settings.get("mcp.enableProjectConfig") ?? true,
+				// Always filter Exa - we have native integration
+				filterExa: true,
+				// Filter browser MCP servers when builtin browser tool is active
+				filterBrowser: settings.get("browser.enabled") ?? false,
+				cacheStorage: settings.getStorage(),
+				authStorage,
+				agentDir,
+			});
+			mcpManager = mcpResult.manager;
 
 				if (settings.get("mcp.notifications")) {
 					mcpManager.setNotificationsEnabled(true);
@@ -1988,11 +1996,14 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		// execution back through the parent — wrong for isolated tasks and for
 		// pending-action queueing.
 		const builtInToolNames = builtinTools.map(t => t.name);
-		const customToolPaths: ToolPathWithSource[] =
-			options.preloadedCustomToolPaths ??
-			(await logger.time("discoverCustomToolPaths", () => discoverCustomToolPaths([], cwd)));
-		const customToolsLoadResult = await logger.time("loadCustomTools", () =>
-			loadCustomTools(customToolPaths, cwd, builtInToolNames, action => queueResolveHandler(toolSession, action)),
+		const discoveredCustomTools = await logger.time(
+			"discoverAndLoadCustomTools",
+			discoverAndLoadCustomTools,
+			[],
+			cwd,
+			builtInToolNames,
+			action => queueResolveHandler(toolSession, action),
+			agentDir,
 		);
 		for (const { path, error } of customToolsLoadResult.errors) {
 			logger.error("Custom tool load failed", { path, error });
@@ -2043,6 +2054,8 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				options.preloadedPreparedExtensions,
 				cwd,
 				eventBus,
+				disabledExtensionIds,
+				agentDir,
 			);
 			for (const { path, error } of extensionsResult.errors) {
 				logger.error("Failed to bind extension", { path, error });

@@ -676,9 +676,10 @@ export interface DiscoverExtensionPathOptions {
 export async function discoverExtensionPaths(
 	configuredPaths: string[],
 	cwd: string,
-	disabledExtensionIds?: string[],
-	options: DiscoverExtensionPathOptions = {},
-): Promise<string[]> {
+	eventBus?: EventBus,
+	disabledExtensionIds: string[] = [],
+	agentDir?: string,
+): Promise<LoadExtensionsResult> {
 	const allPaths: string[] = [];
 	const seen = new Set<string>();
 	const disabled = new Set(disabledExtensionIds ?? []);
@@ -701,21 +702,12 @@ export async function discoverExtensionPaths(
 		}
 	};
 
-	const ambient = options.ambient !== false;
-	if (ambient) {
-		// 1. Discover extension modules via capability API (native .omp/.pi only).
-		// Scope the load to the native provider — the extension-module capability
-		// also has claude/codex/gemini/opencode providers, and their items were
-		// discarded here anyway (see #4198). The provider filter skips the walk
-		// entirely instead of running four foreign directory scans and dropping
-		// the results.
-		const discovered = await loadCapability<ExtensionModule>(extensionModuleCapability.id, {
-			...loadOptions,
-			providers: ["native"],
-		});
-		for (const ext of discovered.items) {
-			addPath(ext.path);
-		}
+	// 1. Discover extension modules via capability API (native .omp/.pi only)
+	const discovered = await loadCapability<ExtensionModule>(extensionModuleCapability.id, { cwd, agentDir });
+	for (const ext of discovered.items) {
+		if (ext._source.provider !== "native") continue;
+		if (isDisabledName(ext.name)) continue;
+		addPath(ext.path);
 	}
 
 	// 2. Discover JS/TS hook factories and bind them through the extension

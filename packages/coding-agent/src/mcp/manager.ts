@@ -179,7 +179,6 @@ export interface MCPLoadResult {
 	exaApiKeys: string[];
 }
 
-/** Options for discovering and connecting to MCP servers */
 export interface MCPDiscoverOptions {
 	/** Whether to load project-level config (default: true) */
 	enableProjectConfig?: boolean;
@@ -187,8 +186,10 @@ export interface MCPDiscoverOptions {
 	filterExa?: boolean;
 	/** Whether to filter out browser MCP servers when builtin browser tool is enabled (default: false) */
 	filterBrowser?: boolean;
-	/** Called when MCP server connection state changes. */
-	onStatus?: (event: McpConnectionStatusEvent) => void;
+	/** Called when starting to connect to servers */
+	onConnecting?: (serverNames: string[]) => void;
+	/** Active agent directory propagated to MCP config loading. */
+	agentDir?: string;
 }
 
 /** Handles an MCP `WWW-Authenticate` challenge and returns refreshed config. */
@@ -483,21 +484,13 @@ export class MCPManager {
 	 * Returns tools and any connection errors.
 	 */
 	async discoverAndConnect(options?: MCPDiscoverOptions): Promise<MCPLoadResult> {
-		let loadedConfigs: LoadMCPConfigsResult;
-		try {
-			loadedConfigs = await loadAllMCPConfigs(this.cwd, {
-				enableProjectConfig: options?.enableProjectConfig,
-				filterExa: options?.filterExa,
-				filterBrowser: options?.filterBrowser,
-			});
-		} catch (error) {
-			const message = error instanceof Error ? error.message : String(error);
-			options?.onStatus?.({ type: "failed", serverName: ".mcp.json", error: message });
-			this.#emitConnectionStatus({ type: "failed", serverName: ".mcp.json", error: message });
-			throw error;
-		}
-		const { configs, exaApiKeys, sources } = loadedConfigs;
-		const result = await this.connectServers(configs, sources, options?.onStatus);
+		const { configs, exaApiKeys, sources } = await loadAllMCPConfigs(this.cwd, {
+			enableProjectConfig: options?.enableProjectConfig,
+			filterExa: options?.filterExa,
+			filterBrowser: options?.filterBrowser,
+			agentDir: options?.agentDir,
+		});
+		const result = await this.connectServers(configs, sources, options?.onConnecting);
 		result.exaApiKeys = exaApiKeys;
 		return result;
 	}

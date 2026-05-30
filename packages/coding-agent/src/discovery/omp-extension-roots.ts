@@ -132,13 +132,15 @@ interface ScopeDirs {
 }
 
 function scopeDirs(ctx: LoadContext): ScopeDirs {
-	// Mirror `Settings` resolution: user config lives at `getAgentDir()`, which
-	// honors `PI_CODING_AGENT_DIR` / `PI_CONFIG_DIR`. Falling back to
-	// `ctx.home/.omp/agent` would diverge from the canonical user config.yml
-	// that the extension-module loader already reads via `settings.get(...)`.
+	// Mirror `Settings` resolution: user config lives at the active agent dir.
+	// Prefer the SDK-scoped `ctx.agentDir` (populated when a caller passes
+	// `agentDir` to `loadCapability` / `createAgentSession`) so non-default
+	// profiles see their own sibling discovery surface; fall back to
+	// `getAgentDir()` (which honors `PI_CODING_AGENT_DIR` / `PI_CONFIG_DIR`)
+	// for callers that rely on the process-global agent dir.
 	return {
 		project: path.join(ctx.cwd, ".omp"),
-		user: getAgentDir(),
+		user: ctx.agentDir ?? getAgentDir(),
 	};
 }
 

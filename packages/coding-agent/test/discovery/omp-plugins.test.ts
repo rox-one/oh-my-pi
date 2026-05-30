@@ -16,7 +16,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, expect, test } from "bun:te
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { getCapability } from "@oh-my-pi/pi-coding-agent/capability";
+import { getCapability, loadCapability } from "@oh-my-pi/pi-coding-agent/capability";
 import { clearCache } from "@oh-my-pi/pi-coding-agent/capability/fs";
 import { hookCapability } from "@oh-my-pi/pi-coding-agent/capability/hook";
 import { mcpCapability } from "@oh-my-pi/pi-coding-agent/capability/mcp";
@@ -229,6 +229,22 @@ test("user config.yml is sourced from getAgentDir() so PI_CODING_AGENT_DIR redir
 
 	const skills = await loadFromPlugin<{ name: string }>(skillCapability.id, ctx());
 	expect(skills.map(s => s.name)).toContain("my-skill");
+});
+
+test("loadCapability options.agentDir flows into ctx so SDK callers with createAgentSession({ agentDir }) get sibling discovery", async () => {
+	// Mirrors `createAgentSession({ agentDir })` plumbing — the SDK forwards the
+	// session-scoped agent dir to `loadCapability`, which must override the
+	// process-global default for omp-plugins sub-discovery.
+	const customAgentDir = path.join(tempDir, "sdk-agent");
+	fs.mkdirSync(customAgentDir, { recursive: true });
+	writeFile(path.join(customAgentDir, "config.yml"), YAML.stringify({ extensions: [ext] }, null, 2));
+
+	const skills = await loadCapability<{ name: string; _source: { provider: string } }>(skillCapability.id, {
+		cwd: project,
+		agentDir: customAgentDir,
+	});
+	const pluginSkills = skills.items.filter(item => item._source.provider === "omp-plugins");
+	expect(pluginSkills.map(s => s.name)).toContain("my-skill");
 });
 
 test("`--extension` CLI injection is wired through the same provider", async () => {

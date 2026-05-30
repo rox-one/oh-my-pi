@@ -16,6 +16,15 @@ export interface LoadContext {
 	home: string;
 	/** Git repository root (directory containing .git), or null if not in a repo */
 	repoRoot: string | null;
+	/**
+	 * Active agent directory for SDK-scoped user config. When omitted, providers
+	 * MUST fall back to the process-global `getAgentDir()`. Set this from
+	 * {@link LoadOptions.agentDir} so SDK callers that pass a non-default
+	 * `agentDir` (e.g. `createAgentSession({ agentDir })`) see their profile's
+	 * sibling skills/hooks/tools/`.mcp.json` discovered alongside the matching
+	 * `config.yml`.
+	 */
+	agentDir?: string;
 }
 
 /**
@@ -66,6 +75,8 @@ export interface LoadOptions<T = unknown> {
 	excludeProviders?: string[];
 	/** Custom cwd. Default: getProjectDir() */
 	cwd?: string;
+	/** Active agent directory. Propagated to {@link LoadContext.agentDir}. */
+	agentDir?: string;
 	/** Include items even if they fail validation. Default: false */
 	includeInvalid?: boolean;
 	/** Include items disabled via settings. Default: false */

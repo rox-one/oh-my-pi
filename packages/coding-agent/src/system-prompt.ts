@@ -384,8 +384,8 @@ export async function resolvePromptInput(input: string | undefined, description:
 export interface LoadContextFilesOptions {
 	/** Working directory to start walking up from. Default: getProjectDir() */
 	cwd?: string;
-	/** Disabled extension IDs to honor instead of the process-global settings. */
-	disabledExtensions?: string[];
+	/** Active agent directory propagated to {@link LoadOptions.agentDir}. */
+	agentDir?: string;
 }
 
 /**
@@ -433,9 +433,16 @@ export async function loadProjectContextFiles(
 ): Promise<Array<{ path: string; content: string; depth?: number }>> {
 	const resolvedCwd = options.cwd ?? getProjectDir();
 
-	const result = await loadCapability(contextFileCapability.id, {
-		cwd: resolvedCwd,
-		disabledExtensions: options.disabledExtensions,
+	const result = await loadCapability(contextFileCapability.id, { cwd: resolvedCwd, agentDir: options.agentDir });
+
+	// Convert ContextFile items and preserve depth info
+	const files = result.items.map(item => {
+		const contextFile = item as ContextFile;
+		return {
+			path: contextFile.path,
+			content: contextFile.content,
+			depth: contextFile.depth,
+		};
 	});
 
 	// Materialize ContextFile items, expanding any `@path/to/file` includes
@@ -471,7 +478,10 @@ export async function loadProjectContextFiles(
 export async function loadSystemPromptFiles(options: LoadContextFilesOptions = {}): Promise<string | null> {
 	const resolvedCwd = options.cwd ?? getProjectDir();
 
-	const result = await loadCapability<SystemPromptFile>(systemPromptCapability.id, { cwd: resolvedCwd });
+	const result = await loadCapability<SystemPromptFile>(systemPromptCapability.id, {
+		cwd: resolvedCwd,
+		agentDir: options.agentDir,
+	});
 
 	if (result.items.length === 0) return null;
 
