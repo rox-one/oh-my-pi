@@ -343,21 +343,14 @@ import { type AdvisorStats, SessionAdvisors, type SessionAdvisorsHost } from "./
 import type { BuildSessionContextOptions, SessionContext } from "./session-context";
 import { getRestorableSessionModels } from "./session-context";
 import { formatSessionDumpText } from "./session-dump-format";
-import type { BranchSummaryEntry, NewSessionOptions } from "./session-entries";
-import { SessionHandoff, type SessionHandoffHost } from "./session-handoff";
-import {
-	COMPACTION_CHECK_NONE,
-	createCodexCompactionContext as createMaintenanceCodexCompactionContext,
-	SessionMaintenance,
-	type SessionMaintenanceHost,
-} from "./session-maintenance";
-import { cleanupEmptyMoveSession, copySessionArtifacts, type SessionManager } from "./session-manager";
-import { SessionMemory, type SessionMemoryHost } from "./session-memory";
-import { buildSessionMetadata } from "./session-metadata";
-import { rebaseResourcePathMetadata } from "./session-paths";
-import { SessionProviderBoundary, type SessionProviderBoundaryHost } from "./session-provider-boundary";
-import { SessionStatsTracker, type SessionStatsTrackerHost } from "./session-stats";
-import { SessionTools, type SessionToolsHost } from "./session-tools";
+import type {
+	BranchSummaryEntry,
+	CompactionEntry,
+	NewSessionOptions,
+	SessionContext,
+	SessionManager,
+} from "./session-manager";
+import { getLatestCompactionEntry, getRestorableSessionModel } from "./session-manager";
 import type { ShakeMode, ShakeResult } from "./shake-types";
 import { skillPromptTitleInput } from "./skill-title-input";
 import { ToolChoiceQueue } from "./tool-choice-queue";
@@ -10248,33 +10241,31 @@ export class AgentSession {
 			}
 
 			// Restore model if saved
-			const targetModelStrings = getRestorableSessionModels(
+			const targetModelStr = getRestorableSessionModel(
 				sessionContext.models,
 				this.sessionManager.getLastModelChangeRole(),
 			);
-			if (targetModelStrings.length > 0) {
-				const availableModels = this.#modelRegistry.getAvailable();
-				let match: Model | undefined;
-				for (const targetModelStr of targetModelStrings) {
-					const slashIdx = targetModelStr.indexOf("/");
-					if (slashIdx <= 0) continue;
+			if (targetModelStr) {
+				const slashIdx = targetModelStr.indexOf("/");
+				if (slashIdx > 0) {
 					const provider = targetModelStr.slice(0, slashIdx);
 					const modelId = targetModelStr.slice(slashIdx + 1);
-					match = availableModels.find(m => m.provider === provider && m.id === modelId);
-					if (match) break;
-				}
-				if (match) {
-					const currentModel = this.model;
-					const shouldResetProviderState =
-						switchingToDifferentSession ||
-						(currentModel !== undefined &&
-							(currentModel.provider !== match.provider ||
-								currentModel.id !== match.id ||
-								currentModel.api !== match.api));
-					if (shouldResetProviderState) {
-						await this.#setModelWithProviderSessionReset(match);
-					} else {
-						this.agent.setModel(match);
+					const availableModels = this.#modelRegistry.getAvailable();
+					const match = availableModels.find(m => m.provider === provider && m.id === modelId);
+					if (match) {
+						const currentModel = this.model;
+						const shouldResetProviderState =
+							switchingToDifferentSession ||
+							(currentModel !== undefined &&
+								(currentModel.provider !== match.provider ||
+									currentModel.id !== match.id ||
+									currentModel.api !== match.api));
+						if (shouldResetProviderState) {
+							this.#setModelWithProviderSessionReset(match);
+						} else {
+							this.agent.setModel(match);
+							this.#syncToolCallBatchCap(match);
+						}
 					}
 				}
 			}

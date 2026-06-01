@@ -149,26 +149,11 @@ import {
 	obfuscateProviderContext,
 	type SecretObfuscator,
 } from "./secrets";
-import { AgentSession, type InitialRetryFallbackState, type PlanYolo, type Prewalk } from "./session/agent-session";
-import { discoverAuthStorage as discoverAuthStorageFromConfig } from "./session/auth-broker-config";
-import type { AuthStorage } from "./session/auth-storage";
-import { withDateCwdReminder } from "./session/date-cwd-reminder";
-import { createInterruptedTurnAbortMessage } from "./session/exit-diagnostics";
-import {
-	type CustomMessage,
-	convertToLlm,
-	LSP_LATE_DIAGNOSTIC_MESSAGE_TYPE,
-	replaceLlmImagesWithText,
-	USER_INTERRUPT_LABEL,
-	wrapSteeringForModel,
-} from "./session/messages";
-import { clampProviderContextImages } from "./session/provider-image-budget";
-import { getRestorableSessionModels } from "./session/session-context";
-import { SessionManager } from "./session/session-manager";
-import { collectMountedMCPToolRoutes, projectMountedMCPXdevGuidance } from "./session/session-tools";
-import { createSettingsAwareStreamFn } from "./session/settings-stream-fn";
-import { SnapcompactInlineTransformer } from "./session/snapcompact-inline";
-import { createSnapcompactSavingsRecorder } from "./session/snapcompact-savings-journal";
+import { AgentSession } from "./session/agent-session";
+import { resolveAuthBrokerConfig } from "./session/auth-broker-config";
+import { AuthBrokerClient, AuthStorage, RemoteAuthCredentialStore } from "./session/auth-storage";
+import { type CustomMessage, convertToLlm } from "./session/messages";
+import { getRestorableSessionModel, SessionManager } from "./session/session-manager";
 import { closeAllConnections } from "./ssh/connection-manager";
 import { unmountAll } from "./ssh/sshfs-mount";
 import {
@@ -1480,31 +1465,16 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 	);
 	let model = options.model;
 	let modelFallbackMessage: string | undefined;
-	let initialRetryFallback: InitialRetryFallbackState | undefined;
-	// Identify session model strings to restore in fallback order. We do an
-	// initial pass here so model-dependent setup (thinking-level resolution,
-	// host preconnect) can use the restored model; extension-registered
-	// providers aren't visible yet, so we retry the preferred candidates once
-	// extensions register below.
-	const sessionModelStrings =
-		!hasExplicitModel && hasExistingSession
-			? getRestorableSessionModels(existingSession.models, sessionManager.getLastModelChangeRole())
-			: [];
-	let restoredSessionModelIndex = -1;
-	let restoredSessionThinkingLevel: ConfiguredThinkingLevel | undefined;
-	if (!hasExplicitModel && !model && sessionModelStrings.length > 0) {
-		logger.time("restoreSessionModel", () => {
-			let failedSessionModel: string | undefined;
-			for (let i = 0; i < sessionModelStrings.length; i++) {
-				const sessionModelStr = sessionModelStrings[i];
-				const parsedModel = parseModelString(sessionModelStr, {
-					allowMaxSuffix: true,
-					allowAutoAlias: true,
-					isLiteralModelId: (provider, id) => modelRegistry.find(provider, id) !== undefined,
-				});
-				if (!parsedModel) {
-					failedSessionModel ??= sessionModelStr;
-					continue;
+	// If session has data, try to restore model from it.
+	// Skip restore when an explicit model was requested.
+	const sessionModelStr = getRestorableSessionModel(existingSession.models, sessionManager.getLastModelChangeRole());
+	if (!hasExplicitModel && !model && hasExistingSession && sessionModelStr) {
+		await logger.time("restoreSessionModel", async () => {
+			const parsedModel = parseModelString(sessionModelStr);
+			if (parsedModel) {
+				const restoredModel = modelRegistry.find(parsedModel.provider, parsedModel.id);
+				if (restoredModel && (await hasModelApiKey(restoredModel))) {
+					model = restoredModel;
 				}
 
 				const restoredModel = modelRegistry.find(parsedModel.provider, parsedModel.id);
@@ -1516,8 +1486,8 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				}
 				failedSessionModel ??= sessionModelStr;
 			}
-			if (failedSessionModel) {
-				modelFallbackMessage = `Could not restore model ${failedSessionModel}`;
+			if (!model) {
+				modelFallbackMessage = `Could not restore model ${sessionModelStr}`;
 			}
 		});
 	}

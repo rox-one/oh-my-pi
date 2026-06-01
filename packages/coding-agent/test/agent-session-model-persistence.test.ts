@@ -11,7 +11,7 @@ import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { getRestorableSessionModels } from "@oh-my-pi/pi-coding-agent/session/session-context";
 import { EPHEMERAL_MODEL_CHANGE_ROLE } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
-import { AUTO_THINKING } from "@oh-my-pi/pi-coding-agent/thinking";
+import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
 import { TempDir } from "@oh-my-pi/pi-utils";
 
 describe("AgentSession model persistence", () => {
@@ -59,16 +59,12 @@ describe("AgentSession model persistence", () => {
 		return `${model.provider}/${model.id}`;
 	}
 
-	async function writeRoleModelSession(
-		defaultRoleValue: string,
-		smolRoleValue: string,
-		lastRole = "smol",
-	): Promise<string> {
+	async function writeRoleModelSession(defaultRoleValue: string, smolRoleValue: string): Promise<string> {
 		const targetSessionFile = path.join(tempDir.path(), `target-${Bun.nanoseconds()}.jsonl`);
 		const timestamp = "2026-06-01T00:00:00.000Z";
 		await Bun.write(
 			targetSessionFile,
-			`${[
+			[
 				{ type: "session", version: 3, id: "target-session", timestamp, cwd: tempDir.path() },
 				{
 					type: "model_change",
@@ -84,11 +80,11 @@ describe("AgentSession model persistence", () => {
 					parentId: "default-model",
 					timestamp,
 					model: smolRoleValue,
-					role: lastRole,
+					role: "smol",
 				},
 			]
 				.map(entry => JSON.stringify(entry))
-				.join("\n")}\n`,
+				.join("\n") + "\n",
 		);
 		return targetSessionFile;
 	}
@@ -126,7 +122,7 @@ describe("AgentSession model persistence", () => {
 		session = new AgentSession({
 			agent,
 			sessionManager: options?.persist
-				? SessionManager.create(tempDir.path(), path.join(tempDir.path(), "active"))
+				? SessionManager.create(tempDir.path(), path.join(tempDir.path(), `active-${authStorages.length}`))
 				: SessionManager.inMemory(),
 			settings: sessionSettings,
 			modelRegistry,
@@ -313,199 +309,21 @@ describe("AgentSession model persistence", () => {
 		const smolRoleValue = modelValue(smolModel);
 		const targetSessionFile = await writeRoleModelSession(defaultRoleValue, smolRoleValue);
 
-		const result = await createStartupResumeSession(targetSessionFile);
-
-		expect(result.session.model?.id).toBe(smolModel.id);
-	});
-
-	it("falls back to the saved default model when switch-session role restore is unavailable", async () => {
-		const defaultModel = getAnthropicModelOrThrow("claude-sonnet-4-5");
-		const previousModel = getAnthropicModelOrThrow("claude-sonnet-4-6");
-		const defaultRoleValue = modelValue(defaultModel);
-		const targetSessionFile = await writeRoleModelSession(defaultRoleValue, "anthropic/not-loaded-anymore");
-
-		const created = await createSession({
-			initialModel: previousModel,
-			modelRoles: { default: defaultRoleValue },
-			persist: true,
-		});
-
-		await expect(created.session.switchSession(targetSessionFile)).resolves.toBe(true);
-		expect(created.session.model?.id).toBe(defaultModel.id);
-	});
-
-	it("restores the saved default model when switch-session last role is fallback", async () => {
-		const defaultModel = getAnthropicModelOrThrow("claude-sonnet-4-5");
-		const fallbackModel = getAnthropicModelOrThrow("claude-sonnet-4-6");
-		const defaultRoleValue = modelValue(defaultModel);
-		const targetSessionFile = await writeRoleModelSession(
-			defaultRoleValue,
-			modelValue(fallbackModel),
-			EPHEMERAL_MODEL_CHANGE_ROLE,
+		const authStorage = await AuthStorage.create(path.join(tempDir.path(), `testauth-${authStorages.length}.db`));
+		authStorages.push(authStorage);
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		const modelRegistry = new ModelRegistry(
+			authStorage,
+			path.join(tempDir.path(), `models-${authStorages.length}.yml`),
 		);
-
-		const created = await createSession({
-			initialModel: fallbackModel,
-			modelRoles: { default: defaultRoleValue },
-			persist: true,
-		});
-
-		await expect(created.session.switchSession(targetSessionFile)).resolves.toBe(true);
-		expect(created.session.model?.id).toBe(defaultModel.id);
-	});
-
-	it("falls back to the saved default model when startup role restore is unavailable", async () => {
-		const defaultModel = getAnthropicModelOrThrow("claude-sonnet-4-5");
-		const settingsFallbackModel = getAnthropicModelOrThrow("claude-sonnet-4-6");
-		const defaultRoleValue = modelValue(defaultModel);
-		const targetSessionFile = await writeRoleModelSession(defaultRoleValue, "anthropic/not-loaded-anymore");
-		const settings = Settings.isolated();
-		settings.setModelRole("default", modelValue(settingsFallbackModel));
-
-		const result = await createStartupResumeSession(targetSessionFile, settings);
-
-		expect(result.session.model?.id).toBe(defaultModel.id);
-	});
-
-	it("restores the saved default model when startup last role is fallback", async () => {
-		const defaultModel = getAnthropicModelOrThrow("claude-sonnet-4-5");
-		const fallbackModel = getAnthropicModelOrThrow("claude-sonnet-4-6");
-		const defaultRoleValue = modelValue(defaultModel);
-		const targetSessionFile = await writeRoleModelSession(
-			defaultRoleValue,
-			modelValue(fallbackModel),
-			EPHEMERAL_MODEL_CHANGE_ROLE,
-		);
-		const settings = Settings.isolated();
-		settings.setModelRole("default", modelValue(fallbackModel));
-
-		const result = await createStartupResumeSession(targetSessionFile, settings);
-
-		expect(result.session.model?.id).toBe(defaultModel.id);
-	});
-
-	it("restores a temporary model when switching sessions", async () => {
-		const defaultModel = getAnthropicModelOrThrow("claude-sonnet-4-5");
-		const temporaryModel = getAnthropicModelOrThrow("claude-sonnet-4-6");
-		const defaultRoleValue = modelValue(defaultModel);
-		const targetSessionFile = await writeRoleModelSession(defaultRoleValue, modelValue(temporaryModel), "temporary");
-
-		const created = await createSession({
-			initialModel: defaultModel,
-			modelRoles: { default: defaultRoleValue },
-			persist: true,
-		});
-
-		await expect(created.session.switchSession(targetSessionFile)).resolves.toBe(true);
-		expect(created.session.model?.id).toBe(temporaryModel.id);
-	});
-
-	it("restores a temporary model during startup resume", async () => {
-		const defaultModel = getAnthropicModelOrThrow("claude-sonnet-4-5");
-		const temporaryModel = getAnthropicModelOrThrow("claude-sonnet-4-6");
-		const defaultRoleValue = modelValue(defaultModel);
-		const targetSessionFile = await writeRoleModelSession(defaultRoleValue, modelValue(temporaryModel), "temporary");
-		const settings = Settings.isolated();
-		settings.setModelRole("default", defaultRoleValue);
-
-		const result = await createStartupResumeSession(targetSessionFile, settings);
-
-		expect(result.session.model?.id).toBe(temporaryModel.id);
-	});
-
-	it("activates auto thinking on startup resume when modelRoles.default carries an explicit :auto suffix", async () => {
-		const defaultModel = getAnthropicModelOrThrow("claude-sonnet-4-5");
-		const targetSessionFile = await writeRoleModelSession(
-			modelValue(defaultModel),
-			modelValue(defaultModel),
-			"default",
-		);
-		const settings = Settings.isolated();
-		settings.setModelRole("default", `${modelValue(defaultModel)}:auto`);
-
-		const result = await createStartupResumeSession(targetSessionFile, settings);
-
-		expect(result.session.model?.id).toBe(defaultModel.id);
-		expect(result.session.configuredThinkingLevel()).toBe(AUTO_THINKING);
-	});
-
-	it("marks an incomplete process-exit transcript aborted during SDK resume without dropping history", async () => {
-		const sessionManager = SessionManager.create(tempDir.path(), path.join(tempDir.path(), "interrupted"));
-		const interruptedAssistant: AssistantMessage = {
-			role: "assistant",
-			content: [{ type: "toolCall", id: "call_read", name: "read", arguments: { path: "state.txt" } }],
-			api: "anthropic-messages",
-			provider: "anthropic",
-			model: "claude-sonnet-4-5",
-			usage: {
-				input: 1,
-				output: 1,
-				cacheRead: 0,
-				cacheWrite: 0,
-				totalTokens: 2,
-				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-			},
-			stopReason: "toolUse",
-			timestamp: Date.now(),
-		};
-		sessionManager.appendMessage({ role: "user", content: "inspect state", timestamp: Date.now() });
-		sessionManager.appendMessage(interruptedAssistant);
-		sessionManager.appendMessage({
-			role: "toolResult",
-			toolCallId: "call_read",
-			toolName: "read",
-			content: [{ type: "text", text: "preserved partial result" }],
-			isError: false,
-			timestamp: Date.now(),
-		});
-		sessionManager.appendCustomEntry("session_exit", {
-			reason: "exit",
-			kind: "process_exit",
-			recordedAt: "2026-07-11T02:20:08.800Z",
-		});
-		await sessionManager.flush();
-		const sessionFile = sessionManager.getSessionFile();
-		if (!sessionFile) throw new Error("Expected interrupted session file");
-
-		const result = await createStartupResumeSession(sessionFile);
-		const messages = result.session.sessionManager.buildSessionContext({ transcript: true }).messages;
-		expect(messages.at(-1)).toMatchObject({
-			role: "assistant",
-			content: [],
-			stopReason: "aborted",
-			errorMessage: "Previous OMP process exited before completing the turn.",
-		});
-		expect(
-			messages.some(
-				message =>
-					message.role === "toolResult" &&
-					message.content.some(part => part.type === "text" && part.text === "preserved partial result"),
-			),
-		).toBe(true);
-		expect(messages.filter(message => message.role === "assistant" && message.stopReason === "aborted")).toHaveLength(
-			1,
-		);
-	});
-
-	it("marks a first user-message process-exit tail aborted with the selected model", async () => {
-		const defaultModel = getAnthropicModelOrThrow("claude-sonnet-4-5");
-		const settings = Settings.isolated();
-		settings.setModelRole("default", modelValue(defaultModel));
-		const sessionManager = SessionManager.create(tempDir.path(), path.join(tempDir.path(), "interrupted-user"));
-		sessionManager.appendModelChange(modelValue(defaultModel));
-		sessionManager.appendMessage({ role: "user", content: "inspect state", timestamp: Date.now() });
-		sessionManager.appendCustomEntry("session_exit", {
-			reason: "exit",
-			kind: "process_exit",
-			recordedAt: "2026-07-11T02:20:08.800Z",
-		});
+		const sessionManager = await SessionManager.open(targetSessionFile, path.join(tempDir.path(), "startup"));
 		const result = await createAgentSession({
 			cwd: tempDir.path(),
 			agentDir: tempDir.path(),
-			authStorage: sharedAuthStorage,
-			modelRegistry: sharedModelRegistry,
+			authStorage,
+			modelRegistry,
 			sessionManager,
-			settings,
+			settings: Settings.isolated(),
 			disableExtensionDiscovery: true,
 			skills: [],
 			contextFiles: [],
@@ -516,103 +334,7 @@ describe("AgentSession model persistence", () => {
 			skipPythonPreflight: true,
 		});
 		session = result.session;
-		expect(result.session.model?.id).toBe(defaultModel.id);
-		expect(
-			result.session.sessionManager
-				.getBranch()
-				.find(entry => entry.type === "message" && entry.message.role === "assistant"),
-		).toMatchObject({
-			type: "message",
-			message: {
-				role: "assistant",
-				api: defaultModel.api,
-				provider: defaultModel.provider,
-				model: defaultModel.id,
-				stopReason: "aborted",
-			},
-		});
-	});
 
-	it("marks an interrupted first turn aborted when switching sessions", async () => {
-		const defaultModel = getAnthropicModelOrThrow("claude-sonnet-4-5");
-		const created = await createSession({ initialModel: defaultModel, persist: true });
-		const targetFile = path.join(tempDir.path(), "switch-interrupted-user.jsonl");
-		const timestamp = "2026-07-11T02:20:08.800Z";
-		await Bun.write(
-			targetFile,
-			`${[
-				{ type: "session", version: 3, id: "switch-target", timestamp, cwd: tempDir.path() },
-				{
-					type: "model_change",
-					id: "model",
-					parentId: null,
-					timestamp,
-					model: modelValue(defaultModel),
-				},
-				{
-					type: "message",
-					id: "user",
-					parentId: "model",
-					timestamp,
-					message: { role: "user", content: "inspect state", timestamp: Date.parse(timestamp) },
-				},
-				{
-					type: "custom",
-					id: "exit",
-					parentId: "user",
-					timestamp,
-					customType: "session_exit",
-					data: { reason: "exit", kind: "process_exit", recordedAt: timestamp },
-				},
-			]
-				.map(entry => JSON.stringify(entry))
-				.join("\n")}\n`,
-		);
-
-		await expect(created.session.switchSession(targetFile)).resolves.toBe(true);
-
-		expect(created.session.sessionManager.buildSessionContext({ transcript: true }).messages.at(-1)).toMatchObject({
-			role: "assistant",
-			api: defaultModel.api,
-			provider: defaultModel.provider,
-			model: defaultModel.id,
-			stopReason: "aborted",
-		});
-	});
-
-	it("lists restorable temporary model before the default fallback", () => {
-		expect(
-			getRestorableSessionModels(
-				{
-					default: "anthropic/claude-sonnet-4-5",
-					temporary: "anthropic/claude-sonnet-4-6",
-				},
-				"temporary",
-			),
-		).toEqual(["anthropic/claude-sonnet-4-6", "anthropic/claude-sonnet-4-5"]);
-	});
-
-	it("lists only the default model for ephemeral fallback restores", () => {
-		expect(
-			getRestorableSessionModels(
-				{
-					default: "anthropic/claude-sonnet-4-5",
-					[EPHEMERAL_MODEL_CHANGE_ROLE]: "anthropic/claude-sonnet-4-6",
-				},
-				EPHEMERAL_MODEL_CHANGE_ROLE,
-			),
-		).toEqual(["anthropic/claude-sonnet-4-5"]);
-	});
-
-	it("lists a named role model before the default fallback", () => {
-		expect(
-			getRestorableSessionModels(
-				{
-					default: "anthropic/claude-sonnet-4-5",
-					smol: "anthropic/claude-sonnet-4-6",
-				},
-				"smol",
-			),
-		).toEqual(["anthropic/claude-sonnet-4-6", "anthropic/claude-sonnet-4-5"]);
+		expect(result.session.model?.id).toBe(smolModel.id);
 	});
 });

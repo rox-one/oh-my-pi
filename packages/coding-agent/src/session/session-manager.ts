@@ -262,102 +262,33 @@ class SessionEntryIndex {
 		if (bucket) bucket.push(entry);
 		else this.#children.set(entry.parentId, [entry]);
 
-		if (entry.type === "label") {
-			if (entry.label) this.#labels.set(entry.targetId, entry.label);
-			else this.#labels.delete(entry.targetId);
-		}
-
-		addUsage(this.#usage, entryUsage(entry));
+/** Selects the model string that should become active when restoring a session. */
+export function getRestorableSessionModel(
+	models: Readonly<Record<string, string>>,
+	lastModelChangeRole: string | undefined,
+): string | undefined {
+	if (lastModelChangeRole) {
+		const roleModel = models[lastModelChangeRole];
+		if (roleModel) return roleModel;
 	}
+	return models.default;
+}
 
-	has(id: string): boolean {
-		return this.#entriesById.has(id);
-	}
-
-	get(id: string): SessionEntry | undefined {
-		return this.#entriesById.get(id);
-	}
-
-	/**
-	 * The live id→entry map. Read-only for callers (lookups + `generateId`
-	 * collision checks); never mutate it directly — go through `insert`/`rebuild`.
-	 */
-	entriesById(): Map<string, SessionEntry> {
-		return this.#entriesById;
-	}
-
-	leafId(): string | null {
-		return this.#leaf;
-	}
-
-	leafEntry(): SessionEntry | undefined {
-		return this.#leaf ? this.#entriesById.get(this.#leaf) : undefined;
-	}
-
-	setLeaf(id: string | null): void {
-		this.#leaf = id;
-	}
-
-	childrenOf(parentId: string): SessionEntry[] {
-		return [...(this.#children.get(parentId) ?? [])];
-	}
-
-	labelFor(id: string): string | undefined {
-		return this.#labels.get(id);
-	}
-
-	labelsInEffect(): IterableIterator<[string, string]> {
-		return this.#labels.entries();
-	}
-
-	usageSnapshot(): UsageStatistics {
-		return { ...this.#usage };
-	}
-
-	pathTo(id: string | null | undefined = this.#leaf): SessionEntry[] {
-		const branch: SessionEntry[] = [];
-		const seen = new Set<string>();
-		let cursor = id ? this.#entriesById.get(id) : undefined;
-
-		while (cursor && !seen.has(cursor.id)) {
-			seen.add(cursor.id);
-			branch.push(cursor);
-			cursor = cursor.parentId ? this.#entriesById.get(cursor.parentId) : undefined;
-		}
-		branch.reverse();
-		return branch;
-	}
-
-	tree(entries: readonly SessionEntry[]): SessionTreeNode[] {
-		const nodes = new Map<string, SessionTreeNode>();
-		const roots: SessionTreeNode[] = [];
-
-		for (const entry of entries) {
-			nodes.set(entry.id, { entry, children: [], label: this.#labels.get(entry.id) });
-		}
-
-		for (const entry of entries) {
-			const node = nodes.get(entry.id)!;
-			const parentId = entry.parentId;
-			if (parentId === null || parentId === entry.id) {
-				roots.push(node);
-				continue;
-			}
-
-			const parent = nodes.get(parentId);
-			if (parent) parent.children.push(node);
-			else roots.push(node);
-		}
-
-		const stack = [...roots];
-		while (stack.length > 0) {
-			const node = stack.pop()!;
-			node.children.sort(orderedByTimestamp);
-			stack.push(...node.children);
-		}
-
-		return roots;
-	}
+export interface SessionInfo {
+	path: string;
+	id: string;
+	/** Working directory where the session was started. Empty string for old sessions. */
+	cwd: string;
+	title?: string;
+	/** Path to the parent session (if this session was forked). */
+	parentSessionPath?: string;
+	created: Date;
+	modified: Date;
+	messageCount: number;
+	/** File size in bytes on disk; used for compact list rendering. */
+	size: number;
+	firstMessage: string;
+	allMessagesText: string;
 }
 
 export type ReadonlySessionManager = Pick<
