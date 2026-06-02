@@ -8565,7 +8565,46 @@ export class AgentSession {
 
 	/** Resolves configured role models and the currently active role index. */
 	getRoleModelCycle(roleOrder: readonly string[]): RoleModelCycle | undefined {
-		return this.#models.getRoleModelCycle(roleOrder);
+		const availableModels = this.#modelRegistry.getAvailable();
+		if (availableModels.length === 0) return undefined;
+
+		const currentModel = this.model;
+		if (!currentModel) return undefined;
+		const matchPreferences = { usageOrder: this.settings.getStorage()?.getModelUsageOrder() };
+		const models: ResolvedRoleModel[] = [];
+
+		for (const role of roleOrder) {
+			const roleModelStr =
+				role === "default"
+					? (this.settings.getModelRole("default") ?? `${currentModel.provider}/${currentModel.id}`)
+					: this.settings.getModelRole(role);
+			if (!roleModelStr) continue;
+
+			const resolved = resolveModelRoleValue(roleModelStr, availableModels, {
+				settings: this.settings,
+				matchPreferences,
+				modelRegistry: this.#modelRegistry,
+			});
+			if (!resolved.model) continue;
+
+			models.push({
+				role,
+				model: resolved.model,
+				thinkingLevel: resolved.thinkingLevel,
+				explicitThinkingLevel: resolved.explicitThinkingLevel,
+			});
+		}
+
+		if (models.length === 0) return undefined;
+
+		const lastRole = this.sessionManager.getLastRestorableModelChangeRole();
+		let currentIndex = lastRole ? models.findIndex(entry => entry.role === lastRole) : -1;
+		if (currentIndex === -1) {
+			currentIndex = models.findIndex(entry => modelsAreEqual(entry.model, currentModel));
+		}
+		if (currentIndex === -1) currentIndex = 0;
+
+		return { models, currentIndex };
 	}
 
 	/** Applies a resolved role model without changing global settings. */
@@ -10243,7 +10282,7 @@ export class AgentSession {
 			// Restore model if saved
 			const targetModelStrings = getRestorableSessionModels(
 				sessionContext.models,
-				this.sessionManager.getLastModelChangeRole(),
+				this.sessionManager.getLastRestorableModelChangeRole(),
 			);
 			if (targetModelStrings.length > 0) {
 				const availableModels = this.#modelRegistry.getAvailable();

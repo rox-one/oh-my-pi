@@ -62,33 +62,40 @@ describe("AgentSession model persistence", () => {
 		defaultRoleValue: string,
 		smolRoleValue: string,
 		lastRole = "smol",
+		tail?: { model: string; role: string },
 	): Promise<string> {
 		const targetSessionFile = path.join(tempDir.path(), `target-${Bun.nanoseconds()}.jsonl`);
 		const timestamp = "2026-06-01T00:00:00.000Z";
-		await Bun.write(
-			targetSessionFile,
-			`${[
-				{ type: "session", version: 3, id: "target-session", timestamp, cwd: tempDir.path() },
-				{
-					type: "model_change",
-					id: "default-model",
-					parentId: null,
-					timestamp,
-					model: defaultRoleValue,
-					role: "default",
-				},
-				{
-					type: "model_change",
-					id: "smol-model",
-					parentId: "default-model",
-					timestamp,
-					model: smolRoleValue,
-					role: lastRole,
-				},
-			]
-				.map(entry => JSON.stringify(entry))
-				.join("\n")}\n`,
-		);
+		const entries = [
+			{ type: "session", version: 3, id: "target-session", timestamp, cwd: tempDir.path() },
+			{
+				type: "model_change",
+				id: "default-model",
+				parentId: null,
+				timestamp,
+				model: defaultRoleValue,
+				role: "default",
+			},
+			{
+				type: "model_change",
+				id: "smol-model",
+				parentId: "default-model",
+				timestamp,
+				model: smolRoleValue,
+				role: lastRole,
+			},
+		];
+		if (tail) {
+			entries.push({
+				type: "model_change",
+				id: "tail-model",
+				parentId: "smol-model",
+				timestamp,
+				model: tail.model,
+				role: tail.role,
+			});
+		}
+		await Bun.write(targetSessionFile, `${entries.map(entry => JSON.stringify(entry)).join("\n")}\n`);
 		return targetSessionFile;
 	}
 	async function createSession(options?: {
@@ -356,6 +363,26 @@ describe("AgentSession model persistence", () => {
 		expect(created.session.model?.id).toBe(defaultModel.id);
 	});
 
+	it("restores the previous non-temporary role when switch-session tail is temporary", async () => {
+		const defaultModel = getAnthropicModelOrThrow("claude-sonnet-4-5");
+		const smolModel = getAnthropicModelOrThrow("claude-sonnet-4-6");
+		const defaultRoleValue = modelValue(defaultModel);
+		const smolRoleValue = modelValue(smolModel);
+		const targetSessionFile = await writeRoleModelSession(defaultRoleValue, smolRoleValue, "smol", {
+			model: defaultRoleValue,
+			role: "temporary",
+		});
+
+		const created = await createSession({
+			initialModel: defaultModel,
+			modelRoles: { default: defaultRoleValue, smol: smolRoleValue },
+			persist: true,
+		});
+
+		await expect(created.session.switchSession(targetSessionFile)).resolves.toBe(true);
+		expect(created.session.model?.id).toBe(smolModel.id);
+	});
+
 	it("falls back to the saved default model when startup role restore is unavailable", async () => {
 		const defaultModel = getAnthropicModelOrThrow("claude-sonnet-4-5");
 		const settingsFallbackModel = getAnthropicModelOrThrow("claude-sonnet-4-6");
@@ -380,5 +407,22 @@ describe("AgentSession model persistence", () => {
 		const result = await createStartupResumeSession(targetSessionFile, settings);
 
 		expect(result.session.model?.id).toBe(defaultModel.id);
+	});
+
+	it("restores the previous non-temporary role when startup tail is temporary", async () => {
+		const defaultModel = getAnthropicModelOrThrow("claude-sonnet-4-5");
+		const smolModel = getAnthropicModelOrThrow("claude-sonnet-4-6");
+		const defaultRoleValue = modelValue(defaultModel);
+		const smolRoleValue = modelValue(smolModel);
+		const targetSessionFile = await writeRoleModelSession(defaultRoleValue, smolRoleValue, "smol", {
+			model: defaultRoleValue,
+			role: "temporary",
+		});
+		const settings = Settings.isolated();
+		settings.setModelRole("default", defaultRoleValue);
+
+		const result = await createStartupResumeSession(targetSessionFile, settings);
+
+		expect(result.session.model?.id).toBe(smolModel.id);
 	});
 });

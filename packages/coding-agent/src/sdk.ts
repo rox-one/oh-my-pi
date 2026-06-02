@@ -1472,7 +1472,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 	// extensions register below.
 	const sessionModelStrings =
 		!hasExplicitModel && hasExistingSession
-			? getRestorableSessionModels(existingSession.models, sessionManager.getLastModelChangeRole())
+			? getRestorableSessionModels(existingSession.models, sessionManager.getLastRestorableModelChangeRole())
 			: [];
 	let restoredSessionModelIndex = -1;
 	if (!hasExplicitModel && !model && sessionModelStrings.length > 0) {

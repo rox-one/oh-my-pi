@@ -2391,10 +2391,27 @@ export class SessionManager {
 	 * model change has been recorded.
 	 */
 	getLastModelChangeRole(): string | undefined {
-		const branch = this.getBranch();
-		for (let index = branch.length - 1; index >= 0; index--) {
-			const entry = branch[index];
-			if (entry.type === "model_change") return entry.role ?? "default";
+		return this.#getLastModelChangeRole();
+	}
+
+	/**
+	 * Get the most recent non-temporary model role from the current session path.
+	 * Temporary model changes are transient fallbacks and must not be restored.
+	 */
+	getLastRestorableModelChangeRole(): string | undefined {
+		return this.#getLastModelChangeRole({ skipTemporary: true });
+	}
+
+	#getLastModelChangeRole(options?: { skipTemporary?: boolean }): string | undefined {
+		let current = this.getLeafEntry();
+		while (current) {
+			if (current.type === "model_change") {
+				const role = current.role ?? "default";
+				if (!options?.skipTemporary || role !== "temporary") {
+					return role;
+				}
+			}
+			current = current.parentId ? this.#byId.get(current.parentId) : undefined;
 		}
 		return undefined;
 	}
