@@ -17,22 +17,8 @@ import { performance } from "node:perf_hooks";
 import { $flag, getDebugLogPath, logger } from "@oh-my-pi/pi-utils";
 import { DEFAULT_MAX_INLINE_IMAGES, ImageBudget } from "./components/image";
 import { isKeyRelease, matchesKey } from "./keys";
-import { LoopWatchdog } from "./loop-watchdog";
-import { setAltScreenActive, type Terminal } from "./terminal";
-import {
-	encodeKittyDeleteAllImages,
-	encodeKittyDeleteImage,
-	encodeKittyPlacementLine,
-	ImageProtocol,
-	isImageProtocolForced,
-	isInsideTerminalMultiplexer,
-	parseKittyDirectPlacementLine,
-	setCellDimensions,
-	setTerminalImageProtocol,
-	shouldEnableSynchronizedOutputByDefault,
-	synchronizedOutputUserOverride,
-	TERMINAL,
-} from "./terminal-capabilities";
+import { type Terminal, terminalResetsViewportOnEraseScrollback } from "./terminal";
+import { ImageProtocol, setCellDimensions, setTerminalImageProtocol, TERMINAL } from "./terminal-capabilities";
 import {
 	Ellipsis,
 	extractSegments,
@@ -849,8 +835,27 @@ export class TUI extends Container {
 	 * runtime against the terminal's DECRQM mode-2026 report — enabled on a
 	 * positive report, disabled on a negative one.
 	 */
-	get synchronizedOutput(): boolean {
-		return this.#synchronizedOutputEnabled;
+	setClearOnShrink(enabled: boolean): void {
+		this.#clearOnShrink = enabled;
+	}
+
+	/**
+	 * When enabled, live render frames rebuild native scrollback on offscreen and
+	 * structural changes even when the viewport position is unobservable (POSIX,
+	 * where `isNativeViewportAtBottom()` is `undefined`), instead of deferring to a
+	 * non-destructive repaint. This trades the anti-yank guarantee for a clean,
+	 * duplicate-free history and is meant for windows where output above the fold
+	 * is actively re-rendering — e.g. a tool whose result is still streaming and
+	 * re-laying-out rows that have already scrolled into history. A snap to the tail
+	 * is acceptable there. A terminal that can report a *known*-scrolled viewport
+	 * (Windows) still defers; only the unknown case is forced to rebuild. POSIX
+	 * hosts whose terminal is known to reset the viewport on ED3 (WezTerm,
+	 * kitty, ghostty, alacritty — see #1682) also defer, since the destructive
+	 * `\x1b[3J` would yank a scrolled-up reader; the deferred rebuild lands at
+	 * the next checkpoint where input has pinned the viewport to the bottom.
+	 */
+	setEagerNativeScrollbackRebuild(enabled: boolean): void {
+		this.#eagerNativeScrollbackRebuild = enabled;
 	}
 
 	setFocus(component: Component | null): void {
@@ -2190,47 +2195,102 @@ export class TUI extends Container {
 			return;
 		}
 
-		// Fullscreen alt-screen short-circuit. While the topmost visible overlay
-		// requests it, borrow the terminal's alternate buffer and paint only the
-		// modal there; the normal screen and all accounting stay untouched.
-		const topOverlay = this.#getTopmostVisibleOverlay();
-		const wantAlt = topOverlay?.options?.fullscreen === true;
-		const wantMouseTracking = wantAlt && topOverlay.options?.mouseTracking !== false;
-		if (wantAlt && !this.#altActive) {
-			// Enhanced keyboard modes can be buffer-local: re-push the active
-			// modified-key reporting sequence on the freshly entered alternate
-			// screen, or Esc/modified keys revert to legacy encoding inside
-			// fullscreen overlays (Ghostty/kitty/iTerm2).
-			const mouseEnter = wantMouseTracking ? MOUSE_TRACKING_ON : "";
-			this.terminal.write(`\x1b[?1049h${this.#keyboardEnhancementEnter()}${mouseEnter}`);
-			setAltScreenActive(true);
-			this.terminal.hideCursor();
-			this.#forgetHardwareCursorState();
-			this.#recordHardwareCursorHidden();
-			this.#altActive = true;
-			this.#altMouseTrackingActive = wantMouseTracking;
-			this.#altPreviousLines = [];
-			this.#altEnterWidth = width;
-			this.#altEnterHeight = height;
-		} else if (!wantAlt && this.#altActive) {
-			const mouseExit = this.#altMouseTrackingActive ? MOUSE_TRACKING_OFF : "";
-			const enhancementExit = this.#keyboardEnhancementExit();
-			const exitSequence = `${mouseExit}${enhancementExit}\x1b[?1049l`;
-			this.terminal.write(exitSequence);
-			setAltScreenActive(false);
-			this.#forgetHardwareCursorState();
-			this.#altActive = false;
-			this.#altMouseTrackingActive = false;
-			this.#altPreviousLines = [];
-			// The alt buffer restore put the pre-overlay normal screen back; a
-			// geometry change while covered invalidates the diff baseline and the
-			// writer's dimension check forces the full anchored rewrite.
-			if (width !== this.#altEnterWidth || height !== this.#altEnterHeight) {
-				this.#forceViewportRepaintOnNextRender = true;
-			}
-		} else if (wantMouseTracking !== this.#altMouseTrackingActive) {
-			this.terminal.write(wantMouseTracking ? MOUSE_TRACKING_ON : MOUSE_TRACKING_OFF);
-			this.#altMouseTrackingActive = wantMouseTracking;
+		// 2. Capture transition + pre-render state before any emitter runs.
+		const prevViewportTop = this.#viewportTopRow;
+		const prevHardwareCursorRow = this.#hardwareCursorRow;
+		const widthChanged = this.#previousWidth > 0 && this.#previousWidth !== width;
+		const heightChanged = this.#previousHeight > 0 && this.#previousHeight !== height;
+		// `setEagerNativeScrollbackRebuild(true)` (coding-agent enables it for the
+		// full duration of every streaming event) normally lets unknown-viewport
+		// frames take the destructive `historyRebuild` path so re-laying-out
+		// streamed output produces a clean, duplicate-free history. On terminals
+		// that reset the viewport to the top of scrollback on ED3 (WezTerm,
+		// kitty, ghostty, alacritty — see #1682) that snap-to-tail yanks any
+		// scrolled-up reader. Defer to the non-destructive viewport repaint
+		// there; the explicit autocomplete/IME opt-in via `requestRender(...,
+		// { allowUnknownViewportMutation: true })` still flows through because
+		// the user's keystroke has pinned the terminal back to the bottom.
+		const eagerRebuildAllowed = this.#eagerNativeScrollbackRebuild && !terminalResetsViewportOnEraseScrollback();
+		const allowUnknownViewportMutation = this.#allowUnknownViewportMutationOnNextRender || eagerRebuildAllowed;
+		this.#allowUnknownViewportMutationOnNextRender = false;
+
+		// 3. Classify intent.
+		const intent = this.#planRender(
+			lines,
+			widthChanged,
+			heightChanged,
+			prevViewportTop,
+			height,
+			allowUnknownViewportMutation,
+		);
+		this.#logRedraw(intent, lines.length, height);
+		// 4. Execute.
+		switch (intent.kind) {
+			case "noop":
+				this.#writeCursorPosition(cursorPos, lines.length);
+				this.#viewportTopRow = Math.max(0, this.#maxLinesRendered - height);
+				this.#previousWidth = width;
+				this.#previousHeight = height;
+				return;
+			case "initial":
+				this.#emitFullPaint(lines, width, height, cursorPos, { clearViewport: true, clearScrollback: false });
+				this.#hasEverRendered = true;
+				return;
+			case "sessionReplace":
+				this.#clearScrollbackOnNextRender = false;
+				this.#clearNativeScrollbackDirty();
+				this.#emitFullPaint(lines, width, height, cursorPos, {
+					clearViewport: true,
+					clearScrollback: !isMultiplexerSession(),
+				});
+				return;
+			case "historyRebuild":
+				this.#clearNativeScrollbackDirty();
+				this.#emitFullPaint(lines, width, height, cursorPos, {
+					clearViewport: true,
+					clearScrollback: !isMultiplexerSession(),
+				});
+				return;
+			case "overlayRebuild":
+				this.#clearNativeScrollbackDirty();
+				this.#emitFullPaint(baseLines, width, height, null, {
+					clearViewport: true,
+					clearScrollback: !isMultiplexerSession(),
+				});
+				this.#emitViewportRepaint(lines, width, height, cursorPos);
+				return;
+			case "viewportRepaint":
+				if (intent.appendFrom !== undefined) {
+					this.#emitAppendTail(lines, intent.appendFrom, height, width, prevViewportTop, prevHardwareCursorRow);
+				}
+				this.#emitViewportRepaint(lines, width, height, cursorPos);
+				return;
+			case "deferredMutation":
+				return;
+			case "deferredShrink":
+				this.#emitViewportRepaint(
+					this.#padDeferredShrinkLines(lines, intent.paddedLength),
+					width,
+					height,
+					cursorPos,
+				);
+				return;
+			case "shrink":
+				this.#emitShrink(lines, width, height, cursorPos, prevHardwareCursorRow, prevViewportTop);
+				return;
+			case "diff":
+				this.#emitDiff(
+					lines,
+					width,
+					height,
+					cursorPos,
+					intent.firstChanged,
+					intent.lastChanged,
+					intent.appendedLines,
+					prevViewportTop,
+					prevHardwareCursorRow,
+				);
+				return;
 		}
 		if (this.#altActive) {
 			this.#renderAltFrame(width, height);

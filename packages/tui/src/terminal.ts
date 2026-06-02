@@ -596,6 +596,44 @@ function isPrivateModeSupported(status: string): boolean {
 }
 
 /**
+ * Whether the host terminal resets the visible viewport to the top of
+ * scrollback when it receives ED3 (`\x1b[3J`).
+ *
+ * WezTerm, kitty, ghostty, and alacritty honor ECMA-48 ED3 by repositioning
+ * the viewport to the top of the (now-erased) scrollback. They also pin only
+ * on user input (no `scroll_to_bottom_on_output`), so a destructive native
+ * scrollback rebuild during streaming yanks a scrolled-up reader to the top.
+ * Caller uses this to gate the renderer's eager scrollback rebuild: when this
+ * returns true, the eager opt-in no longer overrides the unknown-viewport
+ * deferral and the destructive rebuild is held until the next checkpoint,
+ * where the user's keystroke has already pinned the terminal back to the
+ * bottom. Autocomplete/IME paths that pass `allowUnknownViewportMutation`
+ * explicitly are unaffected — the user is actively typing.
+ *
+ * Pure helper for unit testing; the runtime call site reads `$env` /
+ * `process.platform`. See #1682.
+ */
+export function terminalResetsViewportOnEraseScrollback(
+	env: {
+		WEZTERM_PANE?: string | undefined;
+		KITTY_WINDOW_ID?: string | undefined;
+		GHOSTTY_RESOURCES_DIR?: string | undefined;
+		ALACRITTY_WINDOW_ID?: string | undefined;
+		TERM_PROGRAM?: string | undefined;
+	} = $env,
+	platform: NodeJS.Platform = process.platform,
+): boolean {
+	if (platform === "win32") return false;
+	if (env.WEZTERM_PANE || env.KITTY_WINDOW_ID || env.GHOSTTY_RESOURCES_DIR || env.ALACRITTY_WINDOW_ID) {
+		return true;
+	}
+	const termProgram = env.TERM_PROGRAM?.toLowerCase();
+	return (
+		termProgram === "wezterm" || termProgram === "kitty" || termProgram === "ghostty" || termProgram === "alacritty"
+	);
+}
+
+/**
  * Real terminal using process.stdin/stdout
  */
 export class ProcessTerminal implements Terminal {
