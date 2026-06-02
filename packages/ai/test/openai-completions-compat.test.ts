@@ -2157,6 +2157,62 @@ describe("kimi model detection via detectCompat", () => {
 	});
 });
 
+describe("OpenAI-compatible reasoning artifact cleanup", () => {
+	function deepseekCompatModel(): Model<"openai-completions"> {
+		return {
+			...getBundledModel("openai", "gpt-4o-mini"),
+			api: "openai-completions",
+			provider: "deepseek",
+			baseUrl: "https://api.deepseek.com",
+			id: "deepseek-chat",
+			reasoning: true,
+		};
+	}
+
+	it("normalizes stray space-period artifacts across reasoning chunks", async () => {
+		const model = deepseekCompatModel();
+		global.fetch = createMockFetch([
+			{
+				id: "chatcmpl-reasoning-artifact",
+				object: "chat.completion.chunk",
+				created: 0,
+				model: model.id,
+				choices: [{ index: 0, delta: { reasoning_content: "I need to analyze the request " } }],
+			},
+			{
+				id: "chatcmpl-reasoning-artifact",
+				object: "chat.completion.chunk",
+				created: 0,
+				model: model.id,
+				choices: [{ index: 0, delta: { reasoning_content: ". First, inspect files . Then decide." } }],
+			},
+			{
+				id: "chatcmpl-reasoning-artifact",
+				object: "chat.completion.chunk",
+				created: 0,
+				model: model.id,
+				choices: [{ index: 0, delta: { content: "Done" } }],
+			},
+			{
+				id: "chatcmpl-reasoning-artifact",
+				object: "chat.completion.chunk",
+				created: 0,
+				model: model.id,
+				choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+			},
+			"[DONE]",
+		]);
+
+		const result = await streamOpenAICompletions(model, baseContext(), { apiKey: "test-key" }).result();
+		const thinking = result.content
+			.filter((b): b is { type: "thinking"; thinking: string } => b.type === "thinking")
+			.map(b => b.thinking)
+			.join("");
+		expect(thinking).toBe("I need to analyze the request. First, inspect files. Then decide.");
+		expect(thinking).not.toContain(" .");
+	});
+});
+
 describe("NVIDIA NIM DeepSeek special-token stripping", () => {
 	function nvidiaDeepseekModel(): Model<"openai-completions"> {
 		return buildModel({

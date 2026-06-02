@@ -533,6 +533,63 @@ function getOpenAICompletionsProviderSessionState(
 	return created;
 }
 
+function isOpenRouterAnthropicModel(model: Model<"openai-completions">): boolean {
+	return model.provider === "openrouter" && model.id.toLowerCase().startsWith("anthropic/");
+}
+
+/**
+ * Append an OpenRouter routing-variant suffix (e.g. `:nitro`, `:floor`, `:online`, `:exacto`)
+ * to a model id when no explicit variant is already present. A variant is considered
+ * "already present" when `modelId` contains a colon after the last `/` separator —
+ * which covers both user-typed selectors (`anthropic/claude-haiku:nitro`) and catalog
+ * entries that bake the variant in (`deepseek/deepseek-v3.1-terminus:exacto`).
+ *
+ * Exported for unit testing.
+ */
+export function applyOpenRouterRoutingVariant(modelId: string, variant: string | undefined): string {
+	if (!variant) return modelId;
+	const lastSlash = modelId.lastIndexOf("/");
+	const lastColon = modelId.lastIndexOf(":");
+	// Existing `:suffix` after the last path segment — leave the id untouched.
+	if (lastColon > lastSlash) return modelId;
+	return `${modelId}:${variant}`;
+}
+
+function isCompiledGrammarTooLargeStrictError(
+	error: unknown,
+	capturedErrorResponse: CapturedHttpErrorResponse | undefined,
+): boolean {
+	const status = extractHttpStatusFromError(error) ?? capturedErrorResponse?.status;
+	if (status !== 400) return false;
+	const messageParts = [error instanceof Error ? error.message : undefined, capturedErrorResponse?.bodyText]
+		.filter((value): value is string => typeof value === "string" && value.trim().length > 0)
+		.join("\n");
+	return (
+		/invalid_request_error/i.test(messageParts) &&
+		/compiled grammar/i.test(messageParts) &&
+		/too large/i.test(messageParts)
+	);
+}
+
+// Some Chinese-origin reasoning models emit a tokenizer/chat-template artifact as
+// a space followed by a period inside thinking streams. Normalize it to normal
+// punctuation while leaving ordinary text deltas untouched.
+function normalizeThinkingSpacePeriodArtifacts(text: string): string {
+	const firstArtifactIndex = text.indexOf(" .");
+	if (firstArtifactIndex < 0) return text;
+
+	let normalized = "";
+	let start = 0;
+	let artifactIndex = firstArtifactIndex;
+	do {
+		normalized += text.slice(start, artifactIndex);
+		normalized += ".";
+		start = artifactIndex + 2;
+		artifactIndex = text.indexOf(" .", start);
+	} while (artifactIndex >= 0);
+	return normalized + text.slice(start);
+}
+
 // DeepSeek models leak chat-template special tokens (e.g. `<｜tool_calls_begin｜>`,
 // `<｜DSML｜tool_calls｜>`) into visible `content` deltas when hosted behind providers
 // (such as NVIDIA NIM) that don't strip them server-side. The structured `tool_calls`
@@ -806,6 +863,8 @@ const streamOpenAICompletionsOnce = (
 				}
 			};
 			let currentBlock: OpenAIStreamBlock | undefined;
+			let hasPendingThinkingSpace = false;
+			let pendingThinkingSpaceSignature: string | undefined;
 			const blockIndex = (block: OpenAIStreamBlock | undefined): number => {
 				if (!block) return Math.max(0, output.content.length - 1);
 				return output.content.indexOf(block);
@@ -847,6 +906,7 @@ const streamOpenAICompletionsOnce = (
 			};
 			const finishCurrentBlock = (block: OpenAIStreamBlock | undefined): void => {
 				if (!block) return;
+				if (block.type === "thinking") flushPendingThinkingSpace();
 				const contentIndex = blockIndex(block);
 				if (contentIndex < 0) return;
 				if (block.type === "text") {
@@ -919,6 +979,14 @@ const streamOpenAICompletionsOnce = (
 				});
 			};
 
+			function flushPendingThinkingSpace(): void {
+				if (!hasPendingThinkingSpace) return;
+				const signature = pendingThinkingSpaceSignature;
+				hasPendingThinkingSpace = false;
+				pendingThinkingSpaceSignature = undefined;
+				appendThinking(output, stream, " ", signature);
+			}
+
 			const appendTextDelta = (text: string): void => {
 				if (!text) return;
 				if (!firstTokenTime) firstTokenTime = performance.now();
@@ -938,18 +1006,27 @@ const streamOpenAICompletionsOnce = (
 				source: "delta" | "cumulative" = "delta",
 			): void => {
 				if (!thinking) return;
-				let emittedThinking = thinking;
-				if (source === "cumulative") {
-					const key = signature ?? "";
-					const lastSnapshot = lastCumulativeReasoningBySignature.get(key) ?? "";
-					if (thinking.startsWith(lastSnapshot)) {
-						emittedThinking = thinking.slice(lastSnapshot.length);
+				if (hasPendingThinkingSpace) {
+					if (
+						pendingThinkingSpaceSignature === signature &&
+						(thinking.startsWith(".") || thinking.startsWith(" ."))
+					) {
+						hasPendingThinkingSpace = false;
+						pendingThinkingSpaceSignature = undefined;
+					} else {
+						flushPendingThinkingSpace();
 					}
-					lastCumulativeReasoningBySignature.set(key, thinking);
-					if (!emittedThinking) return;
 				}
-				if (!firstTokenTime) firstTokenTime = performance.now();
-				appendThinking(output, stream, emittedThinking, signature);
+
+				let normalized = normalizeThinkingSpacePeriodArtifacts(thinking);
+				if (normalized.endsWith(" ")) {
+					normalized = normalized.slice(0, -1);
+					hasPendingThinkingSpace = true;
+					pendingThinkingSpaceSignature = signature;
+				}
+				if (!normalized) return;
+				if (!firstTokenTime) firstTokenTime = Date.now();
+				appendThinking(output, stream, normalized, signature);
 			};
 
 			let deepseekStripBuffer = "";
@@ -1302,6 +1379,7 @@ const streamOpenAICompletionsOnce = (
 			if (stripDeepseekChatTemplateTokens) {
 				flushDeepseekStripBuffer(true);
 			}
+			flushPendingThinkingSpace();
 
 			// Detect premature stream closure before the normal block-finalization
 			// sweep. Throwing after that sweep would make the error handler emit a
