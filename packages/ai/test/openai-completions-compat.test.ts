@@ -2211,6 +2211,72 @@ describe("OpenAI-compatible reasoning artifact cleanup", () => {
 		expect(thinking).toBe("I need to analyze the request. First, inspect files. Then decide.");
 		expect(thinking).not.toContain(" .");
 	});
+	it("preserves command and dotfile text in affected reasoning streams", async () => {
+		const model = deepseekCompatModel();
+		global.fetch = createMockFetch([
+			{
+				id: "chatcmpl-reasoning-command",
+				object: "chat.completion.chunk",
+				created: 0,
+				model: model.id,
+				choices: [
+					{
+						index: 0,
+						delta: { reasoning_content: "Run `source .venv/bin/activate`, then inspect with `ls .`." },
+					},
+				],
+			},
+			{
+				id: "chatcmpl-reasoning-command",
+				object: "chat.completion.chunk",
+				created: 0,
+				model: model.id,
+				choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+			},
+			"[DONE]",
+		]);
+
+		const result = await streamOpenAICompletions(model, baseContext(), { apiKey: "test-key" }).result();
+		const thinking = result.content
+			.filter((b): b is { type: "thinking"; thinking: string } => b.type === "thinking")
+			.map(b => b.thinking)
+			.join("");
+		expect(thinking).toBe("Run `source .venv/bin/activate`, then inspect with `ls .`.");
+	});
+
+	it("leaves non-affected provider reasoning punctuation untouched", async () => {
+		const model: Model<"openai-completions"> = {
+			...getBundledModel("openai", "gpt-4o-mini"),
+			api: "openai-completions",
+			provider: "openai",
+			id: "gpt-4o-mini",
+			reasoning: true,
+		};
+		global.fetch = createMockFetch([
+			{
+				id: "chatcmpl-reasoning-openai",
+				object: "chat.completion.chunk",
+				created: 0,
+				model: model.id,
+				choices: [{ index: 0, delta: { reasoning_content: "Keep this . Spacing unchanged." } }],
+			},
+			{
+				id: "chatcmpl-reasoning-openai",
+				object: "chat.completion.chunk",
+				created: 0,
+				model: model.id,
+				choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+			},
+			"[DONE]",
+		]);
+
+		const result = await streamOpenAICompletions(model, baseContext(), { apiKey: "test-key" }).result();
+		const thinking = result.content
+			.filter((b): b is { type: "thinking"; thinking: string } => b.type === "thinking")
+			.map(b => b.thinking)
+			.join("");
+		expect(thinking).toBe("Keep this . Spacing unchanged.");
+	});
 });
 
 describe("NVIDIA NIM DeepSeek special-token stripping", () => {

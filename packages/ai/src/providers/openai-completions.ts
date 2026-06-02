@@ -571,23 +571,28 @@ function isCompiledGrammarTooLargeStrictError(
 	);
 }
 
-// Some Chinese-origin reasoning models emit a tokenizer/chat-template artifact as
-// a space followed by a period inside thinking streams. Normalize it to normal
-// punctuation while leaving ordinary text deltas untouched.
-function normalizeThinkingSpacePeriodArtifacts(text: string): string {
-	const firstArtifactIndex = text.indexOf(" .");
-	if (firstArtifactIndex < 0) return text;
+const THINKING_SPACE_PERIOD_ARTIFACT_REGEX = / \.(?=\s+[A-Z])/g;
+const THINKING_SPACE_PERIOD_ARTIFACT_AT_START_REGEX = /^ ?\.(?=\s+[A-Z])/;
 
-	let normalized = "";
-	let start = 0;
-	let artifactIndex = firstArtifactIndex;
-	do {
-		normalized += text.slice(start, artifactIndex);
-		normalized += ".";
-		start = artifactIndex + 2;
-		artifactIndex = text.indexOf(" .", start);
-	} while (artifactIndex >= 0);
-	return normalized + text.slice(start);
+function shouldNormalizeThinkingSpacePeriodArtifacts(model: Model<"openai-completions">): boolean {
+	return (
+		model.provider === "deepseek" ||
+		model.provider === "qwen-portal" ||
+		model.provider === "minimax-code" ||
+		model.provider === "minimax-code-cn" ||
+		/deepseek|qwen|qwq|minimax/i.test(model.id)
+	);
+}
+
+// Some Chinese-origin reasoning models emit a tokenizer/chat-template artifact as
+// a space followed by a period between English sentences inside thinking streams.
+function normalizeThinkingSpacePeriodArtifacts(text: string): string {
+	if (!text.includes(" .")) return text;
+	return text.replace(THINKING_SPACE_PERIOD_ARTIFACT_REGEX, ".");
+}
+
+function startsWithThinkingSpacePeriodArtifact(text: string): boolean {
+	return THINKING_SPACE_PERIOD_ARTIFACT_AT_START_REGEX.test(text);
 }
 
 // DeepSeek models leak chat-template special tokens (e.g. `<｜tool_calls_begin｜>`,
@@ -839,6 +844,8 @@ const streamOpenAICompletionsOnce = (
 			}
 			stream.push({ type: "start", partial: output });
 
+			const parseMiniMaxThinkTags = model.provider === "minimax-code" || model.provider === "minimax-code-cn";
+			const cleanupThinkingSpacePeriodArtifacts = shouldNormalizeThinkingSpacePeriodArtifacts(model);
 			// Some OpenAI-compatible DeepSeek hosts (including NVIDIA NIM and DeepSeek's
 			// native API) leak chat-template tool-call markers in `delta.content` even
 			// though tool calls are also surfaced structurally. Strip the leaked markers
@@ -1006,11 +1013,14 @@ const streamOpenAICompletionsOnce = (
 				source: "delta" | "cumulative" = "delta",
 			): void => {
 				if (!thinking) return;
+				if (!cleanupThinkingSpacePeriodArtifacts) {
+					if (!firstTokenTime) firstTokenTime = Date.now();
+					appendThinking(output, stream, thinking, signature);
+					return;
+				}
+
 				if (hasPendingThinkingSpace) {
-					if (
-						pendingThinkingSpaceSignature === signature &&
-						(thinking.startsWith(".") || thinking.startsWith(" ."))
-					) {
+					if (pendingThinkingSpaceSignature === signature && startsWithThinkingSpacePeriodArtifact(thinking)) {
 						hasPendingThinkingSpace = false;
 						pendingThinkingSpaceSignature = undefined;
 					} else {
