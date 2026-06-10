@@ -247,46 +247,6 @@ function isAnthropicMessagesModel(model: Model): model is Model<"anthropic-messa
 }
 
 /**
- * Targets that have proven they read unsigned foreign thinking when replayed
- * natively. This is a semantic-carry allowlist only: OpenAI-compatible
- * `reasoning_content` schema requirements and llama.cpp cache-prefix replay are
- * handled by their encoders and MUST NOT make foreign thinking look meaningful.
- */
-function targetReadsForeignThinking(model: Model, compat: Model["compat"]): boolean {
-	if (compat === undefined) return false;
-	if (model.api === "anthropic-messages") {
-		return "replayUnsignedThinking" in compat && compat.replayUnsignedThinking === true;
-	}
-	if (model.api !== "openai-completions") return false;
-	if (!("thinkingFormat" in compat)) return false;
-	if (compat.requiresThinkingAsText) return false;
-	return model.reasoning && compat.thinkingFormat === "zai";
-}
-
-const ANTHROPIC_TOOL_CALL_ID_PATTERN = /^[a-zA-Z0-9_-]{1,64}$/;
-
-function isValidAnthropicToolCallId(id: string): boolean {
-	return ANTHROPIC_TOOL_CALL_ID_PATTERN.test(id);
-}
-
-function fallbackAnthropicToolCallId(originalId: string): string {
-	return `toolu_${Bun.hash(originalId).toString(36)}`;
-}
-
-function normalizeAnthropicTargetToolCallId<TApi extends Api>(
-	id: string,
-	model: Model<TApi>,
-	source: AssistantMessage,
-	normalizeToolCallId?: (id: string, model: Model<TApi>, source: AssistantMessage) => string,
-): string {
-	if (isValidAnthropicToolCallId(id)) return id;
-	const normalized =
-		normalizeToolCallId?.(id, model, source) ?? id.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, MAX_TOOL_CALL_ID_LENGTH);
-	if (isValidAnthropicToolCallId(normalized)) return normalized;
-	return fallbackAnthropicToolCallId(id);
-}
-
-/**
  * Normalize tool call ID for cross-provider compatibility.
  * OpenAI Responses API generates IDs that are 450+ chars with special characters like `|`.
  * Anthropic APIs require IDs matching ^[a-zA-Z0-9_-]+$ (max 64 chars).
@@ -520,19 +480,21 @@ export function transformMessages<TApi extends Api>(
 					assistantMsg.api === model.api &&
 					assistantMsg.model === model.id;
 
+				const isAnthropicTarget = isAnthropicMessagesModel(model);
 				// Anthropic enforces an all-or-none contract on prior-turn thinking
 				// blocks: "if you include thinking blocks in prior assistant turns,
 				// you must include ALL thinking blocks (including redacted ones)".
-				// As long as both the source and target speak `anthropic-messages`,
-				// every prior assistant turn's thinking chain must reach the wire
-				// as native `thinking`/`redacted_thinking` blocks — even across
-				// model/provider boundaries (custom providers configured via
-				// `models.yaml`, switching between two anthropic-compatible
-				// endpoints, etc.). The previous logic only honored this for the
-				// LATEST surviving assistant; every earlier turn was demoted to
-				// text or dropped on cross-model replay, breaking continuation
-				// for Anthropic-compatible reasoning endpoints (#2257).
-				const isAnthropicReplay = model.api === "anthropic-messages" && assistantMsg.api === "anthropic-messages";
+				// As long as both the source and target speak `anthropic-messages`
+				// AND the target can replay unsigned thinking natively, every prior
+				// assistant turn's thinking chain must reach the wire as native
+				// `thinking`/`redacted_thinking` blocks — even across model/provider
+				// boundaries (custom providers configured via `models.yaml`, switching
+				// between two anthropic-compatible endpoints, etc.). For official
+				// Anthropic targets, unsigned cross-model thinking is demoted to text
+				// downstream, so matching redacted siblings must be dropped instead of
+				// sent as lone native `redacted_thinking` blocks.
+				const isAnthropicReplay = isAnthropicTarget && assistantMsg.api === "anthropic-messages";
+				const replaysUnsignedAnthropicThinking = isAnthropicTarget && model.compat.replayUnsignedThinking;
 				const isLatestSurvivingAssistant = index === latestSurvivingAssistantIndex;
 				// Thinking signatures can be untrustworthy for two distinct reasons with very
 				// different blast radii:
@@ -609,9 +571,15 @@ export function transformMessages<TApi extends Api>(
 					}
 
 					if (block.type === "redactedThinking") {
-						// Same all-or-none rule applies: a prior turn that keeps any
-						// thinking content must keep its redacted siblings too.
-						if (isAnthropicReplay) return block;
+						// Redacted thinking is native-only. Keep it for same-model
+						// signed replay, the latest byte-for-byte Anthropic turn, or
+						// compatible targets that will also emit sibling unsigned
+						// thinking natively. Drop it when the visible thinking was
+						// cross-model stripped and will be demoted to text.
+						if (isAnthropicReplay) {
+							if (isSameModel || isLatestSurvivingAssistant || replaysUnsignedAnthropicThinking) return block;
+							return [];
+						}
 						if (isSameModel) return block;
 						return [];
 					}

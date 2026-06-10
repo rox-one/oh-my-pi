@@ -212,6 +212,50 @@ describe("Anthropic prior-turn thinking preservation (#2257)", () => {
 		expect(redacted?.data).toBe("encrypted-blob");
 	});
 
+	it("drops prior redacted_thinking when unsigned thinking is demoted to text", () => {
+		// Official Anthropic targets do not replay unsigned thinking natively.
+		// Once a cross-model prior turn's visible thinking signature is stripped,
+		// that thinking becomes text on the wire; the redacted sibling must not
+		// remain as a lone native redacted_thinking block.
+		const target = makeAnthropicModel({
+			provider: "anthropic",
+			id: "claude-sonnet-4-6",
+			baseUrl: "https://api.anthropic.com",
+		});
+		const messages: Message[] = [
+			makeUser("Summarize README"),
+			makeAssistant(
+				[
+					{ type: "thinking", thinking: "visible reasoning", thinkingSignature: "sig_custom" },
+					{ type: "redactedThinking", data: "foreign-encrypted-blob" },
+					{ type: "toolCall", id: "toolu_prior", name: "read", arguments: { path: "README.md" } },
+				],
+				{ model: "reasoning-model-v1" },
+			),
+			toolResult("toolu_prior", "README body"),
+			makeAssistant(
+				[
+					{ type: "thinking", thinking: "official latest", thinkingSignature: "sig_latest" },
+					{ type: "text", text: "summary" },
+				],
+				{
+					provider: "anthropic",
+					model: "claude-sonnet-4-6",
+					stopReason: "stop",
+				},
+			),
+			makeUser("Translate"),
+		];
+
+		const params = convertAnthropicMessages(messages, target, false);
+		const assistants = params.filter(p => p.role === "assistant");
+		const priorBlocks = assistants[0].content as WireBlock[];
+		const text = priorBlocks.find(b => b.type === "text") as WireTextBlock | undefined;
+		expect(text?.text).toBe("visible reasoning");
+		expect(priorBlocks.find(b => b.type === "thinking")).toBeUndefined();
+		expect(priorBlocks.find(b => b.type === "redacted_thinking")).toBeUndefined();
+	});
+
 	it("does not promote prior unsigned thinking from non-anthropic sources to thinking blocks", () => {
 		// Cross-API replay: prior turn came from OpenAI-responses with no
 		// Anthropic signature. The all-or-none rule scope is per-API; we must
