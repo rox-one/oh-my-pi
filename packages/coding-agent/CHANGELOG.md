@@ -4,6 +4,23 @@
 
 ### Fixed
 
+- Fixed Mnemopi `per-project-tagged` enqueue maintenance to flush and consolidate the shared global bank alongside the project bank ([#2321](https://github.com/can1357/oh-my-pi/issues/2321)).
+
+## [15.11.2] - 2026-06-11
+
+### Added
+
+- Added the Expert Elixir language server (`expert`, invoked as `expert --stdio`) to the built-in LSP server list, auto-detected for Mix projects (`mix.exs`/`mix.lock`). When both are installed, `elixir-ls` remains the primary navigation server (Expert is ordered after it).
+- Added `magicKeywords.enabled` and per-keyword `magicKeywords.ultrathink`, `magicKeywords.orchestrate`, and `magicKeywords.workflow` settings to disable hidden magic-keyword notices and ultrathink auto-thinking escalation ([#1796](https://github.com/can1357/oh-my-pi/issues/1796)).
+- Added external-editor support for Plan Review section annotations, preserving multiline feedback for Refine plan ([#2305](https://github.com/can1357/oh-my-pi/issues/2305)).
+- Added plain-RPC slash command discovery with command source metadata and startup/update notifications ([#2261](https://github.com/can1357/oh-my-pi/issues/2261)).
+
+### Changed
+
+- Bash tool calls in one assistant message now run in parallel instead of serializing the batch: non-pty `bash` is scheduled as a shared tool (`pty: true` stays exclusive), and overlapping calls on the same shell session key degrade to isolated one-shot shells so they cannot queue behind or abort each other
+
+### Fixed
+
 - Fixed editor top-border underfill in Warp by registering a Warp-aware visible-width override for status glyphs whose Bun-reported width disagrees with Warp's rendered cell count ([#3885](https://github.com/can1357/oh-my-pi/issues/3885)).
 - Fixed Mnemopi `per-project-tagged` enqueue maintenance to flush and consolidate the shared global bank alongside the project bank ([#2321](https://github.com/can1357/oh-my-pi/issues/2321)).
 
