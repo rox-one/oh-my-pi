@@ -7,6 +7,9 @@
 - Fixed Escape during an active TUI prompt requiring a second press before canceling; the first Escape now aborts the streaming turn immediately. ([#4921](https://github.com/can1357/oh-my-pi/issues/4921))
 
 ## [16.3.12] - 2026-07-08
+- Fixed the npm bundled CLI package to ship fastembed's nested ONNX `napi-v3` native binding at the path Bun-bundled fastembed resolves, restoring local Mnemopi embeddings in bundled installs ([#2389](https://github.com/can1357/oh-my-pi/issues/2389)).
+
+## [15.11.8] - 2026-06-12
 
 ### Added
 
