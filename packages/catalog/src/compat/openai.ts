@@ -656,6 +656,15 @@ export function buildOpenAICompat(spec: ModelSpec<"openai-completions">): Resolv
 	}
 	mergeModelReasoningEffortMap(compat, spec.id, isMimoReasoningEffortModel);
 
+	const whenReasoningDisabledPolicy =
+		spec.compat?.whenReasoningDisabled ??
+		(compat.disableReasoningWhenToolsPresent ? { requiresReasoningContentForToolCalls: false } : undefined);
+	let whenReasoningDisabled: ResolvedOpenAICompat | undefined;
+	if (whenReasoningDisabledPolicy) {
+		whenReasoningDisabled = { ...compat };
+		applyCompatOverrides(whenReasoningDisabled, whenReasoningDisabledPolicy);
+	}
+
 	const whenThinkingPolicy =
 		spec.compat?.whenThinking ??
 		(isDirectDeepseekReasoning
@@ -676,6 +685,9 @@ export function buildOpenAICompat(spec: ModelSpec<"openai-completions">): Resolv
 		}
 		mergeModelReasoningEffortMap(variant, spec.id, isMimoReasoningEffortModel);
 		compat.whenThinking = variant;
+	}
+	if (whenReasoningDisabled) {
+		compat.whenReasoningDisabled = whenReasoningDisabled;
 	}
 
 	return compat;

@@ -1,7 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import { type } from "@oh-my-pi/omptype";
 import { streamOpenAICompletions } from "@oh-my-pi/pi-ai/providers/openai-completions";
-import type { Context, Model, ModelSpec, Tool } from "@oh-my-pi/pi-ai/types";
+import type { AssistantMessage, Context, Message, Model, ModelSpec, Tool, Usage } from "@oh-my-pi/pi-ai/types";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { Effort } from "@oh-my-pi/pi-catalog/effort";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
@@ -12,9 +12,21 @@ const echoTool: Tool = {
 	parameters: type({ text: "string" }),
 };
 
-function contextWithTools(tools: Tool[] = [echoTool]): Context {
+const emptyUsage: Usage = {
+	input: 0,
+	output: 0,
+	cacheRead: 0,
+	cacheWrite: 0,
+	totalTokens: 0,
+	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+};
+
+function contextWithTools(
+	tools: Tool[] = [echoTool],
+	messages: Message[] = [{ role: "user", content: "call tool", timestamp: Date.now() }],
+): Context {
 	return {
-		messages: [{ role: "user", content: "call tool", timestamp: Date.now() }],
+		messages,
 		tools,
 	};
 }
@@ -28,10 +40,10 @@ function abortedSignal(): AbortSignal {
 async function capturePayload(
 	model: Model<"openai-completions">,
 	tools?: Tool[],
-	options: { disableReasoning?: boolean } = {},
+	options: { disableReasoning?: boolean; messages?: Message[] } = {},
 ): Promise<Record<string, unknown>> {
 	const { promise, resolve } = Promise.withResolvers<unknown>();
-	streamOpenAICompletions(model, contextWithTools(options.tools), {
+	streamOpenAICompletions(model, contextWithTools(tools, options.messages), {
 		apiKey: "test-key",
 		signal: abortedSignal(),
 		reasoning: "minimal",
@@ -58,6 +70,26 @@ function customDeepseekFlash(legacyThinkingExtraBody = false): Model<"openai-com
 			...(legacyThinkingExtraBody ? { extraBody: { thinking: { type: "enabled" } } } : {}),
 		},
 	} as ModelSpec<"openai-completions">);
+}
+
+function assistantToolCall(model: Model<"openai-completions">): AssistantMessage {
+	return {
+		role: "assistant",
+		content: [
+			{
+				type: "toolCall",
+				id: "call_echo",
+				name: "echo",
+				arguments: { text: "inspect" },
+			},
+		],
+		api: model.api,
+		provider: model.provider,
+		model: model.id,
+		usage: emptyUsage,
+		stopReason: "toolUse",
+		timestamp: Date.now(),
+	};
 }
 
 describe("issue #1207 / #2690 — DeepSeek V4 reasoning with tools", () => {
@@ -99,6 +131,31 @@ describe("issue #1207 / #2690 — DeepSeek V4 reasoning with tools", () => {
 		expect(body.thinking).toBeUndefined();
 		expect(body.max_tokens).toBe(123);
 		expect(body.max_completion_tokens).toBeUndefined();
+	});
+
+	it("omits reasoning_content replay when direct DeepSeek tools disable reasoning", async () => {
+		const model = customDeepseekFlash();
+		const body = await capturePayload(model, [echoTool], {
+			messages: [
+				assistantToolCall(model),
+				{
+					role: "toolResult",
+					toolCallId: "call_echo",
+					toolName: "echo",
+					content: [{ type: "text", text: "done" }],
+					isError: false,
+					timestamp: Date.now(),
+				},
+				{ role: "user", content: "continue", timestamp: Date.now() },
+			],
+		});
+		const messages = body.messages as Array<Record<string, unknown>>;
+		const assistant = messages.find(message => message.role === "assistant");
+
+		expect(assistant).toBeDefined();
+		expect(Reflect.get(assistant as object, "reasoning_content")).toBeUndefined();
+		expect(body.reasoning_effort).toBeUndefined();
+		expect(body.thinking).toBeUndefined();
 	});
 
 	it("honors explicit disableReasoning by suppressing the direct DeepSeek thinking toggle", async () => {

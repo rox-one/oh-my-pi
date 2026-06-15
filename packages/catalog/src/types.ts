@@ -411,7 +411,13 @@ export interface OpenAICompat {
 	 * alternate view as `compat.whenThinking`; handlers pointer-swap, never
 	 * spread. Default: auto-detected (OpenCode gateways, #1071/#1484).
 	 */
-	whenThinking?: Partial<Omit<OpenAICompat, "whenThinking">>;
+	whenThinking?: Partial<Omit<OpenAICompat, "whenThinking" | "whenReasoningDisabled">>;
+	/**
+	 * Compat deltas applied when a request explicitly suppresses reasoning.
+	 * Use this to disable thinking-mode history replay fields alongside
+	 * top-level reasoning params. Default: auto-detected (direct DeepSeek tools).
+	 */
+	whenReasoningDisabled?: Partial<Omit<OpenAICompat, "whenThinking" | "whenReasoningDisabled">>;
 }
 
 /**
@@ -661,78 +667,39 @@ export interface ResolvedOpenAISharedCompat {
  * `buildModel`; request handlers read fields and never detect, resolve, or
  * allocate.
  */
-export type ResolvedOpenAICompat = ResolvedOpenAISharedCompat &
-	Required<
-		Omit<
-			OpenAICompat,
-			| "supportsDeveloperRole"
-			| "supportsReasoningEffort"
-			| "reasoningEffortMap"
-			| "supportsReasoningParams"
-			| "supportsSamplingParams"
-			| "supportsPenaltyAndStopParams"
-			| "thinkingFormat"
-			| "kimiApiFormat"
-			| "reasoningDisableMode"
-			| "omitReasoningEffort"
-			| "includeEncryptedReasoning"
-			| "filterReasoningHistory"
-			| "disableReasoningOnForcedToolChoice"
-			| "disableReasoningOnToolChoice"
-			| "supportsToolChoice"
-			| "supportsForcedToolChoice"
-			| "supportsNamedToolChoice"
-			| "reasoningContentField"
-			| "requiresReasoningContentForToolCalls"
-			| "requiresReasoningContentForAllAssistantTurns"
-			| "allowsSyntheticReasoningContentForToolCalls"
-			| "replayReasoningContent"
-			| "qwenPreserveThinking"
-			| "qwenTemplateReasoningEffort"
-			| "requiresThinkingAsText"
-			| "requiresMistralToolIds"
-			| "requiresToolResultName"
-			| "requiresAssistantAfterToolResult"
-			| "requiresAssistantContentForToolCalls"
-			| "stripDeepseekSpecialTokens"
-			| "streamMarkupHealingPattern"
-			| "reasoningDeltasMayBeCumulative"
-			| "emptyLengthFinishIsContextError"
-			| "usesOpenAIToolCallIdLimit"
-			| "promptCacheSessionHeader"
-			| "supportsPromptCacheBreakpoints"
-			| "promptCacheBreakpointTtl"
-			| "openRouterRouting"
-			| "isOpenRouterHost"
-			| "supportsStrictMode"
-			| "supportsLongPromptCacheRetention"
-			| "alwaysSendMaxTokens"
-			| "wireModelIdMode"
-			| "vercelGatewayRouting"
-			| "extraBody"
-			| "toolStrictMode"
-			| "toolSchemaFlavor"
-			| "streamFirstEventTimeoutMs"
-			| "streamIdleTimeoutMs"
-			| "cacheControlFormat"
-			| "thinkingKeep"
-			| "strictResponsesPairing"
-			| "supportsImageDetailOriginal"
-			| "whenThinking"
-		>
-	> & {
-		vercelGatewayRouting?: OpenAICompat["vercelGatewayRouting"];
-		extraBody?: OpenAICompat["extraBody"];
-		cacheControlFormat?: OpenAICompat["cacheControlFormat"];
-		thinkingKeep?: OpenAICompat["thinkingKeep"];
-		streamIdleTimeoutMs?: number;
-		toolStrictMode: ResolvedToolStrictMode;
-		/** The model sits behind Vercel AI Gateway. */
-		isVercelGatewayHost: boolean;
-		dropThinkingWhenReasoningEffort: boolean;
-		/** Complete alternate view for thinking-engaged requests; swap pointers, never spread. */
-		whenThinking?: ResolvedOpenAICompat;
-	};
+export type ResolvedOpenAICompat = Required<
+	Omit<
+		OpenAICompat,
+		| "openRouterRouting"
+		| "vercelGatewayRouting"
+		| "extraBody"
+		| "toolStrictMode"
+		| "streamIdleTimeoutMs"
+		| "supportsLongPromptCacheRetention"
+		| "cacheControlFormat"
+		| "thinkingKeep"
+		| "strictResponsesPairing"
+		| "requiresJuiceZeroHack"
+		| "whenThinking"
+		| "whenReasoningDisabled"
+	>
+> & {
+	openRouterRouting?: OpenAICompat["openRouterRouting"];
+	vercelGatewayRouting?: OpenAICompat["vercelGatewayRouting"];
+	extraBody?: OpenAICompat["extraBody"];
+	cacheControlFormat?: OpenAICompat["cacheControlFormat"];
+	thinkingKeep?: OpenAICompat["thinkingKeep"];
+	streamIdleTimeoutMs?: number;
+	toolStrictMode: ResolvedToolStrictMode;
+	/** The model sits behind OpenRouter (routing prefs and max-token omission apply). */
+	isOpenRouterHost: boolean;
+	/** The model sits behind Vercel AI Gateway. */
+	isVercelGatewayHost: boolean;
+	/** Complete alternate view for thinking-engaged requests; swap pointers, never spread. */
+	whenThinking?: ResolvedOpenAICompat;
+	/** Complete alternate view for reasoning-disabled requests; swap pointers, never spread. */
+	whenReasoningDisabled?: ResolvedOpenAICompat;
+};
 
 /** Fully-resolved Responses-API compat view (same contract as `ResolvedOpenAICompat`). */
 export interface ResolvedOpenAIResponsesCompat extends ResolvedOpenAISharedCompat {

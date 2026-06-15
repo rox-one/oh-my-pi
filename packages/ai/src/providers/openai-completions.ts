@@ -1566,7 +1566,9 @@ function buildParams(
 		compat.disableReasoningOnForcedToolChoice &&
 		compat.supportsForcedToolChoice &&
 		isForcedToolChoice(mapToOpenAICompletionsToolChoice(options?.toolChoice));
-	if (compat.whenThinking && thinkingEnabledForRequest && !forcedToolChoiceSuppressesThinking) {
+	if (reasoningDisabledForRequest && compat.whenReasoningDisabled) {
+		compat = compat.whenReasoningDisabled; // precomputed at model build — pointer swap, no allocation
+	} else if (compat.whenThinking && thinkingEnabledForRequest && !forcedToolChoiceSuppressesThinking) {
 		compat = compat.whenThinking; // precomputed at model build — pointer swap, no allocation
 	}
 	const messages = convertMessages(model, context, compat);
