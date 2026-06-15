@@ -40,13 +40,13 @@ function abortedSignal(): AbortSignal {
 async function capturePayload(
 	model: Model<"openai-completions">,
 	tools?: Tool[],
-	options: { disableReasoning?: boolean; messages?: Message[] } = {},
+	options: { disableReasoning?: boolean; messages?: Message[]; sendReasoning?: boolean } = {},
 ): Promise<Record<string, unknown>> {
 	const { promise, resolve } = Promise.withResolvers<unknown>();
 	streamOpenAICompletions(model, contextWithTools(tools, options.messages), {
 		apiKey: "test-key",
 		signal: abortedSignal(),
-		reasoning: "minimal",
+		reasoning: options.sendReasoning === false ? undefined : "minimal",
 		disableReasoning: options.disableReasoning,
 		toolChoice: "auto",
 		maxTokens: 123,
@@ -131,6 +131,17 @@ describe("issue #1207 / #2690 — DeepSeek V4 reasoning with tools", () => {
 		expect(body.thinking).toBeUndefined();
 		expect(body.max_tokens).toBe(123);
 		expect(body.max_completion_tokens).toBeUndefined();
+	});
+
+	it("omits fallback reasoning_effort when disabled direct DeepSeek tools have no explicit reasoning", async () => {
+		const body = await capturePayload(customDeepseekFlash(), [echoTool], {
+			disableReasoning: true,
+			sendReasoning: false,
+		});
+
+		expect(body.tools).toBeDefined();
+		expect(body.reasoning_effort).toBeUndefined();
+		expect(body.thinking).toBeUndefined();
 	});
 
 	it("omits reasoning_content replay when direct DeepSeek tools disable reasoning", async () => {

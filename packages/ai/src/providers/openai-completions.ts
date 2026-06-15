@@ -1835,6 +1835,7 @@ function buildParams(
 			delete params.thinking;
 			delete params.enable_thinking;
 			delete params.chat_template_kwargs;
+			delete params.reasoning_effort;
 		}
 		if (model.provider === "fireworks" && params.reasoning_effort !== undefined) {
 			// Fireworks rejects simultaneous DeepSeek-style `thinking` toggles and
