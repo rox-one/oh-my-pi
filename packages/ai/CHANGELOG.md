@@ -1594,6 +1594,10 @@
 - Fixed `validateToolArguments` silently accepting JSON-encoded array strings (e.g. `'["a","b"]'`) against `union(string, array<string>)` schemas — providers that double-serialize tool-call arguments (Z.AI / GLM) caused tools like `search` to receive the literal `["a","b"]` as a single path, producing zero matches (single element) or glob parse errors (multi-element). A new pre-validation pass parses JSON-array-shaped strings when the schema explicitly accepts both shapes. ([#1788](https://github.com/can1357/oh-my-pi/issues/1788))
 - Fixed Anthropic thinking summaries that arrive wrapped in literal `<thinking>` tags so advisor/raw transcript dumps do not render nested thinking tags ([#2695](https://github.com/can1357/oh-my-pi/issues/2695)).
 
+### Fixed
+
+- Fixed direct DeepSeek V4 tool requests to suppress reasoning payload fields when tools are present, so advisor-style calls can reach the tool-capable backend instead of spending output on text. ([#2690](https://github.com/can1357/oh-my-pi/issues/2690))
+
 ## [16.0.0] - 2026-06-15
 
 ### Breaking Changes

@@ -1556,14 +1556,39 @@ function buildParams(
 	context: Context,
 	options: OpenAICompletionsOptions | undefined,
 	toolStrictModeOverride?: ToolStrictModeOverride,
-): {
-	params: OpenAICompletionsParams;
-	toolStrictMode: AppliedToolStrictMode;
-	strictToolsApplied: boolean;
-} {
-	const initialPolicy = resolveOpenAICompatForRequest(model, options);
-	const initialCompat = initialPolicy.compat as ResolvedOpenAICompat;
-	const cacheRetention = resolveCacheRetention(options?.cacheRetention);
+): { params: OpenAICompletionsParams; toolStrictMode: AppliedToolStrictMode; strictToolsApplied: boolean } {
+	let compat = model.compat;
+	const disableReasoningForTools = compat.disableReasoningWhenToolsPresent && (context.tools?.length ?? 0) > 0;
+	const reasoningDisabledForRequest = Boolean(options?.disableReasoning) || disableReasoningForTools;
+	const thinkingEnabledForRequest =
+		Boolean(options?.reasoning) && !reasoningDisabledForRequest && Boolean(model.reasoning);
+	const forcedToolChoiceSuppressesThinking =
+		compat.disableReasoningOnForcedToolChoice &&
+		compat.supportsForcedToolChoice &&
+		isForcedToolChoice(mapToOpenAICompletionsToolChoice(options?.toolChoice));
+	if (compat.whenThinking && thinkingEnabledForRequest && !forcedToolChoiceSuppressesThinking) {
+		compat = compat.whenThinking; // precomputed at model build — pointer swap, no allocation
+	}
+	const messages = convertMessages(model, context, compat);
+	maybeAddAnthropicCacheControl(compat, messages);
+	const supportsReasoningParams = compat.supportsReasoningParams;
+
+	// Kimi-family models calculate TPM rate limits from max_tokens (not actual
+	// output) and the official guidance requires sending it on every call —
+	// `compat.alwaysSendMaxTokens` carries that detection.
+	const requestedMaxTokens =
+		options?.maxTokens ?? (compat.alwaysSendMaxTokens ? (model.maxTokens ?? OPENAI_MAX_OUTPUT_TOKENS) : undefined);
+	// OpenRouter fans out to upstreams whose output caps differ from the catalog
+	// value (which tracks the highest-cap provider). A max_tokens above the routed
+	// upstream's cap makes OpenRouter silently skip that provider (e.g. Cerebras
+	// GLM-4.7, ~40k) for a higher-cap one, defeating `provider.order`/`only`. Omit
+	// it for OpenRouter so each upstream self-caps and routing is honored — unless
+	// the model always requires max_tokens (Kimi TPM accounting, see above).
+	const omitMaxTokensForRouting = compat.isOpenRouterHost && !compat.alwaysSendMaxTokens;
+	const effectiveMaxTokens =
+		requestedMaxTokens === undefined || omitMaxTokensForRouting
+			? undefined
+			: Math.min(requestedMaxTokens, model.maxTokens ?? Number.POSITIVE_INFINITY, OPENAI_MAX_OUTPUT_TOKENS);
 
 	const requestModelId = resolveOpenAICompletionsModelId(model, options);
 	const params: OpenAICompletionsParams = {
@@ -1706,8 +1731,66 @@ function buildParams(
 		delete params.tool_choice;
 	}
 
-	if (shouldDropAutoToolChoiceForReasoning(model, initialCompat, params.tool_choice, options)) {
-		delete params.tool_choice;
+	if (supportsReasoningParams && compat.thinkingFormat === "zai" && model.reasoning) {
+		// Z.ai uses binary thinking: { type: "enabled" | "disabled" }
+		// Must explicitly disable since z.ai defaults to thinking enabled.
+		const enabled = options?.reasoning && !reasoningDisabledForRequest;
+		params.thinking = { type: enabled ? "enabled" : "disabled" };
+		if (enabled && compat.thinkingKeep) {
+			params.thinking.keep = compat.thinkingKeep;
+		}
+	} else if (supportsReasoningParams && compat.thinkingFormat === "qwen" && model.reasoning) {
+		params.enable_thinking = !!options?.reasoning && !reasoningDisabledForRequest;
+	} else if (supportsReasoningParams && compat.thinkingFormat === "qwen-chat-template" && model.reasoning) {
+		params.chat_template_kwargs = {
+			enable_thinking: !!options?.reasoning && !reasoningDisabledForRequest,
+		};
+	} else if (supportsReasoningParams && compat.thinkingFormat === "openrouter" && model.reasoning) {
+		// OpenRouter normalizes reasoning across providers via a nested reasoning object.
+		// Without an explicit signal, OpenRouter defaults reasoning models to thinking, which
+		// silently consumes the entire output budget on small `max_tokens` requests (e.g.
+		// title generation). Honor `disableReasoning` to opt out cleanly.
+		const openRouterParams = params as typeof params & {
+			reasoning?: { effort?: string } | { enabled: false };
+		};
+		if (reasoningDisabledForRequest) {
+			openRouterParams.reasoning = { enabled: false };
+		} else if (options?.reasoning) {
+			openRouterParams.reasoning = {
+				effort:
+					compat.reasoningEffortMap?.[options.reasoning] ??
+					model.thinking?.effortMap?.[options.reasoning] ??
+					options.reasoning,
+			};
+		}
+	} else if (
+		supportsReasoningParams &&
+		options?.reasoning &&
+		!reasoningDisabledForRequest &&
+		model.reasoning &&
+		compat.supportsReasoningEffort
+	) {
+		// OpenAI-style reasoning_effort
+		params.reasoning_effort = (compat.reasoningEffortMap?.[options.reasoning] ??
+			model.thinking?.effortMap?.[options.reasoning] ??
+			options.reasoning) as Effort;
+	} else if (
+		supportsReasoningParams &&
+		options?.disableReasoning &&
+		!options?.reasoning &&
+		model.reasoning &&
+		compat.supportsReasoningEffort
+	) {
+		// Generic OpenAI-compatible effort endpoints do not expose a true off
+		// switch. Use the model's lowest supported effort as the closest
+		// transport-level approximation when callers request disabled reasoning.
+		const minEffort = getSupportedEfforts(model)[0];
+		if (minEffort === undefined) {
+			throw new Error(`Model ${model.provider}/${model.id} has no supported reasoning efforts`);
+		}
+		params.reasoning_effort = (compat.reasoningEffortMap?.[minEffort] ??
+			model.thinking?.effortMap?.[minEffort] ??
+			minEffort) as Effort;
 	}
 
 	const finalPolicy = resolveOpenAICompatPolicy(model, {
@@ -1744,10 +1827,19 @@ function buildParams(
 
 	applyOpenAIGatewayRouting(params, compat, cacheRetention !== "none");
 
-	applyOpenAIExtraBody(params, compat.extraBody, {
-		dropThinkingWhenReasoningEffort: compat.dropThinkingWhenReasoningEffort,
-	});
-	applyOpenAIChatCompletionsPromptCachePolicy(params, model, options);
+	if (compat.extraBody) {
+		Object.assign(params, compat.extraBody);
+		if (reasoningDisabledForRequest) {
+			delete params.thinking;
+			delete params.enable_thinking;
+			delete params.chat_template_kwargs;
+		}
+		if (model.provider === "fireworks" && params.reasoning_effort !== undefined) {
+			// Fireworks rejects simultaneous DeepSeek-style `thinking` toggles and
+			// OpenAI-style `reasoning_effort`; the effort field carries the user's level.
+			delete params.thinking;
+		}
+	}
 
 	return { params, toolStrictMode, strictToolsApplied };
 }

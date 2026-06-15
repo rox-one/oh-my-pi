@@ -501,10 +501,8 @@ export function buildOpenAICompat(spec: ModelSpec<"openai-completions">): Resolv
 		// every call since the family can otherwise emit very long reasoning traces
 		// before the final answer.
 		alwaysSendMaxTokens: isKimiModel,
-		// Native Kimi K3 always reasons through `reasoning_effort` (never the
-		// K2.x binary `thinking` block that #827's forced-tool-choice conflict is
-		// about), so suppressing its effort would leave K3 in an unsupported mode.
-		disableReasoningOnForcedToolChoice: (isKimiModel && !isMoonshotKimiK3) || isAnthropicModel,
+		disableReasoningOnForcedToolChoice: isKimiModel || isAnthropicModel,
+		disableReasoningWhenToolsPresent: isDirectDeepseekReasoning,
 		disableReasoningOnToolChoice: isDeepseekFamily && Boolean(spec.reasoning) && !isOpenRouter,
 		supportsToolChoice: !isDirectDeepseekReasoning,
 		// DeepSeek reasoning models on OpenCode Zen/Go 400 with

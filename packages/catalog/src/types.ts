@@ -303,6 +303,13 @@ export interface OpenAICompat {
 	 * Default: auto-detected (DeepSeek reasoning models).
 	 */
 	disableReasoningOnToolChoice?: boolean;
+	/**
+	 * Drop reasoning fields for any request that advertises tools. Use for
+	 * providers/models that route reasoning requests to a backend that cannot
+	 * call tools even when the transport accepts the `tools` array.
+	 * Default: auto-detected (direct DeepSeek reasoning models).
+	 */
+	disableReasoningWhenToolsPresent?: boolean;
 	/** OpenRouter-specific routing preferences. Only used when baseUrl points to OpenRouter. */
 	openRouterRouting?: OpenRouterRouting;
 	/** Vercel AI Gateway routing preferences. Only used when baseUrl points to Vercel AI Gateway. */

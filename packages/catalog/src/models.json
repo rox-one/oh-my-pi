@@ -100047,6 +100047,7 @@
 				"supportsUsageInStreaming": true,
 				"alwaysSendMaxTokens": false,
 				"disableReasoningOnForcedToolChoice": false,
+				"disableReasoningWhenToolsPresent": false,
 				"disableReasoningOnToolChoice": false,
 				"supportsToolChoice": true,
 				"supportsForcedToolChoice": true,
@@ -228313,9 +228314,9 @@
 				"text"
 			],
 			"cost": {
-				"input": 0.0574,
-				"output": 0.1148,
-				"cacheRead": 0.011479999999999999,
+				"input": 0.098,
+				"output": 0.196,
+				"cacheRead": 0.02,
 				"cacheWrite": 0
 			},
 			"contextWindow": 1048576,
