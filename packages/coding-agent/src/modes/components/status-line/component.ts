@@ -299,6 +299,9 @@ function hasGitSegment(segments: readonly StatusLineSegmentId[]): boolean {
 function hasPrSegment(segments: readonly StatusLineSegmentId[]): boolean {
 	return segments.includes("pr");
 }
+function hasGitBackedSegment(segments: readonly StatusLineSegmentId[]): boolean {
+	return hasGitSegment(segments) || hasPrSegment(segments);
+}
 
 function hasNonContextSegment(segments: readonly StatusLineSegmentRef[]): boolean {
 	for (const segment of segments) {
@@ -490,6 +493,12 @@ export class StatusLineComponent implements Component {
 	}
 	#gitEnabled(): boolean {
 		return settings.get("git.enabled");
+	}
+	#hasGitBackedSegment(): boolean {
+		const effectiveSettings = this.#resolveSettings();
+		return (
+			hasGitBackedSegment(effectiveSettings.leftSegments) || hasGitBackedSegment(effectiveSettings.rightSegments)
+		);
 	}
 
 	#gitEnabled(): boolean {
@@ -721,7 +730,7 @@ export class StatusLineComponent implements Component {
 			return;
 		}
 
-		if (!this.#gitEnabled()) {
+		if (!this.#gitEnabled() || !this.#hasGitBackedSegment()) {
 			this.#invalidateGitCaches();
 			return;
 		}
