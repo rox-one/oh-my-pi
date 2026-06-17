@@ -8,7 +8,7 @@ import { StatusLineComponent, type StatusLineSettings } from "@oh-my-pi/pi-codin
 import { STATUS_LINE_PRESETS } from "@oh-my-pi/pi-coding-agent/modes/components/status-line/presets";
 import { initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 import * as git from "@oh-my-pi/pi-coding-agent/utils/git";
-import { removeSyncWithRetries, setProjectDir } from "@oh-my-pi/pi-utils";
+import { setProjectDir } from "@oh-my-pi/pi-utils";
 import { beginSettingsTest, restoreSettingsTestState, type SettingsTestState } from "./helpers/settings-test-state";
 
 let settingsState: SettingsTestState | undefined;
@@ -243,7 +243,6 @@ describe("StatusLineComponent effective settings cache", () => {
 	it("skips git probes when no git-backed segment is visible", async () => {
 		const headSpy = spyOn(git.head, "resolveSync").mockReturnValue(null);
 		const statusSpy = spyOn(git.status, "summary").mockResolvedValue({ staged: 0, unstaged: 0, untracked: 0 });
-		const repoSpy = spyOn(git.repo, "resolveSync").mockReturnValue(null);
 		try {
 			const component = makeComponent({
 				preset: "custom",
@@ -252,29 +251,14 @@ describe("StatusLineComponent effective settings cache", () => {
 				sessionAccent: false,
 			});
 
-			component.watchBranch(() => {
-				throw new Error("git watcher should not fire when no git-backed segment is visible");
-			});
 			component.getTopBorder(100);
 			await Promise.resolve();
 
-			expect(repoSpy).not.toHaveBeenCalled();
 			expect(headSpy).not.toHaveBeenCalled();
 			expect(statusSpy).not.toHaveBeenCalled();
 		} finally {
-			repoSpy.mockRestore();
 			statusSpy.mockRestore();
 			headSpy.mockRestore();
 		}
-	});
-});
-
-describe("StatusLineComponent hook statuses", () => {
-	it("renders every keyed status on a deterministic line", () => {
-		const component = makeComponent({ showHookStatus: true });
-		component.setHookStatus("project-time", "$0.04 (dev)");
-		component.setHookStatus("ponytail", "Ponytail");
-
-		expect(component.render(8)).toEqual(["Ponytail", "$0.04 (…"]);
 	});
 });

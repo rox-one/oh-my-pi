@@ -56,8 +56,13 @@ export class FooterComponent implements Component {
 		this.#gitUnwatch = null;
 
 		if (!settings.get("git.enabled")) return;
-		const repository = git.repo.resolveSync(getProjectDir());
-		if (!repository) return;
+
+		void git.head
+			.resolve(getProjectDir())
+			.then(head => {
+				if (!head) {
+					return;
+				}
 
 		try {
 			this.#gitUnwatch = git.head.watch(repository, () => {

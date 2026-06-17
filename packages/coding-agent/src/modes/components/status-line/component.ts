@@ -292,6 +292,13 @@ function isContextSegment(segment: StatusLineSegmentRef): boolean {
 function hasContextSegment(segments: readonly StatusLineSegmentRef[]): boolean {
 	return segments.includes("context_pct") || segments.includes("context_total");
 }
+function hasGitSegment(segments: readonly StatusLineSegmentId[]): boolean {
+	return segments.includes("git");
+}
+
+function hasPrSegment(segments: readonly StatusLineSegmentId[]): boolean {
+	return segments.includes("pr");
+}
 
 function hasNonContextSegment(segments: readonly StatusLineSegmentRef[]): boolean {
 	for (const segment of segments) {
@@ -480,6 +487,9 @@ export class StatusLineComponent implements Component {
 			compactThinkingLevel: settings.get("statusLine.compactThinkingLevel"),
 			contextLine: settings.get("statusLine.contextLine"),
 		};
+	}
+	#gitEnabled(): boolean {
+		return settings.get("git.enabled");
 	}
 
 	#gitEnabled(): boolean {
@@ -711,15 +721,17 @@ export class StatusLineComponent implements Component {
 			return;
 		}
 
-		const { effectiveGitCwd } = this.#resolveActiveRepoCache();
-		const repository = git.repo.resolveSync(effectiveGitCwd);
-		if (!repository) {
-			// There is no path to watch yet. Cache the negative result only for the
-			// fallback poll interval so a later `git init` becomes visible without
-			// generic invalidations or a render-path probe on every paint.
-			this.#gitWatcherUnavailable = true;
+		if (!this.#gitEnabled()) {
+			this.#invalidateGitCaches();
 			return;
 		}
+
+		const repository = git.repo.resolveSync(getProjectDir());
+		if (!repository) return;
+
+		const watchPath = git.repo.isReftableSync(repository)
+			? path.join(repository.gitDir, "reftable")
+			: repository.headPath;
 
 		// git swaps HEAD via `HEAD.lock` + atomic rename. That both unlinks the
 		// HEAD inode (freezing a file-bound `fs.watch` after the first switch —
@@ -846,38 +858,11 @@ export class StatusLineComponent implements Component {
 		this.#jjStatusLastFetch = 0;
 		this.#jjCacheGeneration++;
 	}
-
-	/**
-	 * Re-point the status line's VCS watcher and caches at a new cwd/repository.
-	 * Atomically retires the old watcher/listeners, invalidates VCS caches and
-	 * in-flight controllers, then runs watcher setup for the new cwd and requests
-	 * a repaint. Called by {@link InteractiveMode.applyCwdChange} after the
-	 * SessionManager's cwd has moved — the watcher ownership always follows the
-	 * effective cwd/repo, so a stale watcher for the previous repo can never
-	 * invalidate the new one. Generic repaints use {@link invalidate} and must
-	 * never retire the watcher or abort a live resolve.
-	 */
-	applyCwdChange(): void {
-		this.#retireGitWatcher();
-		this.invalidateGitCaches();
-		this.#setupGitWatcher();
-		this.#onBranchChange?.();
-	}
-
-	#resetJjRequests(): void {
-		this.#jjBranchActive?.controller.abort();
-		this.#jjBranchActive = undefined;
-		this.#jjStatusActive?.controller.abort();
-		this.#jjStatusActive = undefined;
-	}
-	#getCurrentBranch(effectiveGitCwd?: string): string | null {
+	#getCurrentBranch(): string | null {
 		if (!this.#gitEnabled()) return null;
 
-		const gitCwd = effectiveGitCwd ?? this.#resolveActiveRepoCache().effectiveGitCwd;
-		const fallbackCacheExpired =
-			this.#gitWatcherUnavailable &&
-			(this.#branchLastFetch === undefined || Date.now() - this.#branchLastFetch >= WATCHER_FAILURE_POLL_TTL_MS);
-		if (this.#cachedBranch !== undefined && this.#cachedBranchCwd === gitCwd && !fallbackCacheExpired) {
+		const cwd = getProjectDir();
+		if (this.#cachedBranch !== undefined && this.#cachedBranchCwd === cwd) {
 			return this.#cachedBranch;
 		}
 
@@ -977,14 +962,9 @@ export class StatusLineComponent implements Component {
 		return branch === this.#defaultBranch;
 	}
 
-	#getGitStatus(effectiveGitCwd?: string): { staged: number; unstaged: number; untracked: number } | null {
+	#getGitStatus(): { staged: number; unstaged: number; untracked: number } | null {
 		if (!this.#gitEnabled()) return null;
-
-		const gitCwd = effectiveGitCwd ?? this.#resolveActiveRepoCache().effectiveGitCwd;
-		if (this.#gitStatusInFlightCwd !== undefined) {
-			return this.#cachedGitStatusCwd === gitCwd ? this.#cachedGitStatus : null;
-		}
-		if (this.#cachedGitStatusCwd === gitCwd && Date.now() - this.#gitStatusLastFetch < 1000) {
+		if (this.#gitStatusInFlight || Date.now() - this.#gitStatusLastFetch < 1000) {
 			return this.#cachedGitStatus;
 		}
 
@@ -1013,102 +993,10 @@ export class StatusLineComponent implements Component {
 		return this.#cachedGitStatusCwd === gitCwd ? this.#cachedGitStatus : null;
 	}
 
-	// Resolve (and cache per cwd) the jj workspace root, resetting both jj caches
-	// on a cwd change so a directory switch refetches label + status.
-	#jjRootFor(cwd: string): string | null {
-		if (this.#jjRoot === undefined || this.#jjRootCwd !== cwd) {
-			this.#jjRootCwd = cwd;
-			this.#jjRoot = jj.repo.rootSync(cwd);
-			this.#cachedJjBranch = null;
-			this.#jjBranchLastFetch = 0;
-			this.#cachedJjStatus = null;
-			this.#jjStatusLastFetch = 0;
-			this.#jjCacheGeneration++;
-		}
-		return this.#jjRoot;
-	}
-
-	// jj working-copy bookmark label (nearest bookmark, change-id fallback), shown
-	// in the `git` segment where git HEAD is detached/absent under jj. Throttled,
-	// cached, and repaints on resolve.
-	#getJjBranch(effectiveGitCwd?: string): string | null {
-		const cwd = effectiveGitCwd ?? this.#resolveActiveRepoCache().effectiveGitCwd;
-		const root = this.#jjRootFor(cwd);
-		if (!root) return null;
-		if (this.#jjBranchActive || Date.now() - this.#jjBranchLastFetch < JJ_REFRESH_TTL_MS) {
-			return this.#cachedJjBranch;
-		}
-		const request: JjResolveRequest = {
-			id: ++this.#jjResolveSeq,
-			controller: new AbortController(),
-		};
-		this.#jjBranchActive = request;
-		const generation = this.#jjCacheGeneration;
-		(async () => {
-			let next: string | null = null;
-			try {
-				next = await jj.workingCopy.label(root, {
-					signal: request.controller.signal,
-					timeoutMs: jj.JJ_COMMAND_TIMEOUT_MS,
-				});
-			} finally {
-				if (this.#jjBranchActive?.id === request.id) this.#jjBranchActive = undefined;
-				// Advance the throttle only if no reset raced this query; a reset
-				// leaves LastFetch at 0 so the current root refetches instead of
-				// being throttled on a superseded result.
-				if (this.#jjCacheGeneration === generation) this.#jjBranchLastFetch = Date.now();
-			}
-			// Drop a result whose caches were reset mid-flight — a repo switch OR a
-			// same-root HEAD/bookmark move — so a superseded label never lands in
-			// the live cache.
-			if (this.#jjCacheGeneration !== generation || this.#disposed) return;
-			const changed = next !== this.#cachedJjBranch;
-			this.#cachedJjBranch = next;
-			if (changed) this.#onBranchChange?.();
-		})();
-		return this.#cachedJjBranch;
-	}
-
-	// jj working-copy status counts (`@` vs its parent), used in place of git
-	// status in a jj repo where `git status` has no `.git` to read. Throttled,
-	// cached, and repaints on resolve like #getJjBranch.
-	#getJjStatus(effectiveGitCwd?: string): { staged: number; unstaged: number; untracked: number } | null {
-		const cwd = effectiveGitCwd ?? this.#resolveActiveRepoCache().effectiveGitCwd;
-		const root = this.#jjRootFor(cwd);
-		if (!root) return null;
-		if (this.#jjStatusActive || Date.now() - this.#jjStatusLastFetch < JJ_REFRESH_TTL_MS) {
-			return this.#cachedJjStatus;
-		}
-		const request: JjResolveRequest = {
-			id: ++this.#jjResolveSeq,
-			controller: new AbortController(),
-		};
-		this.#jjStatusActive = request;
-		const generation = this.#jjCacheGeneration;
-		(async () => {
-			let next: { staged: number; unstaged: number; untracked: number } | null = null;
-			try {
-				next = await jj.status.summary(root, {
-					signal: request.controller.signal,
-					timeoutMs: jj.JJ_COMMAND_TIMEOUT_MS,
-				});
-			} finally {
-				if (this.#jjStatusActive?.id === request.id) this.#jjStatusActive = undefined;
-				if (this.#jjCacheGeneration === generation) this.#jjStatusLastFetch = Date.now();
-			}
-			if (this.#jjCacheGeneration !== generation || this.#disposed) return;
-			const prev = this.#cachedJjStatus;
-			this.#cachedJjStatus = next;
-			if (JSON.stringify(prev) !== JSON.stringify(next)) this.#onBranchChange?.();
-		})();
-		return this.#cachedJjStatus;
-	}
-
-	#lookupPr(effectiveGitCwd?: string): { number: number; url: string } | null {
+	#lookupPr(): { number: number; url: string } | null {
 		if (!this.#gitEnabled()) return null;
 
-		const gitCwd = effectiveGitCwd ?? this.#resolveActiveRepoCache().effectiveGitCwd;
-		const branch = this.#getCurrentBranch(gitCwd);
+		const branch = this.#getCurrentBranch();
 		const currentContext = branch ? createPrCacheContext(branch, this.#cachedBranchRepoId ?? null) : null;
 
 		if (canReuseCachedPr(this.#cachedPr, this.#cachedPrContext, currentContext)) {
@@ -1654,10 +1542,9 @@ export class StatusLineComponent implements Component {
 	#buildSegmentContext(
 		width: number,
 		segmentOptions: StatusLineSettings["segmentOptions"],
-		includePath: boolean,
+		includeContext: boolean,
 		includeGit: boolean,
 		includePr: boolean,
-		previewTitle?: string,
 	): SegmentContext {
 		const state = this.session.state;
 
@@ -1696,31 +1583,10 @@ export class StatusLineComponent implements Component {
 			contextPercent = collabState.contextUsage.percent ?? contextPercent;
 		}
 
-		const shouldResolveActiveRepo = this.#gitEnabled() && (includePath || includeGit || includePr);
-		const projectDir = getProjectDir();
-		const activeRepoCache = shouldResolveActiveRepo
-			? this.#resolveActiveRepoCache()
-			: { projectDir, activeRepo: null, effectiveGitCwd: projectDir, worktree: null };
-		let gitBranch = includeGit || includePr ? this.#getCurrentBranch(activeRepoCache.effectiveGitCwd) : null;
-		// A jj repo has no git branch to read: git HEAD is detached (colocated) or
-		// absent. A pending reftable resolve owns this cwd as an explicit Git repo,
-		// so it must not be mistaken for an absent Git checkout and fall through to
-		// an ancestor jj workspace.
-		const gitHeadResolvePending = this.#branchResolveActive?.cwd === activeRepoCache.effectiveGitCwd;
-		const gitHeadIsJjLike =
-			!this.#cachedBranchHasGitRepository &&
-			!gitHeadResolvePending &&
-			(gitBranch === "detached" || gitBranch === null);
-		if (includeGit && gitHeadIsJjLike) {
-			gitBranch = this.#getJjBranch(activeRepoCache.effectiveGitCwd) ?? gitBranch;
-		}
-		const gitStatus = includeGit
-			? ((gitHeadIsJjLike ? this.#getJjStatus(activeRepoCache.effectiveGitCwd) : null) ??
-				this.#getGitStatus(activeRepoCache.effectiveGitCwd))
-			: null;
-		const gitPr = includePr ? this.#lookupPr(activeRepoCache.effectiveGitCwd) : null;
-		const compactionSpeculation = this.session.compactionSpeculation ?? "idle";
-		this.#syncSpeculationBlink(compactionSpeculation);
+		const gitBranch = includeGit || includePr ? this.#getCurrentBranch() : null;
+		const gitStatus = includeGit ? this.#getGitStatus() : null;
+		const gitPr = includePr ? this.#lookupPr() : null;
+
 		return {
 			session: this.session,
 			focusedAgentId: this.#focusedAgentId,
@@ -1825,9 +1691,8 @@ export class StatusLineComponent implements Component {
 		previewTitle?: string,
 	): string {
 		const effectiveSettings = this.#resolveSettings();
-		const plain = layout !== "box";
-		const includePath =
-			hasPathSegment(effectiveSettings.leftSegments) || hasPathSegment(effectiveSettings.rightSegments);
+		const includeContext =
+			hasContextSegment(effectiveSettings.leftSegments) || hasContextSegment(effectiveSettings.rightSegments);
 		const gitEnabled = this.#gitEnabled();
 		const includeGit =
 			gitEnabled &&
@@ -1837,14 +1702,11 @@ export class StatusLineComponent implements Component {
 		const ctx = this.#buildSegmentContext(
 			width,
 			effectiveSettings.segmentOptions,
-			includePath,
+			includeContext,
 			includeGit,
 			includePr,
-			previewTitle,
 		);
-		const separatorDef = plain
-			? { left: "·", right: "·" }
-			: getSeparator(effectiveSettings.separator ?? "powerline-thin", theme);
+		const separatorDef = getSeparator(effectiveSettings.separator ?? "powerline-thin", theme);
 
 		// `transparent` reuses the empty-string sentinel (`\x1b[49m`) so the bar
 		// inherits the terminal's default background, matching custom themes that
