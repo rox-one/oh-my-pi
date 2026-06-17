@@ -440,7 +440,182 @@ export class SelectorController {
 	 * This handles side effects and session-specific settings.
 	 */
 	handleSettingChange(id: string, value: unknown): void {
-		applySettingSideEffects(this.ctx, id, value);
+		// Discovery provider toggles
+		if (id.startsWith("discovery.")) {
+			const providerId = id.replace("discovery.", "");
+			if (value) {
+				enableProvider(providerId);
+			} else {
+				disableProvider(providerId);
+			}
+			return;
+		}
+
+		switch (id) {
+			// Session-managed settings (not in SettingsManager)
+			case "autoCompact":
+				this.ctx.session.setAutoCompactionEnabled(value as boolean);
+				this.ctx.statusLine.setAutoCompactEnabled(value as boolean);
+				break;
+			case "steeringMode":
+				this.ctx.session.setSteeringMode(value as "all" | "one-at-a-time");
+				break;
+			case "followUpMode":
+				this.ctx.session.setFollowUpMode(value as "all" | "one-at-a-time");
+				break;
+			case "interruptMode":
+				this.ctx.session.setInterruptMode(value as "immediate" | "wait");
+				break;
+			case "thinkingLevel":
+			case "defaultThinkingLevel":
+				this.ctx.session.setThinkingLevel(value as ConfiguredThinkingLevel, true);
+				this.ctx.statusLine.invalidate();
+				this.ctx.updateEditorBorderColor();
+				break;
+			case "personality":
+				void this.ctx.session.refreshBaseSystemPrompt().catch(err => {
+					this.ctx.showError(`Failed to apply personality: ${err}`);
+				});
+				break;
+
+			case "autocompleteMaxVisible":
+				this.ctx.editor.setAutocompleteMaxVisible(typeof value === "number" ? value : Number(value));
+				break;
+
+			// Settings with UI side effects
+			case "showImages":
+				for (const child of this.ctx.chatContainer.children) {
+					if (child instanceof ToolExecutionComponent) {
+						child.setShowImages(value as boolean);
+					}
+				}
+				break;
+			case "hideThinking":
+				this.ctx.hideThinkingBlock = value as boolean;
+				this.ctx.session.agent.hideThinkingSummary = value as boolean;
+				for (const child of this.ctx.chatContainer.children) {
+					if (child instanceof AssistantMessageComponent) {
+						child.setHideThinkingBlock(value as boolean);
+						child.invalidate();
+					}
+				}
+				break;
+			case "theme": {
+				setTheme(value as string, true).then(result => {
+					this.ctx.statusLine.invalidate();
+					this.ctx.updateEditorTopBorder();
+					this.ctx.ui.invalidate();
+					if (!result.success) {
+						this.ctx.showError(`Failed to load theme "${value}": ${result.error}\nFell back to dark theme.`);
+					}
+				});
+				break;
+			}
+			case "symbolPreset": {
+				setSymbolPreset(value as "unicode" | "nerd" | "ascii").then(() => {
+					this.ctx.statusLine.invalidate();
+					this.ctx.updateEditorTopBorder();
+					this.ctx.ui.invalidate();
+				});
+				break;
+			}
+			case "colorBlindMode": {
+				setColorBlindMode(value === "true" || value === true).then(() => {
+					this.ctx.ui.invalidate();
+				});
+				break;
+			}
+			case "temperature": {
+				const temp = typeof value === "number" ? value : Number(value);
+				this.ctx.session.agent.temperature = temp >= 0 ? temp : undefined;
+				break;
+			}
+			case "topP": {
+				const topP = typeof value === "number" ? value : Number(value);
+				this.ctx.session.agent.topP = topP >= 0 ? topP : undefined;
+				break;
+			}
+			case "topK": {
+				const topK = typeof value === "number" ? value : Number(value);
+				this.ctx.session.agent.topK = topK >= 0 ? topK : undefined;
+				break;
+			}
+			case "minP": {
+				const minP = typeof value === "number" ? value : Number(value);
+				this.ctx.session.agent.minP = minP >= 0 ? minP : undefined;
+				break;
+			}
+			case "presencePenalty": {
+				const presencePenalty = typeof value === "number" ? value : Number(value);
+				this.ctx.session.agent.presencePenalty = presencePenalty >= 0 ? presencePenalty : undefined;
+				break;
+			}
+			case "repetitionPenalty": {
+				const repetitionPenalty = typeof value === "number" ? value : Number(value);
+				this.ctx.session.agent.repetitionPenalty = repetitionPenalty >= 0 ? repetitionPenalty : undefined;
+				break;
+			}
+			case "git.enabled":
+			case "statusLinePreset":
+			case "statusLine.preset":
+			case "statusLineSeparator":
+			case "statusLine.separator":
+			case "statusLineShowHooks":
+			case "statusLine.showHookStatus":
+			case "statusLine.sessionAccent":
+			case "statusLine.transparent":
+			case "statusLineSegments":
+			case "statusLineModelThinking":
+			case "statusLinePathAbbreviate":
+			case "statusLinePathMaxLength":
+			case "statusLinePathStripWorkPrefix":
+			case "statusLineGitShowBranch":
+			case "statusLineGitShowStaged":
+			case "statusLineGitShowUnstaged":
+			case "statusLineGitShowUntracked":
+			case "statusLineTimeFormat":
+			case "statusLineTimeShowSeconds": {
+				const statusLineSettings = {
+					preset: settings.get("statusLine.preset"),
+					leftSegments: settings.get("statusLine.leftSegments"),
+					rightSegments: settings.get("statusLine.rightSegments"),
+					separator: settings.get("statusLine.separator"),
+					showHookStatus: settings.get("statusLine.showHookStatus"),
+					sessionAccent: settings.get("statusLine.sessionAccent"),
+					transparent: settings.get("statusLine.transparent"),
+					segmentOptions: settings.get("statusLine.segmentOptions"),
+				};
+				this.ctx.statusLine.updateSettings(statusLineSettings);
+				this.ctx.updateEditorTopBorder();
+				this.ctx.ui.requestRender();
+				break;
+			}
+
+			// Provider settings - update runtime preferences
+			case "providers.webSearch":
+				if (typeof value === "string" && isSearchProviderPreference(value)) {
+					setPreferredSearchProvider(value);
+				}
+				break;
+			case "providers.webSearchExclude":
+				if (Array.isArray(value)) {
+					setExcludedSearchProviders(value.filter(isSearchProviderId));
+				}
+				break;
+			case "providers.image":
+				if (isImageProviderPreference(value)) {
+					setPreferredImageProvider(value);
+				}
+				break;
+
+			// MCP update injection - live subscribe/unsubscribe
+			case "mcp.notifications":
+				this.ctx.mcpManager?.setNotificationsEnabled(value as boolean);
+				break;
+
+			// All other settings are handled by the definitions (get/set on SettingsManager)
+			// No additional side effects needed
+		}
 	}
 
 	showModelSelector(options?: { temporaryOnly?: boolean }): void {
