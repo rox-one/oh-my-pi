@@ -313,12 +313,32 @@ function defaultModel(): string {
  * Resolve the embedding model name for the currently active runtime scope.
  *
  * Reads (in order): the active provider's `model` from `withMnemopiRuntimeOptions`,
- * the `MNEMOPI_EMBEDDING_MODEL` env var, then the bundled fastembed default. Stored
- * alongside each row in `memory_embeddings.model` so migrations can re-embed when
- * the active model changes.
+ * the `MNEMOPI_EMBEDDING_MODEL` env var, then the bundled fastembed default.
+ * Used by the embedding pipeline to decide which provider/dimensions to load;
+ * NOT what gets stamped into `memory_embeddings.model` (see
+ * {@link currentEmbeddingFingerprint}).
  */
 export function currentEmbeddingModel(): string {
 	return defaultModel();
+}
+
+/**
+ * Stable identifier for the current embedding *configuration*, not just the
+ * model. Stamped into `memory_embeddings.model` so
+ * `reconcileEmbeddingModel` can detect when the produced vector would
+ * meaningfully change — including changes to `MNEMOPI_EMBEDDING_MAX_INPUT_CHARS`
+ * or `embeddings.maxInputChars`, not only a model swap. Rows stamped with the
+ * bare model name (pre-#3126 builds) mismatch the new fingerprint on next
+ * store open so the head/tail clip reaches every existing long memory via
+ * the normal reconcile rebuild path.
+ *
+ * Format: `<model>` when the cap is `0`/disabled (preserves byte-compat for
+ * users who opt out of capping), `<model>@chars:<N>` otherwise.
+ */
+export function currentEmbeddingFingerprint(): string {
+	const model = currentEmbeddingModel();
+	const cap = effectiveMaxInputChars();
+	return cap === 0 ? model : `${model}@chars:${cap}`;
 }
 
 export function isApiModel(modelName: string): boolean {

@@ -1,18 +1,7 @@
 import type { Database } from "bun:sqlite";
 import { logger } from "@oh-my-pi/pi-utils";
 import { generateId as generateTimedId, sha256Hex16, stableMemoryId } from "../../util/ids";
-import {
-	cjkFtsTerms,
-	containsSpacelessCjk,
-	FACT_MATCH_STOPWORDS,
-	factMatchTokens,
-	ftsQueryTerms,
-	hasCjk,
-	isCjkChar,
-	RECALL_SYNONYMS,
-	recallTokens,
-} from "../../util/regex";
-import { currentEmbeddingModel, embed } from "../embeddings";
+import { currentEmbeddingFingerprint, embed } from "../embeddings";
 import { getMnemopiRuntimeOptions, mnemopiDebugEnabled, withMnemopiRuntimeOptions } from "../runtime-options";
 import { buildExactVectorIndex, searchExactVectorIndex } from "../vector-index";
 import type { BeamMemoryState, JsonValue, Metadata } from "./types";
@@ -781,8 +770,8 @@ async function runEmbedding(beam: BeamMemoryState, items: readonly EmbedItem[]):
 	try {
 		const matrix = await embed(items.map(item => item.content));
 		if (matrix === null) return;
-		const model = currentEmbeddingModel();
-		using insertEmbedding = beam.db.prepare(
+		const model = currentEmbeddingFingerprint();
+		const insertEmbedding = beam.db.prepare(
 			"INSERT OR REPLACE INTO memory_embeddings(memory_id, embedding_json, model) VALUES (?, ?, ?)",
 		);
 		const insertMany = beam.db.transaction((rows: readonly EmbedItem[]) => {

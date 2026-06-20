@@ -15,6 +15,13 @@ import { Mnemopi } from "@oh-my-pi/pi-mnemopi/core/memory";
 const OLD_MODEL = "BAAI/bge-small-en-v1.5";
 const NEW_MODEL = "intfloat/multilingual-e5-large";
 
+// `memory_embeddings.model` rows are stamped with `currentEmbeddingFingerprint()`
+// (model + active input cap) so a cap change triggers reconcile just like a
+// model change. The test runtime leaves `MNEMOPI_EMBEDDING_MAX_INPUT_CHARS`
+// unset, so the default 8192 char cap applies.
+const DEFAULT_CAP_SUFFIX = "@chars:8192";
+const NEW_STAMP = `${NEW_MODEL}${DEFAULT_CAP_SUFFIX}`;
+
 // Deterministic fastembed-shaped provider so the background rebuild actually
 // writes rows (and stamps them with the active model) under the test runtime.
 function fakeEmbed() {
@@ -70,7 +77,7 @@ describe("reconcileEmbeddingModel on store open", () => {
 				model: string;
 			}[];
 			expect(rows.map(row => row.memory_id).sort()).toEqual([...ids].sort());
-			expect(rows.every(row => row.model === NEW_MODEL)).toBe(true);
+			expect(rows.every(row => row.model === NEW_STAMP)).toBe(true);
 		} finally {
 			memory.close();
 			db.close();
@@ -78,7 +85,7 @@ describe("reconcileEmbeddingModel on store open", () => {
 	});
 
 	it("leaves embeddings untouched when the stored model already matches", () => {
-		const { db } = seedDb(NEW_MODEL);
+		const { db } = seedDb(NEW_STAMP);
 		const memory = new Mnemopi({ db, embeddings: { model: NEW_MODEL, provider: fakeEmbed() } });
 		try {
 			// No mismatch -> no wipe, no rebuild enqueued.
@@ -91,6 +98,31 @@ describe("reconcileEmbeddingModel on store open", () => {
 			};
 			expect(ep.v).not.toBeNull();
 			expect(Array.from(ep.v as Uint8Array)).toEqual([1, 2, 3, 4]);
+		} finally {
+			memory.close();
+			db.close();
+		}
+	});
+
+	it("rebuilds existing rows when only the input cap changes (#3126 upgrade path)", async () => {
+		// Simulate a pre-#3126 DB: rows stamped with the bare model name and no
+		// cap suffix. After the upgrade, those rows mismatch the new
+		// `${MODEL}@chars:N` fingerprint, get wiped, and re-embedded through the
+		// head/tail clip — otherwise long memories from the silent-truncation era
+		// keep their stale prefix-only vectors forever.
+		const { db, ids } = seedDb(NEW_MODEL);
+		const memory = new Mnemopi({ db, embeddings: { model: NEW_MODEL, provider: fakeEmbed() } });
+		try {
+			expect(countEmbeddings(memory)).toBe(0);
+			expect(memory.beam.pendingExtractions.size).toBeGreaterThanOrEqual(1);
+
+			await memory.flushExtractions();
+			const rows = memory.conn.query("SELECT memory_id, model FROM memory_embeddings ORDER BY memory_id").all() as {
+				memory_id: string;
+				model: string;
+			}[];
+			expect(rows.map(row => row.memory_id).sort()).toEqual([...ids].sort());
+			expect(rows.every(row => row.model === NEW_STAMP)).toBe(true);
 		} finally {
 			memory.close();
 			db.close();
@@ -183,7 +215,7 @@ describe("reconcileEmbeddingModel on store open", () => {
 				model: string;
 			}[];
 			expect(rows.map(row => row.memory_id).sort()).toEqual(["ep-1", "wm-1"]);
-			expect(rows.every(row => row.model === NEW_MODEL)).toBe(true);
+			expect(rows.every(row => row.model === NEW_STAMP)).toBe(true);
 		} finally {
 			memory.close();
 			db.close();
