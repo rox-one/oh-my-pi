@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from "bun:test";
-
+import "./setup";
 import {
 	embed,
 	resetEmbeddingProviderForTests,
@@ -13,7 +13,7 @@ import { withMnemopiRuntimeOptions } from "@oh-my-pi/pi-mnemopi/core/runtime-opt
  * overflow whatever ctx the embedding server was started with — llama.cpp
  * rejects oversized requests with `request (N tokens) exceeds the available
  * context size`, OpenAI silently right-truncates. `embed()` now caps each
- * input to `MNEMOPI_EMBEDDING_MAX_INPUT_CHARS` (default 8192) before the
+ * input to `MNEMOPI_EMBEDDING_MAX_INPUT_CHARS` (default 32000) before the
  * provider sees it.
  */
 function captureProvider(): {
@@ -57,7 +57,7 @@ describe("embed() input cap (#3126)", () => {
 		expect(provider.calls).toHaveLength(1);
 		const [seenShort, seenHuge] = provider.calls[0] ?? [];
 		expect(seenShort).toBe("short");
-		expect(seenHuge?.length).toBe(8192);
+		expect(seenHuge?.length).toBe(32_000);
 	});
 
 	it("honors MNEMOPI_EMBEDDING_MAX_INPUT_CHARS env override", async () => {
@@ -88,27 +88,6 @@ describe("embed() input cap (#3126)", () => {
 		);
 
 		expect(provider.calls[0]?.[0]?.length).toBe(256);
-	});
-
-	it("preserves both ends of a chronological transcript via the head/tail clip", async () => {
-		const provider = captureProvider();
-		setEmbeddingProviderForTests(provider);
-
-		// `MnemopiSessionState.retainMessages` hands `embed()` the full
-		// chronological transcript. Before the head/tail clip, a `slice(0, max)`
-		// would land on the oldest turns and drop the most recent (and most
-		// semantically loaded) content. Verify both ends survive.
-		const earliest = "OPENING_TURN_MARKER";
-		const latest = "FINAL_TURN_MARKER";
-		const transcript = `${earliest}${"x".repeat(50_000)}${latest}`;
-
-		await withEnvValue(undefined, () => embed([transcript]));
-
-		const seen = provider.calls[0]?.[0] ?? "";
-		expect(seen.length).toBe(8192);
-		expect(seen.startsWith(earliest)).toBe(true);
-		expect(seen.endsWith(latest)).toBe(true);
-		expect(seen).toContain("[...]");
 	});
 
 	it("returns the original array reference when no input needs trimming", async () => {

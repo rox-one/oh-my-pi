@@ -4,6 +4,12 @@
 
 ### Fixed
 
+- Stopped Mnemopi retention from overflowing the embedding model's context window: `embed()` now caps each input at `MNEMOPI_EMBEDDING_MAX_INPUT_CHARS` (default 32000 chars) so a long multi-turn `MnemopiSessionState.retainMessages` transcript can't make llama.cpp's `/embeddings` server reject the request with `request (N tokens) exceeds the available context size` and silently drop vector recall for that memory ([#3126](https://github.com/can1357/oh-my-pi/issues/3126)).
+
+## [16.1.7] - 2026-06-20
+
+### Fixed
+
 - Fixed Escape during an active TUI prompt requiring a second press before canceling; the first Escape now aborts the streaming turn immediately. ([#4921](https://github.com/can1357/oh-my-pi/issues/4921))
 
 ## [16.3.12] - 2026-07-08
