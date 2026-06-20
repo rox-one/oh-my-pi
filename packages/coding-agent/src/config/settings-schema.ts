@@ -2031,6 +2031,16 @@ export const SETTINGS_SCHEMA = {
 			description: "Action when pressing Escape twice with empty editor",
 		},
 	},
+	"tui.slashHistory": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "interaction",
+			group: "Input",
+			label: "Slash Command History",
+			description: "Store built-in slash commands for up-arrow recall",
+		},
+	},
 
 	treeFilterMode: {
 		type: "enum",
