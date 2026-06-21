@@ -1556,6 +1556,9 @@
 - Fixed Escape waiting for an in-flight `session_stop` extension handler to exhaust its timeout; abort now cancels the active stop pass without reporting a false timeout or applying stale continuation context ([#6489](https://github.com/can1357/oh-my-pi/issues/6489)).
 - Fixed the agent not resuming after re-answering a past `ask` from the session tree. Committing a new answer via `/tree` branched a fresh sibling `toolResult` and rebuilt context, but nothing ever continued the agent — unlike a live `ask`, whose continuation is intrinsic to the streaming run loop — so the model never consumed the new answer and the session sat idle until a manual prompt. `navigateTree` now reports the commit (`askReanswerCommitted`) and the interactive `/tree` handler resumes the agent via `resumeAfterAskReanswer()` *after* its transcript rebuild, so the resumed turn never renders against the stale pre-rebuild UI. Plain leaf moves and the read-only `reopenAsk` probe stay idle ([#6483](https://github.com/can1357/oh-my-pi/issues/6483)).
 - Fixed Ctrl+C and fatal shutdown entering an `ExtensionExitError` rejection loop while an extension or hook was still loading ([#6488](https://github.com/can1357/oh-my-pi/issues/6488)).
+### Changed
+
+- Unified default, custom, and subagent system prompt assembly into ordered Runtime, System, Append, and Project zones, preserving harness tools, policies, skills, rules, safety constraints, and project context when model behavior is replaced.
 
 ## [17.1.3] - 2026-07-24
 

@@ -6,8 +6,7 @@ Primary implementation:
 
 - `packages/coding-agent/src/system-prompt.ts` (`buildSystemPrompt`, `loadSystemPromptFiles`)
 - `packages/coding-agent/src/main.ts` (`discoverSystemPromptFile`, `discoverAppendSystemPromptFile`)
-- `packages/coding-agent/src/prompts/system/system-prompt.md` (default stable instruction template)
-- `packages/coding-agent/src/prompts/system/custom-system-prompt.md` (custom-prompt template; used when `--system-prompt` / `SYSTEM.md` or SDK `customSystemPrompt` is provided)
+- `packages/coding-agent/src/prompts/system/system-prompt.md` (unified template; handles both default and custom prompts via `{{#if customPrompt}}` conditionals)
 - `packages/coding-agent/src/prompts/system/project-prompt.md` (project/environment footer)
 
 ## Inputs and precedence
@@ -21,8 +20,12 @@ Primary implementation:
 
 `SYSTEM.md` and `APPEND_SYSTEM.md` are searched project-first, then user-level. At each scope the config bases are ordered `.omp`, `.claude`, `.codex`, `.gemini`:
 
-1. `<cwd>/.omp/<file>`, `<cwd>/.claude/<file>`, `<cwd>/.codex/<file>`, `<cwd>/.gemini/<file>`
-2. `~/.omp/agent/<file>`, `~/.claude/<file>`, `~/.codex/<file>`, `~/.gemini/<file>`
+| Input | Source | Effect |
+|---|---|---|
+| `--system-prompt <text-or-file>` | CLI flag | Replaces the default System zone while preserving Runtime and Project. Highest precedence. |
+| `SYSTEM.md` | `<cwd>/.omp/SYSTEM.md`, then `~/.omp/agent/SYSTEM.md` (and equivalent paths under `.claude`, `.codex`, `.gemini`) | Same effect as `--system-prompt`; used when the flag is absent. |
+| `--append-system-prompt <text-or-file>` | CLI flag | Adds the Append zone after the selected default/custom System and before Project. |
+| `APPEND_SYSTEM.md` | Same discovery as `SYSTEM.md` | Same effect as `--append-system-prompt`; used when the flag is absent. |
 
 The native user path follows the active profile: with `omp --profile work`, `~/.omp/agent` becomes `~/.omp/profiles/work/agent`. `PI_CONFIG_DIR` changes the native config-directory name. This shared config lookup does not use `PI_CODING_AGENT_DIR` as an arbitrary replacement base.
 
@@ -34,37 +37,28 @@ A flag wins over every discovered file. For each filename, project scope wins ov
 
 For a single-line value, OMP first tries to read that value as a file path. If reading fails because the path does not exist (or is too long to be a path), the value is used literally. A value containing a newline is used literally without a file read. Other file-read failures are logged and the original value is still used literally.
 
-## What `SYSTEM.md` replaces
+## 2) Runtime, System, Append, and Project
 
 CLI startup passes resolved `SYSTEM.md` / `--system-prompt` text as `options.customSystemPrompt` and resolved `APPEND_SYSTEM.md` / `--append-system-prompt` text as `options.appendSystemPrompt` via `applyResolvedSystemPromptInputs` in `packages/coding-agent/src/main.ts`. These flow into `buildSystemPrompt` as `resolvedCustomPrompt` and `resolvedAppendSystemPrompt`.
 
-`buildSystemPrompt` selects the rendering template based on whether `resolvedCustomPrompt` is set (`system-prompt.ts` line 686):
+`buildSystemPrompt` assembles four ordered zones:
 
-```ts
-const rendered = prompt.render(
-    resolvedCustomPrompt ? customSystemPromptTemplate : systemPromptTemplate, data
-);
-```
+1. **Runtime** — conventions, tools, tool policy, skills, rules, MCP/internal protocols, and tool-specific safety. Harness-owned and always preserved.
+2. **System** — role, personality, behavior, workflow, and delivery contract. The bundled default is replaced as a unit by a custom prompt.
+3. **Append** — optional user text appended after the selected default/custom System.
+4. **Project** — workstation, cwd, context files, directory rules, workspace tree, date, and repository context. Dynamically rendered and always preserved.
 
-**Without** a custom system prompt, the default template (`system-prompt.md`) renders the full stable default instructions (staff-engineer preamble, tool inventory, skills, rules, exploration rules, workflow rules, etc.) plus any append prompt.
-
-**With** a custom system prompt, the custom template (`custom-system-prompt.md`) renders instead. This template outputs:
-
-1. the custom system prompt text (`customPrompt`);
-2. the append prompt text, if any (`appendPrompt`);
-3. project/environment context (context files, git info, skills, rules).
-
-In both cases `buildSystemPrompt` also renders `project-prompt.md` as a second block carrying environment metadata (workstation info, cwd, workspace tree, etc.), which is always preserved.
-
-When a custom system prompt is provided, `callerControlsCustomPrompt` is set to `true` in `buildSystemPrompt`, which suppresses the secondary capability path (`loadSystemPromptFiles`) entirely — `systemPromptCustomization` is `null`. This prevents the auto-discovered `SYSTEM.md` from being loaded a second time through the capability layer.
-
-The current date and working directory no longer live in the footer: they are emitted as a `<system-reminder>` block on the first user turn of each provider request (`date-cwd-reminder.md`). Keeping per-request bytes out of the system prompt lets open-weight providers (DeepSeek, Qwen, GLM, …) that render tool schemas after the system content keep their prefix cache, and lets a session crossing midnight refresh the date without rebuilding the prompt (#7404).
-
-- Providing `--system-prompt` or `SYSTEM.md` replaces the stable default instructions. The dynamic project/environment footer from `project-prompt.md` remains.
-- Providing `--append-system-prompt` or `APPEND_SYSTEM.md` without a custom system prompt appends text after all default blocks.
-- Providing both produces: custom system prompt, append prompt, then the preserved dynamic project/environment footer.
+`system-prompt.md` is the unified Runtime/System/Append template. Its `{{#if customPrompt}}` branch selects custom text; the `{{else}}` branch renders the bundled System behavior. `project-prompt.md` renders the Project zone as a subsequent provider-facing block.
 
 Consequences:
+
+- `SYSTEM.md` replaces default model behavior, not harness capabilities.
+- Tool inventory, tool policy, skills, rules, MCP protocols, and tool-specific safety remain available with custom prompts.
+- `APPEND_SYSTEM.md` follows the selected System zone and appears exactly once.
+- Project/environment context remains after default, custom, and append content.
+- Subagent prompts use the same custom-System path, replacing the main-agent role/workflow without losing Runtime or Project.
+
+When a custom prompt is provided, `callerControlsCustomPrompt` suppresses the secondary capability discovery path. This prevents a second `SYSTEM.md` from being loaded or injected.
 
 - To add a few instructions while retaining the complete default prompt, use only `APPEND_SYSTEM.md` or `--append-system-prompt`.
 - To replace the default instruction template while retaining generated project context, skills, and rules, use `SYSTEM.md` or `--system-prompt`.
@@ -74,7 +68,14 @@ Consequences:
 
 Without `SYSTEM.md`, append text is rendered at the end of `project-prompt.md`, after the default instruction block and project/environment content.
 
-With `SYSTEM.md`, append text is rendered immediately after the custom text in `custom-system-prompt.md`. Context, skills, and rules follow it, and the separate project/environment footer follows that block. The templates prevent the append text and context files from being emitted twice.
+The built-in prompt templates are Handlebars (`packages/utils/src/prompt.ts`), but user-provided strings are not compiled with that renderer. A `{{value}}` reference in Handlebars still does not recursively render its substituted contents — the value is emitted as a string. Concretely:
+
+```handlebars
+{{! The custom prompt is emitted verbatim inside the template }}
+{{#if customPrompt}}
+{{customPrompt}}
+{{/if}}
+```
 
 SDK-generated append content (for enabled memory/auto-learn features and MCP guidance) is combined before the user-supplied append text.
 
@@ -98,7 +99,13 @@ those characters reach the model literally. Internal values such as `cwd`, `skil
 
 ### Add rules to the default prompt
 
-Create `APPEND_SYSTEM.md` without a `SYSTEM.md`:
+---
+
+## 4) Recommended patterns
+
+### Add rules without replacing default behavior
+
+Use `APPEND_SYSTEM.md` (or `--append-system-prompt`) without `SYSTEM.md`. Runtime, the bundled System behavior, and Project remain intact.
 
 ```text
 # ~/.omp/agent/APPEND_SYSTEM.md
@@ -106,7 +113,9 @@ Prefer Bun APIs over Node APIs in this project.
 When you change a public function, run `bun check` before yielding.
 ```
 
-### Supply a custom base prompt
+### Replace model behavior while keeping harness capabilities
+
+Use `SYSTEM.md` (or `--system-prompt`). This replaces the bundled role, personality, workflow, and delivery contract. Runtime still supplies generated tool guidance, skills, rules, MCP/internal protocols, and tool-specific safety; Project still supplies environment and repository context.
 
 ```text
 # <cwd>/.omp/SYSTEM.md
@@ -114,18 +123,7 @@ You are a code reviewer. Read changes, surface concrete issues, and never edit f
 Cite paths with backticks.
 ```
 
-OMP still adds the generated context, skills, rules, and project/environment footer, but not the default instruction template's tool and workflow guidance.
-
-### Replace the personality block
-
-The default template renders a personality block chosen by the `personality` setting (`default`, `friendly`, `pragmatic`, `none`). A user-level `PERSONALITY.md` replaces the selected preset's text:
-
-```text
-# ~/.omp/agent/PERSONALITY.md
-Follow ASD-STE100 Simplified Technical English for all responses.
-```
-
-Only the agent directory is checked (`~/.omp/agent` by default; profile- and XDG-aware) — there is no project-level or other-config-base lookup. `personality: none` still omits the block entirely (subagents always run with `none`), and an empty or unreadable file falls back to the configured preset with a logged warning.
+Use `APPEND_SYSTEM.md` alongside it when a separate final supplement should follow the custom behavior.
 
 ### Customize automatic session titles
 
@@ -146,22 +144,19 @@ quotes, `<title>...</title>` markers, and terminal punctuation, and treats
 12 words is rejected rather than truncated. Empty, deferred, or rejected output
 leaves the session unnamed, so a later eligible title attempt can name it.
 
-## Full provider-facing replacement (SDK only)
+The normal CLI file/flag path preserves Runtime and Project. SDK code using `CreateAgentSessionOptions.systemPrompt` can replace the complete provider-facing prompt array and omit either zone; `.omp/SYSTEM.md`, `~/.omp/agent/SYSTEM.md`, and `--system-prompt` cannot.
 
 `CreateAgentSessionOptions.systemPrompt` is a different, lower-level API. A string or array replaces the fully rendered default blocks; a callback receives the rendered block array and returns its replacement. This can omit all generated context and safety blocks.
 
-The CLI flags and files do **not** set this property: they set `customSystemPrompt` and `appendSystemPrompt`, which continue through the bundled templates described above.
+There is no built-in way to inherit selected subsections of the bundled System behavior while replacing the rest. Use Append to retain the complete bundled System, or copy the required behavior into `SYSTEM.md`. Runtime remains available in both cases.
 
 ## Quick reference
 
 ## 5) Deduplication
 
-When a CLI flag or discovered `SYSTEM.md` provides a custom system prompt, `applyResolvedSystemPromptInputs` sets `options.customSystemPrompt`. Inside `buildSystemPrompt`, this sets `callerControlsCustomPrompt = true`, which suppresses the secondary capability path (`loadSystemPromptFiles`) entirely — `systemPromptCustomization` is resolved to `null` without ever loading the capability-layer `SYSTEM.md`. There is no double injection to deduplicate at the template level.
+When a CLI flag or discovered `SYSTEM.md` provides a custom System zone, `applyResolvedSystemPromptInputs` sets `options.customSystemPrompt`. `callerControlsCustomPrompt` then suppresses secondary capability discovery, so the same `SYSTEM.md` is not loaded twice.
 
-When the SDK supplies `customSystemPrompt` directly (without the CLI path), the capability path can still run. `buildSystemPrompt` deduplicates in that case:
-
-- `dedupePromptSource` drops a `systemPromptCustomization` block when it already appears in an internally supplied `customPrompt` or append prompt.
-- `dedupeAlwaysApplyRules` omits always-apply rules whose body appears verbatim in any of `{customPrompt, appendPrompt, systemPromptCustomization}`.
+Always-apply rules are deduplicated against the custom prompt, append prompt, and context files. A rule whose body is already present in one of those sources is omitted from Runtime injection.
 
 ---
 
@@ -170,7 +165,7 @@ When the SDK supplies `customSystemPrompt` directly (without the CLI path), the 
 Only one path actually drives the customization a CLI user sees: the primary CLI path. The capability layer exists but its `SYSTEM.md` output never reaches the rendered prompt under normal CLI startup.
 
 - The primary CLI path (`discoverSystemPromptFile` / `discoverAppendSystemPromptFile` in `main.ts`, which feeds `resolvedSystemPrompt` / `resolvedAppendPrompt`) calls `findConfigFile`. `findConfigFile` checks only `<cwd>/.omp`, `<cwd>/.claude`, `<cwd>/.codex`, `<cwd>/.gemini`, and the user-level equivalents — it does **not** walk up ancestors. Files in `<ancestor>/.omp/SYSTEM.md` are ignored when `omp` is started from a subdirectory.
-- The secondary capability path (`loadSystemPromptFiles` → builtin discovery) does walk up via `findNearestProjectConfigDir` and requires the project `.omp/` directory to be non-empty. Its result is rendered into the template variable `systemPromptCustomization`. Under normal CLI startup the default template (`system-prompt.md`) never references that variable, so ancestor-walk capability content has no user-visible effect.
+- The secondary capability path (`loadSystemPromptFiles` → builtin discovery) does walk up via `findNearestProjectConfigDir` and requires the project `.omp/` directory to be non-empty. Under normal CLI startup, `callerControlsCustomPrompt` suppresses this path entirely when the primary path found a custom prompt.
 
 Net effect for CLI users: put `SYSTEM.md` / `APPEND_SYSTEM.md` directly under `<cwd>/.omp` (or another supported config base under cwd) or in the user-level location (`~/.omp/agent/SYSTEM.md` etc.). Ancestor paths are not searched.
 
@@ -180,11 +175,11 @@ Net effect for CLI users: put `SYSTEM.md` / `APPEND_SYSTEM.md` directly under `<
 
 | Goal | Use |
 |---|---|
-| Add an instruction on top of the full default prompt | `APPEND_SYSTEM.md` or `--append-system-prompt` |
-| Replace the stable default instructions but keep project/environment context | `SYSTEM.md` or `--system-prompt` |
-| Preserve generated skills/rules/tool guidance while customizing | `APPEND_SYSTEM.md`; `SYSTEM.md` replaces that generated block |
+| Add instructions while keeping bundled model behavior | `APPEND_SYSTEM.md` or `--append-system-prompt` |
+| Replace bundled model behavior while keeping Runtime and Project | `SYSTEM.md` or `--system-prompt` |
+| Preserve generated skills/rules/tool guidance while customizing | `SYSTEM.md`; Runtime remains outside the replaceable System zone |
 | Customize automatic session titles | `TITLE_SYSTEM.md`; chat-turn `SYSTEM.md` / `APPEND_SYSTEM.md` do not affect title generation |
 | Use `{{cwd}}` / `{{date}}` / other internals in my file | Not supported. Files are inserted verbatim. |
-| Inherit specific sections from `system-prompt.md` | Not supported; use append, or copy what you need into `SYSTEM.md`. |
+| Inherit selected bundled System subsections | Not supported; use Append or copy the required behavior into `SYSTEM.md` |
 | Override at a per-repo level | Project `.omp/SYSTEM.md` under the cwd you launch `omp` from |
 | Override globally | `~/.omp/agent/SYSTEM.md` or `~/.omp/agent/APPEND_SYSTEM.md` |
