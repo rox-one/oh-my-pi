@@ -27,7 +27,6 @@ import { loadSkills, type Skill } from "./extensibility/skills";
 import { hasObsidian } from "./internal-urls/vault-protocol";
 import activeRepoContextTemplate from "./prompts/system/active-repo-context.md" with { type: "text" };
 import computerSafetyPrompt from "./prompts/system/computer-safety.md" with { type: "text" };
-import customSystemPromptTemplate from "./prompts/system/custom-system-prompt.md" with { type: "text" };
 import defaultPersonality from "./prompts/system/personalities/default.md" with { type: "text" };
 import friendlyPersonality from "./prompts/system/personalities/friendly.md" with { type: "text" };
 import pragmaticPersonality from "./prompts/system/personalities/pragmatic.md" with { type: "text" };
@@ -138,13 +137,6 @@ function dedupeAlwaysApplyRules(
 	return alwaysApplyRules.filter(
 		rule => !promptSources.some(source => promptSourceContainsRule(source, rule.content)),
 	);
-}
-
-function dedupePromptSource(source: string | null | undefined, otherSources: Array<string | null | undefined>): string {
-	const resolvedSource = firstNonEmpty(source);
-	if (!resolvedSource) return "";
-
-	return otherSources.some(otherSource => promptSourceContainsRule(otherSource, resolvedSource)) ? "" : resolvedSource;
 }
 
 function firstNonEmpty(...values: (string | undefined | null)[]): string | null {
@@ -712,8 +704,7 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 	const prepDefaults = {
 		resolvedCustomPrompt: undefined as string | undefined,
 		resolvedAppendPrompt: undefined as string | undefined,
-		systemPromptCustomization: null as string | null,
-		contextFiles: dedupeContainedContextFiles(providedContextFiles ?? []),
+		contextFiles: dedupeExactContextFiles(providedContextFiles ?? []),
 		skills: providedSkills ?? ([] as Skill[]),
 		workspaceTree: {
 			rootPath: resolvedCwd,
@@ -758,14 +749,15 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		return result.value;
 	}
 
-	// Caller-supplied `customPrompt` / `resolvedCustomPrompt` owns block 0; the
-	// secondary capability-path `SYSTEM.md` walk-up MUST NOT silently augment it,
-	// because that would defeat CLI precedence over project/user `SYSTEM.md`.
+	// Resolve custom prompt: CLI/SDK takes precedence over SYSTEM.md.
+	// When the caller provides a custom prompt, SYSTEM.md discovery is skipped.
 	const callerControlsCustomPrompt =
 		(typeof providedResolvedCustomPrompt === "string" && providedResolvedCustomPrompt.length > 0) ||
 		(typeof customPrompt === "string" && customPrompt.length > 0);
-	const systemPromptCustomizationPromise: Promise<string | null> = callerControlsCustomPrompt
-		? Promise.resolve(null)
+	const customPromptPromise = callerControlsCustomPrompt
+		? providedResolvedCustomPrompt !== undefined
+			? Promise.resolve(providedResolvedCustomPrompt)
+			: resolvePromptInput(customPrompt, "system prompt")
 		: logger.time("loadSystemPromptFiles", loadSystemPromptFiles, { cwd: resolvedCwd });
 	const contextFilesPromise = (async () => {
 		const primary = providedContextFiles
@@ -827,7 +819,6 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 	const [
 		resolvedCustomPrompt,
 		resolvedAppendPrompt,
-		systemPromptCustomization,
 		contextFiles,
 		skills,
 		workspaceTree,
@@ -836,13 +827,7 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		gpu,
 		personalityBlock,
 	] = await Promise.all([
-		withDeadline(
-			"customPrompt",
-			providedResolvedCustomPrompt !== undefined
-				? Promise.resolve(providedResolvedCustomPrompt)
-				: resolvePromptInput(customPrompt, "system prompt"),
-			prepDefaults.resolvedCustomPrompt,
-		),
+		withDeadline("customPrompt", customPromptPromise, prepDefaults.resolvedCustomPrompt),
 		withDeadline(
 			"appendSystemPrompt",
 			providedResolvedAppendPrompt !== undefined
@@ -850,7 +835,6 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 				: resolvePromptInput(appendSystemPrompt, "append system prompt"),
 			prepDefaults.resolvedAppendPrompt,
 		),
-		withDeadline("loadSystemPromptFiles", systemPromptCustomizationPromise, prepDefaults.systemPromptCustomization),
 		withDeadline("loadProjectContextFiles", contextFilesPromise, prepDefaults.contextFiles).then(
 			dedupeContainedContextFiles,
 		),
@@ -943,24 +927,15 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 	const hasRead = toolNames.includes("read");
 	const filteredSkills = hasRead ? skills.filter(skill => skill.hide !== true) : [];
 
-	const effectiveSystemPromptCustomization = dedupePromptSource(systemPromptCustomization, [
-		resolvedCustomPrompt,
-		resolvedAppendPrompt,
-	]);
 	const contextPromptSources = contextFiles.map(file => file.content);
-	const promptSources = [
-		effectiveSystemPromptCustomization,
-		resolvedCustomPrompt,
-		resolvedAppendPrompt,
-		...contextPromptSources,
-	];
+	const promptSources = [resolvedCustomPrompt, resolvedAppendPrompt, ...contextPromptSources];
 	const injectedAlwaysApplyRules = dedupeAlwaysApplyRules(alwaysApplyRules, promptSources);
 
 	const environment = getEnvironmentInfo(cpuModel, gpu);
 	const data = {
-		systemPromptCustomization: effectiveSystemPromptCustomization,
 		customPrompt: resolvedCustomPrompt,
 		appendPrompt: resolvedAppendPrompt ?? "",
+		computerSafetyPrompt: toolNames.includes("computer") ? computerSafetyPrompt.trim() : "",
 		tools: [...new Set([...toolNames, ...xdevTools.map(mounted => mounted.name)])],
 		toolInfo,
 		toolInventory,
@@ -998,16 +973,9 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		xdevDocs,
 		autoQaEnabled,
 	};
-	const rendered = prompt.render(resolvedCustomPrompt ? customSystemPromptTemplate : systemPromptTemplate, data);
+	const rendered = prompt.render(systemPromptTemplate, data);
 	const systemPrompt = [rendered];
-	if (toolNames.includes("computer")) {
-		systemPrompt.push(computerSafetyPrompt.trim());
-	}
-	// Custom prompt templates already render context files and append text; the
-	// project footer still carries environment, cwd, workspace, and dir-context.
-	const projectPrompt = prompt
-		.render(projectPromptTemplate, resolvedCustomPrompt ? { ...data, contextFiles: [], appendPrompt: "" } : data)
-		.trim();
+	const projectPrompt = prompt.render(projectPromptTemplate, data).trim();
 	if (projectPrompt) {
 		systemPrompt.push(projectPrompt);
 	}
