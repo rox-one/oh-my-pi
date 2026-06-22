@@ -4,6 +4,19 @@
 
 ### Fixed
 
+- Fixed model switches to providers with lower image caps by clamping the transient outgoing context to the target provider's image budget, preserving text history and the newest images instead of wedging the session on a provider 400. ([#3227](https://github.com/can1357/oh-my-pi/issues/3227))
+
+## [16.1.12] - 2026-06-21
+
+### Changed
+
+- Refined secret obfuscation to only target message roles and fields containing operator secrets
+- Restricted obfuscator to ignore secrets and regex matches shorter than 8 characters
+- Optimized obfuscation to skip static system prompts and tool schemas in provider contexts
+- Ensured image data bytes are never modified to prevent corrupted data URL payloads
+
+### Fixed
+
 - Fixed Mnemopi `per-project-tagged` enqueue maintenance to flush and consolidate the shared global bank alongside the project bank ([#2321](https://github.com/can1357/oh-my-pi/issues/2321)).
 
 ## [15.11.2] - 2026-06-11
