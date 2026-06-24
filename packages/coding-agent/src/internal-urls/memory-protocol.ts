@@ -22,9 +22,13 @@ export function memoryRootsFromRegistry(): string[] {
 	const agentDir = getAgentDir();
 	const roots: string[] = [];
 	for (const ref of AgentRegistry.global().list()) {
-		const sm = ref.session?.sessionManager;
-		if (!sm) continue;
-		const root = getMemoryRoot(agentDir, sm.getCwd());
+		const session = ref.session;
+		if (!session?.sessionManager) continue;
+		const root = getMemoryRoot(
+			agentDir,
+			session.sessionManager.getCwd(),
+			session.settings.get("workspace.identifier"),
+		);
 		if (root && !roots.includes(root)) roots.push(root);
 	}
 	return roots;

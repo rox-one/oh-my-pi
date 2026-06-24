@@ -47,22 +47,8 @@ import {
 	TTS_LOCAL_VOICE_VALUES,
 } from "../tts/models";
 import { EDIT_MODES } from "../utils/edit-mode";
-import {
-	DEFAULT_WEB_SEARCH_TIMEOUT_SECONDS,
-	MAX_WEB_SEARCH_TIMEOUT_SECONDS,
-	SEARCH_PROVIDER_CHOICES,
-	type SearchProviderId,
-} from "../web/search/types";
-import {
-	SERVICE_TIER_ANTHROPIC_OPTIONS,
-	SERVICE_TIER_ANTHROPIC_VALUES,
-	SERVICE_TIER_GOOGLE_OPTIONS,
-	SERVICE_TIER_GOOGLE_VALUES,
-	SERVICE_TIER_INHERIT_OPTIONS,
-	SERVICE_TIER_INHERIT_SETTING_VALUES,
-	SERVICE_TIER_OPENAI_OPTIONS,
-	SERVICE_TIER_OPENAI_VALUES,
-} from "./service-tier";
+import { WORKSPACE_IDENTIFIER_MODES } from "../utils/workspace-storage-identifier";
+import { SEARCH_PROVIDER_OPTIONS, SEARCH_PROVIDER_PREFERENCES, type SearchProviderId } from "../web/search/types";
 
 /** Unified settings schema - single source of truth for all settings.
  *
@@ -2679,6 +2665,37 @@ export const SETTINGS_SCHEMA = {
 			label: "Elide Uneventful Results",
 			description:
 				"Prune tool results flagged contextually useless (no matches, timed-out waits) once consumed (cache-aware)",
+		},
+	},
+
+	"workspace.identifier": {
+		type: "enum",
+		values: WORKSPACE_IDENTIFIER_MODES,
+		default: "path",
+		ui: {
+			tab: "context",
+			group: "Experimental",
+			label: "Workspace Identifier (experimental)",
+			description:
+				"Controls how default sessions and per-project memories are keyed. Git modes fall back to path outside Git or when git is unavailable.",
+			options: [
+				{
+					value: "path",
+					label: "Path",
+					description: "Current behavior: key by normalized project path.",
+				},
+				{
+					value: "git-remote",
+					label: "Git remote",
+					description:
+						"Use origin URL, or the first configured remote URL, so worktrees for one fork share storage.",
+				},
+				{
+					value: "git-root",
+					label: "Git root commit",
+					description: "Use the first reachable commit hash so forks and hosting platforms share storage.",
+				},
+			],
 		},
 	},
 

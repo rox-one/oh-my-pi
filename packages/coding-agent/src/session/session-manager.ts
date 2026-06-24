@@ -18,7 +18,7 @@ import {
 	stringifyJson,
 	toError,
 } from "@oh-my-pi/pi-utils";
-import type { StructuredSubagentSchemaMode } from "../task/types";
+import type { WorkspaceIdentifierMode } from "../utils/workspace-storage-identifier";
 import { ArtifactManager } from "./artifacts";
 import { type BlobPutOptions, type BlobPutResult, BlobStore } from "./blob-store";
 import type { CompactionMethod } from "./compaction-methods";
@@ -464,6 +464,7 @@ export class SessionManager {
 	#sessionDir: string;
 	readonly #persist: boolean;
 	readonly #storage: SessionStorage;
+	readonly #workspaceIdentifierMode: WorkspaceIdentifierMode;
 	readonly #blobs: BlobStore;
 
 	#sessionId = "";
@@ -552,11 +553,18 @@ export class SessionManager {
 	#sessionNameChangedCallbacks = new Set<() => void>();
 	#persistenceErrorCallbacks = new Set<(error: Error) => void>();
 
-	private constructor(cwd: string, sessionDir: string, persist: boolean, storage: SessionStorage) {
+	private constructor(
+		cwd: string,
+		sessionDir: string,
+		persist: boolean,
+		storage: SessionStorage,
+		workspaceIdentifierMode: WorkspaceIdentifierMode = "path",
+	) {
 		this.#cwd = cwd;
 		this.#sessionDir = sessionDir;
 		this.#persist = persist;
 		this.#storage = storage;
+		this.#workspaceIdentifierMode = workspaceIdentifierMode;
 		this.#blobs = new BlobStore(getBlobsDir());
 
 		if (persist && sessionDir) this.#storage.ensureDirSync(sessionDir);
@@ -1480,12 +1488,12 @@ export class SessionManager {
 			return;
 		}
 
-		const managedRoot = resolveManagedSessionRoot(this.#sessionDir, this.#cwd);
+		const managedRoot = resolveManagedSessionRoot(this.#sessionDir, this.#cwd, this.#workspaceIdentifierMode);
 		const nextSessionDir =
 			resolvedTargetDir ??
 			(managedRoot
-				? computeDefaultSessionDir(resolvedCwd, this.#storage, managedRoot)
-				: computeDefaultSessionDir(resolvedCwd, this.#storage));
+				? computeDefaultSessionDir(resolvedCwd, this.#storage, managedRoot, this.#workspaceIdentifierMode)
+				: computeDefaultSessionDir(resolvedCwd, this.#storage, undefined, this.#workspaceIdentifierMode));
 
 		let sessionFileExisted = false;
 		// Track source+dest for concurrent completed appends during relocation
@@ -2627,8 +2635,9 @@ export class SessionManager {
 		cwd: string,
 		agentDir?: string,
 		storage: SessionStorage = new FileSessionStorage(),
+		mode: WorkspaceIdentifierMode = "path",
 	): string {
-		return computeDefaultSessionDir(cwd, storage, getSessionsDir(agentDir));
+		return computeDefaultSessionDir(cwd, storage, getSessionsDir(agentDir), mode);
 	}
 
 	/**
@@ -2636,9 +2645,14 @@ export class SessionManager {
 	 * @param cwd Working directory (stored in the session header)
 	 * @param sessionDir Optional session directory; defaults to the cwd-derived dir.
 	 */
-	static create(cwd: string, sessionDir?: string, storage: SessionStorage = new FileSessionStorage()): SessionManager {
-		const dir = sessionDir ?? SessionManager.getDefaultSessionDir(cwd, undefined, storage);
-		const manager = new SessionManager(cwd, dir, true, storage);
+	static create(
+		cwd: string,
+		sessionDir?: string,
+		storage: SessionStorage = new FileSessionStorage(),
+		mode: WorkspaceIdentifierMode = "path",
+	): SessionManager {
+		const dir = sessionDir ?? SessionManager.getDefaultSessionDir(cwd, undefined, storage, mode);
+		const manager = new SessionManager(cwd, dir, true, storage, mode);
 		manager.#resetToNewSession();
 		return manager;
 	}
@@ -2679,10 +2693,15 @@ export class SessionManager {
 		cwd: string,
 		sessionDir?: string,
 		storage: SessionStorage = new FileSessionStorage(),
-		options?: { copyArtifacts?: boolean; suppressBreadcrumb?: boolean; sessionFile?: string },
+		options?: {
+			suppressBreadcrumb?: boolean;
+			sessionFile?: string;
+			workspaceIdentifierMode?: WorkspaceIdentifierMode;
+		},
 	): Promise<SessionManager> {
-		const dir = sessionDir ?? SessionManager.getDefaultSessionDir(cwd, undefined, storage);
-		const manager = new SessionManager(cwd, dir, true, storage);
+		const mode = options?.workspaceIdentifierMode ?? "path";
+		const dir = sessionDir ?? SessionManager.getDefaultSessionDir(cwd, undefined, storage, mode);
+		const manager = new SessionManager(cwd, dir, true, storage, mode);
 		manager.#suppressBreadcrumb = options?.suppressBreadcrumb === true;
 
 		const sourceEntries = structuredClone(await loadEntriesFromFile(sourcePath, storage)) as FileEntry[];
@@ -2727,25 +2746,29 @@ export class SessionManager {
 		filePath: string,
 		sessionDir?: string,
 		storage: SessionStorage = new FileSessionStorage(),
-		options?: { initialCwd?: string; suppressBreadcrumb?: boolean },
+		options?: {
+			initialCwd?: string;
+			suppressBreadcrumb?: boolean;
+			workspaceIdentifierMode?: WorkspaceIdentifierMode;
+		},
 	): Promise<SessionManager> {
-		const loaded = await loadSessionFile(filePath, storage);
-		const header = loaded.entries.find(entry => entry.type === "session") as SessionHeader | undefined;
-		// Resume into the session's recorded cwd only when it is verifiably
-		// accessible. A deleted or permission-blocked (macOS TCC denial) project
-		// dir would make the constructor's #cwd — and the `setProjectDir` chdir
-		// interactive mode runs next — fail, so fall back to the launch cwd and
-		// anchor /new and /branch there too, keeping the resumed session where
-		// the user already is.
+		const mode = options?.workspaceIdentifierMode ?? "path";
+		const loaded = await loadEntriesFromFile(filePath, storage);
+		const header = loaded.find(entry => entry.type === "session") as SessionHeader | undefined;
+		// Resume into the session's recorded cwd only when that directory still
+		// exists. A deleted project dir would make the constructor's #cwd — and the
+		// `setProjectDir` chdir interactive mode runs next — point at (and fail on)
+		// a missing path, so fall back to the launch cwd and anchor /new and /branch
+		// there too, keeping the resumed session where the user already is.
 		const recordedCwd = header?.cwd;
 		const recordedCwdUsable = !!recordedCwd && (await directoryIsEnterable(recordedCwd));
 		const cwd = recordedCwdUsable ? recordedCwd : (options?.initialCwd ?? getProjectDir());
 		const dir =
 			sessionDir ??
 			(recordedCwd && !recordedCwdUsable
-				? SessionManager.getDefaultSessionDir(cwd, undefined, storage)
+				? SessionManager.getDefaultSessionDir(cwd, undefined, storage, mode)
 				: path.dirname(path.resolve(filePath)));
-		const manager = new SessionManager(cwd, dir, true, storage);
+		const manager = new SessionManager(cwd, dir, true, storage, mode);
 		manager.#suppressBreadcrumb = options?.suppressBreadcrumb === true;
 		await manager.#setSessionFile(filePath, loaded);
 		return manager;
@@ -2832,8 +2855,9 @@ export class SessionManager {
 		cwd: string,
 		sessionDir?: string,
 		storage: SessionStorage = new FileSessionStorage(),
+		mode: WorkspaceIdentifierMode = "path",
 	): Promise<SessionManager> {
-		const dir = sessionDir ?? SessionManager.getDefaultSessionDir(cwd, undefined, storage);
+		const dir = sessionDir ?? SessionManager.getDefaultSessionDir(cwd, undefined, storage, mode);
 		const resolvedCwd = path.resolve(cwd);
 		const breadcrumb = await readTerminalBreadcrumbEntry();
 		let chosenSession: string | null | undefined;
@@ -2870,7 +2894,7 @@ export class SessionManager {
 				let currentProjectAlreadyHasSession = false;
 
 				if (breadcrumbCwdMissing && newestIsBreadcrumb) {
-					const localSession = (await SessionManager.list(cwd, dir, storage)).find(
+					const localSession = (await SessionManager.list(cwd, dir, storage, mode)).find(
 						session =>
 							path.resolve(session.path) !== breadcrumbFile &&
 							session.cwd &&
@@ -2892,6 +2916,7 @@ export class SessionManager {
 					// recorded cwd, which would no-op moveTo when it equals `cwd`.
 					const manager = await SessionManager.open(breadcrumb.sessionFile, undefined, storage, {
 						initialCwd: breadcrumbCwd,
+						workspaceIdentifierMode: mode,
 					});
 					await manager.moveTo(cwd, sessionDir);
 					return manager;
@@ -2903,7 +2928,7 @@ export class SessionManager {
 
 		if (chosenSession === undefined) chosenSession = await findMostRecentSession(dir, storage);
 
-		const manager = new SessionManager(cwd, dir, true, storage);
+		const manager = new SessionManager(cwd, dir, true, storage, mode);
 		if (chosenSession) await manager.setSessionFile(chosenSession);
 		else manager.#resetToNewSession();
 		return manager;
@@ -2914,7 +2939,7 @@ export class SessionManager {
 		cwd: string = getProjectDir(),
 		storage: SessionStorage = new MemorySessionStorage(),
 	): SessionManager {
-		const manager = new SessionManager(cwd, "", false, storage);
+		const manager = new SessionManager(cwd, "", false, storage, "path");
 		manager.#resetToNewSession();
 		return manager;
 	}
@@ -2927,10 +2952,10 @@ export class SessionManager {
 		cwd: string,
 		sessionDir?: string,
 		storage: SessionStorage = new FileSessionStorage(),
+		mode: WorkspaceIdentifierMode = "path",
 	): Promise<SessionInfo[]> {
-		const dir = sessionDir ?? SessionManager.getDefaultSessionDir(cwd, undefined, storage);
-		const sessions = await listSessions(dir, storage);
-		return sortPinnedFirst(sessions, await loadPinnedSessionIds());
+		const dir = sessionDir ?? SessionManager.getDefaultSessionDir(cwd, undefined, storage, mode);
+		return listSessions(dir, storage);
 	}
 
 	/** List all sessions across all project directories, pinned sessions first. */

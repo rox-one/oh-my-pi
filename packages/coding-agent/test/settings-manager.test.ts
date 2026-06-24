@@ -541,6 +541,11 @@ describe("Settings", () => {
 				unsubscribe();
 			}
 		});
+
+		it("exposes workspace identifier modes", () => {
+			expect(getDefault("workspace.identifier")).toBe("path");
+			expect(getEnumValues("workspace.identifier")).toEqual(["path", "git-remote", "git-root"]);
+		});
 	});
 
 	describe("get()", () => {

@@ -82,6 +82,7 @@ import {
 	TTS_LOCAL_VOICE_OPTIONS,
 } from "../../tts/models";
 import { canonicalizeMessage } from "../../utils/thinking-display";
+import type { WorkspaceIdentifierMode } from "../../utils/workspace-storage-identifier";
 import { createAcpClientBridge } from "./acp-client-bridge";
 import {
 	extractAssistantMessageText,
@@ -1152,7 +1153,7 @@ export class AcpAgent implements Agent {
 				const cwd = typeof params.cwd === "string" ? (params.cwd as string) : undefined;
 				if (!cwd) throw new Error("cwd required");
 				const limit = typeof params.limit === "number" ? Math.max(1, Math.min(500, params.limit as number)) : 100;
-				const sessions = await SessionManager.list(cwd);
+				const sessions = await this.#listStoredSessions(cwd);
 				const sorted = sessions.sort((l, r) => r.modified.getTime() - l.modified.getTime()).slice(0, limit);
 				return { sessions: sorted.map(s => this.#toSessionInfo(s)) };
 			}
@@ -2192,8 +2193,29 @@ export class AcpAgent implements Agent {
 		return usage;
 	}
 
+	#activeSettings(cwd?: string): Settings | undefined {
+		if (cwd) {
+			for (const record of this.#sessions.values()) {
+				if (record.session.sessionManager.getCwd() === cwd) {
+					return record.session.settings;
+				}
+			}
+		}
+		const [firstRecord] = this.#sessions.values();
+		return this.#initialSession?.settings ?? firstRecord?.session.settings;
+	}
+
+	async #workspaceIdentifierModeForCwd(cwd: string): Promise<WorkspaceIdentifierMode> {
+		const baseSettings = this.#activeSettings(cwd);
+		if (!baseSettings) return "path";
+		const scopedSettings = await baseSettings.cloneForCwd(cwd);
+		return scopedSettings.get("workspace.identifier");
+	}
+
 	async #listStoredSessions(cwd?: string): Promise<StoredSessionInfo[]> {
-		const sessions = cwd ? await SessionManager.list(cwd) : await SessionManager.listAll();
+		const sessions = cwd
+			? await SessionManager.list(cwd, undefined, undefined, await this.#workspaceIdentifierModeForCwd(cwd))
+			: await SessionManager.listAll();
 		return sessions.sort((left, right) => right.modified.getTime() - left.modified.getTime());
 	}
 

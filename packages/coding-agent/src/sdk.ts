@@ -1358,6 +1358,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			: logger.time("discoverCustomCommands", loadCustomCommandsInternal, { cwd, agentDir });
 	customCommandsPromise.catch(() => {});
 	const skillsSettings = settings.getGroup("skills");
+	const workspaceMode = settings.get("workspace.identifier");
 	const disabledExtensionIds = settings.get("disabledExtensions") ?? [];
 	const discoveredSkillsPromise =
 		options.skills === undefined
@@ -1373,18 +1374,10 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 
 	const sessionManager =
 		options.sessionManager ??
-		logger.time("sessionManager", () =>
-			SessionManager.create(cwd, SessionManager.getDefaultSessionDir(cwd, agentDir)),
-		);
-	const configuredDirs = options.additionalDirectories
-		? options.additionalDirectories
-		: settings.get("workspace.additionalDirectories");
-	if (configuredDirs.length > 0) {
-		// Merge with any roots restored from the session header (resume/fork), not replace.
-		const existing = sessionManager.getAdditionalDirectories();
-		const merged = [...new Set([...existing, ...configuredDirs])];
-		await sessionManager.setAdditionalDirectories(merged);
-	}
+		logger.time("sessionManager", () => {
+			const computedDir = SessionManager.getDefaultSessionDir(cwd, agentDir, undefined, workspaceMode);
+			return SessionManager.create(cwd, computedDir, undefined, workspaceMode);
+		});
 	const providerSessionId = options.providerSessionId ?? sessionManager.getSessionId();
 	const forkCacheShapeChanged =
 		options.model !== undefined ||

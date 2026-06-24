@@ -80,8 +80,17 @@ export class LearnTool implements AgentTool<typeof learnSchema> {
 			}
 		} else if (backend === "local") {
 			const result = await localBackend.save?.(
-				{ agentDir: this.session.settings.getAgentDir(), cwd: this.session.settings.getCwd() },
-				{ content: params.memory, context: params.context, source: "coding-agent-learn", importance: 0.8 },
+				{
+					agentDir: this.session.settings.getAgentDir(),
+					cwd: this.session.settings.getCwd(),
+					session: this.session,
+				},
+				{
+					content: params.memory,
+					context: params.context,
+					source: "coding-agent-learn",
+					importance: 0.8,
+				},
 			);
 			if (!result || result.stored === 0) {
 				throw new Error("Lesson was empty after sanitization; nothing stored.");

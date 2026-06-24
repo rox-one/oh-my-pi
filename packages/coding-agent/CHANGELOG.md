@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added experimental workspace identifier modes for sharing default sessions and per-project memories by Git remote or root commit.
+
 ### Fixed
 
 - Fixed WSL sessions missing Agent Skills stored in the Windows host profile's `.agents/skills` directory. ([#3779](https://github.com/can1357/oh-my-pi/issues/3779))

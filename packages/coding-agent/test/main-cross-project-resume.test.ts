@@ -22,7 +22,9 @@ import type { SessionInfo } from "@oh-my-pi/pi-coding-agent/session/session-list
 import * as sessionListingModule from "@oh-my-pi/pi-coding-agent/session/session-listing";
 import { loadEntriesFromFile } from "@oh-my-pi/pi-coding-agent/session/session-loader";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
-import { getProjectDir, normalizePathForComparison, setProjectDir } from "@oh-my-pi/pi-utils";
+import { getProjectDir, setProjectDir } from "@oh-my-pi/pi-utils";
+
+const originalProjectDir = getProjectDir();
 
 function buildArgs(resume: string, sessionDir?: string): Args {
 	return {
@@ -53,7 +55,91 @@ function buildGlobalMatch(cwd: string): { session: SessionInfo; scope: "global" 
 	};
 }
 
-const stubSettings = { get: () => undefined } as unknown as Settings;
+const stubSettings = { get: () => undefined, reloadForCwd: async () => {} } as unknown as Settings;
+
+describe("createSessionManager — shared-bucket local resume", () => {
+	let tempRoot: string;
+	let launchProject: string;
+	let existingProject: string;
+	let sessionDir: string;
+
+	beforeEach(async () => {
+		tempRoot = await fsp.mkdtemp(path.join(os.tmpdir(), "omp-shared-resume-"));
+		launchProject = path.join(tempRoot, "launch");
+		existingProject = path.join(tempRoot, "existing");
+		sessionDir = path.join(tempRoot, "sessions");
+		await fsp.mkdir(launchProject, { recursive: true });
+		await fsp.mkdir(existingProject, { recursive: true });
+		setProjectDir(launchProject);
+	});
+
+	afterEach(async () => {
+		vi.restoreAllMocks();
+		setProjectDir(originalProjectDir);
+		await fsp.rm(tempRoot, { recursive: true, force: true });
+	});
+
+	it("rescopes startup to an existing different cwd from a local git-identifier resume match", async () => {
+		const persisted = SessionManager.create(existingProject, sessionDir);
+		persisted.appendMessage({ role: "user", content: "shared bucket resume", timestamp: 1 });
+		await persisted.ensureOnDisk();
+		await persisted.flush();
+		const sessionFile = persisted.getSessionFile();
+		if (!sessionFile) throw new Error("Expected persisted session file");
+		const sessionId = persisted.getSessionId();
+		await persisted.close();
+
+		const resolveSpy = vi.spyOn(sessionListingModule, "resolveResumableSession").mockResolvedValue({
+			scope: "local",
+			session: {
+				path: sessionFile,
+				id: sessionId,
+				cwd: existingProject,
+				title: "shared-bucket",
+				created: new Date(0),
+				modified: new Date(0),
+				messageCount: 1,
+				size: 0,
+				firstMessage: "shared bucket resume",
+				allMessagesText: "shared bucket resume",
+			},
+		});
+		const reloadForCwd = vi.fn(async () => {});
+		const gitModeSettings = {
+			get: (key: string) => (key === "workspace.identifier" ? "git-remote" : undefined),
+			reloadForCwd,
+		} as unknown as Settings;
+		const openSpy = vi.spyOn(SessionManager, "open");
+
+		const result = await createSessionManager(buildArgs(sessionId.slice(0, 8)), launchProject, gitModeSettings);
+
+		if (!result) throw new Error("Expected resumed session manager");
+		try {
+			expect(result.getCwd()).toBe(path.resolve(existingProject));
+			expect(getProjectDir()).toBe(path.resolve(existingProject));
+			expect(reloadForCwd).toHaveBeenCalledTimes(1);
+			expect(reloadForCwd).toHaveBeenCalledWith(path.resolve(existingProject));
+			expect(openSpy).toHaveBeenCalledWith(
+				sessionFile,
+				undefined,
+				undefined,
+				expect.objectContaining({
+					initialCwd: path.resolve(existingProject),
+					workspaceIdentifierMode: "git-remote",
+				}),
+			);
+			expect(resolveSpy).toHaveBeenCalledWith(
+				sessionId.slice(0, 8),
+				launchProject,
+				undefined,
+				undefined,
+				"git-remote",
+			);
+		} finally {
+			await result.close();
+		}
+	});
+});
 
 describe("createSessionManager — cross-project --resume", () => {
 	let existingProject: string;

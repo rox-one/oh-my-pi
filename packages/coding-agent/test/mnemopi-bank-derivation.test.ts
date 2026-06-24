@@ -100,6 +100,33 @@ describe("computeMnemopiBankScope (#2412)", () => {
 		expect(here).toEqual(there);
 		expect(here.bank).toBe("default");
 	});
+
+	it("shares per-project banks across linked worktrees in git-remote mode", async () => {
+		const fixture = await createGitFixture("@mnemopi-git-worktree-");
+		try {
+			const repo = computeMnemopiBankScope(undefined, fixture.repoCwd, "per-project", "git-remote");
+			const worktree = computeMnemopiBankScope(undefined, fixture.worktreeCwd, "per-project", "git-remote");
+
+			expect(worktree.bank).toBe(repo.bank);
+		} finally {
+			await fixture.root.remove();
+		}
+	});
+
+	it("separates fork remotes but shares root commits when requested", async () => {
+		const fixture = await createGitFixture("@mnemopi-git-fork-");
+		try {
+			const remoteRepo = computeMnemopiBankScope(undefined, fixture.repoCwd, "per-project", "git-remote");
+			const remoteFork = computeMnemopiBankScope(undefined, fixture.cloneCwd, "per-project", "git-remote");
+			const rootRepo = computeMnemopiBankScope(undefined, fixture.repoCwd, "per-project", "git-root");
+			const rootFork = computeMnemopiBankScope(undefined, fixture.cloneCwd, "per-project", "git-root");
+
+			expect(remoteFork.bank).not.toBe(remoteRepo.bank);
+			expect(rootFork.bank).toBe(rootRepo.bank);
+		} finally {
+			await fixture.root.remove();
+		}
+	});
 });
 
 describe("extendRecallWithLegacyBanks (#2412)", () => {
@@ -121,6 +148,26 @@ describe("extendRecallWithLegacyBanks (#2412)", () => {
 		]);
 		const extended = extendRecallWithLegacyBanks(["active-bank"], mainDbPath, childCwd);
 		expect(extended).not.toContain("mixed-cwd-legacy");
+	});
+
+	it("keeps configured-bank legacy rescue inside the configured namespace", () => {
+		const cwd = path.join(rootDir.path(), "projects", "configured-namespace");
+		createBankFixture("alpha-bank", [{ cwd }]);
+		createBankFixture("alpha-bank-legacy", [{ cwd }]);
+		createBankFixture("beta-bank", [{ cwd }]);
+		createBankFixture("beta-bank-legacy", [{ cwd }]);
+
+		const alpha = extendRecallWithLegacyBanks(["alpha-bank-active"], mainDbPath, cwd, "alpha bank");
+		expect(alpha).toContain("alpha-bank");
+		expect(alpha).toContain("alpha-bank-legacy");
+		expect(alpha).not.toContain("beta-bank");
+		expect(alpha).not.toContain("beta-bank-legacy");
+
+		const beta = extendRecallWithLegacyBanks(["beta-bank-active"], mainDbPath, cwd, "beta bank");
+		expect(beta).toContain("beta-bank");
+		expect(beta).toContain("beta-bank-legacy");
+		expect(beta).not.toContain("alpha-bank");
+		expect(beta).not.toContain("alpha-bank-legacy");
 	});
 });
 
@@ -147,3 +194,48 @@ describe("extendRecallWithLegacyBanks edge cases", () => {
 		expect(out).not.toContain("corrupt-C");
 	});
 });
+
+interface GitFixture {
+	cloneCwd: string;
+	repoCwd: string;
+	root: TempDir;
+	worktreeCwd: string;
+}
+
+async function createGitFixture(prefix: string): Promise<GitFixture> {
+	const root = await TempDir.create(prefix);
+	const repoCwd = root.join("repo");
+	const worktreeCwd = root.join("repo-linked");
+	const cloneCwd = root.join("repo-clone");
+
+	await runGit(root.path(), ["init", repoCwd]);
+	await runGit(repoCwd, ["config", "user.email", "test@example.com"]);
+	await runGit(repoCwd, ["config", "user.name", "Test User"]);
+	await Bun.write(path.join(repoCwd, "README.md"), "fixture\n");
+	await runGit(repoCwd, ["add", "README.md"]);
+	await runGit(repoCwd, ["-c", "commit.gpgsign=false", "commit", "-m", "initial"]);
+	await runGit(repoCwd, ["remote", "add", "origin", "git@github.com:owner/project.git"]);
+	await runGit(repoCwd, ["worktree", "add", "-b", "linked", worktreeCwd]);
+	await runGit(root.path(), ["clone", repoCwd, cloneCwd]);
+	await runGit(cloneCwd, ["remote", "set-url", "origin", "https://gitlab.example/fork/project.git"]);
+
+	return { cloneCwd, repoCwd, root, worktreeCwd };
+}
+
+async function runGit(cwd: string, args: readonly string[]): Promise<string> {
+	const child = Bun.spawn(["git", ...args], {
+		cwd,
+		env: { ...process.env, GIT_CONFIG_NOSYSTEM: "1", GIT_OPTIONAL_LOCKS: "0" },
+		stdout: "pipe",
+		stderr: "pipe",
+	});
+	const [stdout, stderr, exitCode] = await Promise.all([
+		new Response(child.stdout as ReadableStream<Uint8Array>).text(),
+		new Response(child.stderr as ReadableStream<Uint8Array>).text(),
+		child.exited,
+	]);
+	if (exitCode !== 0) {
+		throw new Error(`git ${args.join(" ")} failed (${exitCode}): ${stderr || stdout}`);
+	}
+	return stdout;
+}

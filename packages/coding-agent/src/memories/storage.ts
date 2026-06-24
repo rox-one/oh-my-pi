@@ -37,7 +37,9 @@ const GLOBAL_KIND = "memory_consolidate_global";
 const DEFAULT_RETRY_REMAINING = 3;
 
 /**
- * Per-project job key so Phase 2 consolidation is isolated to a single cwd.
+ * Per-project job key so Phase 2 consolidation is isolated to a single workspace scope.
+ * The `cwd` parameter and derived job key are legacy names: git modes pass the
+ * workspace scope key here.
  * Previously a single "global" key caused cross-project memory contamination.
  */
 function globalJobKey(cwd: string): string {
@@ -487,7 +489,9 @@ WHERE kind = ? AND job_key = ? AND status = 'running' AND ownership_token = ?
 	return Number(result.changes ?? 0) > 0;
 }
 
-// Filter by cwd so each project only consolidates its own thread outputs.
+// Filter by workspace scope so each project only consolidates its own thread outputs.
+// The `cwd` column/parameter and job key are legacy names; git modes store/pass
+// the workspace scope key.
 // Before this filter existed, whichever project ran Phase 2 first got every
 // project's data written into its memory directory (see #369).
 export function listStage1OutputsForGlobal(db: Database, limit: number, cwd: string): Stage1OutputRow[] {

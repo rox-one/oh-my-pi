@@ -108,6 +108,7 @@ import { concreteThinkingLevel, parseConfiguredThinkingLevel } from "./thinking"
 import type { LspStartupServerInfo } from "./tools";
 import { getChangelogPath, resolveStartupChangelogForDisplay, type StartupChangelogSelection } from "./utils/changelog";
 import { EventBus } from "./utils/event-bus";
+import type { WorkspaceIdentifierMode } from "./utils/workspace-storage-identifier";
 
 type RunAcpMode = (createSession: AcpSessionFactory) => Promise<never>;
 type RunPrintMode = (session: AgentSession, options: PrintModeOptions) => Promise<void>;
@@ -414,7 +415,12 @@ async function loadTrustedSessionExtensions(
 export function createAcpSessionFactory(args: AcpSessionFactoryOptions): AcpSessionFactory {
 	return async (cwd, factoryOptions) => {
 		const nextSettings = await args.settings.cloneForCwd(cwd);
-		const nextSessionManager = SessionManager.create(cwd, args.sessionDir);
+		const nextSessionManager = SessionManager.create(
+			cwd,
+			args.sessionDir,
+			undefined,
+			nextSettings.get("workspace.identifier"),
+		);
 		const agentId = `acp:${nextSessionManager.getSessionId()}`;
 		// `baseOptions.titleSystemPrompt` is resolved from the launch cwd; an ACP
 		// host can open `session/new` for any client-supplied workspace, so
@@ -696,6 +702,7 @@ async function moveMissingCwdSessionIfNeeded(
 	session: SessionInfo,
 	cwd: string,
 	sessionDir: string | undefined,
+	workspaceIdentifierMode: WorkspaceIdentifierMode,
 	askToMoveSession: SessionPrompt,
 ): Promise<MissingCwdMoveResult> {
 	const sourceCwd = session.cwd;
@@ -717,160 +724,39 @@ async function moveMissingCwdSessionIfNeeded(
 	// to the launch cwd, which would make the `moveTo` below a no-op whenever the
 	// move target equals the current project dir. moveTo never chdirs, so the
 	// stale cwd is only a relocation source, not a directory we enter.
-	const manager = await SessionManager.open(session.path, sessionDir, undefined, { initialCwd: sourceCwd });
+	const manager = await SessionManager.open(session.path, sessionDir, undefined, {
+		initialCwd: sourceCwd,
+		workspaceIdentifierMode,
+	});
 	await manager.moveTo(cwd, sessionDir);
 	return { status: "moved", manager };
 }
 
-type ResumedProjectResult = { cwd: string; chdirFailed?: string };
-
-async function switchToResumedProject(
-	resumedCwd: string | undefined,
+// Shared git-identifier buckets can return a session whose header cwd belongs
+// to another existing worktree. Match the startup picker: adopt that project
+// before the AgentSession is built so settings, plugins, and capabilities are
+// scoped to the resumed session rather than the launch directory.
+async function rescopeStartupToManagerCwd(
+	manager: SessionManager,
 	activeSettings: Settings,
-	pluginPreloadPromise: Promise<unknown>,
-	sessionManager: SessionManager,
-): Promise<ResumedProjectResult> {
-	const launchCwd = getProjectDir();
+	beforeProjectDirChange: () => Promise<void> = async () => {},
+): Promise<SessionManager> {
+	const targetCwd = manager.getCwd();
 	if (
-		!resumedCwd ||
-		normalizePathForComparison(resumedCwd) === normalizePathForComparison(launchCwd) ||
-		(await directoryIsMissing(resumedCwd))
+		targetCwd &&
+		normalizePathForComparison(targetCwd) !== normalizePathForComparison(getProjectDir()) &&
+		(await directoryExists(targetCwd))
 	) {
-		return { cwd: launchCwd };
+		await beforeProjectDirChange();
+		setProjectDir(targetCwd);
+		clearPluginRootsAndCaches();
+		resetCapabilities();
+		await activeSettings.reloadForCwd(getProjectDir());
 	}
-
-	// Let the launch-cwd preload settle before clearing and re-warming its caches.
-	await pluginPreloadPromise.catch(() => {});
-	try {
-		setProjectDir(resumedCwd);
-	} catch (error) {
-		logger.warn("Could not switch to resumed project directory", { cwd: resumedCwd, error: String(error) });
-		try {
-			await sessionManager.moveTo(launchCwd);
-		} catch (rollbackError) {
-			throw new SessionResolutionError(
-				`Could not switch to resumed project ${resumedCwd}; failed to restore launch directory ${launchCwd}: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`,
-			);
-		}
-		return { cwd: launchCwd, chdirFailed: resumedCwd };
-	}
-	clearPluginRootsAndCaches();
-	resetCapabilities();
-	const cwd = getProjectDir();
-	// clearPluginRootsAndCaches only kicks off an unawaited re-warm; await a fresh
-	// destination preload so sync consumers (plugin-provided LSP/DAP config) never
-	// read the launch project's stale/empty roots during session creation.
-	await preloadPluginRoots(os.homedir(), cwd);
-	await activeSettings.reloadForCwd(cwd);
-	return { cwd };
+	return manager;
 }
-
-/**
- * Resolve the effective model allow-list from an explicit `--models` scope or,
- * failing that, the active project's `enabledModels`. A totally collapsed scope
- * gets one cache-aware discovery pass before session construction: otherwise an
- * all-discovery `--models` launch can select an unrelated static model before the
- * later background rebuild activates the requested scope. The pass only helps
- * providers already known to be discoverable (models.yml `discovery:`, runtime
- * managers); a scope naming only extension-supplied models stays empty here
- * because those providers register during `createAgentSession` — that case is
- * covered by deferring to the SDK's `modelPattern` resolution in
- * {@link buildSessionOptions}. Re-run after a resume switches projects so the
- * destination project's settings-derived scope wins over the launch directory's.
- */
-export async function resolveScopedModels(
-	parsed: Args,
-	modelRegistry: Pick<ModelRegistry, "getAvailable" | "getDiscoverableProviders" | "refresh">,
-	activeSettings: Settings,
-): Promise<ScopedModel[]> {
-	const modelPatterns = parsed.models ?? activeSettings.get("enabledModels");
-	if (!modelPatterns || modelPatterns.length === 0) {
-		return [];
-	}
-	const preferences = getModelMatchPreferences(activeSettings);
-	const scopedModels = await resolveModelScope(modelPatterns, modelRegistry, preferences, activeSettings);
-	if (scopedModels.length > 0 || modelRegistry.getDiscoverableProviders().length === 0) {
-		return scopedModels;
-	}
-	await modelRegistry.refresh("online-if-uncached");
-	return await resolveModelScope(modelPatterns, modelRegistry, preferences, activeSettings);
-}
-
-/**
- * Map resolver scope entries to the session's Ctrl+P cycle shape, filling in the
- * configured default thinking level for entries without an explicit `:level`
- * suffix. `auto` is session-level only, so it is coerced to a concrete default here.
- */
-export function toSessionScopedModels(
-	scopedModels: readonly ScopedModel[],
-	activeSettings: Settings,
-): Array<{ model: Model; thinkingLevel?: ThinkingLevel }> {
-	if (scopedModels.length === 0) return [];
-	const defaultThinkingLevel = concreteThinkingLevel(
-		parseConfiguredThinkingLevel(activeSettings.get("defaultThinkingLevel")),
-	);
-	return scopedModels.map(scopedModel => ({
-		model: scopedModel.model,
-		thinkingLevel: scopedModel.explicitThinkingLevel
-			? (scopedModel.thinkingLevel ?? defaultThinkingLevel)
-			: defaultThinkingLevel,
-	}));
-}
-
-/** Whether two scope lists reference the same set of models (order-independent). */
-function sameScopedModelSet(a: ReadonlyArray<{ model: Model }>, b: ReadonlyArray<{ model: Model }>): boolean {
-	if (a.length !== b.length) return false;
-	const keys = new Set(a.map(entry => `${entry.model.provider}/${entry.model.id}`));
-	return b.every(entry => keys.has(`${entry.model.provider}/${entry.model.id}`));
-}
-
-/** Minimal session surface the post-discovery scope rebuild mutates. */
-export interface ScopedModelSink {
-	readonly isDisposed: boolean;
-	readonly scopedModels: ReadonlyArray<{ model: Model; thinkingLevel?: ThinkingLevel }>;
-	setScopedModels(scopedModels: Array<{ model: Model; thinkingLevel?: ThinkingLevel }>): void;
-}
-
-/**
- * Startup resolves the `--models`/`enabledModels` scope from the model registry
- * before background provider discovery runs — `createSession` fires
- * `refreshInBackground()` only after the session is built — so a scoped selector
- * whose model first materializes through runtime discovery (e.g.
- * `opencode-go/ox-alpha-free` on a fresh launch with no cache row) is absent from
- * the frozen scoped `/models` list even though it is in `enabledModels`, invokable
- * via `--model`, and listed by `omp models find`. Once the initial refresh settles,
- * re-resolve the scope and, when the set changed, push the fuller list into the
- * session so the scoped picker and Ctrl+P cycle include it. A scope that resolved
- * to zero models may become active here when the startup discovery pass returned
- * no models but the background pass succeeded. Fire-and-forget — never blocks the
- * prompt on background discovery latency. Issue #9220.
- */
-export async function rebuildScopedModelsAfterDiscovery(
-	session: ScopedModelSink,
-	parsed: Args,
-	modelRegistry: Pick<ModelRegistry, "getAvailable" | "awaitBackgroundRefresh">,
-	activeSettings: Settings,
-): Promise<void> {
-	const patterns = parsed.models ?? activeSettings.get("enabledModels");
-	if (!patterns || patterns.length === 0) return;
-	await modelRegistry.awaitBackgroundRefresh();
-	if (session.isDisposed) return;
-	const rebuilt = await resolveModelScope(
-		patterns,
-		modelRegistry,
-		getModelMatchPreferences(activeSettings),
-		activeSettings,
-	);
-	const mapped = toSessionScopedModels(rebuilt, activeSettings);
-	if (mapped.length === 0 || sameScopedModelSet(session.scopedModels, mapped)) return;
-	session.setScopedModels(mapped);
-}
-
-async function getChangelogForDisplay(
-	parsed: Args,
-	mode: SettingValue<"startup.changelogMode">,
-): Promise<StartupChangelogSelection | undefined> {
-	if (parsed.continue || parsed.resume || isForeignSessionImport(parsed)) {
+async function getChangelogForDisplay(parsed: Args): Promise<string | undefined> {
+	if (parsed.continue || parsed.resume) {
 		return undefined;
 	}
 
@@ -908,23 +794,29 @@ export async function createSessionManager(
 	cwd: string,
 	activeSettings: Settings = settings,
 	askToMoveSession: SessionPrompt = promptMoveSession,
+	beforeProjectDirChange: () => Promise<void> = async () => {},
 ): Promise<SessionManager | undefined> {
+	const workspaceMode = activeSettings.get("workspace.identifier");
 	if (parsed.fork) {
 		if (parsed.noSession) {
 			throw new SessionResolutionError("--fork requires session persistence");
 		}
 		const forkSource = parsed.fork;
 		if (forkSource.includes("/") || forkSource.includes("\\") || forkSource.endsWith(".jsonl")) {
-			return await SessionManager.forkFrom(forkSource, cwd, parsed.sessionDir);
+			return await SessionManager.forkFrom(forkSource, cwd, parsed.sessionDir, undefined, {
+				workspaceIdentifierMode: workspaceMode,
+			});
 		}
-		const match = await resolveResumableSession(forkSource, cwd, parsed.sessionDir);
+		const match = await resolveResumableSession(forkSource, cwd, parsed.sessionDir, undefined, workspaceMode);
 		if (!match) {
 			throw new SessionResolutionError(
 				`Session "${forkSource}" not found.`,
 				"Run `omp --resume` without an argument to pick from recent sessions, or `omp` to start a new one.",
 			);
 		}
-		return await SessionManager.forkFrom(match.session.path, cwd, parsed.sessionDir);
+		return await SessionManager.forkFrom(match.session.path, cwd, parsed.sessionDir, undefined, {
+			workspaceIdentifierMode: workspaceMode,
+		});
 	}
 
 	if (parsed.noSession) {
@@ -935,9 +827,15 @@ export async function createSessionManager(
 	if (typeof parsed.resume === "string") {
 		const sessionArg = parsed.resume;
 		if (sessionArg.includes("/") || sessionArg.includes("\\") || sessionArg.endsWith(".jsonl")) {
-			return await SessionManager.open(sessionArg, parsed.sessionDir);
+			return await rescopeStartupToManagerCwd(
+				await SessionManager.open(sessionArg, parsed.sessionDir, undefined, {
+					workspaceIdentifierMode: workspaceMode,
+				}),
+				activeSettings,
+				beforeProjectDirChange,
+			);
 		}
-		const match = await resolveResumableSession(sessionArg, cwd, parsed.sessionDir);
+		const match = await resolveResumableSession(sessionArg, cwd, parsed.sessionDir, undefined, workspaceMode);
 		if (!match) {
 			throw new SessionResolutionError(
 				`Session "${sessionArg}" not found.`,
@@ -950,6 +848,7 @@ export async function createSessionManager(
 				match.session,
 				cwd,
 				parsed.sessionDir,
+				workspaceMode,
 				askToMoveSession,
 			);
 			if (moveResult.status === "moved") {
@@ -960,36 +859,71 @@ export async function createSessionManager(
 			}
 		}
 		if (match.scope === "global") {
-			const moveResult = await moveMissingCwdSessionIfNeeded(
-				sessionArg,
-				match.session,
-				cwd,
-				parsed.sessionDir,
-				askToMoveSession,
-			);
-			if (moveResult.status === "moved") {
-				return moveResult.manager;
-			}
-			if (moveResult.status === "declined") {
-				return undefined;
+			const normalizedCwd = normalizePathForComparison(cwd);
+			const normalizedMatchCwd = normalizePathForComparison(match.session.cwd || cwd);
+			if (normalizedCwd !== normalizedMatchCwd) {
+				const moveResult = await moveMissingCwdSessionIfNeeded(
+					sessionArg,
+					match.session,
+					cwd,
+					parsed.sessionDir,
+					workspaceMode,
+					askToMoveSession,
+				);
+				if (moveResult.status === "moved") {
+					return moveResult.manager;
+				}
+				if (moveResult.status === "declined") {
+					return undefined;
+				}
+				const forkPromptResult = await askToForkSession(match.session);
+				if (forkPromptResult === "unavailable") {
+					throw new SessionResolutionError(
+						`Session "${sessionArg}" is in another project (${match.session.cwd}); run interactively to fork it into the current project.`,
+					);
+				}
+				if (forkPromptResult === "declined") {
+					// User declined the cross-project fork prompt. Caller distinguishes
+					// this cancellation from the "default new session" undefined return
+					// by checking `typeof parsed.resume === "string"`.
+					return undefined;
+				}
+				return await SessionManager.forkFrom(match.session.path, cwd, parsed.sessionDir, undefined, {
+					workspaceIdentifierMode: workspaceMode,
+				});
 			}
 		}
-		return await SessionManager.open(match.session.path, parsed.sessionDir);
+		return await rescopeStartupToManagerCwd(
+			await SessionManager.open(match.session.path, parsed.sessionDir, undefined, {
+				initialCwd: match.session.cwd || cwd,
+				workspaceIdentifierMode: workspaceMode,
+			}),
+			activeSettings,
+			beforeProjectDirChange,
+		);
 	}
 	if (parsed.continue) {
-		return await SessionManager.continueRecent(cwd, parsed.sessionDir);
+		return await rescopeStartupToManagerCwd(
+			await SessionManager.continueRecent(cwd, parsed.sessionDir, undefined, workspaceMode),
+			activeSettings,
+			beforeProjectDirChange,
+		);
 	}
 	// --resume without value is handled separately (needs picker UI)
 	// If --session-dir provided without --continue/--resume, create new session there
 	if (parsed.sessionDir) {
-		return SessionManager.create(cwd, parsed.sessionDir);
+		return SessionManager.create(cwd, parsed.sessionDir, undefined, workspaceMode);
 	}
 	// Auto-resume: behave like --continue if the setting is enabled and a prior
 	// session exists. When a prior session is resumed, mark parsed.continue so
 	// buildSessionOptions restores the session's model/thinking instead of
 	// overriding them with CLI defaults.
 	if (activeSettings.get("autoResume")) {
-		const manager = await SessionManager.continueRecent(cwd, parsed.sessionDir);
+		const manager = await rescopeStartupToManagerCwd(
+			await SessionManager.continueRecent(cwd, parsed.sessionDir, undefined, workspaceMode),
+			activeSettings,
+			beforeProjectDirChange,
+		);
 		if (manager.getEntries().length > 0) {
 			parsed.continue = true;
 		}
@@ -1383,16 +1317,113 @@ export async function runRootCommand(
 			process.exit(0);
 		}
 
-		if (parsedArgs.export) {
-			let result: string;
-			try {
-				const outputPath = parsedArgs.messages.length > 0 ? parsedArgs.messages[0] : undefined;
-				const { exportFromFile } = await import("./export/html");
-				result = await exportFromFile(parsedArgs.export, outputPath);
-			} catch (error: unknown) {
-				const message = error instanceof Error ? error.message : "Failed to export session";
-				process.stderr.write(`${chalk.red(`Error: ${message}`)}\n`);
-				process.exit(1);
+	let cwd = getProjectDir();
+	const settingsInstance =
+		deps.settings ?? (await logger.time("settings:init", Settings.init, { cwd, configFiles: parsedArgs.config }));
+	if (parsedArgs.approvalMode) {
+		// Runtime override (not persisted): every settings.get("tools.approvalMode") downstream
+		// sees this value. The wrapper still honours --auto-approve / --yolo on top of it.
+		settingsInstance.override("tools.approvalMode", parsedArgs.approvalMode);
+	} else if (parsedArgs.autoApprove) {
+		// --auto-approve / --yolo without an explicit --approval-mode: reflect in settings so
+		// setup-time checks (e.g. #wrapToolForAcpPermission) also see the yolo intent.
+		settingsInstance.override("tools.approvalMode", "yolo");
+	}
+	if (parsedArgs.mode === "rpc" || parsedArgs.mode === "rpc-ui") {
+		applyRpcDefaultSettingOverrides(settingsInstance);
+	} else if (parsedArgs.mode === "acp") {
+		applyAcpDefaultSettingOverrides(settingsInstance);
+	}
+	if (parsedArgs.noPty || parsedArgs.mode === "rpc-ui") {
+		Bun.env.PI_NO_PTY = "1";
+	}
+	if (parsedArgs.noTitle || parsedArgs.mode === "rpc" || parsedArgs.mode === "rpc-ui" || parsedArgs.mode === "acp") {
+		Bun.env.PI_NO_TITLE = "1";
+	}
+	const mode = parsedArgs.mode || "text";
+	const isProtocolMode = mode === "rpc" || mode === "rpc-ui" || mode === "acp";
+	// Protocol modes own stdin; treating it as prompt text would consume JSON-RPC frames before their transports start.
+	const pipedInput = isProtocolMode ? undefined : await logger.time("readPipedInput", readPipedInput);
+	const autoPrint = pipedInput !== undefined && !parsedArgs.print && parsedArgs.mode === undefined;
+	const isInteractive = !parsedArgs.print && !autoPrint && parsedArgs.mode === undefined;
+
+	// Initialize discovery system with settings for provider persistence
+	logger.time("initializeWithSettings", initializeWithSettings, settingsInstance);
+
+	// Apply model role overrides from CLI args or env vars (ephemeral, not persisted)
+	const smolModel = parsedArgs.smol ?? $env.PI_SMOL_MODEL;
+	const slowModel = parsedArgs.slow ?? $env.PI_SLOW_MODEL;
+	const planModel = parsedArgs.plan ?? $env.PI_PLAN_MODEL;
+	if (smolModel || slowModel || planModel) {
+		settingsInstance.overrideModelRoles({
+			smol: smolModel,
+			slow: slowModel,
+			plan: planModel,
+		});
+	}
+
+	// --print-thoughts (single-shot print mode) must surface reasoning, so un-hide
+	// thinking before the session is built — otherwise a passive omitThinking
+	// setting makes the provider omit summaries and the flag prints nothing. An
+	// explicit --hide-thinking block display option still wins for output display.
+	if (parsedArgs.printThoughts && !isProtocolMode && !isInteractive) {
+		settingsInstance.override("omitThinking", false);
+	}
+	// Apply --hide-thinking CLI flag (ephemeral, not persisted)
+	if (parsedArgs.hideThinking) {
+		settingsInstance.override("hideThinkingBlock", true);
+	}
+	// Apply --advisor CLI flag (ephemeral, not persisted)
+	if (parsedArgs.advisor) {
+		settingsInstance.override("advisor.enabled", true);
+	}
+
+	await logger.time(
+		"initTheme:final",
+		initTheme,
+		isInteractive,
+		settingsInstance.get("symbolPreset"),
+		settingsInstance.get("colorBlindMode"),
+		settingsInstance.get("theme.dark"),
+		settingsInstance.get("theme.light"),
+	);
+
+	let scopedModels: ScopedModel[] = [];
+	const modelPatterns = parsedArgs.models ?? settingsInstance.get("enabledModels");
+	const modelMatchPreferences = getModelMatchPreferences(settingsInstance);
+	if (modelPatterns && modelPatterns.length > 0) {
+		scopedModels = await logger.time(
+			"resolveModelScope",
+			resolveModelScope,
+			modelPatterns,
+			modelRegistry,
+			modelMatchPreferences,
+		);
+	}
+
+	// Create session manager based on CLI flags. SessionResolutionError signals a
+	// user-facing failure (unknown --resume/--fork id, non-interactive fork
+	// prompt, --fork with --no-session): print + exit cleanly instead of letting
+	// it surface as `[Uncaught Exception]` (see issue #2084).
+	let sessionManager: SessionManager | undefined;
+	try {
+		sessionManager = await logger.time(
+			"createSessionManager",
+			createSessionManager,
+			parsedArgs,
+			cwd,
+			settingsInstance,
+			promptForkSession,
+			promptMoveSession,
+			async () => {
+				await pluginPreloadPromise.catch(() => {});
+			},
+		);
+	} catch (error: unknown) {
+		if (error instanceof SessionResolutionError) {
+			process.stderr.write(`${chalk.red(`Error: ${error.message}`)}\n`);
+			if (error.hint) {
+				process.stderr.write(`${chalk.dim(error.hint)}\n`);
 			}
 			writeStartupNotice(parsedArgs, `Exported to: ${result}\n`);
 			process.exit(0);
@@ -1402,9 +1433,9 @@ export async function runRootCommand(
 			process.stderr.write(`${chalk.red("Error: @file arguments are not supported in RPC mode")}\n`);
 			process.exit(1);
 		}
-		const mode = parsedArgs.mode || "text";
-		// RPC owns stdin. Claim its singleton stream before plugin/extension discovery can load an in-process consumer.
-		const rpcInput = mode === "rpc" || mode === "rpc-ui" ? claimRpcInput() : undefined;
+		throw error;
+	}
+	cwd = getProjectDir();
 
 		// Kick off plugin-root preload in parallel with the remaining startup work.
 		// Awaited later (before extension/skill discovery in createAgentSession needs it).
@@ -1417,278 +1448,29 @@ export async function runRootCommand(
 		// warning before we reach the await site below.
 		pluginPreloadPromise.catch(() => {});
 
-		// Trusted files load as exact module paths, never as package roots whose
-		// sibling hooks/tools/commands/MCP content could be discovered implicitly.
-		if (!parsedArgs.trustedExtensions?.length) {
-			// Register CLI-provided extension package paths (`--extension`, `--hook`) so
-			// the `omp-plugins` discovery provider can surface their `skills/`, `hooks/`,
-			// `tools/`, `commands/`, `rules/`, `prompts/`, and `.mcp.json` sub-trees.
-			// Explicit roots remain authorized under `--no-extensions`; only ambient
-			// extension discovery is disabled.
-			const cliExtensions = [...(parsedArgs.extensions ?? []), ...(parsedArgs.hooks ?? [])];
-			injectOmpExtensionCliRoots(cliExtensions, home, getProjectDir(), {
-				mode: parsedArgs.noExtensions ? "explicit-only" : "merge",
-				replace: true,
-			});
-		}
-
-		let cwd = getProjectDir();
-		// Classify the host before opening auth or settings storage so every
-		// session-critical database connection picks the right busy timeout.
-		// See getDbBusyTimeoutMs().
-		const isProtocolMode = mode === "rpc" || mode === "rpc-ui" || mode === "acp";
-		// Protocol modes own stdin; treating it as prompt text would consume JSON-RPC frames before their transports start.
-		const pipedInput = isProtocolMode ? undefined : await logger.time("readPipedInput", readPipedInput);
-		const autoPrint = pipedInput !== undefined && !parsedArgs.print && parsedArgs.mode === undefined;
-		const isInteractive = !parsedArgs.print && !autoPrint && parsedArgs.mode === undefined;
-		// Only the interactive host renders a focusable Agent Hub / subagent session
-		// tree; declare it so headless subagent optimizations (e.g. skipping replan
-		// title refresh) can tell a focusable process from a print/RPC/eval one.
-		setInteractiveHost(isInteractive);
-		if (!isInteractive) {
-			stopPendingStartupComposer();
-		}
-		// Auth and settings are independent; start both before awaiting either.
-		// A configured-but-unreachable auth broker still receives the actionable
-		// startup error below, while its cache/config I/O overlaps settings I/O.
-		const authStoragePromise = logger.time("discoverAuthStorage", deps.discoverAuthStorage ?? discoverAuthStorage);
-		authStoragePromise.catch(() => {});
-		const settingsPromise = deps.settings
-			? Promise.resolve(deps.settings)
-			: logger.time("settings:init", Settings.init, { cwd, configFiles: parsedArgs.config });
-		settingsPromise.catch(() => {});
-		let authStorage: AuthStorage;
-		try {
-			authStorage = await authStoragePromise;
-		} catch (error) {
-			const message = await describeAuthBrokerStartupError(error);
-			if (message === null) throw error;
-			process.stderr.write(`${chalk.red(`Error: ${message}`)}\n`);
-			process.exit(1);
-		}
-
-		const settingsInstance = await settingsPromise;
-		if (parsedArgs.approvalMode) {
-			// Runtime override (not persisted): every settings.get("tools.approvalMode") downstream
-			// sees this value. The wrapper still honours --auto-approve / --yolo on top of it.
-			settingsInstance.override("tools.approvalMode", parsedArgs.approvalMode);
-		} else if (parsedArgs.autoApprove) {
-			// --auto-approve / --yolo without an explicit --approval-mode: reflect in settings so
-			// setup-time checks (e.g. #wrapToolForAcpPermission) also see the yolo intent.
-			settingsInstance.override("tools.approvalMode", "yolo");
-		}
-		if (parsedArgs.mode === "rpc" || parsedArgs.mode === "rpc-ui") {
-			applyRpcDefaultSettingOverrides(settingsInstance);
-		} else if (parsedArgs.mode === "acp") {
-			applyAcpDefaultSettingOverrides(settingsInstance);
-		}
-
-		// The registry composes policy-dependent metadata synchronously, including
-		// extended-context window caps, so it must receive the finalized settings.
-		const modelRegistry = logger.time(
-			"modelRegistry:init",
-			() => new ModelRegistry(authStorage, undefined, { settings: settingsInstance }),
+	// Handle --resume (no value): show session picker
+	if (parsedArgs.resume === true && !parsedArgs.fork) {
+		const workspaceMode = settingsInstance.get("workspace.identifier");
+		const folderSessions = await logger.time(
+			"SessionManager.list",
+			SessionManager.list,
+			cwd,
+			parsedArgs.sessionDir,
+			undefined,
+			workspaceMode,
 		);
-		if (parsedArgs.noPty || parsedArgs.mode === "rpc-ui") {
-			Bun.env.PI_NO_PTY = "1";
-		}
-		if (
-			parsedArgs.noTitle ||
-			parsedArgs.mode === "rpc" ||
-			parsedArgs.mode === "rpc-ui" ||
-			parsedArgs.mode === "acp"
-		) {
-			Bun.env.PI_NO_TITLE = "1";
-		}
-
-		// Initialize discovery system with settings for provider persistence
-		logger.time("initializeWithSettings", initializeWithSettings, settingsInstance);
-
-		// Apply model role overrides from CLI args or env vars (ephemeral, not persisted)
-		const smolModel = parsedArgs.smol ?? $env.PI_SMOL_MODEL;
-		const slowModel = parsedArgs.slow ?? $env.PI_SLOW_MODEL;
-		const planModel = parsedArgs.plan ?? $env.PI_PLAN_MODEL;
-		if (smolModel || slowModel || planModel) {
-			settingsInstance.overrideModelRoles({
-				smol: smolModel,
-				slow: slowModel,
-				plan: planModel,
-			});
-		}
-
-		// --print-thoughts (single-shot print mode) must surface reasoning, so un-hide
-		// thinking before the session is built — otherwise a passive omitThinking
-		// setting makes the provider omit summaries and the flag prints nothing. An
-		// explicit --hide-thinking block display option still wins for output display.
-		if (parsedArgs.printThoughts && !isProtocolMode && !isInteractive) {
-			settingsInstance.override("omitThinking", false);
-		}
-		// Apply --hide-thinking CLI flag (ephemeral, not persisted)
-		if (parsedArgs.hideThinking) {
-			settingsInstance.override("hideThinkingBlock", true);
-		}
-		// Apply --advisor CLI flag (ephemeral, not persisted)
-		if (parsedArgs.advisor) {
-			settingsInstance.override("advisor.enabled", true);
-		}
-		// Apply --external-thinking CLI flag (ephemeral, not persisted)
-		if (parsedArgs.externalThinking) {
-			settingsInstance.override("externalThinking", true);
-		}
-
-		await logger.time(
-			"initTheme:final",
-			initTheme,
-			isInteractive,
-			settingsInstance.get("symbolPreset"),
-			settingsInstance.get("colorBlindMode"),
-			settingsInstance.get("theme.dark"),
-			settingsInstance.get("theme.light"),
-		);
-
-		applyStartupComposerPreferences({
-			quiet: settingsInstance.get("startup.quiet"),
-			composerShape: settingsInstance.get("composer.shape") ?? "box",
-			showHardwareCursor: settingsInstance.get("showHardwareCursor"),
-			maxInlineImages: settingsInstance.get("tui.maxInlineImages"),
-			resizeScrollback: settingsInstance.get("tui.resizeScrollback"),
-			imeSafeCursor: settingsInstance.get("tui.imeSafeCursor"),
-			autocompleteMaxVisible: settingsInstance.get("autocompleteMaxVisible"),
-			spellingTypoDetection: settingsInstance.get("spelling.typoDetection"),
-			spellingAutocomplete: settingsInstance.get("spelling.autocomplete"),
-			spellingAutocorrect: settingsInstance.get("spelling.autocorrect"),
-			theme: {
-				symbolPreset: settingsInstance.get("symbolPreset"),
-				colorBlindMode: settingsInstance.get("colorBlindMode"),
-				darkTheme: settingsInstance.get("theme.dark"),
-				lightTheme: settingsInstance.get("theme.light"),
-			},
-		});
-		setStartupComposerLspServers(discoverStartupLspServers(cwd, "connecting"));
-
-		let scopedModels = await logger.time(
-			"resolveModelScope",
-			resolveScopedModels,
-			parsedArgs,
-			modelRegistry,
-			settingsInstance,
-		);
-
-		// Resolve an explicit `--continue <id>` before extension flags are loaded.
-		// Reading the token immediately after `--continue` distinguishes the session
-		// id from UUID-shaped values owned by later extension flags.
-		normalizeContinueSessionArgs(parsedArgs, rawArgs);
-
-		// Resolve native resume/fork flags or import one foreign transcript into a
-		// fresh persisted OMP session before constructing the AgentSession.
-		let sessionManager: SessionManager | undefined;
-		let foreignSource: ForeignSessionSource | undefined;
-		try {
-			foreignSource = resolveForeignSessionSource(parsedArgs);
-			if (foreignSource) {
-				if (isProtocolMode) {
-					throw new SessionResolutionError(`--from-${foreignSource} is not supported in ${mode} mode`);
-				}
-				const sourceName = foreignSessionSourceName(foreignSource);
-				const store = (deps.createForeignSessionStore ?? createForeignSessionStore)(foreignSource);
-				let foreignSessions: ForeignSessionInfo[];
-				try {
-					foreignSessions = await logger.time(`list${sourceName}Sessions`, () => store.list());
-				} catch (error) {
-					const message = error instanceof Error ? error.message : String(error);
-					throw new SessionResolutionError(`Failed to list ${sourceName} sessions: ${message}`);
-				}
-				if (foreignSessions.length === 0) {
-					writeStartupNotice(parsedArgs, `${chalk.dim(`No ${sourceName} sessions found`)}\n`);
-					stopStartupWatchdog();
-					process.exit(0);
-				}
-				const choices = foreignSessions.map(foreignSessionInfoToSessionInfo);
-				pauseStartupWatchdog();
-				let selected: SessionInfo | null;
-				try {
-					selected = await logger.time(
-						`select${sourceName}Session`,
-						deps.selectSession ?? selectSession,
-						choices,
-						{
-							title: `Import ${sourceName} Session`,
-							scopeLabel: false,
-							showCwd: true,
-							allowDelete: false,
-							allowGlobalScope: false,
-							historySearch: false,
-						},
-					);
-				} finally {
-					resumeStartupWatchdog();
-				}
-				if (!selected) {
-					writeStartupNotice(parsedArgs, `${chalk.dim(`No ${sourceName} session selected`)}\n`);
-					stopStartupWatchdog();
-					process.exit(0);
-				}
-				const foreignSession = foreignSessions.find(
-					session => session.id === selected.id && session.path === selected.path,
-				);
-				if (!foreignSession) {
-					throw new SessionResolutionError(`Selected ${sourceName} session is no longer available`);
-				}
-				try {
-					sessionManager = await logger.time(
-						`import${sourceName}Session`,
-						persistForeignSession,
-						store,
-						foreignSession,
-						{ fallbackCwd: cwd, sessionDir: parsedArgs.sessionDir },
-					);
-				} catch (error) {
-					const message = error instanceof Error ? error.message : String(error);
-					throw new SessionResolutionError(`Failed to import ${sourceName} session: ${message}`);
-				}
-			} else {
-				sessionManager = await logger.time(
-					"createSessionManager",
-					createSessionManager,
-					parsedArgs,
-					cwd,
-					settingsInstance,
-				);
-			}
-		} catch (error: unknown) {
-			if (error instanceof SessionResolutionError) {
-				process.stderr.write(`${chalk.red(`Error: ${error.message}`)}\n`);
-				if (error.hint) {
-					process.stderr.write(`${chalk.dim(error.hint)}\n`);
-				}
-				process.exit(1);
-			}
-			throw error;
-		}
-
-		if ((typeof parsedArgs.resume === "string" || foreignSource) && sessionManager) {
-			const previousCwd = cwd;
-			const resumedProject = await switchToResumedProject(
-				sessionManager.getCwd(),
-				settingsInstance,
-				pluginPreloadPromise,
-				sessionManager,
-			);
-			cwd = resumedProject.cwd;
-			if (resumedProject.chdirFailed) {
-				writeStartupNotice(
-					parsedArgs,
-					`${chalk.yellow(`Could not switch to resumed project ${resumedProject.chdirFailed}; staying in ${cwd}.`)}\n`,
-				);
-			}
-			if (cwd !== previousCwd) {
-				// applyStartupCwd persists an explicit --cwd in parsedArgs; once resume
-				// switches projects, keep session construction on the destination too.
-				parsedArgs.cwd = cwd;
-				// Destination project may scope a different `enabledModels`; re-resolve
-				// so the model UI and session options reflect it (explicit `--models`
-				// stays fixed inside resolveScopedModels).
-				scopedModels = await resolveScopedModels(parsedArgs, modelRegistry, settingsInstance);
+		let preloadedAllSessions: SessionInfo[] | undefined;
+		if (folderSessions.length === 0) {
+			// Probe globally so we can exit fast when the user has no sessions at
+			// all, but never auto-switch the picker into all-projects scope — that
+			// silently surfaced other projects' history when the cwd was empty
+			// (issue #3099). The preloaded list also makes the user's Tab switch
+			// instant on the way in.
+			preloadedAllSessions = await logger.time("SessionManager.listAll", SessionManager.listAll);
+			if (preloadedAllSessions.length === 0) {
+				writeStartupNotice(parsedArgs, `${chalk.dim("No sessions found")}\n`);
+				stopStartupWatchdog();
+				process.exit(0);
 			}
 		}
 
@@ -1699,6 +1481,32 @@ export async function runRootCommand(
 			stopStartupWatchdog();
 			process.exit(0);
 		}
+		// Resuming a session from another project: switch the process into that
+		// project's directory and refresh cwd-derived caches before the session is
+		// built, so settings discovery, plugins, and capabilities all scope to it.
+		// Skip the chdir when the recorded project directory is gone: `setProjectDir`
+		// would throw on the missing path. `SessionManager.open` then falls back to
+		// the launch cwd, so the resumed session simply stays where the user is.
+		if (
+			selected.cwd &&
+			normalizePathForComparison(selected.cwd) !== normalizePathForComparison(getProjectDir()) &&
+			(await directoryExists(selected.cwd))
+		) {
+			// Let the original (launch-cwd) plugin-root preload settle first so its
+			// late resolution can't clobber the re-warm we trigger below.
+			await pluginPreloadPromise.catch(() => {});
+			setProjectDir(selected.cwd);
+			clearPluginRootsAndCaches();
+			resetCapabilities();
+			cwd = getProjectDir();
+			// Re-scope project settings (.claude/settings.yml etc.) to the resumed
+			// project in place so the session is built with its configuration.
+			await settingsInstance.reloadForCwd(cwd);
+		}
+		sessionManager = await SessionManager.open(selected.path, undefined, undefined, {
+			workspaceIdentifierMode: settingsInstance.get("workspace.identifier"),
+		});
+	}
 
 		// Handle --resume (no value): show session picker
 		if (parsedArgs.resume === true && !parsedArgs.fork) {

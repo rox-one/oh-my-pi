@@ -17,6 +17,8 @@ import readPathTemplate from "../prompts/memories/read-path.md" with { type: "te
 import stageOneInputTemplate from "../prompts/memories/stage_one_input.md" with { type: "text" };
 import stageOneSystemTemplate from "../prompts/memories/stage_one_system.md" with { type: "text" };
 import type { AgentSession } from "../session/agent-session";
+import type { WorkspaceIdentifierMode } from "../utils/workspace-storage-identifier";
+import { resolveWorkspaceStorageIdentity } from "../utils/workspace-storage-identifier";
 import {
 	claimStage1Jobs,
 	clearMemoryData as clearMemoryDataInDb,
@@ -185,7 +187,7 @@ async function readMemoryToolDeveloperInstructionsSnapshot(
 ): Promise<MemoryToolDeveloperInstructionsSnapshot | undefined> {
 	const cfg = loadMemoryConfig(settings);
 	if (!cfg.enabled) return undefined;
-	const memoryRoot = getMemoryInstructionRoot(agentDir, settings);
+	const memoryRoot = getMemoryRoot(agentDir, settings.getCwd(), settings.get("workspace.identifier"));
 
 	let summary = "";
 	try {
@@ -296,23 +298,33 @@ export async function buildMemoryToolDeveloperInstructions(
 /**
  * Clear all persisted memory state and generated artifacts.
  */
-export async function clearMemoryData(agentDir: string, cwd: string): Promise<void> {
+export async function clearMemoryData(
+	agentDir: string,
+	cwd: string,
+	mode: WorkspaceIdentifierMode = "path",
+): Promise<void> {
 	const db = openMemoryDb(getAgentDbPath(agentDir));
 	try {
 		clearMemoryDataInDb(db);
 	} finally {
 		closeMemoryDb(db);
 	}
-	await fs.rm(getMemoryRoot(agentDir, cwd), { recursive: true, force: true });
+	await fs.rm(getMemoryRoot(agentDir, cwd, mode), { recursive: true, force: true });
 }
 
 /**
  * Force-enqueue global consolidation maintenance work.
  */
-export function enqueueMemoryConsolidation(agentDir: string, cwd: string, sourceUpdatedAt = unixNow()): void {
+export function enqueueMemoryConsolidation(
+	agentDir: string,
+	cwd: string,
+	sourceUpdatedAt = unixNow(),
+	mode: WorkspaceIdentifierMode = "path",
+): void {
+	const scopeKey = getMemoryScopeKey(cwd, mode);
 	const db = openMemoryDb(getAgentDbPath(agentDir));
 	try {
-		enqueueGlobalWatermark(db, sourceUpdatedAt, cwd, { forceDirtyWhenNotAdvanced: true });
+		enqueueGlobalWatermark(db, sourceUpdatedAt, scopeKey, { forceDirtyWhenNotAdvanced: true });
 	} finally {
 		closeMemoryDb(db);
 	}
@@ -342,18 +354,23 @@ async function runMemoryStartup(options: MemoryStartupOptions): Promise<void> {
 	await options.session.refreshBaseSystemPrompt?.();
 }
 
-async function runPhase1(options: MemoryStartupOptions): Promise<void> {
-	if (!isMemoryStartupActive(options)) return;
-	const { session, modelRegistry, agentDir, config } = options;
+async function runPhase1(options: {
+	session: AgentSession;
+	settings: Settings;
+	modelRegistry: ModelRegistry;
+	agentDir: string;
+	config: MemoryRuntimeConfig;
+}): Promise<void> {
+	const { session, settings, modelRegistry, agentDir, config } = options;
 	const db = openMemoryDb(getAgentDbPath(agentDir));
 	const nowSec = unixNow();
 	const workerId = `memory-${process.pid}`;
-	const memoryRoot = getMemoryRoot(agentDir, session.sessionManager.getCwd());
+	const mode = settings.get("workspace.identifier");
+	const memoryRoot = getMemoryRoot(agentDir, session.sessionManager.getCwd(), mode);
 	const currentThreadId = session.sessionManager.getSessionId();
 
 	try {
-		const threads = await collectThreads(session, currentThreadId);
-		if (!isMemoryStartupActive(options)) return;
+		const threads = await collectThreads(session, currentThreadId, mode);
 		upsertThreads(db, threads);
 
 		const phase1Model = await resolveMemoryModel({
@@ -426,13 +443,15 @@ async function runPhase1(options: MemoryStartupOptions): Promise<void> {
 				return;
 			}
 
+			const scopeKey = claim.cwd ?? "";
+
 			if (result.kind === "no_output") {
 				markStage1SucceededNoOutput(db, {
 					threadId: claim.threadId,
 					ownershipToken: claim.ownershipToken,
 					sourceUpdatedAt: claim.sourceUpdatedAt,
 					nowSec: unixNow(),
-					cwd: claim.cwd,
+					cwd: scopeKey,
 				});
 				stats.succeededNoOutput += 1;
 				return;
@@ -446,7 +465,7 @@ async function runPhase1(options: MemoryStartupOptions): Promise<void> {
 				rolloutSummary: result.output.rolloutSummary,
 				rolloutSlug: result.output.rolloutSlug,
 				nowSec: unixNow(),
-				cwd: claim.cwd,
+				cwd: scopeKey,
 			});
 			stats.succeeded += 1;
 			stats.produced += 1;
@@ -473,26 +492,33 @@ async function runPhase1(options: MemoryStartupOptions): Promise<void> {
 	}
 }
 
-async function runPhase2(options: MemoryStartupOptions): Promise<void> {
-	if (!isMemoryStartupActive(options)) return;
-	const { session, modelRegistry, agentDir, config } = options;
+async function runPhase2(options: {
+	session: AgentSession;
+	settings: Settings;
+	modelRegistry: ModelRegistry;
+	agentDir: string;
+	config: MemoryRuntimeConfig;
+}): Promise<void> {
+	const { session, settings, modelRegistry, agentDir, config } = options;
 	const cwd = session.sessionManager.getCwd();
+	const mode = settings.get("workspace.identifier");
+	const scopeKey = getMemoryScopeKey(cwd, mode);
 	const db = openMemoryDb(getAgentDbPath(agentDir));
 	const nowSec = unixNow();
 	const workerId = `memory-${process.pid}`;
-	const memoryRoot = getMemoryRoot(agentDir, cwd);
+	const memoryRoot = getMemoryRoot(agentDir, cwd, mode);
 
 	try {
 		const claimResult = tryClaimGlobalPhase2Job(db, {
 			workerId,
 			leaseSeconds: config.phase2LeaseSeconds,
 			nowSec,
-			cwd,
+			cwd: scopeKey,
 		});
 		if (claimResult.kind !== "claimed") return;
 
 		const claim = claimResult.claim;
-		const outputs = listStage1OutputsForGlobal(db, config.maxRawMemoriesForGlobal, cwd);
+		const outputs = listStage1OutputsForGlobal(db, config.maxRawMemoriesForGlobal, scopeKey);
 		const newWatermark = computeCompletionWatermark(claim.inputWatermark, outputs);
 
 		await syncPhase2Artifacts(memoryRoot, outputs);
@@ -504,7 +530,7 @@ async function runPhase2(options: MemoryStartupOptions): Promise<void> {
 				ownershipToken: claim.ownershipToken,
 				newWatermark,
 				nowSec: unixNow(),
-				cwd,
+				cwd: scopeKey,
 			});
 			if (!marked) {
 				logger.warn("Phase2 empty-input completion lost ownership", { memoryRoot });
@@ -524,7 +550,7 @@ async function runPhase2(options: MemoryStartupOptions): Promise<void> {
 				retryDelaySeconds: config.phase2RetryDelaySeconds,
 				reason: "No model available for phase2",
 				memoryRoot,
-				cwd,
+				scopeKey,
 			});
 			return;
 		}
@@ -535,7 +561,7 @@ async function runPhase2(options: MemoryStartupOptions): Promise<void> {
 				retryDelaySeconds: config.phase2RetryDelaySeconds,
 				reason: "No API key available for phase2",
 				memoryRoot,
-				cwd,
+				scopeKey,
 			});
 			return;
 		}
@@ -551,7 +577,7 @@ async function runPhase2(options: MemoryStartupOptions): Promise<void> {
 				ownershipToken: claim.ownershipToken,
 				leaseSeconds: config.phase2LeaseSeconds,
 				nowSec: unixNow(),
-				cwd,
+				cwd: scopeKey,
 			});
 			if (!ok) {
 				heartbeatLostOwnership = true;
@@ -577,7 +603,7 @@ async function runPhase2(options: MemoryStartupOptions): Promise<void> {
 				ownershipToken: claim.ownershipToken,
 				newWatermark,
 				nowSec: unixNow(),
-				cwd,
+				cwd: scopeKey,
 			});
 			if (!marked) {
 				throw new Error("Phase2 could not mark success: ownership lost");
@@ -589,7 +615,7 @@ async function runPhase2(options: MemoryStartupOptions): Promise<void> {
 				retryDelaySeconds: config.phase2RetryDelaySeconds,
 				reason: String(error),
 				memoryRoot,
-				cwd,
+				scopeKey,
 				error,
 			});
 		} finally {
@@ -607,18 +633,18 @@ function markPhase2FailureWithFallback(
 		retryDelaySeconds: number;
 		reason: string;
 		memoryRoot: string;
-		cwd: string;
+		scopeKey: string;
 		error?: unknown;
 	},
 ): void {
-	const { claim, retryDelaySeconds, reason, memoryRoot, cwd, error } = params;
+	const { claim, retryDelaySeconds, reason, memoryRoot, scopeKey, error } = params;
 	const nowSec = unixNow();
 	const strictFailed = markGlobalPhase2Failed(db, {
 		ownershipToken: claim.ownershipToken,
 		retryDelaySeconds,
 		reason,
 		nowSec,
-		cwd,
+		cwd: scopeKey,
 	});
 	if (strictFailed) return;
 
@@ -626,7 +652,7 @@ function markPhase2FailureWithFallback(
 		retryDelaySeconds,
 		reason,
 		nowSec,
-		cwd,
+		cwd: scopeKey,
 	});
 	if (!unownedFailed) {
 		logger.warn("Phase2 could not mark failure (ownership lost and unowned fallback skipped)", {
@@ -638,10 +664,15 @@ function markPhase2FailureWithFallback(
 	}
 }
 
-async function collectThreads(session: AgentSession, currentThreadId?: string): Promise<MemoryThread[]> {
+async function collectThreads(
+	session: AgentSession,
+	currentThreadId: string | undefined,
+	mode: WorkspaceIdentifierMode,
+): Promise<MemoryThread[]> {
 	const sessionDir = session.sessionManager.getSessionDir();
 	const files = await fs.readdir(sessionDir);
 	const threads: MemoryThread[] = [];
+	const scopeKeysByCwd = new Map<string, string>();
 	for (const name of files) {
 		if (!name.endsWith(".jsonl")) continue;
 		const fullPath = path.join(sessionDir, name);
@@ -676,11 +707,22 @@ async function collectThreads(session: AgentSession, currentThreadId?: string): 
 		}
 
 		if (currentThreadId && id === currentThreadId) continue;
+		let scopeKey = "";
+		if (cwd) {
+			const cachedScopeKey = scopeKeysByCwd.get(cwd);
+			if (cachedScopeKey !== undefined) {
+				scopeKey = cachedScopeKey;
+			} else {
+				scopeKey = getMemoryScopeKey(cwd, mode);
+				scopeKeysByCwd.set(cwd, scopeKey);
+			}
+		}
+
 		threads.push({
 			id,
 			updatedAt: Math.floor(stat.mtimeMs / 1000),
 			rolloutPath: fullPath,
-			cwd,
+			cwd: scopeKey,
 			sourceKind: "cli",
 		});
 	}
@@ -1271,8 +1313,16 @@ function loadMemoryConfig(settings: Settings): MemoryRuntimeConfig {
 	};
 }
 
-export function getMemoryRoot(agentDir: string, cwd: string): string {
-	return path.join(getMemoriesDir(agentDir), encodeProjectPath(cwd));
+export function getMemoryRoot(agentDir: string, cwd: string, mode: WorkspaceIdentifierMode = "path"): string {
+	const fallbackSegment = encodeProjectPath(cwd);
+	const identity = resolveWorkspaceStorageIdentity(cwd, mode, fallbackSegment);
+	return path.join(getMemoriesDir(agentDir), identity.segment);
+}
+
+export function getMemoryScopeKey(cwd: string, mode: WorkspaceIdentifierMode = "path"): string {
+	if (mode === "path") return cwd;
+	const identity = resolveWorkspaceStorageIdentity(cwd, mode, encodeProjectPath(cwd));
+	return identity.fallback ? cwd : identity.key;
 }
 
 /**
@@ -1333,6 +1383,7 @@ export async function saveLearnedLesson(
 	agentDir: string,
 	cwd: string,
 	input: MemoryBackendSaveInput,
+	mode: WorkspaceIdentifierMode = "path",
 ): Promise<MemoryBackendSaveResult> {
 	const content = normalizeLearnedText(input.content, MAX_LEARNED_CONTENT_CHARS);
 	if (!content) {
@@ -1340,7 +1391,7 @@ export async function saveLearnedLesson(
 	}
 	const context = input.context ? normalizeLearnedText(input.context, MAX_LEARNED_CONTEXT_CHARS) : "";
 	const line = context ? `- ${content} _(context: ${context})_` : `- ${content}`;
-	const filePath = path.join(getMemoryRoot(agentDir, cwd), LEARNED_LESSONS_FILE);
+	const filePath = path.join(getMemoryRoot(agentDir, cwd, mode), LEARNED_LESSONS_FILE);
 
 	// Serialize the read-modify-write per file: parallel `learn` calls (sibling
 	// subagents, or two shared tool calls in one turn) share the project memory
