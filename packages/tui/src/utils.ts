@@ -15,6 +15,8 @@ export { Ellipsis } from "@oh-my-pi/pi-natives";
 export { DEFAULT_TAB_WIDTH } from "@oh-my-pi/pi-utils";
 
 export type HangulCompatibilityJamoWidth = "platform" | "unicode" | 1 | 2;
+/** Ellipsis selector accepted by {@link truncateToWidth}. */
+export type TruncateEllipsisKind = Ellipsis | string | null;
 
 let hangulCompatibilityJamoWidth: HangulCompatibilityJamoWidth = "platform";
 
@@ -154,10 +156,19 @@ export function sliceWithWidth(line: string, startCol: number, length: number, s
 	return nativeSliceWithWidth(line, startCol, length, strict ?? null, DEFAULT_TAB_WIDTH);
 }
 
+function normalizeTruncateEllipsisKind(ellipsisKind: TruncateEllipsisKind | undefined): Ellipsis {
+	if (ellipsisKind === "" || ellipsisKind === "omit") return Ellipsis.Omit;
+	if (ellipsisKind === "..." || ellipsisKind === "ascii") return Ellipsis.Ascii;
+	if (ellipsisKind === null || ellipsisKind === undefined || typeof ellipsisKind === "string") {
+		return Ellipsis.Unicode;
+	}
+	return ellipsisKind;
+}
+
 export function truncateToWidth(
 	text: string,
 	maxWidth: number,
-	ellipsisKind?: Ellipsis | null | "",
+	ellipsisKind?: TruncateEllipsisKind,
 	pad?: boolean | null,
 ): string {
 	maxWidth = Math.max(0, maxWidth | 0);
@@ -169,7 +180,7 @@ export function truncateToWidth(
 	return nativeTruncateToWidth(
 		text,
 		maxWidth,
-		(typeof ellipsisKind === "string" ? Ellipsis.Omit : ellipsisKind) ?? Ellipsis.Unicode,
+		normalizeTruncateEllipsisKind(ellipsisKind),
 		pad ?? false,
 		DEFAULT_TAB_WIDTH,
 	);
