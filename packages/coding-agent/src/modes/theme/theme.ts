@@ -599,7 +599,7 @@ const NERD_SYMBOLS: SymbolMap = {
 	"icon.warning": "\uf071",
 	// pick:  | alt:  ↺
 	"icon.rewind": "\uf0e2",
-	// pick: 󰁪 (nf-md-autorenew) | alt: 󰁨 (nf-md-auto_fix)  
+	// pick: 󰁪 (nf-md-autorenew) | alt: 󰁨 (nf-md-auto_fix)
 	"icon.auto": "\u{f006a}",
 	"icon.fast": "\uf0e7",
 	"icon.extensionSkill": "\uf0eb",

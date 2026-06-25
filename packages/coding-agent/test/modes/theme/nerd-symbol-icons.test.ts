@@ -1,9 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import {
-	Theme,
-	type ThemeBg,
-	type ThemeColor,
-} from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
+import { Theme, type ThemeBg, type ThemeColor } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 
 /**
  * Regression contract for issue #3481: the `nerd` symbol preset must not ship
