@@ -342,12 +342,12 @@ export async function resolveStdioSpawnCommand(
 	// Direct-spawn only when we resolved to a concrete file AND its extension
 	// is not a batch script. Everything else (resolved .cmd/.bat, or an
 	// unresolved extensionless command) goes through cmd.exe so PATHEXT runs.
-	// Windows stdio servers stay attached so wrapper grandchildren inherit the
-	// same console session. Only hide the child when OMP itself has no console
-	// to share; CREATE_NO_WINDOW breaks console inheritance for nested wrappers.
-	const detached = false;
+	// `windowsHide: true` is set unconditionally on win32 so the subprocess
+	// never materializes a console window — `StdioTransport.connect()` spawns
+	// with `detached: true` to escape terminal job-control signals, and on
+	// Windows that flag would otherwise allocate a new console (issue #3519).
 	const needsCmdExe = resolved === null || isWindowsBatchCommand(resolvedCommand);
-	if (!needsCmdExe) return { cmd: [resolvedCommand, ...args], windowsHide, detached };
+	if (!needsCmdExe) return { cmd: [resolvedCommand, ...args], windowsHide: true };
 
 	return {
 		cmd: buildCmdExeArgv(resolveComSpec(options.env), resolvedCommand, args),
