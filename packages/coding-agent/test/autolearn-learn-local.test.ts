@@ -6,14 +6,15 @@ import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import {
 	buildMemoryToolDeveloperInstructions,
 	getMemoryRoot,
-	refreshMemoryToolDeveloperInstructionsCacheAfterStartup,
+	getMemoryScopeKey,
 	saveLearnedLesson,
 } from "@oh-my-pi/pi-coding-agent/memories";
+import * as memoryStorage from "@oh-my-pi/pi-coding-agent/memories/storage";
 import { localBackend } from "@oh-my-pi/pi-coding-agent/memory-backend/local-backend";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { LearnTool } from "@oh-my-pi/pi-coding-agent/tools/learn";
-import { removeWithRetries } from "@oh-my-pi/pi-utils";
+import { getAgentDbPath, removeWithRetries } from "@oh-my-pi/pi-utils";
 
 Bun.env.PI_PYTHON_SKIP_CHECK = "1";
 
@@ -138,6 +139,38 @@ describe("learned-lesson storage (local backend)", () => {
 		const result = await localBackend.save?.({ agentDir, cwd: projCwd }, { content: "Via the backend" });
 		expect(result?.stored).toBe(1);
 		expect(await Bun.file(learnedFile).text()).toContain("- Via the backend");
+	});
+
+	it("the local backend's enqueue() uses the active workspace identifier", async () => {
+		const { repoCwd, worktreeCwd } = await createLinkedWorktree(tmp);
+		const settings = Settings.isolated({ "memory.backend": "local", "workspace.identifier": "git-remote" });
+
+		await fs.mkdir(agentDir, { recursive: true });
+		await localBackend.enqueue(agentDir, worktreeCwd, { settings } as Parameters<typeof localBackend.enqueue>[2]);
+
+		const db = memoryStorage.openMemoryDb(getAgentDbPath(agentDir));
+		try {
+			const sharedScope = getMemoryScopeKey(repoCwd, "git-remote");
+			expect(getMemoryScopeKey(worktreeCwd, "git-remote")).toBe(sharedScope);
+
+			const claim = memoryStorage.tryClaimGlobalPhase2Job(db, {
+				workerId: "local-backend-enqueue-test",
+				leaseSeconds: 60,
+				nowSec: 1_800_000_000,
+				cwd: sharedScope,
+			});
+			expect(claim.kind).toBe("claimed");
+
+			const pathClaim = memoryStorage.tryClaimGlobalPhase2Job(db, {
+				workerId: "local-backend-enqueue-path-test",
+				leaseSeconds: 60,
+				nowSec: 1_800_000_000,
+				cwd: worktreeCwd,
+			});
+			expect(pathClaim.kind).toBe("skipped_not_dirty");
+		} finally {
+			memoryStorage.closeMemoryDb(db);
+		}
 	});
 
 	it("local backend status reports writable", async () => {

@@ -73,6 +73,7 @@ export interface MemoryBackendSaveResult {
 export interface MemoryBackendOperationContext {
 	agentDir: string;
 	cwd: string;
+	settings?: Settings;
 	session?: AgentSession;
 }
 

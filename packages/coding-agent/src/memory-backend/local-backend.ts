@@ -1,4 +1,3 @@
-import type { Settings } from "../config/settings";
 import {
 	buildMemoryToolDeveloperInstructions,
 	clearMemoryData,
@@ -8,16 +7,6 @@ import {
 	startMemoryStartupTask,
 } from "../memories";
 import type { MemoryBackend, MemoryBackendOperationContext } from "./types";
-
-interface LocalMemoryOperationSession {
-	settings: Settings;
-}
-
-interface LocalMemoryOperationContext {
-	agentDir: string;
-	cwd: string;
-	session?: LocalMemoryOperationSession;
-}
 
 /**
  * Wraps the existing `memories/` module as a `MemoryBackend`.
@@ -41,10 +30,10 @@ export const localBackend = {
 	},
 	async enqueue(agentDir, cwd, session) {
 		const mode = session?.settings.get("workspace.identifier") ?? "path";
-		enqueueMemoryConsolidation(agentDir, cwd, undefined, mode);
+		enqueueMemoryConsolidation(agentDir, cwd, mode);
 	},
-	async save(context: LocalMemoryOperationContext, input) {
-		const mode = context.session?.settings.get("workspace.identifier") ?? "path";
+	async save(context, input) {
+		const mode = (context.settings ?? context.session?.settings)?.get("workspace.identifier") ?? "path";
 		return saveLearnedLesson(context.agentDir, context.cwd, input, mode);
 	},
 	async status(_context: MemoryBackendOperationContext) {

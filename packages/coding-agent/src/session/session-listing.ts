@@ -739,7 +739,13 @@ export async function resolveResumableSession(
 	storage: SessionStorage = new FileSessionStorage(),
 	mode: WorkspaceIdentifierMode = "path",
 ): Promise<ResolvedSessionMatch | undefined> {
-	const localSessionDir = sessionDir ?? computeDefaultSessionDir(cwd, storage, undefined, mode);
+	const storage = isSessionStorage(storageOrOptions) ? storageOrOptions : new FileSessionStorage();
+	const resolvedOptions = isSessionStorage(storageOrOptions) ? options : storageOrOptions;
+	const localSessionDir =
+		sessionDir ??
+		computeDefaultSessionDir(cwd, storage, {
+			identifierMode: resolvedOptions.identifierMode,
+		});
 	const localSessions = await listSessions(localSessionDir, storage);
 	const localMatch = localSessions.find(session => sessionMatchesResumeArg(session, sessionArg));
 	if (localMatch) {

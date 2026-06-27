@@ -3,6 +3,7 @@ import * as path from "node:path";
 import { getMemoryRoot } from "@oh-my-pi/pi-coding-agent/memories";
 import { computeMnemopiBankScope } from "@oh-my-pi/pi-coding-agent/mnemopi/config";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import type { GitRepository } from "@oh-my-pi/pi-coding-agent/utils/git";
 import {
 	normalizeGitRemoteIdentifier,
 	resolveWorkspaceStorageIdentity,
@@ -10,13 +11,22 @@ import {
 import { TempDir } from "@oh-my-pi/pi-utils";
 
 const tempDirs: TempDir[] = [];
-const originalPath = process.env.PATH;
 
 interface GitFixture {
 	agentDir: string;
 	cloneCwd: string;
 	repoCwd: string;
 	worktreeCwd: string;
+}
+
+function gitRepository(commonDir: string): GitRepository {
+	return {
+		commonDir,
+		gitDir: path.join(commonDir, ".git"),
+		gitEntryPath: path.join(commonDir, ".git"),
+		headPath: path.join(commonDir, ".git", "HEAD"),
+		repoRoot: commonDir,
+	};
 }
 
 async function makeTempDir(prefix: string): Promise<TempDir> {
@@ -26,13 +36,6 @@ async function makeTempDir(prefix: string): Promise<TempDir> {
 }
 
 afterEach(async () => {
-	if (originalPath === undefined) {
-		delete process.env.PATH;
-		delete Bun.env.PATH;
-	} else {
-		process.env.PATH = originalPath;
-		Bun.env.PATH = originalPath;
-	}
 	await Promise.all(tempDirs.splice(0).map(dir => dir.remove()));
 });
 
@@ -89,20 +92,6 @@ describe("workspace storage identity", () => {
 		});
 	});
 
-	it("falls back when git cannot be found on PATH", async () => {
-		const fixture = await createFixture("@workspace-identity-path-");
-		const emptyPath = await makeTempDir("@workspace-identity-empty-path-");
-		process.env.PATH = emptyPath.path();
-		Bun.env.PATH = emptyPath.path();
-
-		const identity = resolveWorkspaceStorageIdentity(fixture.repoCwd, "git-root", "path-bucket");
-
-		expect(identity.requestedMode).toBe("git-root");
-		expect(identity.mode).toBe("path");
-		expect(identity.segment).toBe("path-bucket");
-		expect(identity.fallback).toBe(true);
-	});
-
 	it("falls back for shallow repositories in git-root mode", async () => {
 		const root = await makeTempDir("@workspace-identity-shallow-");
 		const repoCwd = root.join("repo");
@@ -136,9 +125,10 @@ describe("workspace storage identity", () => {
 	});
 
 	it("normalizes remote URL variants without credentials", () => {
-		const scp = normalizeGitRemoteIdentifier("git@github.com:Owner/repo.git", "/tmp");
-		const ssh = normalizeGitRemoteIdentifier("ssh://git@github.com/Owner/repo.git", "/tmp");
-		const https = normalizeGitRemoteIdentifier("https://token@github.com/Owner/repo", "/tmp");
+		const git = gitRepository("/tmp");
+		const scp = normalizeGitRemoteIdentifier(git, "git@github.com:Owner/repo.git");
+		const ssh = normalizeGitRemoteIdentifier(git, "ssh://git@github.com/Owner/repo.git");
+		const https = normalizeGitRemoteIdentifier(git, "https://token@github.com/Owner/repo");
 
 		expect(scp).toBe("github.com/Owner/repo");
 		expect(ssh).toBe(scp);
@@ -148,13 +138,14 @@ describe("workspace storage identity", () => {
 	it("normalizes local .git remotes to the worktree path identity", async () => {
 		const dir = await makeTempDir("@workspace-identity-local-remote-");
 		const repoCwd = dir.join("project");
-		const worktreeRemote = normalizeGitRemoteIdentifier(repoCwd, "/tmp");
-		const dotGitRemote = normalizeGitRemoteIdentifier(`${repoCwd}/.git`, "/tmp");
-		const dotGitSlashRemote = normalizeGitRemoteIdentifier(`${repoCwd}/.git/`, "/tmp");
-		const suffixGitRemote = normalizeGitRemoteIdentifier(`${repoCwd}.git`, "/tmp");
-		const suffixGitSlashRemote = normalizeGitRemoteIdentifier(`${repoCwd}.git/`, "/tmp");
-		const fileSuffixGitSlashRemote = normalizeGitRemoteIdentifier(`file://${repoCwd}.git/`, "/tmp");
-		const fileDotGitSlashRemote = normalizeGitRemoteIdentifier(`file://${repoCwd}/.git/`, "/tmp");
+		const git = gitRepository("/tmp");
+		const worktreeRemote = normalizeGitRemoteIdentifier(git, repoCwd);
+		const dotGitRemote = normalizeGitRemoteIdentifier(git, `${repoCwd}/.git`);
+		const dotGitSlashRemote = normalizeGitRemoteIdentifier(git, `${repoCwd}/.git/`);
+		const suffixGitRemote = normalizeGitRemoteIdentifier(git, `${repoCwd}.git`);
+		const suffixGitSlashRemote = normalizeGitRemoteIdentifier(git, `${repoCwd}.git/`);
+		const fileSuffixGitSlashRemote = normalizeGitRemoteIdentifier(git, `file://${repoCwd}.git/`);
+		const fileDotGitSlashRemote = normalizeGitRemoteIdentifier(git, `file://${repoCwd}/.git/`);
 
 		expect(worktreeRemote).toBe(`file:${repoCwd}`);
 		expect(dotGitRemote).toBe(worktreeRemote);

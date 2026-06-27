@@ -8,7 +8,7 @@ import type {
 	MemoryRuntimeContext,
 } from "./types";
 export function createMemoryRuntimeContext(context: MemoryBackendOperationContext): MemoryRuntimeContext {
-	const settings = context.session?.settings;
+	const settings = context.settings ?? context.session?.settings;
 	return {
 		async status() {
 			if (!settings) {

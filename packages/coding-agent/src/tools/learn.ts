@@ -83,7 +83,7 @@ export class LearnTool implements AgentTool<typeof learnSchema> {
 				{
 					agentDir: this.session.settings.getAgentDir(),
 					cwd: this.session.settings.getCwd(),
-					session: this.session,
+					settings: this.session.settings,
 				},
 				{
 					content: params.memory,

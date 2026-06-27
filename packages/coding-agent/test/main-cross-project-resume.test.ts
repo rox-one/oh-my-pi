@@ -128,13 +128,9 @@ describe("createSessionManager — shared-bucket local resume", () => {
 					workspaceIdentifierMode: "git-remote",
 				}),
 			);
-			expect(resolveSpy).toHaveBeenCalledWith(
-				sessionId.slice(0, 8),
-				launchProject,
-				undefined,
-				undefined,
-				"git-remote",
-			);
+			expect(resolveSpy).toHaveBeenCalledWith(sessionId.slice(0, 8), launchProject, undefined, {
+				identifierMode: "git-remote",
+			});
 		} finally {
 			await result.close();
 		}

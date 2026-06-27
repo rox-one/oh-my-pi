@@ -318,8 +318,8 @@ export async function clearMemoryData(
 export function enqueueMemoryConsolidation(
 	agentDir: string,
 	cwd: string,
-	sourceUpdatedAt = unixNow(),
 	mode: WorkspaceIdentifierMode = "path",
+	sourceUpdatedAt = unixNow(),
 ): void {
 	const scopeKey = getMemoryScopeKey(cwd, mode);
 	const db = openMemoryDb(getAgentDbPath(agentDir));

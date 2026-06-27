@@ -1,5 +1,6 @@
 import * as path from "node:path";
-import { $which, WhichCachePolicy } from "@oh-my-pi/pi-utils";
+import { fileURLToPath } from "bun";
+import { type GitRepository, repo, root } from "./git";
 
 export const WORKSPACE_IDENTIFIER_MODES = ["path", "git-remote", "git-root"] as const;
 export type WorkspaceIdentifierMode = (typeof WORKSPACE_IDENTIFIER_MODES)[number];
@@ -12,20 +13,9 @@ export interface WorkspaceStorageIdentity {
 	fallback: boolean;
 }
 
-interface GitCommandResult {
-	exitCode: number;
-	stdout: string;
-}
-
-const GIT_READ_ONLY_ARGS = [
-	"--no-optional-locks",
-	"-c",
-	"core.fsmonitor=false",
-	"-c",
-	"core.untrackedCache=false",
-] as const;
-const ROOT_COMMIT_PATTERN = /^[0-9a-f]{40}$/;
 const REMOTE_SLUG_MAX_LENGTH = 72;
+
+const memoizedStoredIdentity = new Map<string, WorkspaceStorageIdentity>();
 
 export function resolveWorkspaceStorageIdentity(
 	cwd: string,
@@ -33,17 +23,32 @@ export function resolveWorkspaceStorageIdentity(
 	pathFallbackSegment: string,
 ): WorkspaceStorageIdentity {
 	const resolvedCwd = path.resolve(cwd || ".");
+	const memoKey = `${requestedMode}\0${resolvedCwd}`;
+	const memoized = memoizedStoredIdentity.get(memoKey);
+	if (memoized) {
+		return memoized;
+	}
+	const identity = resolveWorkspaceStorageIdentityInternal(resolvedCwd, requestedMode, pathFallbackSegment);
+	memoizedStoredIdentity.set(memoKey, identity);
+	return identity;
+}
+
+function resolveWorkspaceStorageIdentityInternal(
+	resolvedCwd: string,
+	requestedMode: WorkspaceIdentifierMode,
+	pathFallbackSegment: string,
+): WorkspaceStorageIdentity {
 	if (requestedMode === "path") {
 		return pathIdentity(resolvedCwd, requestedMode, pathFallbackSegment, false);
 	}
 
-	const git = $which("git", { cache: WhichCachePolicy.Fresh, PATH: process.env.PATH });
-	if (!git) {
+	const repository = repo.resolveSync(resolvedCwd);
+	if (!repository) {
 		return pathIdentity(resolvedCwd, requestedMode, pathFallbackSegment, true);
 	}
 
 	if (requestedMode === "git-remote") {
-		const remote = resolveGitRemoteIdentifier(git, resolvedCwd);
+		const remote = resolveGitRemoteIdentifier(repository);
 		if (!remote) {
 			return pathIdentity(resolvedCwd, requestedMode, pathFallbackSegment, true);
 		}
@@ -58,7 +63,7 @@ export function resolveWorkspaceStorageIdentity(
 		};
 	}
 
-	const rootCommit = resolveGitRootCommit(git, resolvedCwd);
+	const rootCommit = resolveGitRootCommit(resolvedCwd);
 	if (!rootCommit) {
 		return pathIdentity(resolvedCwd, requestedMode, pathFallbackSegment, true);
 	}
@@ -73,19 +78,16 @@ export function resolveWorkspaceStorageIdentity(
 	};
 }
 
-export function normalizeGitRemoteIdentifier(rawUrl: string, cwd: string): string | null {
-	const trimmed = rawUrl.trim();
-	if (!trimmed) return null;
-
-	const scpRemote = parseScpRemote(trimmed);
+export function normalizeGitRemoteIdentifier(git: GitRepository, remoteUrl: string): string | null {
+	const scpRemote = parseScpRemote(remoteUrl);
 	if (scpRemote) {
 		return remoteHostPathIdentifier(scpRemote.host, scpRemote.remotePath);
 	}
 
-	const parsed = parseRemoteUrl(trimmed);
+	const parsed = parseRemoteUrl(remoteUrl);
 	if (parsed) {
 		if (parsed.protocol === "file:") {
-			return localRemoteIdentifier(decodeUriPath(parsed.pathname), cwd);
+			return localRemoteIdentifier(fileURLToPath(parsed), git.commonDir);
 		}
 
 		if (!parsed.hostname) return null;
@@ -95,7 +97,7 @@ export function normalizeGitRemoteIdentifier(rawUrl: string, cwd: string): strin
 		);
 	}
 
-	return localRemoteIdentifier(trimmed, cwd);
+	return localRemoteIdentifier(remoteUrl, git.commonDir);
 }
 
 function pathIdentity(
@@ -113,82 +115,27 @@ function pathIdentity(
 	};
 }
 
-function resolveGitRemoteIdentifier(git: string, cwd: string): string | null {
-	const origin = runGit(git, cwd, ["remote", "get-url", "origin"]);
-	const originUrl = firstLine(origin);
-	if (origin.exitCode === 0 && originUrl) {
-		const normalized = normalizeGitRemoteIdentifier(originUrl, cwd);
+function resolveGitRemoteIdentifier(git: GitRepository): string | null {
+	const remotes = repo.getRemotesSync(git);
+	const origin = remotes.find(remote => remote.name === "origin");
+	if (origin) {
+		const normalized = normalizeGitRemoteIdentifier(git, origin.fetchUrl);
 		if (normalized) return normalized;
 	}
 
-	const remotes = runGit(git, cwd, ["remote"]);
-	if (remotes.exitCode !== 0) return null;
-
-	for (const remoteName of remotes.stdout
-		.split(/\r?\n/)
-		.map(remote => remote.trim())
-		.filter(Boolean)) {
-		const remote = runGit(git, cwd, ["remote", "get-url", remoteName]);
-		const remoteUrl = firstLine(remote);
-		if (remote.exitCode !== 0 || !remoteUrl) continue;
-
-		const normalized = normalizeGitRemoteIdentifier(remoteUrl, cwd);
+	for (const remote of remotes) {
+		const normalized = normalizeGitRemoteIdentifier(git, remote.fetchUrl);
 		if (normalized) return normalized;
 	}
 
 	return null;
 }
 
-function resolveGitRootCommit(git: string, cwd: string): string | null {
-	const shallow = isShallowRepository(git, cwd);
-	if (shallow !== false) return null;
+function resolveGitRootCommit(cwd: string): string | null {
+	const shallow = repo.isShallowRepositorySync(cwd);
+	if (shallow) return null;
 
-	const result = runGit(git, cwd, ["rev-list", "--max-parents=0", "--reverse", "HEAD"]);
-	if (result.exitCode !== 0) return null;
-
-	for (const line of result.stdout.split(/\r?\n/)) {
-		const candidate = line.trim().toLowerCase();
-		if (ROOT_COMMIT_PATTERN.test(candidate)) return candidate;
-	}
-
-	return null;
-}
-
-function isShallowRepository(git: string, cwd: string): boolean | null {
-	const result = runGit(git, cwd, ["rev-parse", "--is-shallow-repository"]);
-	if (result.exitCode !== 0) return null;
-
-	const value = firstLine(result);
-	if (value === "true") return true;
-	if (value === "false") return false;
-	return null;
-}
-
-function runGit(git: string, cwd: string, args: readonly string[]): GitCommandResult {
-	try {
-		const result = Bun.spawnSync([git, ...GIT_READ_ONLY_ARGS, ...args], {
-			cwd,
-			env: { ...process.env, GIT_OPTIONAL_LOCKS: "0" },
-			stdout: "pipe",
-			stderr: "pipe",
-			windowsHide: true,
-		});
-
-		return {
-			exitCode: result.exitCode ?? 0,
-			stdout: new TextDecoder().decode(result.stdout),
-		};
-	} catch {
-		return { exitCode: 1, stdout: "" };
-	}
-}
-
-function firstLine(result: GitCommandResult): string | null {
-	const line = result.stdout
-		.split(/\r?\n/)
-		.map(value => value.trim())
-		.find(Boolean);
-	return line ?? null;
+	return root.shaSync(cwd);
 }
 
 function parseScpRemote(rawUrl: string): { host: string; remotePath: string } | null {
@@ -218,11 +165,11 @@ function remoteHostPathIdentifier(host: string, rawPath: string): string | null 
 	return `${host}/${normalizedPath}`;
 }
 
-function localRemoteIdentifier(rawPath: string, cwd: string): string | null {
+function localRemoteIdentifier(rawPath: string, commonDir: string): string | null {
 	const trimmed = rawPath.trim();
 	if (!trimmed) return null;
 
-	const resolved = path.resolve(cwd || ".", trimmed);
+	const resolved = path.resolve(trimTrailingGit(commonDir), trimmed);
 	const withoutTrailingSlash = trimTrailingSlashes(resolved);
 	return `file:${trimTrailingSlashes(trimTrailingGit(withoutTrailingSlash))}`;
 }
