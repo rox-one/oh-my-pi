@@ -916,17 +916,14 @@ export class CustomEditor extends Editor {
 		void promise.then(this.#onPasteSettled, this.#onPasteSettled);
 	}
 
-	override handleInput(data: string): void {
+	handleInput(data: string): void {
 		// Serialize behind any in-flight async paste so a trailing Enter / follow-up key can't
 		// submit before the clipboard image reaches `pendingImages` (Codex PR #3602 review).
 		if (this.#pasteInFlight > 0) {
 			this.#pendingInput.push(data);
 			return;
 		}
-		// textEquals avoids getText()'s O(buffer) join on every keystroke; kitty
-		// sequences always start with ESC, so plain bytes skip the native parse.
-		const hadBareQueuePrefix = this.textEquals("->") || this.textEquals("=>");
-		const kittyParsed = data.charCodeAt(0) === 0x1b ? parseKittySequence(data) : null;
+		const kittyParsed = parseKittySequence(data);
 		if (kittyParsed && (kittyParsed.modifier & 64) !== 0 && this.onCapsLock) {
 			// Caps Lock is modifier bit 64
 			this.onCapsLock();
