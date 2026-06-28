@@ -3,7 +3,7 @@ import type { AssistantMessage } from "@oh-my-pi/pi-ai";
 import * as ai from "@oh-my-pi/pi-ai";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import {
-	classifyUnexpectedStop,
+	isObviousUnexpectedStopText,
 	isUnexpectedStopCandidate,
 	parseUnexpectedStopClassification,
 } from "@oh-my-pi/pi-coding-agent/session/unexpected-stop-classifier";
@@ -145,6 +145,19 @@ describe("classifyUnexpectedStop", () => {
 		expect(options?.disableReasoning).toBe(true);
 		expect(options?.maxTokens).toBe(4096);
 		expect(options?.maxTokens).toBeGreaterThan(1024);
+	});
+});
+
+describe("isObviousUnexpectedStopText", () => {
+	it("detects clear continuation promises", () => {
+		expect(isObviousUnexpectedStopText("Doing that now.")).toBe(true);
+		expect(isObviousUnexpectedStopText("I will run the scoped tests next.")).toBe(true);
+	});
+
+	it("rejects negated action statements", () => {
+		expect(isObviousUnexpectedStopText("I am not doing that now.")).toBe(false);
+		expect(isObviousUnexpectedStopText("I will not run tests next.")).toBe(false);
+		expect(isObviousUnexpectedStopText("I don't need to continue now.")).toBe(false);
 	});
 });
 
