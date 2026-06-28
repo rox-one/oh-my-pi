@@ -135,6 +135,71 @@ describe("createSessionManager — shared-bucket local resume", () => {
 			await result.close();
 		}
 	});
+
+	it("keeps startup scoped to launch cwd for path-mode local resume matches in another existing project", async () => {
+		const persisted = SessionManager.create(existingProject, sessionDir);
+		persisted.appendMessage({ role: "user", content: "path bucket resume", timestamp: 1 });
+		await persisted.ensureOnDisk();
+		await persisted.flush();
+		const sessionFile = persisted.getSessionFile();
+		if (!sessionFile) throw new Error("Expected persisted session file");
+		const sessionId = persisted.getSessionId();
+		await persisted.close();
+
+		const resolveSpy = vi.spyOn(sessionListingModule, "resolveResumableSession").mockResolvedValue({
+			scope: "local",
+			session: {
+				path: sessionFile,
+				id: sessionId,
+				cwd: existingProject,
+				title: "path-bucket",
+				created: new Date(0),
+				modified: new Date(0),
+				messageCount: 1,
+				size: 0,
+				firstMessage: "path bucket resume",
+				allMessagesText: "path bucket resume",
+			},
+		});
+		const reloadForCwd = vi.fn(async () => {});
+		const pathModeSettings = {
+			get: () => undefined,
+			reloadForCwd,
+		} as unknown as Settings;
+		const beforeProjectDirChange = vi.fn(async () => {});
+		const openSpy = vi.spyOn(SessionManager, "open");
+
+		const result = await createSessionManager(
+			buildArgs(sessionId.slice(0, 8)),
+			launchProject,
+			pathModeSettings,
+			undefined,
+			undefined,
+			beforeProjectDirChange,
+		);
+
+		if (!result) throw new Error("Expected resumed session manager");
+		try {
+			expect(result.getCwd()).toBe(path.resolve(existingProject));
+			expect(getProjectDir()).toBe(path.resolve(launchProject));
+			expect(beforeProjectDirChange).not.toHaveBeenCalled();
+			expect(reloadForCwd).not.toHaveBeenCalled();
+			expect(openSpy).toHaveBeenCalledWith(
+				sessionFile,
+				undefined,
+				undefined,
+				expect.objectContaining({
+					initialCwd: path.resolve(existingProject),
+					workspaceIdentifierMode: undefined,
+				}),
+			);
+			expect(resolveSpy).toHaveBeenCalledWith(sessionId.slice(0, 8), launchProject, undefined, {
+				identifierMode: undefined,
+			});
+		} finally {
+			await result.close();
+		}
+	});
 });
 
 describe("createSessionManager — cross-project --resume", () => {

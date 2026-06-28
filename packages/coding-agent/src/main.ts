@@ -755,6 +755,25 @@ async function rescopeStartupToManagerCwd(
 	}
 	return manager;
 }
+
+async function rescopeStartupToManagerCwdForSharedWorkspace(
+	manager: SessionManager,
+	workspaceIdentifierMode: WorkspaceIdentifierMode | undefined,
+	activeSettings: Settings,
+	beforeProjectDirChange: () => Promise<void> = async () => {},
+): Promise<SessionManager> {
+	const targetCwd = manager.getCwd();
+	if (workspaceIdentifierMode === "path" || workspaceIdentifierMode === undefined || !targetCwd) {
+		return manager;
+	}
+	if (normalizePathForComparison(targetCwd) === normalizePathForComparison(getProjectDir())) {
+		return manager;
+	}
+	if (!(await directoryExists(targetCwd))) {
+		return manager;
+	}
+	return await rescopeStartupToManagerCwd(manager, activeSettings, beforeProjectDirChange);
+}
 async function getChangelogForDisplay(parsed: Args): Promise<string | undefined> {
 	if (parsed.continue || parsed.resume) {
 		return undefined;
@@ -829,10 +848,11 @@ export async function createSessionManager(
 	if (typeof parsed.resume === "string") {
 		const sessionArg = parsed.resume;
 		if (sessionArg.includes("/") || sessionArg.includes("\\") || sessionArg.endsWith(".jsonl")) {
-			return await rescopeStartupToManagerCwd(
+			return await rescopeStartupToManagerCwdForSharedWorkspace(
 				await SessionManager.open(sessionArg, parsed.sessionDir, undefined, {
 					workspaceIdentifierMode: workspaceMode,
 				}),
+				workspaceMode,
 				activeSettings,
 				beforeProjectDirChange,
 			);
@@ -897,18 +917,20 @@ export async function createSessionManager(
 				});
 			}
 		}
-		return await rescopeStartupToManagerCwd(
+		return await rescopeStartupToManagerCwdForSharedWorkspace(
 			await SessionManager.open(match.session.path, parsed.sessionDir, undefined, {
 				initialCwd: match.session.cwd || cwd,
 				workspaceIdentifierMode: workspaceMode,
 			}),
+			workspaceMode,
 			activeSettings,
 			beforeProjectDirChange,
 		);
 	}
 	if (parsed.continue) {
-		return await rescopeStartupToManagerCwd(
+		return await rescopeStartupToManagerCwdForSharedWorkspace(
 			await SessionManager.continueRecent(cwd, parsed.sessionDir, undefined, workspaceMode),
+			workspaceMode,
 			activeSettings,
 			beforeProjectDirChange,
 		);
@@ -923,8 +945,9 @@ export async function createSessionManager(
 	// buildSessionOptions restores the session's model/thinking instead of
 	// overriding them with CLI defaults.
 	if (activeSettings.get("autoResume")) {
-		const manager = await rescopeStartupToManagerCwd(
+		const manager = await rescopeStartupToManagerCwdForSharedWorkspace(
 			await SessionManager.continueRecent(cwd, parsed.sessionDir, undefined, workspaceMode),
+			workspaceMode,
 			activeSettings,
 			beforeProjectDirChange,
 		);
