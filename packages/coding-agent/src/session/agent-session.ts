@@ -191,8 +191,8 @@ import {
 	shouldDisableReasoning,
 	toReasoningEffort,
 } from "../thinking";
-import { formatTitleConversationContext, type TitleConversationTurn } from "../tiny/text";
 import { HEURISTIC_UNEXPECTED_STOP_MODEL_KEY } from "../tiny/models";
+import { formatTitleConversationContext, type TitleConversationTurn } from "../tiny/text";
 import { shutdownTinyTitleClient } from "../tiny/title-client";
 import type { ImageAttachmentEntry } from "../tools";
 import { resolveApproval } from "../tools/approval";

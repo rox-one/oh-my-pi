@@ -42,6 +42,8 @@ const OBVIOUS_ACTION_STOP_PATTERNS = [
 ] as const;
 const NEGATED_ACTION_STOP_PATTERN =
 	/\b(?:not|never|won't|will not|can't|cannot|don't|do not|should not|need not|am not|isn't|aren't)\b[^.!?]{0,80}\b(?:doing|running|applying|fixing|checking|testing|updating|changing|investigating|inspecting|run|apply|fix|check|test|update|change|inspect|investigate|continue)\b[^.!?]{0,80}\b(?:now|next)\b/i;
+const ACTION_OFFER_STOP_PATTERN =
+	/\b(?:let me know|if you (?:want|would like) me to|if you'd like me to)\b[^.!?]{0,160}\b(?:run|apply|fix|check|test|update|change|inspect|investigate|continue)\b[^.!?]{0,80}\b(?:now|next)\b/i;
 
 export interface ClassifyUnexpectedStopDeps {
 	settings: Settings;
@@ -74,7 +76,7 @@ export function isUnexpectedStopCandidate(message: AssistantMessage): boolean {
 }
 
 export function isObviousUnexpectedStopText(text: string): boolean {
-	if (NEGATED_ACTION_STOP_PATTERN.test(text)) return false;
+	if (NEGATED_ACTION_STOP_PATTERN.test(text) || ACTION_OFFER_STOP_PATTERN.test(text)) return false;
 	return OBVIOUS_ACTION_STOP_PATTERNS.some(pattern => pattern.test(text));
 }
 

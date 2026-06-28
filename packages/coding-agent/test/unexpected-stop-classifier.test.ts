@@ -159,6 +159,11 @@ describe("isObviousUnexpectedStopText", () => {
 		expect(isObviousUnexpectedStopText("I will not run tests next.")).toBe(false);
 		expect(isObviousUnexpectedStopText("I don't need to continue now.")).toBe(false);
 	});
+
+	it("rejects conditional action offers", () => {
+		expect(isObviousUnexpectedStopText("Let me know if you want me to run the tests next.")).toBe(false);
+		expect(isObviousUnexpectedStopText("If you'd like me to apply the fix next, say so.")).toBe(false);
+	});
 });
 
 describe("parseUnexpectedStopClassification", () => {

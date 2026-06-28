@@ -60,6 +60,7 @@ function createFixture(streamingMessage: AssistantMessage, tool?: AgentTool) {
 		settings,
 		statusLine: { invalidate: vi.fn() },
 		updateEditorTopBorder: vi.fn(),
+		noteDisplayableThinkingContent: vi.fn(() => false),
 		streamingComponent: { updateContent: vi.fn(), markTranscriptBlockFinalized: vi.fn() },
 		streamingMessage,
 		transcriptMessageComponents: new WeakMap(),
