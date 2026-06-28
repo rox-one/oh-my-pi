@@ -53,9 +53,10 @@ function createFixture(streamingMessage: AssistantMessage) {
 	const ctx = {
 		isInitialized: true,
 		init: vi.fn(async () => {}),
-		ui: { requestRender: vi.fn(), requestComponentRender: vi.fn() },
-		statusLine: { invalidate: vi.fn() },
+		ui: { requestRender: vi.fn() },
+		statusLine: { invalidate: vi.fn(), markActivityStart: vi.fn(), markActivityEnd: vi.fn() },
 		updateEditorTopBorder: vi.fn(),
+		noteDisplayableThinkingContent: vi.fn(() => false),
 		streamingComponent,
 		streamingMessage,
 		transcriptMessageComponents: new WeakMap(),
