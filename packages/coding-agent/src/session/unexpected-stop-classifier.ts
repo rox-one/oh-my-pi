@@ -5,7 +5,11 @@ import type { ModelRegistry } from "../config/model-registry";
 import { resolveRoleSelection } from "../config/model-resolver";
 import type { Settings } from "../config/settings";
 import unexpectedStopClassifierPrompt from "../prompts/system/unexpected-stop-classifier.md" with { type: "text" };
-import { isTinyMemoryLocalModelKey, ONLINE_MEMORY_MODEL_KEY } from "../tiny/models";
+import {
+	HEURISTIC_UNEXPECTED_STOP_MODEL_KEY,
+	isTinyMemoryLocalModelKey,
+	ONLINE_MEMORY_MODEL_KEY,
+} from "../tiny/models";
 import { tinyModelClient } from "../tiny/title-client";
 
 const CLASSIFIER_SYSTEM_PROMPT = prompt.render(unexpectedStopClassifierPrompt);
@@ -31,6 +35,11 @@ const ANSWER_MAX_TOKENS = 16;
  * word.
  */
 const ONLINE_REASONING_SAFE_MAX_TOKENS = 4096;
+
+const OBVIOUS_ACTION_STOP_PATTERNS = [
+	/\b(?:doing|running|applying|fixing|checking|testing|updating|changing|investigating|inspecting)\s+(?:that|this|it)\s+now\b/i,
+	/\b(?:let me|i(?:'ll| will| should| need to| am going to))\b[^.!?]{0,160}\b(?:run|apply|fix|check|test|update|change|inspect|investigate|continue)\b[^.!?]{0,80}\b(?:now|next)\b/i,
+] as const;
 
 export interface ClassifyUnexpectedStopDeps {
 	settings: Settings;
@@ -62,12 +71,19 @@ export function isUnexpectedStopCandidate(message: AssistantMessage): boolean {
 	return hasContent;
 }
 
+export function isObviousUnexpectedStopText(text: string): boolean {
+	return OBVIOUS_ACTION_STOP_PATTERNS.some(pattern => pattern.test(text));
+}
+
 export async function classifyUnexpectedStop(
 	text: string,
 	deps: ClassifyUnexpectedStopDeps,
 ): Promise<boolean | undefined> {
 	const backend = deps.settings.get("providers.unexpectedStopModel");
 	try {
+		if (backend === HEURISTIC_UNEXPECTED_STOP_MODEL_KEY) {
+			return isObviousUnexpectedStopText(text);
+		}
 		if (backend === ONLINE_MEMORY_MODEL_KEY) {
 			return await classifyOnline(text, deps);
 		}

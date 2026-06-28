@@ -5,6 +5,74 @@
 ### Added
 
 - Added experimental workspace identifier modes for sharing default sessions and per-project memories by Git remote or root commit.
+- Added mouse support for scrolling and interaction in the debug log and raw SSE stream viewers.
+- Added the `statusLine.compactThinkingLevel` setting to render the model segment's thinking level as a single leading glyph instead of a separate text suffix.
+- Added support for tracking reasoning tokens in session and advisor statistics.
+- Added Remote Compaction V2 streaming configuration settings (`compaction.remoteStreamingV2Enabled` and `compaction.v2RetainedMessageBudget`) to control token budgets and toggle V2 streaming for remote compaction.
+- Added the `edit.citationTags` setting to emit model-facing hashline section headers as OpenAI citation markers with opaque source IDs, along with citation-marker unwrapping for hashline edit parsing, diff previews, and streaming matching.
+- Added mutable session titles backed by a fixed JSONL title slot with append-only title-change audit entries, replan title refresh, and configurable idle recaps.
+- Added incremental `yield` submissions with typed sections and last-turn final results for subagents.
+
+### Changed
+
+- Refactored and improved the debug log and raw SSE stream viewers to use a standard, wider, bordered overlay component with clearer status indicators, controls, and dynamic layouts.
+- Updated the idle recap feature to use an LLM-generated summary of where things stand (anchored by the live goal and active todo task) instead of a static status line.
+- Refined interrupted thinking system instructions to encourage smoother continuation.
+
+### Fixed
+
+- Fixed array-typed output schema validation by correctly assembling incremental yields into lists
+- Fixed OpenAI/Codex compatibility by removing top-level schema combinators from tool parameters
+- Fixed validation errors for untyped final yields in strict-mode providers by allowing `null` types
+
+- Fixed Alt+M default-role model configuration being disabled by the current session's context size. ([#3708](https://github.com/can1357/oh-my-pi/issues/3708))
+- Fixed MCP `type: "sse"` servers by adding the legacy HTTP+SSE endpoint handshake and streaming JSON-RPC response path. ([#3710](https://github.com/can1357/oh-my-pi/issues/3710))
+- Fixed interrupted reasoning blocks being incorrectly stripped when they contained a valid signature
+- Fixed interrupted thinking being lost in LLM provider requests after user interrupts by properly stripping trailing reasoning blocks from assistant turns while preserving them in the UI and session history.
+- Fixed the live todo HUD going stale during long tool-use loops by introducing a mid-run reconciliation reminder that prompts the agent to update incomplete items.
+- Fixed resumed OpenAI and OpenAI-Codex sessions losing encrypted reasoning and native assistant turns during rehydration.
+- Fixed the ask tool's custom answer editor dropping the original question and option list while typing.
+- Fixed auto-snapcompact failing the session on local blockers (such as text-only active models, high non-ASCII transcripts, or context budget overflows) by gracefully downgrading automatic maintenance to context-full compaction.
+- Fixed autoresearch's `before_agent_start` handler crashing when the system prompt was undefined.
+- Fixed OMP exiting silently during startup when encountering standalone Codex hook scripts in `~/.codex/hooks/`.
+- Fixed unreachable keyboard shortcuts in HTML session exports by changing the "toggle thinking" and "toggle tools" shortcuts from `Ctrl+T` and `Ctrl+O` to bare `T` and `O` keys.
+- Fixed user-invoked `/skill:` prompts reaching model providers as developer turns instead of user turns, including during compaction.
+- Fixed reasoning streaming being locked off for OpenAI-compatible providers that stream reasoning content without advertising reasoning support in model metadata.
+- Fixed `/shake` and other mid-stream chat rebuilds erasing live LLM output by preserving the in-flight streaming components and pending tools.
+- Fixed the `time_spent` status-line segment ticking continuously during idle sessions by ensuring it only accumulates active agent execution windows and resets correctly across session switches.
+### Fixed
+
+- Fixed normal `stop` turns that promise more work being allowed to end the session by default; unexpected-stop detection now uses local heuristics by default, while the model classifier remains opt-in for ambiguous stops.
+
+## [16.2.2] - 2026-06-27
+
+### Added
+
+- Added a new `tiny` model role for consolidated online task handling.
+- Added a `textVerbosity` setting to control OpenAI and Codex response detail.
+
+### Changed
+
+- Simplified the status line subagent display by removing running state and hub hint indicators.
+- Updated online title, memory, and classification tasks to prioritize the new `tiny` model role.
+
+### Fixed
+
+- Improved reliability of auto-retry logic for aborted requests by standardizing error classification across model adapters and ensuring stale session states are reset.
+- Enhanced MCP authentication error detection, header-based server discovery, and 401/403 authorization failure detection during Smithery commands and HTTP RPCs.
+- Fixed auto-generated session titles incorrectly preserving user all-caps text, ensuring proper sentence casing while still respecting intentional mixed-case identifiers.
+- Fixed Tavily web search with recency filters to automatically retry without a time range if Tavily returns an empty HTTP 200 response.
+- Fixed TUI thought stream stalling and `ui.loop-blocked` warnings during subagent-heavy runs by optimizing the mid-run compaction persistence check.
+- Fixed marketplace-installed plugins incorrectly appearing in both the npm plugin list and the extension-package status provider.
+- Fixed inconsistent OpenRouter prompt-cache hits on `/advisor` turns by ensuring advisor agents inherit the same provider-shaping options, hooks, and settings as the main agent.
+- Fixed path-scoped TTSR (Targeted Tool Safety Rules) evaluation for `hashline` and `apply_patch` edit streams, ensuring rules are correctly applied to file paths parsed from section headers and envelope markers without leaking across file scopes.
+
+## [16.2.1] - 2026-06-27
+
+### Added
+
+- Included project context files (AGENTS.md, etc.) in the advisor's system prompt to ensure adherence to user-defined project rules
+- Added project context files (AGENTS.md and the like) to the advisor's system prompt, so the read-only reviewer judges against the user's standing project rules the same way the main agent does.
 
 ### Fixed
 

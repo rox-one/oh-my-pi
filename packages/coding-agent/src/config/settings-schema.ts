@@ -29,6 +29,7 @@ import {
 import {
 	AUTO_THINKING_MODEL_OPTIONS,
 	AUTO_THINKING_MODEL_VALUES,
+	HEURISTIC_UNEXPECTED_STOP_MODEL_KEY,
 	ONLINE_AUTO_THINKING_MODEL_KEY,
 	ONLINE_MEMORY_MODEL_KEY,
 	ONLINE_TINY_TITLE_MODEL_KEY,
@@ -36,6 +37,8 @@ import {
 	TINY_MEMORY_MODEL_VALUES,
 	TINY_TITLE_MODEL_OPTIONS,
 	TINY_TITLE_MODEL_VALUES,
+	UNEXPECTED_STOP_MODEL_OPTIONS,
+	UNEXPECTED_STOP_MODEL_VALUES,
 } from "../tiny/models";
 import { IMAGE_PROVIDER_CHOICES, type ImageProvider } from "../tools/image-providers";
 import {
@@ -5569,9 +5572,8 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 	"features.unexpectedStopDetection": {
-		type: "enum",
-		values: ["none", "mechanical", "smart"] as const,
-		default: "mechanical",
+		type: "boolean",
+		default: true,
 		ui: {
 			tab: "interaction",
 			group: "Agent",
@@ -5595,16 +5597,16 @@ export const SETTINGS_SCHEMA = {
 	},
 	"providers.unexpectedStopModel": {
 		type: "enum",
-		values: TINY_MEMORY_MODEL_VALUES,
-		default: ONLINE_MEMORY_MODEL_KEY,
+		values: UNEXPECTED_STOP_MODEL_VALUES,
+		default: HEURISTIC_UNEXPECTED_STOP_MODEL_KEY,
 		ui: {
 			tab: "providers",
 			group: "Tiny Model",
 			label: "Unexpected Stop Model",
 			description:
-				"Classifier for Smart unexpected-stop detection: online (the TINY role from /models, else smol) by default, or a local on-device model.",
-			condition: "unexpectedStopSmart",
-			options: TINY_MEMORY_MODEL_OPTIONS,
+				"Classifier for unexpected-stop detection: local heuristic by default, or opt into the TINY role / local model for ambiguous stops.",
+			condition: "unexpectedStopDetection",
+			options: UNEXPECTED_STOP_MODEL_OPTIONS,
 		},
 	},
 
