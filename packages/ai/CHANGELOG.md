@@ -1139,6 +1139,12 @@
 - Enabled freeform tool patch support for Azure OpenAI and Codex models.
 - Fixed an issue where the `/usage show` command returned "No usage data available" when using a custom proxy base URL for Codex.
 
+### Fixed
+
+- Fixed GitLab Duo Agent dropping or corrupting long streamed outputs (and the trailing tool call after them) because it treated every checkpoint's `ui_chat_log` as a full snapshot while the `incremental_streaming` capability makes DWS send only the changed tail slice per checkpoint. On long documents the per-slice byte length shrank and varied, so the stall detector falsely flagged a non-advancing workflow and restarted it — discarding the in-flight tool call — while the per-message diff re-emitted or swallowed text. The provider now accumulates the full `ui_chat_log` per workflow by merging each incremental slice by `message_id` (mirroring the official GitLab LSP `mergeIncrementalChatLog`), so entry diffing, stall byte-length comparison, dedup, and the empty-terminal guard all operate on a complete snapshot again. The accumulator persists across the resume that reuses the socket and resets when a fresh workflow seeds a new session.
+
+- Fixed GitLab Duo Agent compaction summarization requests sending the entire serialized history verbatim as the goal, which routinely exceeded the goal byte budget and made compaction requests larger than ordinary turns. The provider now detects a summarization request (a lone `<conversation>…</conversation>` user turn) and shakes it down by eliding ONLY the tool-I/O blocks from oldest to newest, one block at a time, stopping as soon as the goal fits the soft byte budget. The block matcher covers the `xml` dialect that every Duo model id actually resolves to (`<invoke …>…</invoke>` calls and `<tool_response>…</tool_response>` results) as well as the `anthropic`/`minimax` `<function_calls>` / `<function_results>` forms; a prior version matched only `<function_*>`, so on the real `xml` dialect it elided nothing and the goal still overflowed. User prompts and assistant reasoning/text are never shaken, and the trailing summarization instructions plus any `<previous-summary>` block are preserved verbatim — all in a single render with no per-step re-request.
+
 ## [16.2.2] - 2026-06-27
 
 ### Added
