@@ -264,6 +264,27 @@ describe("resolveWorkspaceIdentifierModeForCompletion", () => {
 
 		await expect(resolveWorkspaceIdentifierModeForCompletion({ cwd, agentDir })).resolves.toBe("git-root");
 	});
+
+	it("falls back to path when configured for git-root but git is missing from the current PATH", async () => {
+		const { root, cwd, agentDir } = await makeTempWorkspace("omp-completion-mode-no-git");
+		const emptyBin = path.join(root, "empty-bin");
+		await fs.mkdir(emptyBin);
+		await writeText(path.join(agentDir, "config.yml"), "workspace:\n  identifier: git-root\n");
+
+		await expect(resolveWorkspaceIdentifierModeForCompletion({ cwd, agentDir })).resolves.toBe("git-root");
+
+		const originalPath = process.env.PATH;
+		process.env.PATH = emptyBin;
+		try {
+			await expect(resolveWorkspaceIdentifierModeForCompletion({ cwd, agentDir })).resolves.toBe("path");
+		} finally {
+			if (originalPath === undefined) {
+				delete process.env.PATH;
+			} else {
+				process.env.PATH = originalPath;
+			}
+		}
+	});
 });
 
 describe("omp completions (integration / drift)", () => {

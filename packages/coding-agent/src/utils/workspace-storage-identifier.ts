@@ -1,4 +1,5 @@
 import * as path from "node:path";
+import { $which, WhichCachePolicy } from "@oh-my-pi/pi-utils";
 import { fileURLToPath } from "bun";
 import { type GitRepository, repo, root } from "./git";
 
@@ -23,6 +24,9 @@ export function resolveWorkspaceStorageIdentity(
 	pathFallbackSegment: string,
 ): WorkspaceStorageIdentity {
 	const resolvedCwd = path.resolve(cwd || ".");
+	if (requestedMode !== "path" && !isGitAvailable()) {
+		return pathIdentity(resolvedCwd, requestedMode, pathFallbackSegment, true);
+	}
 	const memoKey = `${requestedMode}\0${resolvedCwd}\0${pathFallbackSegment}`;
 	const memoized = memoizedStoredIdentity.get(memoKey);
 	if (memoized) {
@@ -132,10 +136,18 @@ function resolveGitRemoteIdentifier(git: GitRepository): string | null {
 }
 
 function resolveGitRootCommit(cwd: string): string | null {
-	const shallow = repo.isShallowRepositorySync(cwd);
-	if (shallow) return null;
+	try {
+		const shallow = repo.isShallowRepositorySync(cwd);
+		if (shallow) return null;
 
-	return root.shaSync(cwd);
+		return root.shaSync(cwd);
+	} catch {
+		return null;
+	}
+}
+
+function isGitAvailable(): boolean {
+	return $which("git", { cache: WhichCachePolicy.Fresh, PATH: process.env.PATH }) !== null;
 }
 
 function parseScpRemote(rawUrl: string): { host: string; remotePath: string } | null {

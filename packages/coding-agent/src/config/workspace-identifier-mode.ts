@@ -1,5 +1,5 @@
 import * as path from "node:path";
-import { getAgentDir } from "@oh-my-pi/pi-utils";
+import { $which, getAgentDir, WhichCachePolicy } from "@oh-my-pi/pi-utils";
 import { TOML, YAML } from "bun";
 import { WORKSPACE_IDENTIFIER_MODES, type WorkspaceIdentifierMode } from "../utils/workspace-storage-identifier";
 
@@ -22,6 +22,9 @@ export async function resolveWorkspaceIdentifierModeForCompletion(
 		if (candidateMode !== undefined) {
 			mode = candidateMode;
 		}
+	}
+	if (mode !== "path" && !isGitAvailable()) {
+		return "path";
 	}
 	return mode;
 }
@@ -74,4 +77,8 @@ function isConfigObject(value: unknown): value is Record<string, unknown> {
 
 function isWorkspaceIdentifierMode(value: unknown): value is WorkspaceIdentifierMode {
 	return typeof value === "string" && (WORKSPACE_IDENTIFIER_MODES as readonly string[]).includes(value);
+}
+
+function isGitAvailable(): boolean {
+	return $which("git", { cache: WhichCachePolicy.Fresh, PATH: process.env.PATH }) !== null;
 }

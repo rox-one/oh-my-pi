@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
 import { getMemoryRoot } from "@oh-my-pi/pi-coding-agent/memories";
 import { computeMnemopiBankScope } from "@oh-my-pi/pi-coding-agent/mnemopi/config";
@@ -150,6 +150,41 @@ describe("workspace storage identity", () => {
 		expect(identity.key).toBe(path.resolve(shallowCwd));
 		expect(identity.segment).toBe("path-bucket");
 		expect(identity.fallback).toBe(true);
+	});
+
+	it("falls back to the supplied path segment when git-root command spawning fails after discovery", async () => {
+		const root = await makeTempDir("@workspace-identity-git-root-spawn-");
+		const repoCwd = root.join("repo");
+		await runGit(root.path(), ["init", repoCwd]);
+
+		const realSpawnSync = Bun.spawnSync;
+		let interceptedGitSpawn = false;
+		const spawnSyncSpy = vi.spyOn(Bun, "spawnSync").mockImplementation(((
+			...args: Parameters<typeof Bun.spawnSync>
+		) => {
+			const command = args[0];
+			if (Array.isArray(command) && command[0] === "git") {
+				interceptedGitSpawn = true;
+				throw new Error("git spawn unavailable");
+			}
+
+			return realSpawnSync(...args);
+		}) as typeof Bun.spawnSync);
+
+		try {
+			const identity = resolveWorkspaceStorageIdentity(repoCwd, "git-root", "path-bucket");
+
+			expect(interceptedGitSpawn).toBe(true);
+			expect(identity).toEqual({
+				requestedMode: "git-root",
+				mode: "path",
+				key: path.resolve(repoCwd),
+				segment: "path-bucket",
+				fallback: true,
+			});
+		} finally {
+			spawnSyncSpy.mockRestore();
+		}
 	});
 
 	it("normalizes remote URL variants without credentials", () => {
