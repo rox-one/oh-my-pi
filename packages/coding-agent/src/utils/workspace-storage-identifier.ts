@@ -23,7 +23,7 @@ export function resolveWorkspaceStorageIdentity(
 	pathFallbackSegment: string,
 ): WorkspaceStorageIdentity {
 	const resolvedCwd = path.resolve(cwd || ".");
-	const memoKey = `${requestedMode}\0${resolvedCwd}`;
+	const memoKey = `${requestedMode}\0${resolvedCwd}\0${pathFallbackSegment}`;
 	const memoized = memoizedStoredIdentity.get(memoKey);
 	if (memoized) {
 		return memoized;

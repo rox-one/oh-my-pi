@@ -92,6 +92,34 @@ describe("workspace storage identity", () => {
 		});
 	});
 
+	it("keeps path fallback segments separate for same-cwd callers", async () => {
+		const dir = await makeTempDir("@workspace-identity-fallback-segments-");
+		const cwd = dir.path();
+
+		const firstPathIdentity = resolveWorkspaceStorageIdentity(cwd, "path", "first-path-bucket");
+		const secondPathIdentity = resolveWorkspaceStorageIdentity(cwd, "path", "second-path-bucket");
+		const firstGitFallbackIdentity = resolveWorkspaceStorageIdentity(cwd, "git-remote", "first-git-bucket");
+		const secondGitFallbackIdentity = resolveWorkspaceStorageIdentity(cwd, "git-remote", "second-git-bucket");
+
+		expect(firstPathIdentity.segment).toBe("first-path-bucket");
+		expect(secondPathIdentity.segment).toBe("second-path-bucket");
+		expect(secondPathIdentity).toEqual({
+			requestedMode: "path",
+			mode: "path",
+			key: path.resolve(cwd),
+			segment: "second-path-bucket",
+			fallback: false,
+		});
+		expect(firstGitFallbackIdentity.segment).toBe("first-git-bucket");
+		expect(secondGitFallbackIdentity).toEqual({
+			requestedMode: "git-remote",
+			mode: "path",
+			key: path.resolve(cwd),
+			segment: "second-git-bucket",
+			fallback: true,
+		});
+	});
+
 	it("falls back for shallow repositories in git-root mode", async () => {
 		const root = await makeTempDir("@workspace-identity-shallow-");
 		const repoCwd = root.join("repo");
