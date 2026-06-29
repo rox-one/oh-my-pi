@@ -1,6 +1,17 @@
 # Changelog
 
 ## [Unreleased]
+
+### Fixed
+
+- Fixed WSL sessions missing Agent Skills stored in the Windows host profile's `.agents/skills` directory. ([#3779](https://github.com/can1357/oh-my-pi/issues/3779))
+
+## [16.2.5] - 2026-06-28
+
+### Changed
+
+- Status line now collapses a linked git worktree path to the project name with a worktree icon, leaving the git segment to show the branch once instead of repeating it in the path.
+
 ### Fixed
 
 - Focused live task and eval subagent previews on unfinished agents, collapsing settled rows into a status summary ([#8949](https://github.com/can1357/oh-my-pi/issues/8949)).
