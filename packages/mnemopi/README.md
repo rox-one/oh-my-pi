@@ -78,7 +78,7 @@ The Oh My Pi coding-agent wrapper adds `mnemopi.scoping` on top of those constru
 - `per-project`: isolated project memory
 - `per-project-tagged`: project-local writes plus global recall visibility
 
-In `per-project-tagged`, the wrapper is responsible for combining project-local retention with global recall visibility. The package still just exposes banks plus constructor-level LLM and embedding options.
+Project-local bank identity is also host-owned: the coding-agent wrapper derives it from `workspace.identifier` (`path`, `git-remote`, or `git-root`). In `per-project-tagged`, the wrapper is responsible for combining project-local retention with global recall visibility. The package still just exposes banks plus constructor-level LLM and embedding options.
 
 Common environment fallbacks:
 

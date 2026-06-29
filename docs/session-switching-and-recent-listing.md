@@ -24,9 +24,11 @@ It focuses on current implementation behavior, including fallback paths and cave
 
 `SessionManager` stores file sessions under a canonical-cwd bucket by default:
 
-- `~/.omp/agent/sessions/<encoded-cwd>/*.jsonl`
+- `~/.omp/agent/sessions/<workspace-segment>/*.jsonl`
 
-`<encoded-cwd>` is the path-encoded canonical cwd (`-<relative>` under home, `-tmp-<relative>` under the temp root, `--<encoded-absolute>--` otherwise; see [session.md](session.md#on-disk-layout)). Buckets from the reverted 17.2.5-17.2.8 hashed scheme are migrated best-effort. `SessionManager.list(cwd, sessionDir?)` reads only the resolved bucket unless an explicit `sessionDir` is provided.
+`workspace.identifier` controls `<workspace-segment>`: `path` uses home-relative `-<rel>` names, `-tmp-<rel>` for temp paths, and legacy `--<abs>--` otherwise; `git-remote` uses the repository remote identity; `git-root` uses the repository's first reachable commit. Git modes fall back to `path` when no usable Git identity is available.
+
+`SessionManager.list(cwd, sessionDir?)` reads only that directory unless an explicit `sessionDir` is provided. Callers that honor `workspace.identifier` pass the resolved identifier mode so `--resume`, completion, and ACP project chat lookup read the same bucket that session creation uses.
 
 ### Two listing paths with different payloads
 
@@ -104,12 +106,11 @@ No match throws `Session "..." not found.`.
 
 Handled after initial session-manager construction:
 
-1. list current-folder sessions with `SessionManager.list(cwd, parsed.sessionDir)`
-2. if empty, probe `SessionManager.listAll()` only to distinguish globally empty state and preload the Tab scope; the picker still opens in current-folder scope
-3. if both lists are empty, print `No sessions found` and exit
-4. open the fullscreen TUI picker (`selectSession`)
-5. if canceled, print `No session selected` and exit
-6. on selection, switch process/project-scoped state to the session's cwd, then `SessionManager.open(selected.path)`
+1. list local sessions with `SessionManager.list(cwd, parsed.sessionDir, undefined, settings.get("workspace.identifier"))`
+2. if empty: preload `SessionManager.listAll()` and open the picker in all-projects scope; print `No sessions found` and exit early only when the global list is also empty
+3. open TUI picker (`selectSession`, with optional preloaded `allSessions`/`startInAllScope`)
+4. if canceled: print `No session selected` and exit early
+5. if selected: when the session belongs to another project, switch the process into that project's directory (`setProjectDir`, cache resets, settings reload) first; then `SessionManager.open(selected.path)`
 
 ### `--continue`
 
