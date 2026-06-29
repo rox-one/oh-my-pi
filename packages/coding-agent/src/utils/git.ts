@@ -1075,6 +1075,17 @@ function stripGitConfigComments(line: string): string {
 	return clean.trim();
 }
 
+function unquoteGitConfigValue(value: string): string {
+	const trimmed = value.trim();
+	if (!trimmed.startsWith('"') || !trimmed.endsWith('"')) return trimmed;
+	try {
+		const parsed = JSON.parse(trimmed) as unknown;
+		return typeof parsed === "string" ? parsed : trimmed;
+	} catch {
+		return trimmed;
+	}
+}
+
 function parseGitConfigHasReftable(content: string): boolean {
 	let inExtensions = false;
 	for (const line of content.split("\n")) {
@@ -1129,7 +1140,7 @@ function parseGitConfigRemotes(content: string): GitRemote[] {
 			const remoteSection = /^remote\s+(.+)$/i.exec(section);
 			if (remoteSection) {
 				const name = remoteSection[1].trim();
-				remoteName = name.startsWith('"') && name.endsWith('"') ? JSON.parse(name) : name;
+				remoteName = unquoteGitConfigValue(name);
 			}
 			continue;
 		}
@@ -1141,7 +1152,7 @@ function parseGitConfigRemotes(content: string): GitRemote[] {
 		if (key !== "url") continue;
 		remotes.push({
 			name: remoteName,
-			fetchUrl: trimmed.slice(eqIndex + 1).trim(),
+			fetchUrl: unquoteGitConfigValue(trimmed.slice(eqIndex + 1)),
 		});
 	}
 	return remotes;
