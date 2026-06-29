@@ -10,7 +10,7 @@
  */
 import { type GeneratedProvider, getBundledModels, getBundledProviders } from "@oh-my-pi/pi-catalog/models";
 import { Command } from "@oh-my-pi/pi-utils/cli";
-import { Settings } from "../config/settings";
+import { resolveWorkspaceIdentifierModeForCompletion } from "../config/workspace-identifier-mode";
 import { SessionManager } from "../session/session-manager";
 
 export default class Complete extends Command {
@@ -57,8 +57,7 @@ function completeModels(prefix: string): void {
 
 async function completeSessions(prefix: string): Promise<void> {
 	const cwd = process.cwd();
-	const settings = await Settings.init({ cwd });
-	const mode = settings.get("workspace.identifier");
+	const mode = await resolveWorkspaceIdentifierModeForCompletion({ cwd });
 	const sessions = await SessionManager.list(cwd, undefined, undefined, mode);
 	const lines: string[] = [];
 	for (const session of sessions) {
