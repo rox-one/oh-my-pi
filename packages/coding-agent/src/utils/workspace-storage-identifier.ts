@@ -83,6 +83,10 @@ function resolveWorkspaceStorageIdentityInternal(
 }
 
 export function normalizeGitRemoteIdentifier(git: GitRepository, remoteUrl: string): string | null {
+	if (isWindowsDriveAbsolutePath(remoteUrl.trim())) {
+		return localRemoteIdentifier(remoteUrl, git.commonDir);
+	}
+
 	const scpRemote = parseScpRemote(remoteUrl);
 	if (scpRemote) {
 		return remoteHostPathIdentifier(scpRemote.host, scpRemote.remotePath);
@@ -91,7 +95,7 @@ export function normalizeGitRemoteIdentifier(git: GitRepository, remoteUrl: stri
 	const parsed = parseRemoteUrl(remoteUrl);
 	if (parsed) {
 		if (parsed.protocol === "file:") {
-			return localRemoteIdentifier(fileURLToPath(parsed), git.commonDir);
+			return localRemoteIdentifier(fileRemotePath(parsed), git.commonDir);
 		}
 
 		if (!parsed.hostname) return null;
@@ -150,8 +154,29 @@ function isGitAvailable(): boolean {
 	return $which("git", { cache: WhichCachePolicy.Fresh, PATH: process.env.PATH }) !== null;
 }
 
+function isWindowsDriveAbsolutePath(value: string): boolean {
+	return /^[A-Za-z]:[\\/]/.test(value);
+}
+
+function normalizeLocalRemotePath(rawPath: string, commonDir: string): string {
+	if (isWindowsDriveAbsolutePath(rawPath)) {
+		return path.win32.normalize(path.win32.resolve(rawPath));
+	}
+
+	return path.resolve(trimTrailingGit(commonDir), rawPath);
+}
+
+function fileRemotePath(parsed: URL): string {
+	const decodedPathname = decodeUriPath(parsed.pathname);
+	if (/^\/[A-Za-z]:[\\/]/.test(decodedPathname)) {
+		return decodedPathname.slice(1);
+	}
+
+	return fileURLToPath(parsed);
+}
+
 function parseScpRemote(rawUrl: string): { host: string; remotePath: string } | null {
-	if (/^[A-Za-z][A-Za-z0-9+.-]*:\/\//.test(rawUrl)) return null;
+	if (/^[A-Za-z][A-Za-z0-9+.-]*:\/\//.test(rawUrl) || isWindowsDriveAbsolutePath(rawUrl)) return null;
 
 	const match = /^(?:[^@\s]+@)?([^:/\s]+):(.+)$/.exec(rawUrl);
 	if (!match) return null;
@@ -181,9 +206,9 @@ function localRemoteIdentifier(rawPath: string, commonDir: string): string | nul
 	const trimmed = rawPath.trim();
 	if (!trimmed) return null;
 
-	const resolved = path.resolve(trimTrailingGit(commonDir), trimmed);
-	const withoutTrailingSlash = trimTrailingSlashes(resolved);
-	return `file:${trimTrailingSlashes(trimTrailingGit(withoutTrailingSlash))}`;
+	const resolved = normalizeLocalRemotePath(trimmed, commonDir);
+	const withoutTrailingSlash = trimTrailingPathSeparators(resolved);
+	return `file:${trimTrailingPathSeparators(trimTrailingGit(withoutTrailingSlash))}`;
 }
 
 function decodeUriPath(value: string): string {
@@ -204,6 +229,18 @@ function trimTrailingSlashes(value: string): string {
 		output = output.slice(0, -1);
 	}
 	return output;
+}
+
+function trimTrailingPathSeparators(value: string): string {
+	let output = value;
+	while (output.length > 1 && !isWindowsDriveRoot(output) && /[\\/]$/.test(output)) {
+		output = output.slice(0, -1);
+	}
+	return output;
+}
+
+function isWindowsDriveRoot(value: string): boolean {
+	return /^[A-Za-z]:[\\/]$/.test(value);
 }
 
 function trimTrailingGit(value: string): string {

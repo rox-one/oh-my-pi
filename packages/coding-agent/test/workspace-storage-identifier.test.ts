@@ -198,6 +198,20 @@ describe("workspace storage identity", () => {
 		expect(https).toBe(scp);
 	});
 
+	it("normalizes Windows drive-letter remotes as local paths", () => {
+		const git = gitRepository("/tmp");
+		const backslashRemote = normalizeGitRemoteIdentifier(git, String.raw`C:\repos\origin.git`);
+		const slashRemote = normalizeGitRemoteIdentifier(git, "C:/repos/origin.git");
+		const fileUrlRemote = normalizeGitRemoteIdentifier(git, "file:///C:/repos/origin.git");
+		const dotGitRemote = normalizeGitRemoteIdentifier(git, "C:\\repos\\origin\\.git\\");
+
+		expect(backslashRemote).toBe(String.raw`file:C:\repos\origin`);
+		expect(slashRemote).toBe(backslashRemote);
+		expect(fileUrlRemote).toBe(backslashRemote);
+		expect(dotGitRemote).toBe(backslashRemote);
+		expect(backslashRemote).not.toStartWith("c/");
+	});
+
 	it("normalizes local .git remotes to the worktree path identity", async () => {
 		const dir = await makeTempDir("@workspace-identity-local-remote-");
 		const repoCwd = dir.join("project");
