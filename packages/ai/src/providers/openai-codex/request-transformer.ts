@@ -1,5 +1,5 @@
-import { Effort } from "@oh-my-pi/pi-catalog/effort";
-import { supportsAllTurnsReasoningContext, supportsCodexReasoningSummary } from "@oh-my-pi/pi-catalog/identity";
+import type { Effort } from "@oh-my-pi/pi-catalog/effort";
+import { supportsAllTurnsReasoningContext, supportsReasoningSummary } from "@oh-my-pi/pi-catalog/identity";
 import { requireSupportedEffort } from "@oh-my-pi/pi-catalog/model-thinking";
 import { $env } from "@oh-my-pi/pi-utils";
 import type { Model } from "../../types";
@@ -163,14 +163,14 @@ function getReasoningConfig(
 	const config: ReasoningConfig = {
 		effort: effort === "none" ? "none" : mapCodexWireEffort(model, effort),
 	};
-	// The backend only emits reasoning summaries when `reasoning.summary` is
-	// present: omitting it yields zero `response.reasoning_summary_text.*`
-	// events (measured against gpt-5.5, gpt-5.6-sol and gpt-5.6-terra). So
-	// `undefined` means "default on" — matching `applyResponsesCompatPolicy`
-	// on the plain Responses path — and only an explicit `null` (the caller
-	// hiding thinking) opts out.
-	if (options.reasoningSummary !== null && supportsCodexReasoningSummary(model.id)) {
-		config.summary = options.reasoningSummary ?? "auto";
+	// `reasoning.summary` is universally honored across Codex Responses ids
+	// EXCEPT gpt-5.3-codex-spark, which rejects it with
+	// `Unsupported parameter: 'reasoning.summary' is not supported with this
+	// model` and aborts the turn (no retry). For Spark, omit `summary`
+	// regardless of caller intent; for everything else, keep the prior
+	// behavior (null → omit, value → forward, undefined → "detailed").
+	if (options.reasoningSummary !== null && supportsReasoningSummary(model.id)) {
+		config.summary = options.reasoningSummary ?? "detailed";
 	}
 	return config;
 }
