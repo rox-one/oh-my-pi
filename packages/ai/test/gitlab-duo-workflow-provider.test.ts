@@ -501,9 +501,8 @@ describe("GitLab Duo Workflow provider protocol", () => {
 		const segments: string[] = [];
 		for (let index = 0; index < turnCount; index++) {
 			segments.push(`Human: USER_TURN_${index} keep-me`);
-			segments.push(`Assistant: ASSISTANT_TURN_${index} reasoning-keep`);
 			segments.push(
-				`<function_calls>\n<invoke name="read"><parameter name="path">file_${index}_${heavy}.ts</parameter></invoke>\n</function_calls>`,
+				`Assistant: ASSISTANT_TURN_${index} reasoning-keep<function_calls>\n<invoke name="read"><parameter name="path">file_${index}_${heavy}.ts</parameter></invoke>\n</function_calls>`,
 			);
 			segments.push(
 				`Human: <function_results>\n<result>\n<tool_name>read</tool_name>\n<stdout>RESULT_${index} ${heavy}</stdout>\n</result>\n</function_results>`,
@@ -545,6 +544,163 @@ describe("GitLab Duo Workflow provider protocol", () => {
 		// and the newest tool block is still intact (not all blocks were elided).
 		expect(payload.goal).toContain(`file_${turnCount - 1}_`);
 	});
+	it("uses the last </conversation> so an embedded close tag in tool output stays shake-eligible", () => {
+		const SOFT = 1_048_576;
+		// A tool result embeds the literal `</conversation>` (e.g. a read of a file that
+		// itself contains the wrapper tag). A forward indexOf would treat that embedded
+		// tag as the envelope end, pushing every later tool block into the non-shakeable
+		// tail and leaving the goal over budget. The wrapper's genuine close is the LAST
+		// occurrence, so the whole history stays shake-eligible.
+		const turnCount = 1200;
+		const heavy = "y".repeat(900);
+		const segments: string[] = [];
+		for (let index = 0; index < turnCount; index++) {
+			segments.push(`Human: USER_TURN_${index} keep-me`);
+			segments.push(
+				`Assistant: <function_calls>\n<invoke name="read"><parameter name="path">file_${index}.txt</parameter></invoke>\n</function_calls>`,
+			);
+			segments.push(
+				`Human: <function_results>\n<result>\n<tool_name>read</tool_name>\n<stdout>RESULT_${index} </conversation> ${heavy}</stdout>\n</result>\n</function_results>`,
+			);
+		}
+		const body = segments.join("\n\n");
+		const tail = `\n\nSummarize the conversation above using the required format. UNIQUE_INSTRUCTION_TAIL.`;
+		const summarizationUserText = `<conversation>\n${body}\n</conversation>${tail}`;
+		expect(Buffer.byteLength(summarizationUserText, "utf8")).toBeGreaterThan(SOFT);
+
+		const summarizationContext: Context = {
+			systemPrompt: ["Summarize conversations between users and AI coding assistants."],
+			messages: [{ role: "user", content: summarizationUserText, timestamp: Date.now() }],
+		};
+		const payload = buildGitLabDuoWorkflowStartRequest("workflow-1", model, summarizationContext);
+
+		// Shaken under budget despite the embedded close tag (forward indexOf would not).
+		expect(Buffer.byteLength(payload.goal, "utf8")).toBeLessThan(SOFT);
+		// Trailing instructions after the genuine (last) close survive verbatim.
+		expect(payload.goal).toContain("UNIQUE_INSTRUCTION_TAIL.");
+		// The oldest tool block — past the FIRST embedded close tag — was still elided.
+		expect(payload.goal).toContain("tool I/O elided");
+		expect(payload.goal).not.toContain("RESULT_0 ");
+		// Non-tool user turns survive throughout.
+		expect(payload.goal).toContain("USER_TURN_0 keep-me");
+		expect(payload.goal).toContain(`USER_TURN_${turnCount - 1} keep-me`);
+	});
+	it("elides a tool_response block whose own output embeds </tool_response> mid-content", () => {
+		const SOFT = 1_048_576;
+		// A `<tool_response>` body is raw `result.text` (dialect/rendering.ts), so a
+		// read/grep/bash result can legitimately contain the literal `</tool_response>`.
+		// The transcript renders each tool result as its own `Human:` segment joined by
+		// `\n\n`, so the genuine block close sits at a segment boundary while the embedded
+		// close is mid-content. The matcher anchors the close to the segment boundary, so
+		// the embedded close is skipped and the whole block (head + embedded tag + tail) is
+		// elided.
+		const turnCount = 1200;
+		const heavy = "y".repeat(900);
+		const segments: string[] = [];
+		for (let index = 0; index < turnCount; index++) {
+			segments.push(`Human: USER_TURN_${index} keep-me`);
+			segments.push(`Assistant: <invoke name="read"><parameter name="path">file_${index}.txt</parameter></invoke>`);
+			// The result text embeds a stray `</tool_response>` mid-line before the real
+			// close that terminates the segment.
+			segments.push(
+				`Human: <tool_response>\nRESULT_${index} </tool_response> still-inside ${heavy}\n</tool_response>`,
+			);
+		}
+		const body = segments.join("\n\n");
+		const tail = `\n\nSummarize the conversation above using the required format. UNIQUE_INSTRUCTION_TAIL.`;
+		const summarizationUserText = `<conversation>\n${body}\n</conversation>${tail}`;
+		expect(Buffer.byteLength(summarizationUserText, "utf8")).toBeGreaterThan(SOFT);
+
+		const summarizationContext: Context = {
+			systemPrompt: ["Summarize conversations between users and AI coding assistants."],
+			messages: [{ role: "user", content: summarizationUserText, timestamp: Date.now() }],
+		};
+		const payload = buildGitLabDuoWorkflowStartRequest("workflow-1", model, summarizationContext);
+
+		// Shaken under budget: the embedded close is not at a segment boundary, so the
+		// matcher extends to the real close and elides the whole block.
+		expect(Buffer.byteLength(payload.goal, "utf8")).toBeLessThan(SOFT);
+		expect(payload.goal).toContain("UNIQUE_INSTRUCTION_TAIL.");
+		// The oldest tool block is fully elided — both its head and the `still-inside`
+		// content that followed the embedded close tag are gone.
+		expect(payload.goal).toContain("tool I/O elided");
+		expect(payload.goal).not.toContain("RESULT_0 ");
+		// Non-tool turns survive throughout.
+		expect(payload.goal).toContain("USER_TURN_0 keep-me");
+		expect(payload.goal).toContain(`USER_TURN_${turnCount - 1} keep-me`);
+	});
+	it("elides a tool_response block whose stdout contains blank lines", () => {
+		const SOFT = 1_048_576;
+		const turnCount = 1200;
+		const heavy = "b".repeat(900);
+		const segments: string[] = [];
+		for (let index = 0; index < turnCount; index++) {
+			segments.push(`Human: USER_TURN_${index} keep-me`);
+			segments.push(`Assistant: <invoke name="read"><parameter name="path">file_${index}.txt</parameter></invoke>`);
+			segments.push(
+				`Human: <tool_response>\nRESULT_${index} first line\n\nsecond paragraph ${heavy}\n</tool_response>`,
+			);
+		}
+		const body = segments.join("\n\n");
+		const tail = `\n\nSummarize the conversation above using the required format. UNIQUE_INSTRUCTION_TAIL.`;
+		const summarizationUserText = `<conversation>\n${body}\n</conversation>${tail}`;
+		expect(Buffer.byteLength(summarizationUserText, "utf8")).toBeGreaterThan(SOFT);
+
+		const summarizationContext: Context = {
+			systemPrompt: ["Summarize conversations between users and AI coding assistants."],
+			messages: [{ role: "user", content: summarizationUserText, timestamp: Date.now() }],
+		};
+		const payload = buildGitLabDuoWorkflowStartRequest("workflow-1", model, summarizationContext);
+
+		expect(Buffer.byteLength(payload.goal, "utf8")).toBeLessThan(SOFT);
+		expect(payload.goal).toContain("tool I/O elided");
+		expect(payload.goal).not.toContain("RESULT_0 first line");
+		expect(payload.goal).toContain("USER_TURN_0 keep-me");
+		expect(payload.goal).toContain(`USER_TURN_${turnCount - 1} keep-me`);
+	});
+	it("elides a tool_response block whose own output embeds a literal <tool_response> opener", () => {
+		const SOFT = 1_048_576;
+		// The bot-reported gap: a tool result (e.g. a read of XML/HTML or a prior
+		// transcript) embeds a literal block OPENER inside its raw `result.text`. A
+		// tempered-greedy body that forbids the opener mis-starts on the embedded opener,
+		// so the outer block's head leaks and the whole bulky block is left unshaken
+		// (the previous matcher elided NOTHING here). Anchoring the close to the segment
+		// boundary captures the whole outer block, embedded opener and all.
+		const turnCount = 1200;
+		const heavy = "z".repeat(900);
+		const segments: string[] = [];
+		for (let index = 0; index < turnCount; index++) {
+			segments.push(`Human: USER_TURN_${index} keep-me`);
+			segments.push(`Assistant: <invoke name="read"><parameter name="path">file_${index}.txt</parameter></invoke>`);
+			// The result text embeds a literal `<tool_response>` opener and a literal
+			// `<invoke` opener before the genuine segment-terminating close.
+			segments.push(
+				`Human: <tool_response>\nHEAD_${index} read of a transcript with <tool_response> and <invoke name="x"> ${heavy}\n</tool_response>`,
+			);
+		}
+		const body = segments.join("\n\n");
+		const tail = `\n\nSummarize the conversation above using the required format. UNIQUE_INSTRUCTION_TAIL.`;
+		const summarizationUserText = `<conversation>\n${body}\n</conversation>${tail}`;
+		expect(Buffer.byteLength(summarizationUserText, "utf8")).toBeGreaterThan(SOFT);
+
+		const summarizationContext: Context = {
+			systemPrompt: ["Summarize conversations between users and AI coding assistants."],
+			messages: [{ role: "user", content: summarizationUserText, timestamp: Date.now() }],
+		};
+		const payload = buildGitLabDuoWorkflowStartRequest("workflow-1", model, summarizationContext);
+
+		// Shaken under budget despite the embedded opener (the previous matcher left it at
+		// full size, eliding nothing).
+		expect(Buffer.byteLength(payload.goal, "utf8")).toBeLessThan(SOFT);
+		expect(payload.goal).toContain("UNIQUE_INSTRUCTION_TAIL.");
+		// The oldest tool block is fully elided — including the head text BEFORE the
+		// embedded opener, which a mis-starting matcher would have left behind.
+		expect(payload.goal).toContain("tool I/O elided");
+		expect(payload.goal).not.toContain("HEAD_0 ");
+		// Non-tool turns survive throughout.
+		expect(payload.goal).toContain("USER_TURN_0 keep-me");
+		expect(payload.goal).toContain(`USER_TURN_${turnCount - 1} keep-me`);
+	});
 	it("shakes xml-dialect tool I/O (invoke / tool_response), the form Duo models actually emit", () => {
 		// Every GitLab Duo model id resolves to the `xml` fallback dialect, whose tool I/O
 		// is `<invoke …>…</invoke>` and `<tool_response>…</tool_response>` — NOT the
@@ -582,6 +738,70 @@ describe("GitLab Duo Workflow provider protocol", () => {
 		expect(payload.goal).not.toContain("RESULT_0 ");
 		expect(payload.goal).toContain(`RESULT_${turnCount - 1} `);
 		expect(payload.goal).toContain("UNIQUE_INSTRUCTION_TAIL.");
+	});
+
+	it("preserves assistant prose before a trailing xml tool-call suffix", () => {
+		const SOFT = 1_048_576;
+		const turnCount = 900;
+		const heavy = "p".repeat(1200);
+		const segments: string[] = [];
+		for (let index = 0; index < turnCount; index++) {
+			segments.push(`Human: USER_TURN_${index} keep-me`);
+			segments.push(
+				`Assistant: ASSISTANT_TURN_${index} mentions literal <invoke in prose VISIBLE_AFTER_LITERAL_${index}.<invoke name="read"><parameter name="path">file_${index}.ts</parameter></invoke>`,
+			);
+			segments.push(`Human: <tool_response>\nRESULT_${index} ${heavy}\n</tool_response>`);
+		}
+		const body = segments.join("\n\n");
+		const summarizationUserText = `<conversation>\n${body}\n</conversation>\n\nSummarize using the required format. UNIQUE_INSTRUCTION_TAIL.`;
+		expect(Buffer.byteLength(summarizationUserText, "utf8")).toBeGreaterThan(SOFT);
+
+		const summarizationContext: Context = {
+			systemPrompt: ["Summarize conversations between users and AI coding assistants."],
+			messages: [{ role: "user", content: summarizationUserText, timestamp: Date.now() }],
+		};
+		const payload = buildGitLabDuoWorkflowStartRequest("workflow-1", model, summarizationContext);
+
+		expect(Buffer.byteLength(payload.goal, "utf8")).toBeLessThan(SOFT);
+		expect(payload.goal).toContain("tool I/O elided");
+		expect(payload.goal).toContain("ASSISTANT_TURN_0 mentions literal <invoke in prose VISIBLE_AFTER_LITERAL_0.");
+		expect(payload.goal).toContain(`ASSISTANT_TURN_${turnCount - 1} mentions literal <invoke in prose`);
+		expect(payload.goal).not.toContain("file_0.ts");
+		expect(payload.goal).not.toContain("RESULT_0 ");
+		expect(payload.goal).toContain("UNIQUE_INSTRUCTION_TAIL.");
+	});
+
+	it("elides a final xml tool block before the conversation wrapper close", () => {
+		const SOFT = 1_048_576;
+		const heavy = "z".repeat(SOFT + 10_000);
+		const summarizationUserText = `<conversation>\nAssistant: <invoke name="read"><parameter name="path">huge.txt</parameter></invoke>\n\nHuman: <tool_response>\nFINAL_RESULT ${heavy}\n</tool_response>\n</conversation>\n\nSummarize using the required format. UNIQUE_INSTRUCTION_TAIL.`;
+		expect(Buffer.byteLength(summarizationUserText, "utf8")).toBeGreaterThan(SOFT);
+
+		const summarizationContext: Context = {
+			systemPrompt: ["Summarize conversations between users and AI coding assistants."],
+			messages: [{ role: "user", content: summarizationUserText, timestamp: Date.now() }],
+		};
+		const payload = buildGitLabDuoWorkflowStartRequest("workflow-1", model, summarizationContext);
+
+		expect(Buffer.byteLength(payload.goal, "utf8")).toBeLessThan(SOFT);
+		expect(payload.goal).toContain("tool I/O elided");
+		expect(payload.goal).not.toContain("FINAL_RESULT");
+		expect(payload.goal).toContain("UNIQUE_INSTRUCTION_TAIL.");
+	});
+
+	it("does not elide user-authored XML blocks that only look like tool I/O", () => {
+		const SOFT = 1_048_576;
+		const huge = "u".repeat(SOFT + 50_000);
+		const summarizationUserText = `<conversation>\nHuman: <tool_response>\nUSER_AUTHORED_CONSTRAINT ${huge}\n</tool_response>\n</conversation>\n\nSummarize using the required format.`;
+		const summarizationContext: Context = {
+			systemPrompt: ["Summarize conversations between users and AI coding assistants."],
+			messages: [{ role: "user", content: summarizationUserText, timestamp: Date.now() }],
+		};
+		const payload = buildGitLabDuoWorkflowStartRequest("workflow-1", model, summarizationContext);
+
+		expect(payload.goal).toBe(summarizationUserText);
+		expect(payload.goal).toContain("USER_AUTHORED_CONSTRAINT");
+		expect(payload.goal).not.toContain("tool I/O elided");
 	});
 
 	it("never shakes non-tool content even when tool elision cannot reach the budget", () => {
@@ -1088,6 +1308,8 @@ describe("GitLab Duo Workflow WebSocket state machine", () => {
 		const sockets: GitLabDuoWorkflowWebSocketLike[] = [];
 		const startedWorkflowIds: string[] = [];
 		let closedCount = 0;
+		let pingCount = 0;
+		const heartbeatTimestamps: number[] = [];
 		const webSocketFactory: GitLabDuoWorkflowWebSocketFactory = () => {
 			const index = sockets.length;
 			const socket: GitLabDuoWorkflowWebSocketLike = {
@@ -1096,10 +1318,16 @@ describe("GitLab Duo Workflow WebSocket state machine", () => {
 				onerror: null,
 				onclose: null,
 				send(data) {
-					const parsed = JSON.parse(data) as { startRequest?: { workflowID?: string } };
+					const parsed = JSON.parse(data) as {
+						startRequest?: { workflowID?: string };
+						heartbeat?: { timestamp?: number };
+					};
 					if (parsed.startRequest?.workflowID) startedWorkflowIds.push(parsed.startRequest.workflowID);
+					if (parsed.heartbeat?.timestamp !== undefined) heartbeatTimestamps.push(parsed.heartbeat.timestamp);
 				},
-				ping() {},
+				ping() {
+					pingCount++;
+				},
 				close() {
 					closedCount++;
 				},
@@ -1118,26 +1346,186 @@ describe("GitLab Duo Workflow WebSocket state machine", () => {
 			return socket;
 		};
 
+		// Manual keepalive scheduler: capture the ping/heartbeat callbacks the provider
+		// registers via startKeepalives() and invoke them directly, so the cadence is
+		// driven deterministically without any real or faked clock. (Bun's fake timers
+		// cannot retroactively control an interval that socket.onopen already created,
+		// so a fake-timer approach would silently never fire these senders.)
+		const keepaliveCallbacks: (() => void)[] = [];
 		const stream = streamGitLabDuoWorkflow(model, context, {
 			apiKey: "[REDACTED]",
 			rootNamespaceId: "gid://gitlab/Group/1",
 			fetch: fetchImpl,
 			webSocketFactory,
-			idleTimeoutMs: 25,
+			// Connect timeout far above the keepalive cadence so the socket cannot die on
+			// the handshake guard; the test asserts the keepalive senders actually fire.
+			idleTimeoutMs: 5_000,
+			keepaliveScheduler: {
+				set: callback => {
+					keepaliveCallbacks.push(callback);
+					return callback;
+				},
+				clear: handle => {
+					const index = keepaliveCallbacks.indexOf(handle as () => void);
+					if (index >= 0) keepaliveCallbacks.splice(index, 1);
+				},
+			},
 		});
-		// Let the first socket open and the keepalive timers tick; with the old idle-read
-		// deadline this would have timed out and forced a fresh workflow. Now the socket
-		// stays open until the test explicitly closes it with a terminal frame.
-		await Bun.sleep(80);
+		// Let the real async setup (graphql/direct_access/create + socket open) resolve so
+		// the socket opens and startKeepalives() registers its ping + heartbeat callbacks.
+		for (let i = 0; i < 50 && keepaliveCallbacks.length < 2; i++) {
+			await Promise.resolve();
+		}
+		expect(sockets).toHaveLength(1);
+		expect(keepaliveCallbacks).toHaveLength(2);
+		// Tick the registered keepalive callbacks several times. With the old read-silence
+		// deadline this socket would have been treated as dead; now the ping + heartbeat
+		// senders fire on every tick and the socket stays open until the test closes it
+		// with a terminal frame. Deleting the senders would drop these counters to zero.
+		for (let tick = 0; tick < 3; tick++) {
+			for (const callback of [...keepaliveCallbacks]) callback();
+		}
 		expect(sockets).toHaveLength(1);
 		expect(closedCount).toBe(0);
 		expect(createCount).toBe(1);
 		expect(startedWorkflowIds).toEqual(["workflow-1"]);
+		expect(pingCount).toBeGreaterThanOrEqual(2);
+		expect(heartbeatTimestamps.length).toBeGreaterThanOrEqual(2);
 		// Complete the original workflow on the SAME socket.
 		sockets[0]?.onmessage?.(terminalGitLabDuoWorkflowMessage());
 		const result = await stream.result();
 		expect(stoppedWorkflowIds).toEqual([]);
 		expect(result.stopReason).not.toBe("error");
+	});
+	it("settles the stream when an opened socket fails keepalive sends", async () => {
+		const fetchImpl: FetchImpl = async (input: string | URL | Request, init?: RequestInit) => {
+			const url = String(input);
+			if (url.includes("/api/graphql")) {
+				return new Response(
+					JSON.stringify({
+						data: {
+							aiChatAvailableModels: {
+								defaultModel: { name: "Claude", ref: "claude_sonnet_4_6_vertex" },
+								selectableModels: [],
+								pinnedModel: null,
+							},
+						},
+					}),
+					{ status: 200 },
+				);
+			}
+			if (url.includes("/api/v4/ai/duo_workflows/direct_access")) {
+				return new Response(JSON.stringify({ gitlab_rails: { token: "rails-token" } }), { status: 200 });
+			}
+			if (url.includes("/api/v4/ai/duo_workflows/workflows") && init?.method === "POST") {
+				return new Response(JSON.stringify({ id: "workflow-1" }), { status: 200 });
+			}
+			return new Response("{}", { status: 200 });
+		};
+		const keepaliveCallbacks: (() => void)[] = [];
+		let startRequestSent = false;
+		const socket: GitLabDuoWorkflowWebSocketLike = {
+			onopen: null,
+			onmessage: null,
+			onerror: null,
+			onclose: null,
+			send(data) {
+				const parsed = JSON.parse(data) as { startRequest?: unknown; heartbeat?: unknown };
+				if (parsed.startRequest) {
+					startRequestSent = true;
+					return;
+				}
+				if (parsed.heartbeat) throw new Error("heartbeat send failed");
+			},
+			ping() {},
+			close() {},
+		};
+		const webSocketFactory: GitLabDuoWorkflowWebSocketFactory = () => {
+			queueMicrotask(() => socket.onopen?.(new Event("open")));
+			return socket;
+		};
+
+		const stream = streamGitLabDuoWorkflow(model, context, {
+			apiKey: "[REDACTED]",
+			rootNamespaceId: "gid://gitlab/Group/1",
+			fetch: fetchImpl,
+			webSocketFactory,
+			idleTimeoutMs: 60_000,
+			keepaliveScheduler: {
+				set: callback => {
+					keepaliveCallbacks.push(callback);
+					return callback;
+				},
+				clear: handle => {
+					const index = keepaliveCallbacks.indexOf(handle as () => void);
+					if (index >= 0) keepaliveCallbacks.splice(index, 1);
+				},
+			},
+		});
+		for (let i = 0; i < 50 && keepaliveCallbacks.length < 2; i++) {
+			await Promise.resolve();
+		}
+		expect(startRequestSent).toBe(true);
+		expect(keepaliveCallbacks).toHaveLength(2);
+		for (const callback of [...keepaliveCallbacks]) callback();
+
+		const result = await stream.result();
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toContain("heartbeat send failed");
+	});
+
+	it("settles the stream when the initial startRequest send fails on a fresh socket", async () => {
+		const fetchImpl: FetchImpl = async (input: string | URL | Request) => {
+			const url = String(input);
+			if (url.includes("/api/graphql")) {
+				return new Response(
+					JSON.stringify({
+						data: {
+							aiChatAvailableModels: {
+								defaultModel: { name: "Claude", ref: "claude_sonnet_4_6_vertex" },
+								selectableModels: [],
+								pinnedModel: null,
+							},
+						},
+					}),
+					{ status: 200 },
+				);
+			}
+			if (url.includes("/api/v4/ai/duo_workflows/direct_access")) {
+				return new Response(JSON.stringify({ gitlab_rails: { token: "rails-token" } }), { status: 200 });
+			}
+			if (url.includes("/api/v4/ai/duo_workflows/workflows")) {
+				return new Response(JSON.stringify({ id: "workflow-1" }), { status: 200 });
+			}
+			return new Response("{}", { status: 404 });
+		};
+		const socketReady = Promise.withResolvers<GitLabDuoWorkflowWebSocketLike>();
+		const socket: GitLabDuoWorkflowWebSocketLike = {
+			onopen: null,
+			onmessage: null,
+			onerror: null,
+			onclose: null,
+			send() {
+				throw new Error("socket closed before startRequest");
+			},
+			close() {},
+		};
+		const webSocketFactory: GitLabDuoWorkflowWebSocketFactory = () => {
+			socketReady.resolve(socket);
+			queueMicrotask(() => socket.onopen?.(new Event("open")));
+			return socket;
+		};
+
+		const stream = streamGitLabDuoWorkflow(model, context, {
+			apiKey: "[REDACTED]",
+			rootNamespaceId: "gid://gitlab/Group/1",
+			fetch: fetchImpl,
+			webSocketFactory,
+			idleTimeoutMs: 60_000,
+		});
+		await socketReady.promise;
+		const result = await stream.result();
+		expect(result.stopReason).toBe("error");
 	});
 
 	it("restarts on a fresh workflow when the server reports the max step limit", async () => {
@@ -1221,6 +1609,101 @@ describe("GitLab Duo Workflow WebSocket state machine", () => {
 		expect(createdWorkflowIds).toEqual(["workflow-1", "workflow-2"]);
 		expect(result.stopReason).not.toBe("error");
 		expect(result.errorMessage).toBeUndefined();
+	});
+
+	it("detects empty terminal output per fresh workflow attempt instead of using stale cumulative output", async () => {
+		const createdWorkflowIds: string[] = [];
+		let createCount = 0;
+		const fetchImpl: FetchImpl = async (input: string | URL | Request, init?: RequestInit) => {
+			const url = String(input);
+			if (url.includes("/api/graphql")) {
+				return new Response(
+					JSON.stringify({
+						data: {
+							aiChatAvailableModels: {
+								defaultModel: { name: "Claude", ref: "claude_sonnet_4_6_vertex" },
+								selectableModels: [],
+								pinnedModel: null,
+							},
+						},
+					}),
+					{ status: 200 },
+				);
+			}
+			if (url.includes("/api/v4/ai/duo_workflows/direct_access")) {
+				return new Response(JSON.stringify({ gitlab_rails: { token: "rails-token" } }), { status: 200 });
+			}
+			if (url.includes("/api/v4/ai/duo_workflows/workflows/") && init?.method === "PATCH") {
+				return new Response("{}", { status: 200 });
+			}
+			if (url.includes("/api/v4/ai/duo_workflows/workflows") && init?.method === "POST") {
+				createCount++;
+				const id = `workflow-${createCount}`;
+				createdWorkflowIds.push(id);
+				return new Response(JSON.stringify({ id }), { status: 200 });
+			}
+			return new Response("{}", { status: 404 });
+		};
+		const sockets: GitLabDuoWorkflowWebSocketLike[] = [];
+		const webSocketFactory: GitLabDuoWorkflowWebSocketFactory = () => {
+			const index = sockets.length;
+			const socket: GitLabDuoWorkflowWebSocketLike = {
+				onopen: null,
+				onmessage: null,
+				onerror: null,
+				onclose: null,
+				send() {},
+				close() {},
+			};
+			sockets.push(socket);
+			queueMicrotask(() => {
+				socket.onopen?.(new Event("open"));
+				if (index === 0) {
+					socket.onmessage?.(
+						new MessageEvent("message", {
+							data: JSON.stringify({
+								newCheckpoint: {
+									status: "RUNNING",
+									checkpoint: JSON.stringify({
+										channel_values: {
+											ui_chat_log: [{ message_type: "agent", content: "Partial from failed attempt" }],
+										},
+									}),
+								},
+							}),
+						}),
+					);
+					socket.onmessage?.(
+						new MessageEvent("message", {
+							data: JSON.stringify({
+								status: "FAILED",
+								error: "The workflow reached its maximum step limit and could not complete. Please try again with a more focused goal, or break the task into smaller steps.",
+							}),
+						}),
+					);
+				} else if (index === 1) {
+					// This fresh attempt emits an empty terminal. It must be treated as empty
+					// for THIS attempt even though the cumulative output still contains the
+					// prior attempt's partial text.
+					socket.onmessage?.(terminalGitLabDuoWorkflowMessage(""));
+				} else {
+					socket.onmessage?.(terminalGitLabDuoWorkflowMessage("Fresh complete"));
+				}
+			});
+			return socket;
+		};
+
+		const stream = streamGitLabDuoWorkflow(model, context, {
+			apiKey: "[REDACTED]",
+			rootNamespaceId: "gid://gitlab/Group/1",
+			fetch: fetchImpl,
+			webSocketFactory,
+		});
+		const result = await stream.result();
+
+		expect(createdWorkflowIds).toEqual(["workflow-1", "workflow-2", "workflow-3"]);
+		expect(result.stopReason).not.toBe("error");
+		expect(result.content.some(block => block.type === "text" && block.text.includes("Fresh complete"))).toBe(true);
 	});
 
 	it("retries once on a fresh workflow when the server returns the generic processing error", async () => {
@@ -3126,6 +3609,61 @@ describe("GitLab Duo Workflow WebSocket state machine", () => {
 		// `action` keeps the socket alive for the resume turn, so it is not closed here.
 		// One pending action committed for the resume turn.
 		expect(providerSessionState.active?.pendingActions?.map(action => action.requestID)).toEqual(["req-doc-read"]);
+	});
+
+	it("replaces id-less full checkpoint snapshots positionally instead of appending stale entries", async () => {
+		const socket: GitLabDuoWorkflowWebSocketLike = {
+			onopen: null,
+			onmessage: null,
+			onerror: null,
+			onclose: null,
+			send() {},
+			close() {},
+		};
+		const output: AssistantMessage = {
+			role: "assistant",
+			content: [],
+			api: "gitlab-duo-agent",
+			provider: "gitlab-duo-agent",
+			model: model.id,
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "stop",
+			timestamp: Date.now(),
+		};
+		const stream = new AssistantMessageEventStream();
+		const state: GitLabDuoWorkflowStreamState = { stream, output, started: true };
+		const streamPromise = runGitLabDuoWorkflowSocket(
+			socket,
+			buildGitLabDuoWorkflowStartRequest("workflow-1", model, context),
+			state,
+			{ apiKey: "[REDACTED]" },
+		);
+		socket.onopen?.(new Event("open"));
+		socket.onmessage?.(
+			new MessageEvent("message", {
+				data: JSON.stringify({
+					newCheckpoint: {
+						status: "RUNNING",
+						checkpoint: JSON.stringify({
+							channel_values: { ui_chat_log: [{ message_type: "agent", content: "O" }] },
+						}),
+					},
+				}),
+			}),
+		);
+		socket.onmessage?.(terminalGitLabDuoWorkflowMessage("OK"));
+
+		const result = await streamPromise;
+		const finalOutput = await stream.result();
+		expect(result).toBe("terminal");
+		expect(finalOutput.content).toContainEqual({ type: "text", text: "OK" });
 	});
 
 	it("does not emit an empty assistant continuation when a terminal checkpoint ends after a tool boundary", async () => {
