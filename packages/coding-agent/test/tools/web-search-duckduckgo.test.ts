@@ -44,6 +44,136 @@ describe("DuckDuckGo web search pagination", () => {
 			return new Response(html, { status: 200 });
 		};
 
+		await searchDuckDuckGo({ ...makeParams("how to fix bug in code", fetchMock), recency: "week" });
+
+		expect(captured.url).toBe("https://html.duckduckgo.com/html/");
+		expect(capturedInit?.method).toBe("POST");
+		const form = new URLSearchParams(capturedInit?.body as string);
+		expect(form.get("q")).toBe("how to fix bug in code");
+		expect(form.get("kl")).toBe("us-en");
+		expect(form.get("b")).toBe("");
+		expect(form.get("df")).toBe("w");
+		const headers = capturedInit?.headers as Record<string, string>;
+		expect(headers["Content-Type"]).toBe("application/x-www-form-urlencoded");
+		expect(headers["User-Agent"]).toContain("Mozilla/5.0");
+		expect(headers.Referer).toBe("https://html.duckduckgo.com/");
+		expect(headers["Accept-Language"]).toContain("en");
+		expect(headers["Sec-Fetch-Mode"]).toBe("navigate");
+		expect(headers["Sec-Ch-Ua"]).toContain("Chromium");
+	});
+
+	it("omits the df form param when no recency is requested", async () => {
+		let capturedInit: RequestInit | undefined;
+		const fetchMock: FetchImpl = (_input, init) => {
+			capturedInit = init;
+			return Promise.resolve(
+				new Response(htmlPage({ url: "https://example.com/x", title: "X" }), {
+					status: 200,
+					headers: { "Content-Type": "text/html" },
+				}),
+			);
+		};
+
+		await searchDuckDuckGo(makeParams("plain query", fetchMock));
+
+		const form = new URLSearchParams(capturedInit?.body as string);
+		expect(form.has("df")).toBe(false);
+	});
+
+	it("parses result blocks, unwraps DDG redirect URLs, and clamps to numSearchResults", async () => {
+		const fetchMock: FetchImpl = () =>
+			Promise.resolve(
+				new Response(
+					htmlPage(
+						{
+							url: "https://example.com/first",
+							title: "First &amp; result",
+							snippet: "Snippet <b>one</b>",
+						},
+						{ url: "https://example.com/second", title: "Second" },
+						{ url: "https://example.com/third", title: "Third" },
+					),
+					{ status: 200, headers: { "Content-Type": "text/html" } },
+				),
+			);
+
+		const response = await searchDuckDuckGo({ ...makeParams("multi", fetchMock), numSearchResults: 2 });
+
+		expect(response.provider).toBe("duckduckgo");
+		expect(response.answer).toBeUndefined();
+		expect(response.sources).toEqual([
+			{
+				title: "First & result",
+				url: "https://example.com/first",
+				snippet: "Snippet one",
+			},
+			{
+				title: "Second",
+				url: "https://example.com/second",
+				snippet: undefined,
+			},
+		]);
+	});
+
+	it("deduplicates results that share the same target URL", async () => {
+		const fetchMock: FetchImpl = () =>
+			Promise.resolve(
+				new Response(
+					htmlPage(
+						{ url: "https://example.com/dup", title: "First copy", snippet: "one" },
+						{ url: "https://example.com/dup", title: "Second copy", snippet: "two" },
+						{ url: "https://example.com/unique", title: "Other" },
+					),
+					{ status: 200, headers: { "Content-Type": "text/html" } },
+				),
+			);
+
+		const response = await searchDuckDuckGo(makeParams("dup query", fetchMock));
+
+		expect(response.sources.map(s => s.url)).toEqual(["https://example.com/dup", "https://example.com/unique"]);
+	});
+
+	it("clamps oversized result limits to the provider maximum", async () => {
+		const many = Array.from({ length: 40 }, (_, i) => ({
+			url: `https://example.com/r-${i}`,
+			title: `Result ${i}`,
+		}));
+		const fetchMock: FetchImpl = () =>
+			Promise.resolve(
+				new Response(htmlPage(...many), {
+					status: 200,
+					headers: { "Content-Type": "text/html" },
+				}),
+			);
+
+		const response = await searchDuckDuckGo({ ...makeParams("clamp", fetchMock), numSearchResults: 999 });
+
+		expect(response.sources).toHaveLength(20);
+		expect(response.sources.at(0)?.url).toBe("https://example.com/r-0");
+		expect(response.sources.at(-1)?.url).toBe("https://example.com/r-19");
+	});
+
+	it("supports unwrapped result hrefs (sponsored/instant rows)", async () => {
+		const html = `<div class="result"><h2 class="result__title">
+			<a class="result__a" href="https://direct.example/page">Direct</a>
+		</h2></div>`;
+		const fetchMock: FetchImpl = () =>
+			Promise.resolve(new Response(html, { status: 200, headers: { "Content-Type": "text/html" } }));
+
+		const response = await searchDuckDuckGo(makeParams("direct", fetchMock));
+
+		expect(response.sources).toEqual([{ title: "Direct", url: "https://direct.example/page", snippet: undefined }]);
+	});
+
+	it("throws a clear SearchProviderError when DDG serves the anomaly modal", async () => {
+		const fetchMock: FetchImpl = () =>
+			Promise.resolve(
+				new Response(anomalyPage(), {
+					status: 202,
+					headers: { "Content-Type": "text/html" },
+				}),
+			);
+
 		try {
 			const response = await searchDuckDuckGo({
 				query: "open source software",
