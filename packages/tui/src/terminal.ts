@@ -13,14 +13,18 @@ import {
 import { setKittyProtocolActive } from "./keys";
 import { StdinBuffer } from "./stdin-buffer";
 import {
-	isInsideTerminalMultiplexer,
+	detectTerminalId,
+	isInsideTmux,
 	NotifyProtocol,
 	setCellDimensions,
 	setOsc99Supported,
 	TERMINAL,
 } from "./terminal-capabilities";
-import { isInsideTmux, wrapTmuxPassthrough } from "./tmux";
-import { setHangulCompatibilityJamoWidth } from "./utils";
+import {
+	type HangulCompatibilityJamoWidth,
+	setHangulCompatibilityJamoWidth,
+	setWarpNarrowStatusGlyphsActive,
+} from "./utils";
 
 const TERMINAL_PROGRESS_KEEPALIVE_MS = 1000;
 const TERMINAL_PROGRESS_ACTIVE_SEQUENCE = "\x1b]9;4;3\x07";
@@ -36,6 +40,16 @@ function shouldPollWindowsTerminalAppearance(env: NodeJS.ProcessEnv = Bun.env): 
 	if (!env.WT_SESSION) return false;
 	return !env.TERM_PROGRAM || env.TERM_PROGRAM.toLowerCase() === "windows_terminal";
 }
+/**
+ * Warp renders a handful of status-line glyphs at 1 cell that `Bun.stringWidth`
+ * (and UAX#11) report wider, so the editor's top-border math underfills by the
+ * delta and the renderer truncates the over-Bun-wide line — dropping the right
+ * corner. See {@link setWarpNarrowStatusGlyphsActive} and issue #3885.
+ */
+export function resolveWarpNarrowStatusGlyphsActiveFromTerminalIdentity(env: NodeJS.ProcessEnv = Bun.env): boolean {
+	return detectTerminalId(env) === "warp";
+}
+
 /**
  * Maximum encoded UTF-8 bytes per `process.stdout.write` call on Windows.
  *
@@ -875,9 +889,9 @@ export class ProcessTerminal implements Terminal {
 		// The query handler intercepts input temporarily, then installs the user's handler
 		// See: https://sw.kovidgoyal.net/kitty/keyboard-protocol/
 		this.#queryAndEnableKittyProtocol();
-		// Explicit probes are safe only after their response parser and stdin
-		// data handler are installed. Keep this false throughout temporary stops.
-		this.#active = true;
+		setHangulCompatibilityJamoWidth(resolveHangulCompatibilityJamoWidthFromTerminalIdentity());
+		setWarpNarrowStatusGlyphsActive(resolveWarpNarrowStatusGlyphsActiveFromTerminalIdentity());
+
 		// Query terminal background color via OSC 11 for dark/light detection.
 		// Uses DA1 (Primary Device Attributes) as a sentinel: terminals process
 		// sequences in order, so if DA1 arrives before OSC 11 response,

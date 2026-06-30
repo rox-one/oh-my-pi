@@ -25,24 +25,6 @@ afterAll(() => {
 	setProjectDir(originalProjectDir);
 });
 
-function withTermProgram(value: string | undefined, run: () => void): void {
-	const previous = Bun.env.TERM_PROGRAM;
-	if (value === undefined) {
-		delete Bun.env.TERM_PROGRAM;
-	} else {
-		Bun.env.TERM_PROGRAM = value;
-	}
-	try {
-		run();
-	} finally {
-		if (previous === undefined) {
-			delete Bun.env.TERM_PROGRAM;
-		} else {
-			Bun.env.TERM_PROGRAM = previous;
-		}
-	}
-}
-
 /** Minimal SegmentContext factory — only path/git fields matter for these tests. */
 function createCtx(overrides?: {
 	pathMaxLength?: number;
@@ -262,22 +244,6 @@ describe("status line focused-agent dimming", () => {
 		expect(border).toContain(`\x1b[22m${theme.sep.powerlineRight}\x1b[0m\x1b[2m`);
 		expect(border).toContain("\x1b[0m\x1b[2m");
 		expect(border).toEndWith("\x1b[22m");
-	});
-	it("uses Warp's one-cell status glyph width for the editor border budget", () => {
-		withTermProgram("WarpTerminal", () => {
-			const component = new StatusLineComponent(createStatusLineSession("cache 💾"));
-			component.updateSettings({
-				preset: "custom",
-				leftSegments: ["session_name"],
-				rightSegments: [],
-				separator: "ascii",
-			});
-
-			const border = component.getTopBorder(80);
-
-			expect(border.content).toContain("💾");
-			expect(border.width).toBe(visibleWidth(border.content) - 1);
-		});
 	});
 });
 

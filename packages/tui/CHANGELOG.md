@@ -556,6 +556,9 @@
 ### Added
 
 - Added `Editor.submit()` to allow programmatic composer submission, enabling integration with speech input and other automated flows.
+### Added
+
+- Added `setWarpNarrowStatusGlyphsActive` runtime override and per-glyph correction in `visibleWidth`, enabled automatically on `TERM_PROGRAM=WarpTerminal`. Brings TS-side cell-width measurements in line with Warp's narrower rendering for the status-line glyph set used by the editor top border ([#3885](https://github.com/can1357/oh-my-pi/issues/3885)).
 
 ## [16.2.7] - 2026-06-30
 

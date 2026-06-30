@@ -4,7 +4,7 @@
 
 ### Fixed
 
-- Fixed Warp editor border alignment by measuring reported one-cell status glyphs with Warp-compatible widths ([#3885](https://github.com/can1357/oh-my-pi/issues/3885)).
+- Fixed editor top-border underfill in Warp by registering a Warp-aware visible-width override for status glyphs whose Bun-reported width disagrees with Warp's rendered cell count ([#3885](https://github.com/can1357/oh-my-pi/issues/3885)).
 
 ## [16.2.7] - 2026-06-30
 

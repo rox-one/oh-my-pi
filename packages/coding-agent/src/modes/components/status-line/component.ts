@@ -1,7 +1,7 @@
 import * as path from "node:path";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage, UsageLimit, UsageReport } from "@oh-my-pi/pi-ai";
-import { type Component, detectTerminalId, truncateToWidth, visibleWidth } from "@oh-my-pi/pi-tui";
+import { type Component, truncateToWidth, visibleWidth } from "@oh-my-pi/pi-tui";
 import { getProjectDir } from "@oh-my-pi/pi-utils";
 import { $ } from "bun";
 import { settings } from "../../../config/settings";
@@ -329,33 +329,6 @@ function hasPathSegment(segments: readonly StatusLineSegmentId[]): boolean {
 
 function hasGitBackedSegment(segments: readonly StatusLineSegmentId[]): boolean {
 	return hasGitSegment(segments) || hasPrSegment(segments);
-}
-// Warp reports these status glyphs as one terminal cell; use that width only for
-// the editor border budget so box-drawing fill still lands on the right corner.
-const WARP_ONE_CELL_STATUS_GLYPH_DELTAS = new Map(
-	(["⬢", "◕", "⑂", "💾", "◫", "⟲", "⏱"] as const)
-		.map(glyph => [glyph, 1 - visibleWidth(glyph)] as const)
-		.filter(([, delta]) => delta !== 0),
-);
-
-function countOccurrences(text: string, needle: string): number {
-	let count = 0;
-	for (let index = text.indexOf(needle); index !== -1; index = text.indexOf(needle, index + needle.length)) {
-		count++;
-	}
-	return count;
-}
-
-function statusLineWidth(content: string): number {
-	const width = visibleWidth(content);
-	if (detectTerminalId() !== "warp" || WARP_ONE_CELL_STATUS_GLYPH_DELTAS.size === 0) return width;
-
-	const plain = Bun.stripANSI(content);
-	let delta = 0;
-	for (const [glyph, glyphDelta] of WARP_ONE_CELL_STATUS_GLYPH_DELTAS) {
-		delta += countOccurrences(plain, glyph) * glyphDelta;
-	}
-	return Math.max(0, width + delta);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -2231,7 +2204,7 @@ export class StatusLineComponent implements Component {
 		}
 		return {
 			content,
-			width: statusLineWidth(content),
+			width: visibleWidth(content),
 		};
 	}
 
