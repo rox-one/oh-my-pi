@@ -2,6 +2,78 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Replaced the global `serviceTier` setting with `tier.openai`, `tier.anthropic`, and `tier.google` for granular control
+- Updated `/fast` to target the service-tier family of the currently selected model
+- Updated subagent and advisor tier configuration to use the new per-family setting structure
+- Removed `fastModeScope` setting, as per-family scoping is now natively supported via the `tier.*` settings
+
+- Improved binary file detection and terminal handling to prevent corruption from non-UTF-8 content, and updated file summaries to explicitly note skipped binary files.
+- Enhanced context compaction (snapcompact) to resolve shapes contextually based on rendered text content.
+- Reduced the in-process latency between submitting a message and the first streamed token by deduplicating per-turn non-message token estimation (tool-schema serialization now runs once per prompt instead of three times) and skipping the pre-prompt compaction token estimate when compaction is disabled.
+- Auto thinking no longer blocks turn start on the difficulty classifier: classification races a short pre-dispatch deadline, so a fast classifier still pins the current turn while a slow one runs the turn at the carried/provisional effort and applies its result to the next turn instead of stalling for up to the classification timeout.
+
+### Fixed
+
+- Fixed an issue where CJK (Chinese, Japanese, Korean) history could become unrenderable during repeated context compactions.
+- Fixed a memory exhaustion bug in the TUI when using `/resume` on large previous sessions.
+- Fixed an issue where the `irc` inbox missed messages that arrived while the recipient agent was already running.
+- Fixed a startup hang caused by system-prompt GPU detection blocking and repeatedly running failed probes.
+- Improved error reporting for `omp tiny-models download` by displaying the actual worker-side download error.
+- Resolved status inconsistencies between `/extensions`, `/mcp list`, and the dashboard, ensuring MCP server states, allowlists/denylists, and configuration files (like `mcp.json`) stay fully synchronized.
+- Improved branch-mode task merges to preserve the agent's original commit history (messages and authors) and fixed a bug where merges were rejected due to unrelated dirty changes in the parent checkout.
+
+## [16.2.6] - 2026-06-29
+
+### Changed
+
+- Optimized argument streaming performance by throttling JSON re-parsing for renderers that do not require raw input.
+
+### Fixed
+
+- Fixed memory leaks in the benchmark CLI by ensuring provider sessions are properly closed upon completion.
+- Fixed TUI rendering lag and shimmer frame starvation during streamed tool-call argument previews.
+- Fixed llama.cpp discovery mapping unlimited output limits (max_tokens = -1 / n_predict = -1) to the generic 32K cap instead of the actual discovered runtime context window.
+- Fixed memory exhaustion on Ctrl+C flush for large resumed sessions with repeated compaction summaries, and improved fork session previews starting with developer or assistant turns.
+- Fixed omp search applying web search provider filters before resolving its implicit provider chain.
+- Fixed Gemini web search to support standard GEMINI_API_KEY developer API credentials for native Google Search grounding, in addition to Cloud Code Assist OAuth.
+- Fixed the bash interceptor blocking echo and printf redirects to standard device sinks (such as /dev/null, /dev/tty, /dev/stdout, and /dev/stderr).
+- Fixed session file size inflation in the edit tool by pruning extremely large oldText and newText snapshots (over 32 KB) from tool-result details, while preserving visible diffs, paths, lines, and diagnostic metadata.
+- Fixed Windows MCP stdio launches for PATH-resolved npx.cmd shims by preserving the cmd.exe wrapper path to keep subprocess stdio attached.
+- Fixed the DuckDuckGo web_search provider returning empty results for non-encyclopedic queries by switching from the Instant Answer API to parsing the HTML frontend, and added clear error handling for bot-challenge throttling.
+- Fixed Windows --extension paths with spaces or \\?\ prefixes being truncated or incorrectly passed to Bun import/spawn APIs.
+- Fixed /mcp reauth compatibility with Cloudflare by aligning OAuth prompt behavior with the reference MCP SDK and updating the client label to oh-my-pi.
+
+## [16.2.5] - 2026-06-28
+
+### Changed
+
+- Status line now collapses a linked git worktree path to the project name with a worktree icon, leaving the git segment to show the branch once instead of repeating it in the path.
+
+### Fixed
+
+- Fixed Ollama and llama.cpp discovery overestimating local context windows by using model training metadata instead of the runtime `num_ctx` / `n_ctx`, which could let compaction retry prompts that llama.cpp rejects as over context. ([#3752](https://github.com/can1357/oh-my-pi/issues/3752))
+- Fixed isolated subagent worktrees embedding long task ids and `merged` in the working path; isolation now uses compact hashed segments with an `m` mount dir. ([#3756](https://github.com/can1357/oh-my-pi/issues/3756))
+- Fixed recoverable context-overflow compaction keeping the failed assistant error turn in visible session history after scheduling the retry. ([#3747](https://github.com/can1357/oh-my-pi/issues/3747))
+- Fixed editing a file read from outside the workspace (e.g. `~/.claude/settings.json`) failing with "File not found": the read snapshot header now carries the full out-of-workspace path so the edit resolves it directly instead of against the working directory.
+- Fixed subagents spawned with an output schema (`agent(..., schema=...)`, `task` with structured output) failing with `schema_violation: missing required fields` since the typed-yield rework: a `type: "result"` finalize carrying the full object was assembled as a section named `result`, nesting the payload one level deep. String-typed yields are now treated as terminal finalizers (their data is the complete result), only array-typed yields form accumulating sections, and a data-less finalize keeps accumulated sections instead of collapsing to the last assistant turn.
+- Fixed the per-provider concurrency cap (e.g. `providers.ollama-cloud.maxConcurrency`) bracketing the whole subagent lifecycle, which deadlocked any spawn tree wider than the cap because parents held every slot while waiting for children queued on the same cap. The semaphore now wraps each provider HTTP request, so a parent's slot frees between turns and child subagents can acquire while their parent's tool calls are running. ([#3749](https://github.com/can1357/oh-my-pi/issues/3749))
+- Fixed Ctrl+Q / Ctrl+Enter follow-up submissions sending the literal `[Paste #N]` marker instead of the expanded paste body ([#3737](https://github.com/can1357/oh-my-pi/issues/3737)).
+
+## [16.2.4] - 2026-06-28
+
+### Fixed
+
+- Fixed todo-reminder HUD rendering outside durable chat history while preserving native collapsing and auto-clear behavior.
+- Fixed goal-mode continuations losing track of persisted todo progress, ensuring autonomous goal turns reconcile stale in-progress items before moving to subsequent tasks.
+- Fixed the /move <dir> command to correctly relocate the current session and its artifacts to the target directory, allowing /resume to work seamlessly from the new location.
+- Fixed omp update leaving behind stale Bun install-cache directories for globally installed packages.
+- Fixed a reconnection loop issue in /collab sessions caused by oversized entries (such as large tool outputs) by truncating replicated payloads that exceed 1 MB.
+- Fixed autolearn and local memory writes mutating Anthropic prompt-cache prefixes mid-session, ensuring prompt injections remain session-stable.
+
+## [16.2.3] - 2026-06-28
+
 ### Added
 
 - Added experimental workspace identifier modes for sharing default sessions and per-project memories by Git remote or root commit.

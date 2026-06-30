@@ -368,8 +368,488 @@ import { LoopGuards, type StreamGuardsHost, StreamingEditGuard } from "./stream-
 import { TodoTracker, type TodoTrackerHost } from "./todo-tracker";
 import { TtsrCoordinator, type TtsrCoordinatorHost } from "./ttsr-coordinator";
 
-const PLAN_MODE_REMINDER_MAX = 3;
-const POST_PROMPT_DRAIN_TIMEOUT_MS = 5_000;
+// A side-channel assistant response is signed for the hidden prompt/history that
+// produced it. If we persist that response under a different user turn, native
+// replay anchors become invalid; keep only visible, non-cryptographic content.
+function sanitizeAssistantForReparentedHistory(message: AssistantMessage): AssistantMessage {
+	const content: AssistantMessage["content"] = [];
+	for (const block of message.content) {
+		if (block.type === "redactedThinking") continue;
+		if (block.type === "thinking") {
+			content.push({ type: "thinking", thinking: block.thinking });
+			continue;
+		}
+		content.push(block);
+	}
+	return { ...message, content, providerPayload: undefined };
+}
+
+/** Session-specific events that extend the core AgentEvent */
+export type AgentSessionEvent =
+	| AgentEvent
+	| {
+			type: "auto_compaction_start";
+			reason: "threshold" | "overflow" | "idle" | "incomplete";
+			action: "context-full" | "handoff" | "shake" | "snapcompact";
+	  }
+	| {
+			type: "auto_compaction_end";
+			action: "context-full" | "handoff" | "shake" | "snapcompact";
+			result: CompactionResult | undefined;
+			aborted: boolean;
+			willRetry: boolean;
+			errorMessage?: string;
+			/** True when compaction was skipped for a benign reason (no model, no candidates, nothing to compact). */
+			skipped?: boolean;
+	  }
+	| {
+			type: "auto_retry_start";
+			attempt: number;
+			maxAttempts: number;
+			delayMs: number;
+			errorMessage: string;
+			errorId?: number;
+	  }
+	| { type: "auto_retry_end"; success: boolean; attempt: number; finalError?: string }
+	| { type: "retry_fallback_applied"; from: string; to: string; role: string }
+	| { type: "retry_fallback_succeeded"; model: string; role: string }
+	| { type: "ttsr_triggered"; rules: Rule[] }
+	| { type: "todo_reminder"; todos: TodoItem[]; attempt: number; maxAttempts: number }
+	| { type: "todo_auto_clear" }
+	| { type: "irc_message"; message: CustomMessage }
+	| { type: "notice"; level: "info" | "warning" | "error"; message: string; source?: string }
+	| {
+			type: "thinking_level_changed";
+			thinkingLevel: ThinkingLevel | undefined;
+			/** The user-configured selector when it differs from the effective level (e.g. `auto`). */
+			configured?: ConfiguredThinkingLevel;
+			/** The level `auto` resolved to this turn, once classified. */
+			resolved?: Effort;
+	  }
+	| { type: "goal_updated"; goal: Goal | null; state?: GoalModeState };
+/** Listener function for agent session events */
+export type AgentSessionEventListener = (event: AgentSessionEvent) => void;
+
+const UNEXPECTED_STOP_MAX_RETRIES = 3;
+const UNEXPECTED_STOP_TIMEOUT_MS = 4000;
+const EMPTY_STOP_MAX_RETRIES = 3;
+const RETRY_BACKOFF_MAX_DELAY_MS = 8_000;
+
+type CompactionCheckResult = Readonly<{
+	deferredHandoff: boolean;
+	continuationScheduled: boolean;
+	automaticContinuationBlocked?: boolean;
+}>;
+
+const COMPACTION_CHECK_NONE: CompactionCheckResult = {
+	deferredHandoff: false,
+	continuationScheduled: false,
+};
+const COMPACTION_CHECK_DEFERRED_HANDOFF: CompactionCheckResult = {
+	deferredHandoff: true,
+	continuationScheduled: true,
+};
+const COMPACTION_CHECK_CONTINUATION: CompactionCheckResult = {
+	deferredHandoff: false,
+	continuationScheduled: true,
+};
+const COMPACTION_CHECK_BLOCK_AUTOMATIC_CONTINUATION: CompactionCheckResult = {
+	deferredHandoff: false,
+	continuationScheduled: false,
+	automaticContinuationBlocked: true,
+};
+
+/**
+ * Per-turn prune cache window. A tool result whose all-message suffix exceeds
+ * this is in the warm, already-sent prompt-cache prefix: re-writing it costs the
+ * cacheWrite premium on the whole suffix. Per-turn passes only reclaim inside
+ * this tail (matches the supersede pass's default `suffixTokenLimit`); deeper
+ * stale/age victims are left to compaction/shake, which rebuild the cache anyway.
+ */
+const PRUNE_CACHE_WARM_SUFFIX_TOKENS = 8_000;
+
+/**
+ * Idle gap after which the supersede pass may flush the whole sent region (the
+ * provider cache is cold, so re-writing it is free). MUST exceed the maximum
+ * Anthropic prompt-cache TTL — "long" retention (the OAuth default) is 1h — or a
+ * still-warm prefix is busted by the flush. 90 min leaves margin over the 1h TTL.
+ */
+const PRUNE_IDLE_FLUSH_MS = 90 * 60_000;
+export type CommandMetadataChangedListener = () => void | Promise<void>;
+export type AsyncJobSnapshotItem = Pick<AsyncJob, "id" | "type" | "status" | "label" | "startTime">;
+
+const RETRY_BACKOFF_JITTER_RATIO = 0.25;
+/**
+ * Hysteresis band for the post-maintenance "did we actually create headroom?"
+ * check shared by the shake tail and the context-full / snapcompact tail. A
+ * pass counts as having resolved threshold pressure only when residual context
+ * lands at or below `COMPACTION_RECOVERY_BAND × threshold`. Re-checking against
+ * the raw threshold lets a pass keep reclaiming a trickle of the previous
+ * turn's output and land just under the line every turn, sustaining the
+ * auto-continue dead loop reported in #2275; the same band stops the
+ * context-full / snapcompact tail from re-firing on a history whose single
+ * most-recent kept turn already exceeds the threshold (the snapcompact thrash).
+ */
+const COMPACTION_RECOVERY_BAND = 0.8;
+
+function calculateRetryBackoffDelayMs(baseDelayMs: number, attempt: number): number {
+	const cappedDelayMs = Math.min(Math.max(0, baseDelayMs) * 2 ** Math.max(0, attempt - 1), RETRY_BACKOFF_MAX_DELAY_MS);
+	const jitter = 1 - Math.random() * RETRY_BACKOFF_JITTER_RATIO;
+	return cappedDelayMs * jitter;
+}
+
+/**
+ * Slack added past a sibling credential's block expiry before retrying, so
+ * the next getApiKey lands after the block has actually lapsed.
+ */
+const SIBLING_UNBLOCK_BUFFER_MS = 1_000;
+const NON_WHITESPACE_RE = /\S/;
+
+function hasNonWhitespace(value: string): boolean {
+	return NON_WHITESPACE_RE.test(value);
+}
+
+export interface AsyncJobSnapshot {
+	running: AsyncJobSnapshotItem[];
+	recent: AsyncJobSnapshotItem[];
+	delivery: AsyncJobDeliveryState;
+}
+
+export type { ShakeMode, ShakeResult };
+
+// ============================================================================
+// Types
+// ============================================================================
+
+export interface AgentSessionConfig {
+	agent: Agent;
+	sessionManager: SessionManager;
+	settings: Settings;
+	/** Whether the caller explicitly requested yolo/auto-approve behavior for this session. */
+	autoApprove?: boolean;
+	/** Models to cycle through with Ctrl+P (from --models flag) */
+	scopedModels?: Array<{ model: Model; thinkingLevel?: ThinkingLevel }>;
+	/** Initial session thinking selector. */
+	thinkingLevel?: ConfiguredThinkingLevel;
+	/** Initial per-family service tiers (OpenAI / Anthropic / Google) for the live session. */
+	serviceTierByFamily?: ServiceTierByFamily;
+	/** Prompt templates for expansion */
+	promptTemplates?: PromptTemplate[];
+	/** File-based slash commands for expansion */
+	slashCommands?: FileSlashCommand[];
+	/** Extension runner (created in main.ts with wrapped tools) */
+	extensionRunner?: ExtensionRunner;
+	/** Loaded skills (already discovered by SDK) */
+	skills?: Skill[];
+	/** Skill loading warnings (already captured by SDK) */
+	skillWarnings?: SkillWarning[];
+	/** Custom commands (TypeScript slash commands) */
+	customCommands?: LoadedCustomCommand[];
+	skillsSettings?: SkillsSettings;
+	/** Model registry for API key resolution and model discovery */
+	modelRegistry: ModelRegistry;
+	/** Tool registry for LSP and settings */
+	toolRegistry?: Map<string, AgentTool>;
+	/** Tool names whose current registry entry is still the built-in implementation. */
+	builtInToolNames?: Iterable<string>;
+	/** Current session pre-LLM message transform pipeline */
+	transformContext?: (messages: AgentMessage[], signal?: AbortSignal) => AgentMessage[] | Promise<AgentMessage[]>;
+	/**
+	 * Per-request transform applied after `convertToLlm` and before the
+	 * provider call. Used for snapcompact, secret obfuscation, and image
+	 * clamping. When supplied via {@link createAgentSession}, the advisor agent
+	 * inherits this so its requests undergo the same shaping as the main turn.
+	 */
+	transformProviderContext?: (context: Context, model: Model) => Context | Promise<Context>;
+	/**
+	 * Stream wrapper passed to side-channel requests (`/btw`, `/omfg`, IRC
+	 * auto-replies, and handoff generation) so they apply the same provider
+	 * shaping and host-level request wrappers as normal agent turns. Defaults
+	 * to plain `streamSimple` when omitted.
+	 */
+	sideStreamFn?: StreamFn;
+	/**
+	 * Stream wrapper passed to the advisor agent so its requests apply the
+	 * session's `providers.openrouterVariant`, `providers.antigravityEndpoint`,
+	 * `providers.maxInFlightRequests`, and `model.loopGuard.*` settings —
+	 * keeping OpenRouter sticky-routing / response caching consistent with the
+	 * main agent. Defaults to plain `streamSimple` when omitted.
+	 */
+	advisorStreamFn?: StreamFn;
+	/** Hint that OpenAI Codex requests should prefer websocket transport when supported. */
+	preferWebsockets?: boolean;
+	/** Provider payload hook used by the active session request path */
+	onPayload?: SimpleStreamOptions["onPayload"];
+	/** Provider response hook used by the active session request path */
+	onResponse?: SimpleStreamOptions["onResponse"];
+	/** Raw SSE hook used by the active session request path */
+	onSseEvent?: SimpleStreamOptions["onSseEvent"];
+	/** Per-session raw SSE diagnostic buffer */
+	rawSseDebugBuffer?: RawSseDebugBuffer;
+	/** Current session message-to-LLM conversion pipeline */
+	convertToLlm?: (messages: AgentMessage[]) => Message[] | Promise<Message[]>;
+	/** System prompt builder that can consider tool availability. Returns ordered provider-facing blocks. */
+	rebuildSystemPrompt?: (toolNames: string[], tools: Map<string, AgentTool>) => Promise<{ systemPrompt: string[] }>;
+	/** Rebuild the SSH tool from current capability discovery results. */
+	reloadSshTool?: () => Promise<AgentTool | null>;
+	requestedToolNames?: ReadonlySet<string>;
+	/**
+	 * Optional accessor for live MCP server instructions. Read by the session's
+	 * `rebuildSystemPrompt`-skip optimization to detect server-side instruction
+	 * changes (e.g. an MCP server upgrade) that would otherwise pass the tool-set
+	 * signature comparison and silently keep a stale prompt cached.
+	 */
+	getMcpServerInstructions?: () => Map<string, string> | undefined;
+	/** Enable hidden-by-default MCP tool discovery for this session. */
+	mcpDiscoveryEnabled?: boolean;
+	/** MCP tool names to activate for the current session when discovery mode is enabled. */
+	initialSelectedMCPToolNames?: string[];
+	/** Whether constructor-provided MCP defaults should be persisted immediately. */
+	persistInitialMCPToolSelection?: boolean;
+	/** MCP server names whose tools should seed discovery-mode sessions whenever those servers are connected. */
+	defaultSelectedMCPServerNames?: string[];
+	/** MCP tool names that should seed brand-new sessions created from this AgentSession. */
+	defaultSelectedMCPToolNames?: string[];
+	/** TTSR manager for time-traveling stream rules */
+	ttsrManager?: TtsrManager;
+	/** Secret obfuscator for deobfuscating streaming edit content */
+	obfuscator?: SecretObfuscator;
+	/** Inherited eval executor session id from a parent agent. */
+	parentEvalSessionId?: string;
+	/** Logical owner for retained eval kernels created by this session. */
+	evalKernelOwnerId?: string;
+	/**
+	 * AsyncJobManager that this session installed as the process-global instance.
+	 * Only set for top-level sessions; subagents inherit the parent's manager and
+	 * **MUST NOT** dispose it on their own teardown.
+	 */
+	ownedAsyncJobManager?: AsyncJobManager;
+	/**
+	 * AsyncJobManager reachable by this session for scoped job actions.
+	 *
+	 * Top-level owners receive their own manager, subagents receive the inherited
+	 * parent manager, and secondary in-process top-level sessions receive
+	 * `undefined` so job snapshots and ACP drains cannot observe the primary's
+	 * state.
+	 */
+	asyncJobManager?: AsyncJobManager;
+	/** Agent identity (registry id like "Main" or "Alice") used for IRC routing. */
+	agentId?: string;
+	/** Whether this session is the top-level agent or a subagent. Drives eager-task
+	 *  prelude gating so a top-level session created with a custom `agentId` still
+	 *  receives the always-mode reminder. Defaults to "main". */
+	agentKind?: "main" | "sub";
+	/**
+	 * Override the provider-facing session ID for all API requests from this session.
+	 * When absent, `sessionManager.getSessionId()` is used. Needed when benchmark or
+	 * SDK callers issue probes / prewarming with an explicit `--provider-session-id`
+	 * so that credential sticky selection is consistent with the session's streaming calls.
+	 */
+	providerSessionId?: string;
+	/**
+	 * Full advisor toolset, pre-built in `createAgentSession` against a distinct,
+	 * advisor-scoped `ToolSession` (its own `-advisor` session/agent id) so the
+	 * advisor's tool state stays isolated from the primary. The advisor is a full
+	 * agent; its config `tools` selects a subset (default read/grep/glob). Undefined
+	 * when the advisor is disabled.
+	 */
+	advisorTools?: AgentTool[];
+	/** Preloaded watchdog prompt content for the advisor. */
+	advisorWatchdogPrompt?: string;
+	/** Preloaded YAML top-level `instructions` shared baseline, kept separate from
+	 *  `advisorWatchdogPrompt` so `/advisor configure` can swap it live. */
+	advisorSharedInstructions?: string;
+	/**
+	 * Preloaded project context files (AGENTS.md, etc.) rendered as a system-prompt
+	 * block for the advisor — the same standing instructions the primary agent
+	 * receives, so the reviewer holds the agent to them.
+	 */
+	advisorContextPrompt?: string;
+	/**
+	 * Advisors discovered from `WATCHDOG.yml`. Empty/undefined runs a single
+	 * legacy advisor on the `advisor` role (byte-for-byte the pre-config path).
+	 */
+	advisorConfigs?: AdvisorConfig[];
+	/**
+	 * Strip tool descriptions from provider-bound tool specs on side requests
+	 * (handoff). Must match the session-start value used to build the system
+	 * prompt so inline descriptors are not also sent through provider schemas.
+	 */
+	pruneToolDescriptions?: boolean;
+	/**
+	 * Disconnect this session's OWNED MCP manager on dispose. Provided only when
+	 * the session created the manager (top-level sessions); subagents reuse a
+	 * parent's manager via `options.mcpManager` and omit this so a child's
+	 * teardown never tears down the shared servers.
+	 */
+	disconnectOwnedMcpManager?: () => Promise<void>;
+}
+
+/** Options for AgentSession.prompt() */
+export interface PromptOptions {
+	/** Whether to expand file-based prompt templates (default: true) */
+	expandPromptTemplates?: boolean;
+	/** Image attachments */
+	images?: ImageContent[];
+	/** When streaming, how to queue the message: "steer" (interrupt) or "followUp" (wait). */
+	streamingBehavior?: "steer" | "followUp";
+	/** Optional tool choice override for the next LLM call. */
+	toolChoice?: ToolChoice;
+	/** Send as developer/system message instead of user. Providers that support it use the developer role; others fall back to user. */
+	synthetic?: boolean;
+	/** Marks this prompt as a deliberate user action (typed message, `.`/`c`
+	 *  continue). Clears advisor auto-resume suppression that a user interrupt set.
+	 *  Defaults to `!synthetic`; manual-continue is synthetic yet user-initiated, so
+	 *  it sets this explicitly. Agent-initiated synthetic prompts (auto-continue,
+	 *  plan re-prime, reminders) leave it unset and keep suppression latched. */
+	userInitiated?: boolean;
+	/** Explicit billing/initiator attribution for the prompt. Defaults to user prompts as `user` and synthetic prompts as `agent`. */
+	attribution?: MessageAttribution;
+	/** Skip pre-send compaction checks for this prompt (internal use for maintenance flows). */
+	skipCompactionCheck?: boolean;
+}
+
+/** Result from a handoff operation. */
+export interface HandoffResult {
+	document: string;
+	savedPath?: string;
+}
+
+export interface SessionHandoffOptions {
+	autoTriggered?: boolean;
+	signal?: AbortSignal;
+}
+
+/** Result from cycleModel() */
+export interface ModelCycleResult {
+	model: Model;
+	thinkingLevel: ThinkingLevel | undefined;
+	/** Whether cycling through scoped models (--models flag) or all available */
+	isScoped: boolean;
+}
+
+/** Result from cycleRoleModels() */
+export interface RoleModelCycleResult {
+	model: Model;
+	thinkingLevel: ThinkingLevel | undefined;
+	role: string;
+}
+
+/** A configured role resolved to a concrete model, used by role cycling and
+ *  the plan-approval model slider. */
+export interface ResolvedRoleModel {
+	role: string;
+	model: Model;
+	thinkingLevel?: ThinkingLevel;
+	explicitThinkingLevel: boolean;
+}
+
+/** The set of resolvable role models plus the index of the currently active
+ *  one within {@link ResolvedRoleModel.role} order. */
+export interface RoleModelCycle {
+	models: ResolvedRoleModel[];
+	currentIndex: number;
+}
+
+export interface ContextUsageBreakdown {
+	contextWindow: number;
+	anchored: boolean;
+	usedTokens: number;
+	systemPromptTokens: number;
+	systemToolsTokens: number;
+	systemContextTokens: number;
+	skillsTokens: number;
+	messagesTokens: number;
+	/** Total non-message tokens: system prompt (all parts) + tools. (Identical to computeNonMessageTokens.) */
+	nonMessageTokens: number;
+}
+
+/** Session statistics for /session command */
+export interface SessionStats {
+	sessionFile: string | undefined;
+	sessionId: string;
+	userMessages: number;
+	assistantMessages: number;
+	toolCalls: number;
+	toolResults: number;
+	totalMessages: number;
+	tokens: {
+		input: number;
+		output: number;
+		reasoning: number;
+		cacheRead: number;
+		cacheWrite: number;
+		total: number;
+	};
+	premiumRequests: number;
+	cost: number;
+}
+
+/** Advisor statistics for /advisor status command. */
+export interface AdvisorStats {
+	configured: boolean;
+	active: boolean;
+	model?: Model;
+	contextWindow: number;
+	contextTokens: number;
+	tokens: {
+		input: number;
+		output: number;
+		reasoning: number;
+		cacheRead: number;
+		cacheWrite: number;
+		total: number;
+	};
+	cost: number;
+	messages: {
+		user: number;
+		assistant: number;
+		total: number;
+	};
+	/** Per-advisor breakdown; one entry per active advisor (single-advisor sessions have one). */
+	advisors: PerAdvisorStat[];
+}
+
+/** One advisor's slice of {@link AdvisorStats}, surfaced for the multi-advisor status panel. */
+export interface PerAdvisorStat {
+	name: string;
+	model: Model;
+	contextWindow: number;
+	contextTokens: number;
+	tokens: AdvisorStats["tokens"];
+	cost: number;
+	messages: AdvisorStats["messages"];
+}
+
+/**
+ * One live advisor instance: its own agent/runtime/tools/recorder plus a
+ * per-advisor emission guard and identity. The session holds an array of these;
+ * primary-scoped state (turn counters, interrupt latches, the shared yield
+ * channel) stays on the session.
+ */
+interface ActiveAdvisor {
+	/** Display name from config ("default" for the legacy no-YAML advisor). */
+	name: string;
+	/** Slug for the transcript filename/session id; "" → `__advisor.jsonl`. */
+	slug: string;
+	agent: Agent;
+	runtime: AdvisorRuntime;
+	adviseTool: AdviseTool;
+	emissionGuard: AdvisorEmissionGuard;
+	recorder: AdvisorTranscriptRecorder;
+	/** Latest recorder close, awaited by dispose() so the final turn lands on disk. */
+	recorderClosed: Promise<void>;
+	/** Unsubscribe for the advisor agent's event stream feeding the recorder. */
+	agentUnsubscribe?: () => void;
+	model: Model;
+	thinkingLevel: ThinkingLevel;
+}
+
+export interface FreshSessionResult {
+	previousSessionId: string;
+	sessionId: string;
+	closedProviderSessions: number;
+}
 
 /** Internal marker for hook messages queued through the agent loop */
 // ============================================================================
@@ -489,11 +969,22 @@ export class AgentSession {
 
 	readonly configWarnings: string[] = [];
 
-	readonly #models: ModelControls;
-	readonly #tools: SessionTools;
-	readonly #prewalk: PrewalkCoordinator;
-
-	readonly #providerBoundary: SessionProviderBoundary;
+	#scopedModels: Array<{ model: Model; thinkingLevel?: ThinkingLevel }>;
+	/** Effective, metadata-clamped thinking level applied to the agent (never `auto`). */
+	#thinkingLevel: ThinkingLevel | undefined;
+	/** True when the user configured `auto`; the effective level is resolved per turn. */
+	#autoThinking: boolean = false;
+	/** The level `auto` last resolved to (for UI); undefined until a turn is classified. */
+	#autoResolvedLevel: Effort | undefined;
+	/**
+	 * The classification result carried from the previous turn, applied at the
+	 * start of the next user turn. Lets `auto` thinking adapt without blocking
+	 * turn start on a (potentially slow) classifier round-trip: the in-flight
+	 * turn runs at this carried effort (or the provisional level), and the
+	 * classifier for the current prompt resolves concurrently and feeds the
+	 * NEXT turn. Generation-guarded + clamped to the current model on apply.
+	 */
+	#pendingAutoThinkingEffort: Effort | undefined;
 	#promptTemplates: PromptTemplate[];
 	#slashCommands: FileSlashCommand[];
 
@@ -5888,16 +6379,12 @@ export class AgentSession {
 				return false;
 			}
 
-			// Auto thinking: classify this real user turn and set the effective level
-			// before the model request. A user-invoked `/skill:<name>` arrives as a
-			// user-attributed skill custom message whose expanded body is the task
-			// prompt, so it counts as a user turn. Synthetic/tool-continuation turns
-			// (developer roles), agent-originated or autoloaded skill injections, and
-			// non-auto sessions are skipped. Never blocks the turn — failures fall
-			// back to a concrete level inside the helper.
-			const isUserTurn = message.role === "user" || (message.role === "custom" && isUserInvokedSkillPrompt(message));
-			if (this.isAutoThinking && isUserTurn) {
-				await this.#models.applyAutoThinkingLevel(expandedText, generation);
+			// Auto thinking: race classification against a short pre-dispatch
+			// deadline so a fast classifier pins this turn while a slow one never
+			// blocks turn start for the full timeout. Synthetic/tool-continuation
+			// turns (developer/custom roles) and non-auto sessions are skipped.
+			if (this.#autoThinking && message.role === "user") {
+				await this.#applyAutoThinkingLevel(expandedText, generation);
 				if (this.#promptGeneration !== generation) {
 					return false;
 				}
@@ -5915,9 +6402,12 @@ export class AgentSession {
 			}
 
 			const agentPromptOptions = options?.toolChoice ? { toolChoice: options.toolChoice } : undefined;
-			const nonMessageTokens = computeNonMessageTokens(this, this.agent.tokenizer);
 			const contextWindow = this.model?.contextWindow ?? 0;
 			const breakdown = this.getContextBreakdown({ contextWindow, pendingMessages: messages });
+			// Derive non-message tokens from the breakdown (which already tokenizes the
+			// tool schemas once) instead of recomputing them via a separate
+			// `computeNonMessageTokens` pass over the full tool registry.
+			const nonMessageTokens = breakdown?.nonMessageTokens ?? computeNonMessageTokens(this);
 			const promptTokens =
 				breakdown?.usedTokens ??
 				nonMessageTokens +
@@ -7206,7 +7696,43 @@ export class AgentSession {
 
 	/** Selects the session thinking level and optionally persists it as the default. */
 	setThinkingLevel(level: ConfiguredThinkingLevel | undefined, persist: boolean = false): void {
-		this.#models.setThinkingLevel(level, persist);
+		if (level === AUTO_THINKING) {
+			const provisional = resolveProvisionalAutoLevel(this.model);
+			const wasAuto = this.#autoThinking;
+			this.#autoThinking = true;
+			this.#autoResolvedLevel = undefined;
+			this.#pendingAutoThinkingEffort = undefined;
+			this.#thinkingLevel = provisional;
+			this.#applyThinkingLevelToAgent(provisional);
+			if (persist) {
+				this.settings.set("defaultThinkingLevel", AUTO_THINKING);
+			}
+			if (!wasAuto || this.#thinkingLevel !== provisional) {
+				this.#emit({ type: "thinking_level_changed", thinkingLevel: provisional, configured: AUTO_THINKING });
+			}
+			return;
+		}
+
+		const wasAuto = this.#autoThinking;
+		this.#autoThinking = false;
+		this.#autoResolvedLevel = undefined;
+		this.#pendingAutoThinkingEffort = undefined;
+		const effectiveLevel = resolveThinkingLevelForModel(this.model, level);
+		// Leaving auto must persist even when the resolved effort is unchanged (e.g.
+		// auto resolved to medium, then the user pins medium): otherwise the latest
+		// session entry keeps `configured: "auto"` and resume re-enables auto.
+		const isChanging = wasAuto || effectiveLevel !== this.#thinkingLevel;
+
+		this.#thinkingLevel = effectiveLevel;
+		this.#applyThinkingLevelToAgent(effectiveLevel);
+
+		if (isChanging) {
+			this.sessionManager.appendThinkingLevelChange(effectiveLevel, effectiveLevel);
+			if (persist && effectiveLevel !== undefined && effectiveLevel !== ThinkingLevel.Off) {
+				this.settings.set("defaultThinkingLevel", effectiveLevel);
+			}
+			this.#emit({ type: "thinking_level_changed", thinkingLevel: effectiveLevel });
+		}
 	}
 
 	/** Advances through the thinking selectors supported by the active model. */
@@ -7214,7 +7740,129 @@ export class AgentSession {
 		return this.#models.cycleThinkingLevel();
 	}
 
-	/** Reports whether `/fast` is enabled for the active model family. */
+	/** Hard timeout (ms) for the per-turn auto-thinking classification (aborts it). */
+	static readonly #AUTO_THINKING_TIMEOUT_MS = 4000;
+	/**
+	 * How long (ms) turn start waits for the classifier before dispatching at the
+	 * carried/provisional effort. Sized to let a fast (local) classifier pin the
+	 * current turn; a slow (online) classifier misses it and its result applies
+	 * to the next turn instead of blocking turn start for the full hard timeout.
+	 */
+	static readonly #AUTO_THINKING_DISPATCH_DEADLINE_MS = 200;
+
+	/**
+	 * Set the effective thinking level for the current user turn.
+	 *
+	 * Classification races a short pre-dispatch deadline: a fast (local)
+	 * classifier finishes in time and pins THIS turn; a slow (online) classifier
+	 * misses the deadline and the turn runs at the carried/provisional effort
+	 * instead of blocking turn start for up to the full hard timeout. A late
+	 * result only updates {@link #pendingAutoThinkingEffort} for the NEXT turn —
+	 * it never mutates agent state during this turn, so it cannot change the
+	 * in-flight request, whose reasoning effort the agent loop snapshots once at
+	 * dispatch via `getReasoning()`. `ultrathink` is synchronous and pins the
+	 * current turn immediately. Never throws into the turn; never clears
+	 * `#autoThinking`.
+	 */
+	async #applyAutoThinkingLevel(promptText: string, generation: number): Promise<void> {
+		const model = this.model;
+		if (!model?.reasoning) return;
+		// Models with reasoning but no controllable effort surface (devin-agent
+		// Cascade routes effort via sibling model ids, not a wire param) have
+		// nothing to pick — skip classification rather than discard its result.
+		if (getSupportedEfforts(model).length === 0) return;
+
+		if (this.#magicKeywordEnabled("ultrathink") && containsUltrathink(promptText)) {
+			// The user explicitly asked for maximum thinking; bypass the classifier
+			// and jump straight to the highest auto-supported level for this model.
+			// Synchronous and pre-dispatch, so it pins THIS turn immediately.
+			const ultrathink = clampAutoThinkingEffort(model, Effort.XHigh);
+			if (ultrathink !== undefined && this.#promptGeneration === generation && this.#autoThinking) {
+				this.#applyAutoThinkingResolution(ultrathink);
+			}
+			return;
+		}
+
+		const controller = new AbortController();
+		const hardTimer = setTimeout(() => controller.abort(), AgentSession.#AUTO_THINKING_TIMEOUT_MS);
+		const classification: Promise<Effort | undefined> = classifyDifficulty(promptText, {
+			settings: this.settings,
+			registry: this.#modelRegistry,
+			model,
+			sessionId: this.sessionId,
+			signal: controller.signal,
+			metadataResolver: provider => this.agent.metadataForProvider(provider),
+		})
+			.catch(error => {
+				logger.debug("auto-thinking: classification failed; using fallback level", {
+					error: error instanceof Error ? error.message : String(error),
+				});
+				return undefined;
+			})
+			.finally(() => clearTimeout(hardTimer));
+
+		const resolved = await Promise.race([
+			classification,
+			Bun.sleep(AgentSession.#AUTO_THINKING_DISPATCH_DEADLINE_MS).then(() => undefined),
+		]);
+
+		// Drop the result if the turn was aborted/superseded while racing.
+		if (this.#promptGeneration !== generation || !this.#autoThinking) return;
+
+		if (resolved !== undefined) {
+			// Fast classifier won the race — pin this turn and carry it forward.
+			this.#pendingAutoThinkingEffort = resolved;
+			this.#applyAutoThinkingResolution(resolved);
+			return;
+		}
+
+		// Deadline lost: run this turn at the carried (clamped) or provisional
+		// effort. The classifier keeps running; its late result feeds the NEXT
+		// turn only — never agent state during this turn.
+		const effort = this.#clampedPending(model) ?? resolveProvisionalAutoLevel(model);
+		if (effort !== undefined) {
+			this.#applyAutoThinkingResolution(effort);
+		}
+		void classification.then(late => {
+			if (late === undefined) return;
+			if (this.#promptGeneration !== generation || !this.#autoThinking) return;
+			this.#pendingAutoThinkingEffort = late;
+		});
+	}
+
+	/** The carried-over auto-thinking effort clamped to the current model, or `undefined`. */
+	#clampedPending(model: Model): Effort | undefined {
+		return this.#pendingAutoThinkingEffort === undefined
+			? undefined
+			: clampAutoThinkingEffort(model, this.#pendingAutoThinkingEffort);
+	}
+
+	/** Apply a resolved auto-thinking effort to the agent, persist it, and emit the change. */
+	#applyAutoThinkingResolution(effort: Effort): void {
+		const shouldPersistResolution = this.#autoResolvedLevel !== effort;
+		this.#autoResolvedLevel = effort;
+		this.#thinkingLevel = effort;
+		this.#applyThinkingLevelToAgent(effort);
+		if (shouldPersistResolution) {
+			this.sessionManager.appendThinkingLevelChange(effort, AUTO_THINKING);
+		}
+		this.#emit({
+			type: "thinking_level_changed",
+			thinkingLevel: effort,
+			configured: AUTO_THINKING,
+			resolved: effort,
+		});
+	}
+
+	/**
+	 * True when the currently selected model's family is set to `priority` — the
+	 * `/fast` on/off state for the active model. Returns false when no model is
+	 * selected or the model exposes no service-tier family (e.g. Fireworks, which
+	 * has its own Providers › Fireworks Tier toggle).
+	 *
+	 * For "is priority actually applied to the next request?" use
+	 * {@link isFastModeActive} instead.
+	 */
 	isFastModeEnabled(): boolean {
 		return this.#models.isFastModeEnabled();
 	}
@@ -7327,6 +7975,330 @@ export class AgentSession {
 		this.#yieldTerminationPending = true;
 	}
 
+	async #runPrePromptCompactionIfNeeded(messages: AgentMessage[]): Promise<void> {
+		const model = this.model;
+		if (!model) return;
+		const contextWindow = model.contextWindow ?? 0;
+		if (contextWindow <= 0) return;
+		const compactionSettings = this.settings.getGroup("compaction");
+		// Bail before the (relatively expensive) pre-prompt token estimate when
+		// compaction is disabled — shouldCompact would reject anyway. Mirrors the
+		// enabled gate in #maintainContextMidRun (and the one #checkCompaction
+		// reaches after its cheap overflow/stale-prune passes) and avoids a
+		// redundant full context-breakdown pass on every prompt.
+		if (!compactionSettings.enabled || compactionSettings.strategy === "off") return;
+		const contextTokens = this.#estimatePrePromptContextTokens(messages, contextWindow);
+		if (!shouldCompact(contextTokens, contextWindow, compactionSettings)) return;
+
+		// Auto-promote first: switching to a larger-context model avoids compacting
+		// the history at all. The post-turn threshold path already promotes before
+		// compacting; without this, the pre-prompt path would pre-empt promotion and
+		// compact (snapcompact/summary) a session that should have just been promoted.
+		if (await this.#promoteContextModel()) {
+			logger.debug("Pre-prompt context promotion avoided compaction", {
+				contextTokens,
+				contextWindow,
+				model: `${model.provider}/${model.id}`,
+			});
+			return;
+		}
+
+		logger.debug("Pre-prompt context maintenance triggered by pending prompt size", {
+			contextTokens,
+			contextWindow,
+			model: `${model.provider}/${model.id}`,
+		});
+		await this.#runAutoCompaction("threshold", false, false, false, {
+			autoContinue: false,
+			triggerContextTokens: contextTokens,
+		});
+	}
+
+	/**
+	 * Compact continuing tool-loop runs before the next provider request.
+	 *
+	 * `onTurnEnd` is the safe boundary: tool results for the just-finished turn
+	 * are already paired in `activeMessages`, the live array the agent loop reads
+	 * before its next model call. Before compacting, the just-finished turn is
+	 * synchronously persisted if async message hooks have not reached the normal
+	 * append path yet. Mid-run handoff is suppressed because resetting the session
+	 * while the loop owns `activeMessages` would race the next request; handoff
+	 * strategy falls back to in-place context-full compaction here.
+	 */
+	async #maintainContextMidRun(
+		activeMessages: AgentMessage[],
+		signal: AbortSignal | undefined,
+		context: AgentTurnEndContext | undefined,
+	): Promise<void> {
+		if (
+			signal?.aborted ||
+			this.#isDisposed ||
+			this.isCompacting ||
+			this.isGeneratingHandoff ||
+			!context?.willContinue
+		)
+			return;
+
+		const model = this.model;
+		const contextWindow = model?.contextWindow ?? 0;
+		if (contextWindow <= 0) return;
+
+		const compactionSettings = this.settings.getGroup("compaction");
+		if (
+			!compactionSettings.enabled ||
+			compactionSettings.strategy === "off" ||
+			compactionSettings.midTurnEnabled === false
+		) {
+			return;
+		}
+
+		const lastAssistant = [...activeMessages]
+			.reverse()
+			.find((message): message is AssistantMessage => message.role === "assistant");
+		if (!lastAssistant || lastAssistant.stopReason === "aborted" || lastAssistant.stopReason === "error") return;
+
+		if (!(await this.#persistTurnMessagesForMidRunCompaction(context))) return;
+
+		const billedContextTokens = calculateContextTokens(lastAssistant.usage);
+		const storedContextTokens = this.#estimateStoredContextTokens();
+		const contextTokens = compactionContextTokens(billedContextTokens, storedContextTokens);
+		if (!shouldCompact(contextTokens, contextWindow, compactionSettings)) return;
+
+		// Promote to a larger-context sibling before compacting, mirroring the
+		// pre-prompt (#runPrePromptCompactionIfNeeded) and post-turn threshold
+		// (#checkCompaction) paths. Without this, a long mid-turn tool loop that
+		// crosses the threshold compacts the history (and can hit the no-progress
+		// dead-end on a single oversized turn) on a model that should have just
+		// been promoted to a larger window instead.
+		if (await this.#promoteContextModel()) {
+			logger.debug("Mid-run context promotion avoided compaction", {
+				contextTokens,
+				contextWindow,
+				from: `${model?.provider}/${model?.id}`,
+			});
+			return;
+		}
+
+		const messagesBefore = activeMessages.length;
+		await this.#runAutoCompaction("threshold", false, false, false, {
+			autoContinue: false,
+			suppressContinuation: true,
+			suppressHandoff: true,
+			triggerContextTokens: contextTokens,
+		});
+
+		if (signal?.aborted) return;
+		const compactedMessages = this.agent.state.messages;
+		if (compactedMessages !== activeMessages) {
+			activeMessages.splice(0, activeMessages.length, ...compactedMessages);
+		}
+		logger.debug("Mid-run compaction ran between provider calls", {
+			contextTokens,
+			contextWindow,
+			strategy: compactionSettings.strategy,
+			goalActive: this.#goalModeState?.enabled === true && this.#goalModeState.goal.status === "active",
+			messagesBefore,
+			messagesAfter: activeMessages.length,
+		});
+	}
+	/**
+	 * Check if context maintenance or promotion is needed and run it.
+	 * Called after agent_end and before prompt submission.
+	 *
+	 * Four cases (in order):
+	 * 1. Input overflow + promotion: promote to larger model, retry without maintenance.
+	 * 2. Input overflow + no promotion target: run context maintenance, auto-retry on same model.
+	 * 3. Output incomplete (stopReason === "length", e.g. `response.incomplete`): the
+	 *    model burned its output budget without producing an actionable deliverable
+	 *    (reasoning-only or truncated). Drop the dead turn, try promotion, otherwise
+	 *    run compaction/handoff and retry.
+	 * 4. Threshold: context over threshold, run context maintenance (no auto-retry).
+	 *
+	 * @param assistantMessage The assistant message to check
+	 * @param skipAbortedCheck If false, include aborted messages (for pre-prompt check). Default: true
+	 * @param allowDefer If true, threshold-driven handoff strategy may schedule itself as a
+	 *   deferred post-prompt task instead of running inline. Callers running inside the
+	 *   `agent_end` handler set this to true so `session.prompt()` resolves cleanly; callers
+	 *   on the pre-prompt path (where the next agent turn is about to start) set it to false
+	 *   to avoid racing the deferred handoff against the new turn.
+	 * @param autoContinue Whether maintenance may schedule the agent-authored continuation prompt.
+	 * @returns whether compaction/recovery scheduled a handoff, retry, auto-continue, or
+	 *   queued-message drain that already owns the next turn. Callers MUST skip
+	 *   `session_stop` and other agent continuations when `continuationScheduled`
+	 *   is true.
+	 */
+	async #checkCompaction(
+		assistantMessage: AssistantMessage,
+		skipAbortedCheck = true,
+		allowDefer = true,
+		autoContinue = true,
+	): Promise<CompactionCheckResult> {
+		// Skip if message was aborted (user cancelled) - unless skipAbortedCheck is false
+		if (skipAbortedCheck && assistantMessage.stopReason === "aborted") return COMPACTION_CHECK_NONE;
+		const contextWindow = this.model?.contextWindow ?? 0;
+		const generation = this.#promptGeneration;
+		// Skip overflow check if the message came from a different model.
+		// This handles the case where user switched from a smaller-context model (e.g. opus)
+		// to a larger-context model (e.g. codex) - the overflow error from the old model
+		// shouldn't trigger compaction for the new model.
+		const sameModel =
+			this.model && assistantMessage.provider === this.model.provider && assistantMessage.model === this.model.id;
+		// This handles the case where an error was kept after compaction (in the "kept" region).
+		// The error shouldn't trigger another compaction since we already compacted.
+		// Example: opus fails -> switch to codex -> compact -> switch back to opus -> opus error
+		// is still in context but shouldn't trigger compaction again.
+		const compactionEntry = getLatestCompactionEntry(this.sessionManager.getBranch());
+		const errorIsFromBeforeCompaction =
+			compactionEntry !== null && assistantMessage.timestamp < new Date(compactionEntry.timestamp).getTime();
+		if (sameModel && !errorIsFromBeforeCompaction && AIError.isContextOverflow(assistantMessage, contextWindow)) {
+			// Clear the failed turn from active context so the retry (or the next
+			// user prompt) does not replay it. The persisted branch entry stays
+			// for now: when no recovery path runs, the user-facing transcript
+			// MUST keep the only assistant message explaining why the turn
+			// stopped. The branch entry is dropped further down, but only on the
+			// paths that actually schedule a retry/compaction.
+			this.#removeAssistantMessageFromActiveContext(assistantMessage);
+
+			// Try context promotion first - switch to a larger model and retry without compacting
+			const promoted = await this.#tryContextPromotion(assistantMessage);
+			if (promoted) {
+				await this.#dropPersistedAssistantTurn(assistantMessage);
+				// Retry on the promoted (larger) model without compacting
+				this.#scheduleAgentContinue({ delayMs: 100, generation });
+				return COMPACTION_CHECK_CONTINUATION;
+			}
+
+			// No promotion target available fall through to compaction
+			const compactionSettings = this.settings.getGroup("compaction");
+			if (compactionSettings.enabled && compactionSettings.strategy !== "off") {
+				return await this.#runRecoveryCompactionWithRollback("overflow", assistantMessage, allowDefer, {
+					autoContinue,
+				});
+			}
+			return COMPACTION_CHECK_NONE;
+		}
+
+		// Case 3: Output-side incomplete — `response.incomplete` from OpenAI Responses
+		// (and Codex) maps to stopReason === "length". The model burned its
+		// `max_output_tokens` budget on reasoning/text and emitted no actionable
+		// deliverable. Same recovery class as overflow: promotion if available,
+		// otherwise compaction/handoff. Unlike overflow, the *input* is fine, so we
+		// allow the handoff strategy to actually run.
+		if (sameModel && !errorIsFromBeforeCompaction && assistantMessage.stopReason === "length") {
+			// Same active-context vs persisted-history split as the overflow path
+			// above: clear the dead turn from agent state so it cannot be replayed,
+			// but keep it on the branch unless promotion or compaction actually runs.
+			this.#removeAssistantMessageFromActiveContext(assistantMessage);
+
+			const promoted = await this.#tryContextPromotion(assistantMessage);
+			if (promoted) {
+				await this.#dropPersistedAssistantTurn(assistantMessage);
+				logger.debug("Context promotion triggered by response.incomplete (length stop)", {
+					from: `${assistantMessage.provider}/${assistantMessage.model}`,
+				});
+				this.#scheduleAgentContinue({ delayMs: 100, generation });
+				return COMPACTION_CHECK_CONTINUATION;
+			}
+
+			const incompleteCompactionSettings = this.settings.getGroup("compaction");
+			if (incompleteCompactionSettings.enabled && incompleteCompactionSettings.strategy !== "off") {
+				logger.debug("Compaction triggered by response.incomplete (length stop, no promotion target)", {
+					model: `${assistantMessage.provider}/${assistantMessage.model}`,
+					strategy: incompleteCompactionSettings.strategy,
+				});
+				return await this.#runRecoveryCompactionWithRollback("incomplete", assistantMessage, allowDefer, {
+					autoContinue,
+					triggerContextTokens: calculateContextTokens(assistantMessage.usage),
+				});
+			}
+			// Neither promotion nor compaction is available — surface the dead-end so
+			// the user understands why the turn yielded with nothing.
+			logger.warn("response.incomplete with no recovery path (promotion + compaction both unavailable)", {
+				model: `${assistantMessage.provider}/${assistantMessage.model}`,
+			});
+			return COMPACTION_CHECK_NONE;
+		}
+
+		// Stale-result pass runs every turn, before any threshold gating: it is
+		// cheap (bails when no candidate) and independent of the compaction
+		// setting.
+		const supersedeResult = await this.#pruneStaleToolResults();
+
+		const compactionSettings = this.settings.getGroup("compaction");
+		if (!compactionSettings.enabled || compactionSettings.strategy === "off") return COMPACTION_CHECK_NONE;
+
+		// Case 4: Threshold - turn succeeded but context is getting large
+		// Skip if this was an error (non-overflow errors don't have usage data)
+		if (assistantMessage.stopReason === "error") return COMPACTION_CHECK_NONE;
+		const pruneResult = await this.#pruneToolOutputs();
+		const maintenanceTokensFreed = (supersedeResult?.tokensSaved ?? 0) + (pruneResult?.tokensSaved ?? 0);
+		// `errorIsFromBeforeCompaction` (computed above) is the general
+		// "this assistant message predates the latest compaction" predicate here,
+		// not just an error-specific one; alias it locally so the threshold intent
+		// reads clearly (#3412 review).
+		const assistantPredatesCompaction = errorIsFromBeforeCompaction;
+		// An assistant that predates the latest compaction carries stale, pre-rewrite
+		// `usage`: the scheduled auto-continue re-enters this check with the kept
+		// assistant (#promptWithMessage → #checkCompaction), and its old high prompt
+		// count would re-trip the threshold on a freshly compacted history. Drop the
+		// stale provider number for those messages and let the live stored estimate
+		// (the floor applied below) drive the decision instead.
+		const assistantUsageContextTokens = assistantPredatesCompaction
+			? 0
+			: calculateContextTokens(assistantMessage.usage);
+		const storedContextTokens = this.#estimateStoredContextTokens();
+		// Pruning frees bytes for the NEXT prompt; it does not change the size of
+		// the prompt the LLM just billed for. Earlier revisions subtracted the
+		// per-turn supersede/prune `tokensSaved` from the threshold input, which
+		// let a long-running `/goal` session sit above `compaction.thresholdTokens`
+		// indefinitely whenever per-turn pruning saved enough to drop the
+		// post-prune estimate below the user-configured trigger — the visible
+		// context (anchored to the same provider billing) still showed >threshold,
+		// but `shouldCompact` no-op'd (#3174). Anchor the initial trigger on the
+		// last turn's billed context tokens, floored by the post-prune
+		// stored-conversation estimate so a payload-compression hook still can't
+		// deflate the trigger.
+		const contextTokens = compactionContextTokens(assistantUsageContextTokens, storedContextTokens);
+		const postMaintenanceContextTokens = compactionContextTokens(
+			Math.max(0, assistantUsageContextTokens - maintenanceTokensFreed),
+			storedContextTokens,
+		);
+		const thresholdTokens = resolveThresholdTokens(contextWindow, compactionSettings);
+		const shouldThresholdCompact = shouldCompact(contextTokens, contextWindow, compactionSettings);
+		logger.debug("Auto-compaction threshold decision", {
+			phase: "post-agent-end",
+			goalModeEnabled: this.#goalModeState?.enabled === true,
+			goalStatus: this.#goalModeState?.goal.status,
+			stopReason: assistantMessage.stopReason,
+			sameModel: sameModel === true,
+			contextWindow,
+			strategy: compactionSettings.strategy,
+			thresholdTokens,
+			assistantUsageContextTokens,
+			storedContextTokens,
+			resolvedContextTokens: contextTokens,
+			postMaintenanceContextTokens,
+			maintenanceTokensFreed,
+			shouldCompact: shouldThresholdCompact,
+			contextPromotionEnabled: this.settings.get("contextPromotion.enabled") === true,
+		});
+		if (shouldThresholdCompact) {
+			// Try promotion first — if a larger model is available, switch instead of compacting
+			const promoted = await this.#tryContextPromotion(assistantMessage);
+			if (!promoted) {
+				return await this.#runAutoCompaction("threshold", false, false, allowDefer, {
+					autoContinue,
+					triggerContextTokens: postMaintenanceContextTokens,
+				});
+			}
+			logger.debug("Auto-compaction threshold satisfied but context promotion took over", {
+				contextTokens,
+				contextWindow,
+				model: `${assistantMessage.provider}/${assistantMessage.model}`,
+			});
+		}
+		return COMPACTION_CHECK_NONE;
+	}
 	#assistantMessageHasSuccessfulYieldToolCall(assistantMessage: AssistantMessage, toolCallId: string): boolean {
 		const lastToolCall = assistantMessage.content
 			.slice()
@@ -8404,10 +9376,25 @@ export class AgentSession {
 						? AUTO_THINKING
 						: (sessionContext.thinkingLevel as ThinkingLevel | undefined)
 					: defaultThinkingLevel;
-			this.#models.restoreThinkingLevel(restoredThinkingLevel);
-			this.#models.restoreServiceTiers(
-				hasServiceTierEntry ? (sessionContext.serviceTier ?? {}) : configuredServiceTierByFamily,
-			);
+			if (restoredThinkingLevel === AUTO_THINKING) {
+				this.#autoThinking = true;
+				// Resume in auto (pending) like a fresh auto session: the next user
+				// turn reclassifies. We intentionally do not seed the last resolved
+				// effort, so the cold (--continue) and in-app switch paths display
+				// identically as `auto` until then.
+				this.#autoResolvedLevel = undefined;
+				this.#pendingAutoThinkingEffort = undefined;
+				this.#thinkingLevel = resolveProvisionalAutoLevel(this.model);
+			} else {
+				this.#autoThinking = false;
+				this.#autoResolvedLevel = undefined;
+				this.#pendingAutoThinkingEffort = undefined;
+				this.#thinkingLevel = resolveThinkingLevelForModel(this.model, restoredThinkingLevel);
+			}
+			this.#applyThinkingLevelToAgent(this.#thinkingLevel);
+			this.#serviceTierByFamily = hasServiceTierEntry
+				? (sessionContext.serviceTier ?? {})
+				: configuredServiceTierByFamily;
 
 			if (switchingToDifferentSession) {
 				await this.#memory.resetContextForNewTranscript();
@@ -9247,7 +10234,147 @@ export class AgentSession {
 		contextWindow?: number;
 		pendingMessages?: AgentMessage[];
 	}): ContextUsageBreakdown | undefined {
-		return this.#stats.getContextBreakdown(options);
+		const model = this.model;
+		const rawContextWindow = options?.contextWindow ?? model?.contextWindow ?? 0;
+		const contextWindow = Number.isFinite(rawContextWindow) && rawContextWindow > 0 ? rawContextWindow : 0;
+
+		const {
+			skillsTokens,
+			toolsTokens,
+			systemContextTokens,
+			systemPromptTokens,
+			nonMessageTokens: currentNonMessageTokens,
+		} = computeNonMessageBreakdown(this);
+		const categoryNonMessageTokens = skillsTokens + toolsTokens + systemContextTokens + systemPromptTokens;
+
+		const branchEntries = this.sessionManager.getBranch();
+		const latestCompaction = getLatestCompactionEntry(branchEntries);
+		const compactionIndex = latestCompaction ? branchEntries.lastIndexOf(latestCompaction) : -1;
+
+		let usedTokens = 0;
+		let anchored = false;
+
+		const pendingMessages = options?.pendingMessages ?? [];
+
+		const pending = this.#pendingContextSnapshot;
+
+		// Always locate the latest real assistant-usage anchor after the last
+		// compaction. Its provider-reported promptTokens is ground truth for
+		// everything up to that point; only the tail after it is estimated.
+		let anchorEntry: SessionMessageEntry | undefined;
+		for (let i = branchEntries.length - 1; i > compactionIndex; i--) {
+			const entry = branchEntries[i];
+			if (entry.type === "message" && entry.message.role === "assistant") {
+				const assistant = entry.message;
+				if (assistant.stopReason !== "aborted" && assistant.stopReason !== "error" && assistant.usage) {
+					anchorEntry = entry;
+					break;
+				}
+			}
+		}
+
+		const resolvedActiveMessages = this.messages;
+		let resolvedAnchorIndex = -1;
+		let anchorAssistant: AssistantMessage | undefined;
+		if (anchorEntry) {
+			const a = anchorEntry.message as AssistantMessage;
+			anchorAssistant = a;
+			resolvedAnchorIndex = resolvedActiveMessages.indexOf(a);
+			if (resolvedAnchorIndex === -1) {
+				resolvedAnchorIndex = resolvedActiveMessages.findIndex(
+					msg => msg.role === "assistant" && msg.timestamp === a.timestamp,
+				);
+			}
+		}
+
+		// A real anchor supersedes the in-flight estimate only once a step of the
+		// CURRENT turn has produced provider usage — i.e. it resolves at or after
+		// the pending cutoff. While the turn's first response is still pending (or
+		// the newest real anchor predates this turn) the pending snapshot is the
+		// only thing accounting for the just-submitted prompt, so it wins. This
+		// keeps a long tool turn from stacking an estimate of the entire tail on
+		// top of a stale turn-start prompt.
+		const useAnchor =
+			anchorAssistant !== undefined &&
+			resolvedAnchorIndex !== -1 &&
+			(!pending || resolvedAnchorIndex >= pending.cutoffCount);
+
+		if (useAnchor && anchorAssistant) {
+			const promptTokens =
+				anchorAssistant.contextSnapshot?.promptTokens ?? calculatePromptTokens(anchorAssistant.usage);
+			const nonMessageTokens = anchorAssistant.contextSnapshot?.nonMessageTokens ?? currentNonMessageTokens;
+			anchored = true;
+			let tailTokens = 0;
+			for (let i = resolvedAnchorIndex + 1; i < resolvedActiveMessages.length; i++) {
+				tailTokens += estimateTokens(resolvedActiveMessages[i]);
+			}
+			usedTokens =
+				promptTokens +
+				Math.max(0, currentNonMessageTokens - nonMessageTokens) +
+				tailTokens +
+				pendingMessages.reduce((sum, msg) => sum + estimateTokens(msg), 0);
+		} else if (pending) {
+			anchored = true;
+			let tailTokens = 0;
+			if (resolvedActiveMessages.length > pending.cutoffCount) {
+				for (let i = pending.cutoffCount; i < resolvedActiveMessages.length; i++) {
+					tailTokens += estimateTokens(resolvedActiveMessages[i]);
+				}
+			}
+			usedTokens =
+				pending.promptTokens +
+				Math.max(0, currentNonMessageTokens - pending.nonMessageTokens) +
+				tailTokens +
+				pendingMessages.reduce((sum, msg) => sum + estimateTokens(msg), 0);
+		}
+
+		if (!anchored && !pending && branchEntries.length === 0) {
+			// Fallback: look for the latest assistant message with usage/snapshot in this.messages (for branchless/fake sessions in tests)
+			for (let i = resolvedActiveMessages.length - 1; i >= 0; i--) {
+				const msg = resolvedActiveMessages[i];
+				if (msg.role === "assistant" && msg.stopReason !== "aborted" && msg.stopReason !== "error" && msg.usage) {
+					const promptTokens = msg.contextSnapshot?.promptTokens ?? calculatePromptTokens(msg.usage);
+					const nonMessageTokens = msg.contextSnapshot?.nonMessageTokens ?? currentNonMessageTokens;
+
+					let tailTokens = 0;
+					for (let j = i + 1; j < resolvedActiveMessages.length; j++) {
+						tailTokens += estimateTokens(resolvedActiveMessages[j]);
+					}
+
+					usedTokens =
+						promptTokens +
+						Math.max(0, currentNonMessageTokens - nonMessageTokens) +
+						tailTokens +
+						pendingMessages.reduce((sum, msg) => sum + estimateTokens(msg), 0);
+					anchored = true;
+					break;
+				}
+			}
+		}
+		if (!anchored) {
+			let messagesTokens = 0;
+			for (const msg of resolvedActiveMessages) {
+				messagesTokens += estimateTokens(msg);
+			}
+			usedTokens =
+				currentNonMessageTokens +
+				messagesTokens +
+				pendingMessages.reduce((sum, msg) => sum + estimateTokens(msg), 0);
+		}
+
+		const messagesTokens = Math.max(0, usedTokens - categoryNonMessageTokens);
+
+		return {
+			contextWindow,
+			anchored,
+			usedTokens,
+			systemPromptTokens,
+			systemToolsTokens: toolsTokens,
+			systemContextTokens,
+			skillsTokens,
+			messagesTokens,
+			nonMessageTokens: currentNonMessageTokens,
+		};
 	}
 
 	getContextUsage(options?: { contextWindow?: number }): ContextUsage | undefined {

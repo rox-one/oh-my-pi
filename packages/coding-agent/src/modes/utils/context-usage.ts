@@ -239,18 +239,22 @@ export function computeNonMessageBreakdown(
 	toolsTokens: number;
 	systemContextTokens: number;
 	systemPromptTokens: number;
+	/**
+	 * Total non-message tokens: system prompt (all parts) + tools. Identical to
+	 * {@link computeNonMessageTokens} but computed here so callers that already
+	 * need the category split don't pay for a second `estimateToolSchemaTokens`
+	 * pass over the (potentially large) tool registry.
+	 */
+	nonMessageTokens: number;
 } {
-	const entry = nonMessageTokenCacheEntry(session, tokenizer);
-	if (entry.breakdown) return entry.breakdown;
-	const tools = session.agent?.state?.tools ?? EMPTY_TOOLS;
-	const skillsTokens = estimateSkillsTokens(renderedSkills(session.skills ?? EMPTY_SKILLS, tools), tokenizer);
-	const toolsTokens = estimateToolSchemaTokens(tools, tokenizer);
-	const systemPromptParts = session.systemPrompt ?? EMPTY_STRING_PARTS;
-	const systemContextTokens = tokenizer.countTokens(Array.from(systemPromptParts.slice(1), part => part ?? ""));
-	const systemPromptTokens = Math.max(0, tokenizer.countTokens(systemPromptParts[0] ?? "") - skillsTokens);
-	const breakdown = { skillsTokens, toolsTokens, systemContextTokens, systemPromptTokens };
-	entry.breakdown = breakdown;
-	return breakdown;
+	const skillsTokens = estimateSkillsTokens(session.skills ?? []);
+	const toolsTokens = estimateToolSchemaTokens(session.agent?.state?.tools ?? []);
+	const systemPromptParts = session.systemPrompt ?? [];
+	const firstPartTokens = countTokens(systemPromptParts[0] ?? "");
+	const systemContextTokens = countTokens(systemPromptParts.slice(1));
+	const systemPromptTokens = Math.max(0, firstPartTokens - skillsTokens);
+	const nonMessageTokens = firstPartTokens + systemContextTokens + toolsTokens;
+	return { skillsTokens, toolsTokens, systemContextTokens, systemPromptTokens, nonMessageTokens };
 }
 
 /**
