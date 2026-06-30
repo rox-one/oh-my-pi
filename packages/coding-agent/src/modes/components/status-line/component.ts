@@ -1,15 +1,9 @@
 import * as path from "node:path";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage, UsageLimit, UsageReport } from "@oh-my-pi/pi-ai";
-import {
-	type Component,
-	type ComposerStyle,
-	claudeComposerStyle,
-	padding,
-	truncateToWidth,
-	visibleWidth,
-} from "@oh-my-pi/pi-tui";
-import { adjustHsv, formatNumber, getProjectDir } from "@oh-my-pi/pi-utils";
+import { type Component, detectTerminalId, truncateToWidth, visibleWidth } from "@oh-my-pi/pi-tui";
+import { getProjectDir } from "@oh-my-pi/pi-utils";
+import { $ } from "bun";
 import { settings } from "../../../config/settings";
 import type { AgentSession } from "../../../session/agent-session";
 import type { OAuthAccountIdentity } from "../../../session/auth-storage";
@@ -335,6 +329,33 @@ function hasPathSegment(segments: readonly StatusLineSegmentId[]): boolean {
 
 function hasGitBackedSegment(segments: readonly StatusLineSegmentId[]): boolean {
 	return hasGitSegment(segments) || hasPrSegment(segments);
+}
+// Warp reports these status glyphs as one terminal cell; use that width only for
+// the editor border budget so box-drawing fill still lands on the right corner.
+const WARP_ONE_CELL_STATUS_GLYPH_DELTAS = new Map(
+	(["⬢", "◕", "⑂", "💾", "◫", "⟲", "⏱"] as const)
+		.map(glyph => [glyph, 1 - visibleWidth(glyph)] as const)
+		.filter(([, delta]) => delta !== 0),
+);
+
+function countOccurrences(text: string, needle: string): number {
+	let count = 0;
+	for (let index = text.indexOf(needle); index !== -1; index = text.indexOf(needle, index + needle.length)) {
+		count++;
+	}
+	return count;
+}
+
+function statusLineWidth(content: string): number {
+	const width = visibleWidth(content);
+	if (detectTerminalId() !== "warp" || WARP_ONE_CELL_STATUS_GLYPH_DELTAS.size === 0) return width;
+
+	const plain = Bun.stripANSI(content);
+	let delta = 0;
+	for (const [glyph, glyphDelta] of WARP_ONE_CELL_STATUS_GLYPH_DELTAS) {
+		delta += countOccurrences(plain, glyph) * glyphDelta;
+	}
+	return Math.max(0, width + delta);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -2210,39 +2231,7 @@ export class StatusLineComponent implements Component {
 		}
 		return {
 			content,
-			width: visibleWidth(content),
-			revision: this.#renderRevision,
-		};
-	}
-	/**
-	 * Standalone bar placement derived from the composer style. `bottomBar`
-	 * `"full"` renders both groups on the bottom bar (pi/borderless/field/rail);
-	 * `"left"` renders just the left group there — the right group attaches to
-	 * the editor's top rule via {@link getStandaloneTopBorder} (claude/rule);
-	 * `"none"` returns the bar to the box composer's embedded top border.
-	 * `bottomBarGap` inserts a blank spacer row above the bar for styles whose
-	 * editor has no bottom chrome.
-	 */
-	setComposerStyle(style: Pick<ComposerStyle, "bottomBar" | "bottomBarGap">): void {
-		this.#standalone = style.bottomBar === "none" ? false : style.bottomBar === "left" ? "left-only" : "full";
-		this.#standaloneGap = style.bottomBarGap;
-	}
-
-	/** While true, the standalone bar yields its row to the editor's autocomplete menu. */
-	setAutocompleteActiveProbe(probe: (() => boolean) | undefined): void {
-		this.#autocompleteActiveProbe = probe;
-	}
-
-	/** Plain right-group content for the claude composer's top rule. */
-	getStandaloneTopBorder(width: number, previewTitle?: string): { content: string; width: number; revision: number } {
-		let content = this.#buildStatusLine(width, "plain-right", previewTitle);
-		if (this.#focusedAgentId && content) {
-			content = `\x1b[2m${content.replaceAll("\x1b[0m", "\x1b[0m\x1b[2m")}\x1b[22m`;
-		}
-		return {
-			content,
-			width: visibleWidth(content),
-			revision: this.#renderRevision,
+			width: statusLineWidth(content),
 		};
 	}
 
