@@ -780,4 +780,118 @@ describe("AgentSession role model thinking behavior", () => {
 		// session references the held promise captured.
 		for (let i = 0; i < 4; i++) await Promise.resolve();
 	});
+	it("ignores a stale late classifier when a newer turn's classifier resolves first", async () => {
+		const model = getAnthropicModelOrThrow("claude-sonnet-4-5");
+		const provisional = resolveProvisionalAutoLevel(model);
+		expect(provisional).toBeDefined();
+
+		const seenEffort: (Effort | undefined)[] = [];
+		const mock = createMockModel({ handler: () => ({ content: ["done"] }) });
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: (m, ctx, opts) => {
+				seenEffort.push(agent.state.thinkingLevel);
+				return mock.stream(m, ctx, opts);
+			},
+		});
+		const authStorage = await AuthStorage.create(path.join(tempDir.path(), "testauth-stale-classifier.db"));
+		authStorages.push(authStorage);
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir.path(), "models-stale-classifier.yml"));
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings: Settings.isolated({ "compaction.enabled": false }),
+			modelRegistry,
+			thinkingLevel: AUTO_THINKING,
+		});
+
+		// Hold every classifier past the deadline; resolve them manually.
+		const resolvers: Array<(value: Effort) => void> = [];
+		vi.spyOn(autoThinkingClassifier, "classifyDifficulty").mockImplementation(() => {
+			const controlled = Promise.withResolvers<Effort>();
+			resolvers.push(controlled.resolve);
+			return controlled.promise;
+		});
+
+		// Two turns, both classifiers still pending.
+		// Integration test: each prompt pays one real dispatch deadline.
+		await session.prompt("turn one");
+		await session.prompt("turn two");
+		expect(resolvers).toHaveLength(2);
+
+		// The newer (turn 2) classifier resolves High first, then the older (turn 1)
+		// classifier resolves Low. The stale Low must NOT overwrite the carried High.
+		resolvers[1](Effort.High);
+		for (let i = 0; i < 4; i++) await Promise.resolve();
+		resolvers[0](Effort.Low);
+		for (let i = 0; i < 4; i++) await Promise.resolve();
+
+		// Turn 3 runs at the carried effort from the newer classifier (High).
+		seenEffort.length = 0;
+		await session.prompt("turn three");
+		expect(seenEffort).toEqual([Effort.High]);
+
+		// Settle the last held classifier so its hard-timer .finally clears.
+		resolvers[2]?.(Effort.High);
+		for (let i = 0; i < 4; i++) await Promise.resolve();
+	});
+	it("restores the carried auto-thinking effort when a session switch fails mid-load", async () => {
+		const model = getAnthropicModelOrThrow("claude-sonnet-4-5");
+		const provisional = resolveProvisionalAutoLevel(model);
+		// Seed an effort distinct from provisional so a missing restore (which
+		// falls back to provisional) is observable, not silently correct.
+		const restored = provisional === Effort.Medium ? Effort.High : Effort.Medium;
+		const seenEffort: (Effort | undefined)[] = [];
+		const mock = createMockModel({ handler: () => ({ content: ["done"] }) });
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: (m, ctx, opts) => {
+				seenEffort.push(agent.state.thinkingLevel);
+				return mock.stream(m, ctx, opts);
+			},
+		});
+		const authStorage = await AuthStorage.create(path.join(tempDir.path(), "testauth-switch-rollback.db"));
+		authStorages.push(authStorage);
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir.path(), "models-switch-rollback.yml"));
+		// File-backed session so switchSession has a real session file to reload.
+		const sessionManager = SessionManager.create(tempDir.path(), tempDir.path());
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settings: Settings.isolated({ "compaction.enabled": false }),
+			modelRegistry,
+			thinkingLevel: AUTO_THINKING,
+		});
+
+		// Seed the carried effort: a fast classifier wins the race and pins it.
+		vi.spyOn(autoThinkingClassifier, "classifyDifficulty").mockResolvedValue(restored);
+		await session.prompt("seed the carried effort");
+		expect(seenEffort).toEqual([restored]);
+		const sessionFile = session.sessionFile;
+		expect(sessionFile).toBeTruthy();
+
+		// Force the switch's success-path agent.setThinkingLevel to throw once so
+		// the catch rollback runs (it must restore the carried effort).
+		const setLevelSpy = vi.spyOn(agent, "setThinkingLevel").mockImplementationOnce(() => {
+			throw new Error("switch load boom");
+		});
+		await expect(session.switchSession(sessionFile!)).rejects.toThrow("switch load boom");
+		setLevelSpy.mockRestore();
+
+		// After the failed switch, a fresh slow classifier must run at the RESTORED
+		// carried effort — not provisional (which is what a missing restore yields).
+		// Integration test: the prompt pays one real dispatch deadline.
+		const held = Promise.withResolvers<Effort>();
+		vi.spyOn(autoThinkingClassifier, "classifyDifficulty").mockReturnValue(held.promise);
+		seenEffort.length = 0;
+		await session.prompt("after the failed switch");
+		expect(seenEffort).toEqual([restored]);
+
+		held.resolve(restored);
+		for (let i = 0; i < 4; i++) await Promise.resolve();
+	});
 });

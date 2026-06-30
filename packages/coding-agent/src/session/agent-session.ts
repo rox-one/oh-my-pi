@@ -985,6 +985,15 @@ export class AgentSession {
 	 * NEXT turn. Generation-guarded + clamped to the current model on apply.
 	 */
 	#pendingAutoThinkingEffort: Effort | undefined;
+	/**
+	 * Monotonic invalidation token for in-flight auto-thinking classifiers.
+	 * Bumped at the start of every auto user turn and whenever auto/pending state
+	 * is cleared (setThinkingLevel, session switch). A late classifier result is
+	 * accepted only if the token it captured still matches — so an older, slower
+	 * classifier can never overwrite a newer carried effort (e.g. across an
+	 * ultrathink turn or an auto off→on toggle).
+	 */
+	#autoThinkingToken = 0;
 	#promptTemplates: PromptTemplate[];
 	#slashCommands: FileSlashCommand[];
 
@@ -7702,6 +7711,7 @@ export class AgentSession {
 			this.#autoThinking = true;
 			this.#autoResolvedLevel = undefined;
 			this.#pendingAutoThinkingEffort = undefined;
+			this.#autoThinkingToken++;
 			this.#thinkingLevel = provisional;
 			this.#applyThinkingLevelToAgent(provisional);
 			if (persist) {
@@ -7717,6 +7727,7 @@ export class AgentSession {
 		this.#autoThinking = false;
 		this.#autoResolvedLevel = undefined;
 		this.#pendingAutoThinkingEffort = undefined;
+		this.#autoThinkingToken++;
 		const effectiveLevel = resolveThinkingLevelForModel(this.model, level);
 		// Leaving auto must persist even when the resolved effort is unchanged (e.g.
 		// auto resolved to medium, then the user pins medium): otherwise the latest
@@ -7765,6 +7776,9 @@ export class AgentSession {
 	 * `#autoThinking`.
 	 */
 	async #applyAutoThinkingLevel(promptText: string, generation: number): Promise<void> {
+		// Invalidate any older in-flight classifier: a late result from a previous
+		// turn must never overwrite a newer carried effort.
+		const token = ++this.#autoThinkingToken;
 		const model = this.model;
 		if (!model?.reasoning) return;
 		// Models with reasoning but no controllable effort surface (devin-agent
@@ -7825,6 +7839,9 @@ export class AgentSession {
 		}
 		void classification.then(late => {
 			if (late === undefined) return;
+			// A newer auto turn (or an auto/pending reset) bumped the token — drop
+			// this stale result so it can't overwrite the carried effort.
+			if (token !== this.#autoThinkingToken) return;
 			if (this.#promptGeneration !== generation || !this.#autoThinking) return;
 			this.#pendingAutoThinkingEffort = late;
 		});
@@ -9238,10 +9255,12 @@ export class AgentSession {
 		const previousUsagePreflightReadyForNextModelCall = this.#usagePreflightReadyForNextModelCall;
 		const previousUsagePreflightReadyModel = this.#usagePreflightReadyModel;
 		const previousModel = this.model;
-		const previousThinkingLevel = this.thinkingLevel;
-		const previousAutoThinking = this.isAutoThinking;
-		const previousAutoResolvedLevel = this.autoResolvedThinkingLevel();
-		const previousServiceTierByFamily = this.serviceTierByFamily;
+		const previousThinkingLevel = this.#thinkingLevel;
+		const previousAutoThinking = this.#autoThinking;
+		const previousAutoResolvedLevel = this.#autoResolvedLevel;
+		const previousPendingAutoThinkingEffort = this.#pendingAutoThinkingEffort;
+		const previousServiceTierByFamily = this.#serviceTierByFamily;
+		const previousSelectedMCPToolNames = new Set(this.#selectedMCPToolNames);
 		const previousTools = [...this.agent.state.tools];
 		const previousBaseSystemPrompt = this.#tools.baseSystemPrompt;
 		const previousSystemPrompt = this.agent.state.systemPrompt;
@@ -9384,11 +9403,13 @@ export class AgentSession {
 				// identically as `auto` until then.
 				this.#autoResolvedLevel = undefined;
 				this.#pendingAutoThinkingEffort = undefined;
+				this.#autoThinkingToken++;
 				this.#thinkingLevel = resolveProvisionalAutoLevel(this.model);
 			} else {
 				this.#autoThinking = false;
 				this.#autoResolvedLevel = undefined;
 				this.#pendingAutoThinkingEffort = undefined;
+				this.#autoThinkingToken++;
 				this.#thinkingLevel = resolveThinkingLevelForModel(this.model, restoredThinkingLevel);
 			}
 			this.#applyThinkingLevelToAgent(this.#thinkingLevel);
@@ -9483,14 +9504,16 @@ export class AgentSession {
 				this.agent.setModel(previousModel);
 				modelRolledBack = !modelsAreEqual(rolledBackModel, previousModel);
 			}
-			this.#models.restoreThinkingSnapshot(previousThinkingLevel, previousAutoThinking, previousAutoResolvedLevel);
-			this.#models.restoreServiceTiers(previousServiceTierByFamily);
-			if (modelRolledBack) {
-				this.#emit({ type: "model_changed" });
-			}
-			this.#todo.syncFromBranch();
-			this.#advisors.resetAllRuntimes();
-			this.#advisors.reattachRecorderFeeds();
+			this.#thinkingLevel = previousThinkingLevel;
+			this.#autoThinking = previousAutoThinking;
+			this.#autoResolvedLevel = previousAutoResolvedLevel;
+			this.#pendingAutoThinkingEffort = previousPendingAutoThinkingEffort;
+			// Invalidate any classifier in flight from the failed switch attempt.
+			this.#autoThinkingToken++;
+			this.#applyThinkingLevelToAgent(previousThinkingLevel);
+			this.#serviceTierByFamily = previousServiceTierByFamily;
+			this.#syncTodoPhasesFromBranch();
+			this.#resetAllAdvisorRuntimes();
 			this.#reconnectToAgent();
 			try {
 				await this.#sessionSwitchReconciler?.();
