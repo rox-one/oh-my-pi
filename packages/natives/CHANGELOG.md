@@ -395,6 +395,9 @@
 
 - Fixed an issue where panics in native worker tasks (such as grep, AST parsing, globbing, workspace listing, HTML-to-markdown conversion, fuzzy finding, and clipboard image reading) would abort the host process instead of properly rejecting the returned JavaScript Promise.
 - Fixed a crash on Windows under low memory or commit charge conditions when spawning worker threads for token counting or sorting operations.
+### Fixed
+
+- Fixed native `task::blocking` closures aborting the host process when they panicked (via `.expect(...)` invariants, arithmetic overflow, or third-party panics on adversarial input) instead of rejecting the corresponding JS `Promise`. napi-rs's async-work callback is a plain `extern "C" fn`, so an unwind that escaped `Blocking::compute` was a forced process abort under stabilized C-unwind rules — `grep`, `glob`, `astGrep`, `astMatch`, `astEdit`, `listWorkspace`, `fuzzyFind`, `htmlToMarkdown`, `renderSnapcompactPng`, and `readImageFromClipboard` all shared this exposure. `Blocking::compute` now wraps the user closure in `std::panic::catch_unwind` and surfaces the panic as a `napi::Error` (`GenericFailure`), and the native crash hook treats a panic caught here the same way it already treated uutils panics — logged to the on-disk crash record for diagnosis, kept out of the user-facing stderr crash dump ([#4020](https://github.com/can1357/oh-my-pi/issues/4020)).
 
 ## [16.2.11] - 2026-07-01
 
