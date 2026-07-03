@@ -389,6 +389,59 @@ describe("Anthropic prior-turn thinking preservation (#2257)", () => {
 		}
 	});
 
+	it("drops redacted siblings when same-model abandoned-tool-use thinking is discarded", () => {
+		// Abandoned tool-use turns strip every thinking signature before replay.
+		// If the same-model signing-target guard then drops that visible
+		// thinking block, its redacted sibling must be dropped too; replaying a
+		// lone `redacted_thinking` block violates Anthropic's all-thinking-blocks
+		// contract for that assistant turn.
+		const target = makeAnthropicModel({
+			provider: "anthropic",
+			id: "claude-sonnet-4-6",
+			baseUrl: "https://api.anthropic.com",
+		});
+		const toolCallId = "toolu_abandoned";
+		const messages: Message[] = [
+			makeUser("Fix the layout"),
+			makeAssistant(
+				[
+					{ type: "thinking", thinking: "Private discarded reasoning.", thinkingSignature: "sig_dropped" },
+					{ type: "redactedThinking", data: "encrypted-sibling" },
+					{ type: "toolCall", id: toolCallId, name: "read", arguments: { path: "src/view.ts" } },
+				],
+				{
+					provider: "anthropic",
+					model: "claude-sonnet-4-6",
+					stopReason: "stop",
+				},
+			),
+			toolResult(toolCallId, "view body"),
+			makeAssistant(
+				[
+					{ type: "thinking", thinking: "Later signed reasoning.", thinkingSignature: "sig_latest" },
+					{ type: "text", text: "Done." },
+				],
+				{
+					provider: "anthropic",
+					model: "claude-sonnet-4-6",
+					stopReason: "stop",
+				},
+			),
+			makeUser("Continue."),
+		];
+
+		const params = convertAnthropicMessages(messages, target, false);
+		const assistant = params.find(p => p.role === "assistant");
+		if (!assistant) throw new Error("expected assistant wire message");
+		const blocks = assistant.content as WireBlock[];
+		expect(blocks.find(b => b.type === "thinking")).toBeUndefined();
+		expect(blocks.find(b => b.type === "redacted_thinking")).toBeUndefined();
+		const textBlocks = blocks.filter((b): b is WireTextBlock => b.type === "text");
+		expect(textBlocks).toHaveLength(0);
+		const toolUse = blocks.find(b => b.type === "tool_use") as WireToolUseBlock | undefined;
+		expect(toolUse?.id).toBe(toolCallId);
+	});
+
 	it("drops same-model unsigned thinking when the runtime clone flips signingEndpoint after a signing 400 (#4428 review)", () => {
 		// When `buildParams` detects a signing proxy at runtime (via the `400
 		// Invalid signature in thinking block` retry path), it clones the model
