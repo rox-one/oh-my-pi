@@ -1559,9 +1559,7 @@ function dropOpenRouterKimiForcedToolReasoning(
 
 /** Flattens assistant text blocks for Chat Completions without merging internal block boundaries. */
 export function flattenOpenAICompletionsAssistantTextBlocks(blocks: readonly TextContent[]): string | null {
-	const nonEmptyTextBlocks = blocks
-		.map(block => block.text.toWellFormed())
-		.filter(text => text.trim().length > 0);
+	const nonEmptyTextBlocks = blocks.map(block => block.text.toWellFormed()).filter(text => text.trim().length > 0);
 	if (nonEmptyTextBlocks.length === 0) return null;
 	let text = nonEmptyTextBlocks[0]!;
 	for (const blockText of nonEmptyTextBlocks.slice(1)) {

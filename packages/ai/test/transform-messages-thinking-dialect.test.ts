@@ -85,7 +85,6 @@ function transformedAssistant(messages: Message[], target: Model<Api>): Assistan
 	return assistant;
 }
 
-
 describe("transformMessages cross-provider thinking demotion → canonical dialect", () => {
 	it("renders Anthropic reasoning as a Gemini ```thinking fence when switching to a Gemini target", () => {
 		const gemini = makeModel("google-generative-ai", "google", "gemini-3-pro-preview");

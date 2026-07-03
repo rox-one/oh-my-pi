@@ -706,16 +706,17 @@ export function transformMessages<TApi extends Api>(
 				assistantMsg.content.some(b => b.type === "toolCall");
 			const lastBlockIndex = assistantMsg.content.length - 1;
 
-			const anthropicVisibleThinkingSurvivesReplay = (candidate: AssistantMessage["content"][number], candidateIndex: number) => {
+			const anthropicVisibleThinkingSurvivesReplay = (
+				candidate: AssistantMessage["content"][number],
+				candidateIndex: number,
+			) => {
 				if (candidate.type !== "thinking") return false;
 				if (!isAnthropicReplay) return false;
 				if (isLatestSurvivingAssistant && abandonedToolUse) return true;
 				const candidateSignatureUntrustworthy =
 					abandonedToolUse || (invalidStopReason && candidateIndex === lastBlockIndex);
 				const replaySignature =
-					candidateSignatureUntrustworthy && candidate.thinkingSignature
-						? undefined
-						: candidate.thinkingSignature;
+					candidateSignatureUntrustworthy && candidate.thinkingSignature ? undefined : candidate.thinkingSignature;
 				if (!replaySignature && (!candidate.thinking || candidate.thinking.trim() === "")) return false;
 				if (isSameModel && isSigningAnthropicTarget && (!replaySignature || replaySignature.trim() === "")) {
 					return false;
