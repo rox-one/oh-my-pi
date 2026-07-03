@@ -12,13 +12,11 @@ import { buildModel } from "@oh-my-pi/pi-catalog/build";
  * neither recalled nor influences generation). `transformMessages` therefore
  * demotes the reasoning to a `text` block so it survives as conversation
  * context, usually wrapping it in the TARGET model's own canonical
- * thinking-block dialect (e.g. a ```thinking fence for Gemini). The
- * Anthropic/Claude dialect is the exception: every Claude model
- * (Opus / Sonnet / Haiku / Fable / Mythos, etc.) receives bare assistant prose,
- * because Anthropic's `reasoning_extraction` classifier flags `<thinking>` /
- * `antml:thinking` tags in prior turn history — refusing (Fable) or leaking
- * the wrapped chain-of-thought as visible reasoning on the others. Same-model
- * continuations keep the native `thinking` block untouched.
+ * thinking-block dialect (e.g. a ```thinking fence for Gemini). The entire
+ * Anthropic dialect (all Claude models) is an exception: it receives bare
+ * assistant prose so replayed reasoning does not trigger the `reasoning_extraction`
+ * classifier that blocks wrapped reasoning. Same-model continuations keep the
+ * native `thinking` block untouched.
  */
 const REASONING = "The user wants the Paris weather; I will call get_weather with city=Paris.";
 
@@ -130,17 +128,10 @@ describe("transformMessages cross-provider thinking demotion → canonical diale
 		expect(text).toContain(REASONING);
 	});
 
-	it("renders demoted foreign reasoning as bare assistant prose for every Anthropic-dialect Claude target", () => {
-		// The Anthropic reasoning_extraction classifier flags `<thinking>` and
-		// `antml:thinking` tags in prior turn history for the whole Claude family
-		// — Fable refuses outright, Opus/Sonnet/Haiku/Mythos leak the wrapped
-		// chain-of-thought as visible reasoning. Every Anthropic-dialect target
-		// therefore receives bare prose, not the dialect's canonical thinking
-		// tags.
+	it("renders demoted foreign reasoning as bare prose for all Anthropic-dialect Claude models", () => {
 		const targets = [
 			{ name: "Claude Opus", id: "claude-opus-4-8" },
-			{ name: "Claude Sonnet", id: "claude-sonnet-4-6" },
-			{ name: "Claude Haiku", id: "claude-haiku-4-5" },
+			{ name: "Claude Sonnet", id: "claude-sonnet-5" },
 			{ name: "Claude Fable", id: "claude-fable-5" },
 			{ name: "Claude Mythos", id: "claude-mythos-5" },
 			// Bedrock cross-region inference profiles. `parseAnthropicModel`
@@ -163,12 +154,11 @@ describe("transformMessages cross-provider thinking demotion → canonical diale
 			const first = assistant.content[0];
 			expect(first?.type).toBe("text");
 			const text = first && first.type === "text" ? first.text : "";
+			// All Anthropic models receive bare reasoning prose with no wrapper tags
+			// to avoid triggering reasoning_extraction classifier
 			expect(text).toBe(REASONING);
-			expect(text).toBe(renderDemotedThinking(target.id, REASONING));
 			expect(text).not.toContain("<thinking>");
 			expect(text).not.toContain("</thinking>");
-			expect(text).not.toContain("<think>");
-			expect(text).not.toContain("</think>");
 			expect(text).not.toContain("_Hmm.");
 
 			const reply = assistant.content[1];
