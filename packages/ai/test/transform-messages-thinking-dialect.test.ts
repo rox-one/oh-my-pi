@@ -130,20 +130,15 @@ describe("transformMessages cross-provider thinking demotion → canonical diale
 
 	it("renders demoted foreign reasoning as bare prose for all Anthropic-dialect Claude models", () => {
 		const targets = [
-			{ name: "Claude Opus", id: "claude-opus-4-8" },
-			{ name: "Claude Sonnet", id: "claude-sonnet-5" },
-			{ name: "Claude Fable", id: "claude-fable-5" },
-			{ name: "Claude Mythos", id: "claude-mythos-5" },
-			// Bedrock cross-region inference profiles. `parseAnthropicModel`
-			// doesn't enumerate `haiku`, so this exercises the isClaudeModelId
-			// dotted-prefix fallback specifically.
-			{ name: "Claude Haiku (Bedrock US)", id: "us.anthropic.claude-haiku-4-5-20251001-v1:0" },
-			{ name: "Claude Haiku (Bedrock EU)", id: "eu.anthropic.claude-haiku-4-5-20251001-v1:0" },
-			{ name: "Claude Opus (Bedrock Global)", id: "global.anthropic.claude-opus-4-8" },
+			{ name: "Claude Opus", id: "claude-opus-4-8", provider: "anthropic" },
+			{ name: "Claude Sonnet", id: "claude-sonnet-5", provider: "anthropic" },
+			{ name: "Claude Fable", id: "claude-fable-5", provider: "anthropic" },
+			{ name: "Claude Mythos", id: "claude-mythos-5", provider: "anthropic" },
+			{ name: "Bedrock Claude Haiku", id: "anthropic.claude-3-5-haiku-20241022-v1:0", provider: "aws-bedrock" },
 		] as const;
 
 		for (const target of targets) {
-			const model = makeModel("anthropic-messages", "anthropic", target.id);
+			const model = makeModel("anthropic-messages", target.provider, target.id);
 			const assistant = transformedAssistant(
 				[user(`weather in Paris for ${target.name}?`), geminiThinkingTurn()],
 				model,

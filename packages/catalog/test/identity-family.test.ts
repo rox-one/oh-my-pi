@@ -85,6 +85,8 @@ describe("isClaudeModelId", () => {
 	test("matches Claude namespace and delimiter forms", () => {
 		expect(isClaudeModelId("claude-sonnet-4-6")).toBe(true);
 		expect(isClaudeModelId("anthropic/claude.3")).toBe(true);
+		expect(isClaudeModelId("anthropic.claude-3-5-haiku-20241022-v1:0")).toBe(true);
+		expect(isClaudeModelId("us.anthropic.claude-sonnet-5")).toBe(true);
 		expect(isClaudeModelId("my-claudius")).toBe(false);
 	});
 	test("matches dotted Bedrock cross-region inference profile ids for Claude kinds not enumerated in parseAnthropicModel", () => {
@@ -339,6 +341,7 @@ describe("modelFamilyToken", () => {
 	test("folds aggregator mirrors and namespace prefixes onto the lineage", () => {
 		expect(modelFamilyToken("anthropic/claude-opus-4.8")).toBe("anthropic");
 		expect(modelFamilyToken("openrouter/anthropic/claude-opus-4-8")).toBe("anthropic");
+		expect(modelFamilyToken("anthropic.claude-3-5-haiku-20241022-v1:0")).toBe("anthropic");
 	});
 
 	test("classifies Bedrock cross-region profile ids for Claude kinds not enumerated in parseAnthropicModel", () => {
