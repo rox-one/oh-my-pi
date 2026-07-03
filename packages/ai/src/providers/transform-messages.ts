@@ -722,7 +722,6 @@ export function transformMessages<TApi extends Api>(
 					return !replaySignature || replaySignature.trim() === "";
 				});
 
-
 			const transformedContent = assistantMsg.content.flatMap((block, blockIndex) => {
 				if (block.type === "thinking") {
 					// Only an aborted/errored turn's final (mid-stream) block can hold a
