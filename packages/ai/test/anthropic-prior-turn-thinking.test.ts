@@ -389,6 +389,60 @@ describe("Anthropic prior-turn thinking preservation (#2257)", () => {
 		}
 	});
 
+	it("drops same-model unsigned thinking when the runtime clone flips signingEndpoint after a signing 400 (#4428 review)", () => {
+		// When `buildParams` detects a signing proxy at runtime (via the `400
+		// Invalid signature in thinking block` retry path), it clones the model
+		// compat with `replayUnsignedThinking: false` AND `signingEndpoint: true`.
+		// The `signingEndpoint` flip is load-bearing: without it,
+		// `transformMessages` would keep the unsigned block, then
+		// `convertAnthropicMessages` would demote it to text via
+		// `renderDemotedThinking`, leaking the private reasoning as visible
+		// assistant prose and adding cumulative `reasoning_extraction` heat
+		// on Claude targets. This test pins the drop behavior against the
+		// effective (runtime-cloned) compat shape.
+		// Mirror the exact clone shape produced by `buildParams` when the
+		// signing 400 fires: preserve every resolved compat field, then flip
+		// `replayUnsignedThinking → false` and `signingEndpoint → true`.
+		// `signingEndpoint` is a *resolved* field (not part of the sparse
+		// `AnthropicCompat` override), so this cannot be expressed through
+		// `buildModel({ compat: … })`; the post-override cast is the same
+		// pattern `buildParams` uses at runtime.
+		const base = makeAnthropicModel({
+			provider: "custom-anthropic",
+			id: "reasoning-model",
+			baseUrl: "https://opencode.cloudflare.dev/anthropic",
+		});
+		const target: Model<"anthropic-messages"> = {
+			...base,
+			compat: { ...base.compat, replayUnsignedThinking: false, signingEndpoint: true },
+		};
+		const reasoning = "Private reasoning that must not leak after auto-mark.";
+		const toolCallId = "toolu_autopin";
+		const messages: Message[] = [
+			makeUser("Fix the layout"),
+			makeAssistant(
+				[
+					{ type: "thinking", thinking: reasoning, thinkingSignature: undefined },
+					{ type: "toolCall", id: toolCallId, name: "read", arguments: { path: "src/view.ts" } },
+				],
+				{},
+			),
+			toolResult(toolCallId, "view body"),
+			makeUser("Continue."),
+		];
+
+		const params = convertAnthropicMessages(messages, target, false);
+		const assistant = params.find(p => p.role === "assistant");
+		if (!assistant) throw new Error("expected assistant wire message");
+		const blocks = assistant.content as WireBlock[];
+		// Native thinking dropped, no demoted-text carrier, tool call preserved.
+		expect(blocks.find(b => b.type === "thinking")).toBeUndefined();
+		const textBlocks = blocks.filter((b): b is WireTextBlock => b.type === "text");
+		expect(textBlocks).toHaveLength(0);
+		const toolUse = blocks.find(b => b.type === "tool_use") as WireToolUseBlock | undefined;
+		expect(toolUse?.id).toBe(toolCallId);
+	});
+
 	it("strips official Anthropic source signatures on cross-model replay to a 3p target", () => {
 		// official Anthropic → 3p. Anthropic's signature is bound to the
 		// issuing model+session, so the 3p target cannot reverify or

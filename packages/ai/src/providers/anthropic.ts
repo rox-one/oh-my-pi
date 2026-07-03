@@ -3295,12 +3295,18 @@ function buildParams(
 		fallbacks = options?.fallbacks,
 	} = buildOptions;
 	// A session-scoped auto-demote (learned from a live signing 400) clones the
-	// resolved compat with `replayUnsignedThinking: false` so every subsequent
-	// downstream read (convertAnthropicMessages, transformMessages) sees the
-	// demoted default without mutating the shared `model` reference.
+	// resolved compat with `replayUnsignedThinking: false` AND `signingEndpoint: true`
+	// so every subsequent downstream read (`convertAnthropicMessages`,
+	// `transformMessages`) sees both the demoted default and the signing
+	// policy without mutating the shared `model` reference. Leaving
+	// `signingEndpoint` false would skip the same-model unsigned-thinking
+	// drop guard in `transformMessages`, and the block would silently fall
+	// through to `renderDemotedThinking` — leaking the private reasoning as
+	// visible assistant text and adding cumulative `reasoning_extraction`
+	// heat on Claude targets (#4428).
 	const effectiveModel =
 		forceDemoteUnsignedThinking && model.compat.replayUnsignedThinking
-			? { ...model, compat: { ...model.compat, replayUnsignedThinking: false } }
+			? { ...model, compat: { ...model.compat, replayUnsignedThinking: false, signingEndpoint: true } }
 			: model;
 	const { cacheControl } = getCacheControl(model, options?.cacheRetention);
 
