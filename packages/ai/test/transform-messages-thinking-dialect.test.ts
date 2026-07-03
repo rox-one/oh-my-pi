@@ -1,7 +1,8 @@
 import { describe, expect, it } from "bun:test";
 import { getDialectDefinition, renderDemotedThinking } from "@oh-my-pi/pi-ai/dialect";
+import { flattenOpenAICompletionsAssistantTextBlocks } from "@oh-my-pi/pi-ai/providers/openai-completions";
 import { transformMessages } from "@oh-my-pi/pi-ai/providers/transform-messages";
-import type { Api, AssistantMessage, Message, Model, ModelSpec, UserMessage } from "@oh-my-pi/pi-ai/types";
+import type { Api, AssistantMessage, Message, Model, ModelSpec, TextContent, UserMessage } from "@oh-my-pi/pi-ai/types";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 
 /**
@@ -84,6 +85,7 @@ function transformedAssistant(messages: Message[], target: Model<Api>): Assistan
 	return assistant;
 }
 
+
 describe("transformMessages cross-provider thinking demotion → canonical dialect", () => {
 	it("renders Anthropic reasoning as a Gemini ```thinking fence when switching to a Gemini target", () => {
 		const gemini = makeModel("google-generative-ai", "google", "gemini-3-pro-preview");
@@ -162,48 +164,16 @@ describe("transformMessages cross-provider thinking demotion → canonical diale
 		}
 	});
 
-	it("trims a demoted block that becomes final after following empty thinking blocks are dropped", () => {
-		const claude = makeModel("anthropic-messages", "anthropic", "claude-sonnet-4-6");
-		const turn: AssistantMessage = {
-			...geminiThinkingTurn(),
-			content: [
-				{ type: "thinking", thinking: `${REASONING}\n`, thinkingSignature: "google-sig" },
-				{ type: "thinking", thinking: " \n\t", thinkingSignature: "" },
-			],
-		};
+	it("preserves a boundary when OpenAI-compatible Claude targets flatten bare demotions", () => {
+		const model = makeModel("openai-completions", "openrouter", "anthropic/claude-sonnet-4-6");
+		const assistant = transformedAssistant(
+			[user("weather in Paris?"), anthropicThinkingTurn(), user("Summarize the result.")],
+			model,
+		);
+		const textBlocks = assistant.content.filter((block): block is TextContent => block.type === "text");
 
-		const assistant = transformedAssistant([user("weather in Paris?"), turn], claude);
-
-		expect(assistant.content).toHaveLength(1);
-		const first = assistant.content[0];
-		expect(first?.type).toBe("text");
-		const text = first && first.type === "text" ? first.text : "";
-		expect(text).toBe(REASONING);
-		expect(/\s$/.test(text)).toBe(false);
-	});
-
-	it("trimEnds trailing whitespace already present in bare Anthropic-dialect demoted thinking", () => {
-		const claude = makeModel("anthropic-messages", "anthropic", "claude-sonnet-4-6");
-		const reasoningWithTrailingWhitespace = "The plan is complete.\n \t";
-		const turn: AssistantMessage = {
-			...geminiThinkingTurn(),
-			content: [
-				{
-					type: "thinking",
-					thinking: reasoningWithTrailingWhitespace,
-					thinkingSignature: "google-sig",
-				},
-			],
-		};
-
-		const assistant = transformedAssistant([user("weather in Paris?"), turn], claude);
-
-		expect(assistant.content).toHaveLength(1);
-		const first = assistant.content[0];
-		expect(first?.type).toBe("text");
-		const text = first && first.type === "text" ? first.text : "";
-		expect(text).toBe("The plan is complete.");
-		expect(/\s$/.test(text)).toBe(false);
+		expect(flattenOpenAICompletionsAssistantTextBlocks(textBlocks)).toBe(`${REASONING}\n\nChecking the forecast.`);
+		expect(flattenOpenAICompletionsAssistantTextBlocks(textBlocks)).not.toBe(`${REASONING}Checking the forecast.`);
 	});
 
 	it("keeps the native thinking block for a same-provider/same-model continuation", () => {

@@ -1557,86 +1557,18 @@ function dropOpenRouterKimiForcedToolReasoning(
 	}
 }
 
-function hasActiveNativeKimiK3Reasoning(
-	model: Model<"openai-completions">,
-	options: OpenAICompletionsOptions | undefined,
-): boolean {
-	if (model.provider !== "kimi-code" || model.id.toLowerCase() !== "k3" || !model.reasoning) return false;
-	if (options?.reasoning === undefined || options.disableReasoning) return false;
-	try {
-		const url = new URL(model.baseUrl);
-		return url.hostname === "api.kimi.com" && (url.pathname === "/coding" || url.pathname.startsWith("/coding/"));
-	} catch {
-		return false;
+/** Flattens assistant text blocks for Chat Completions without merging internal block boundaries. */
+export function flattenOpenAICompletionsAssistantTextBlocks(blocks: readonly TextContent[]): string | null {
+	const nonEmptyTextBlocks = blocks
+		.map(block => block.text.toWellFormed())
+		.filter(text => text.trim().length > 0);
+	if (nonEmptyTextBlocks.length === 0) return null;
+	let text = nonEmptyTextBlocks[0]!;
+	for (const blockText of nonEmptyTextBlocks.slice(1)) {
+		const alreadySeparated = /\s$/u.test(text) || /^\s/u.test(blockText);
+		text += `${alreadySeparated ? "" : "\n\n"}${blockText}`;
 	}
-}
-
-function isChatCompletionsPromptCacheableContentBlock(
-	block: unknown,
-): block is { type: "text" | "image_url" | "input_audio" | "file"; prompt_cache_breakpoint?: { mode: "explicit" } } {
-	if (typeof block !== "object" || block === null || !("type" in block)) return false;
-	return block.type === "text" || block.type === "image_url" || block.type === "input_audio" || block.type === "file";
-}
-
-function markLatestStableChatCompletionsCacheBreakpoint(messages: ChatCompletionMessageParam[]): boolean {
-	let latestInputMessage = -1;
-	for (let i = messages.length - 1; i >= 0; i--) {
-		const message = messages[i];
-		if (message.role === "user" || message.role === "developer") {
-			latestInputMessage = i;
-			break;
-		}
-	}
-	if (latestInputMessage <= 0) return false;
-
-	for (let i = latestInputMessage - 1; i >= 0; i--) {
-		const message = messages[i];
-		if (message.role !== "user" && message.role !== "developer" && message.role !== "system") continue;
-		if (typeof message.content === "string") {
-			messages[i] = {
-				...message,
-				content: [{ type: "text", text: message.content, prompt_cache_breakpoint: { mode: "explicit" } }],
-			};
-			return true;
-		}
-		for (let j = message.content.length - 1; j >= 0; j--) {
-			const block = message.content[j];
-			if (!isChatCompletionsPromptCacheableContentBlock(block)) continue;
-			Object.assign(block, { prompt_cache_breakpoint: { mode: "explicit" } });
-			return true;
-		}
-	}
-	return false;
-}
-
-function applyOpenAIChatCompletionsPromptCachePolicy(
-	params: OpenAICompletionsParams,
-	model: Model<"openai-completions">,
-	options: OpenAICompletionsOptions | undefined,
-): void {
-	const promptCacheKey = getOpenAIPromptCacheKey(options);
-	if (model.provider === "kimi-code" && promptCacheKey !== undefined) {
-		params.prompt_cache_key = promptCacheKey;
-	}
-
-	const promptCache = options?.promptCache;
-	if (!promptCache || resolveCacheRetention(options?.cacheRetention) === "none") return;
-	if (!model.compat.supportsPromptCacheBreakpoints) {
-		if (promptCache.mode === "explicit") {
-			throw new AIError.ConfigurationError(
-				`OpenAI explicit prompt caching is unsupported for ${model.provider}/${model.id}; enable compat.supportsPromptCacheBreakpoints only for a compatible endpoint.`,
-			);
-		}
-		return;
-	}
-
-	params.prompt_cache_key = promptCacheKey;
-	params.prompt_cache_options = {
-		mode: promptCache.mode,
-		ttl: promptCache.ttl ?? model.compat.promptCacheBreakpointTtl,
-	};
-	if (promptCache.mode === "explicit" && promptCache.breakpoint !== "none")
-		markLatestStableChatCompletionsCacheBreakpoint(params.messages);
+	return text;
 }
 
 function buildParams(
@@ -2164,27 +2096,18 @@ export function convertMessages(
 				content: null,
 			};
 
-			const textBlocks = msg.content.filter(b => b.type === "text") as TextContent[];
-			// Filter out empty text blocks to avoid API validation errors
-			const nonEmptyTextBlocks = textBlocks.filter(b => b.text && b.text.trim().length > 0);
-			if (nonEmptyTextBlocks.length > 0) {
+			const flattenedText = flattenOpenAICompletionsAssistantTextBlocks(
+				msg.content.filter((b): b is TextContent => b.type === "text"),
+			);
+			if (flattenedText !== null) {
 				// Always send assistant content as a plain string. Some OpenAI-compatible
 				// backends mirror array-of-text-block payloads back to the model literally,
-				// causing recursive nested content in subsequent turns.
-				// Join ordinary adjacent text blocks with no separator so bridge
-				// stitching, imported transcripts, and streaming chunks keep their
-				// original byte sequence. Demoted-thinking blocks (kDemotedThinking,
-				// synthesized by transformMessages) are the one exception: bare
-				// Anthropic-dialect reasoning would otherwise glue onto the first word
-				// of the visible answer. Insert a paragraph break after them — only
-				// when another block actually follows, so a trailing demoted block
-				// never ships trailing whitespace.
-				assistantMsg.content = nonEmptyTextBlocks
-					.map((b, i) => {
-						const text = b.text.toWellFormed();
-						return isDemotedThinking(b) && i < nonEmptyTextBlocks.length - 1 ? `${text}\n` : text;
-					})
-					.join("");
+				// causing recursive nested content in subsequent turns. Preserve a hard
+				// boundary between adjacent internal text blocks: cross-provider demotion
+				// can place bare Anthropic reasoning immediately before the assistant's
+				// original visible answer, and concatenating with `""` produces
+				// `reasoningFinal answer`.
+				assistantMsg.content = flattenedText;
 			}
 
 			// Handle thinking blocks

@@ -706,21 +706,29 @@ export function transformMessages<TApi extends Api>(
 				assistantMsg.content.some(b => b.type === "toolCall");
 			const lastBlockIndex = assistantMsg.content.length - 1;
 
-			const dropsSameModelUnsignedThinking =
+			const anthropicVisibleThinkingSurvivesReplay = (candidate: AssistantMessage["content"][number], candidateIndex: number) => {
+				if (candidate.type !== "thinking") return false;
+				if (!isAnthropicReplay) return false;
+				if (isLatestSurvivingAssistant && abandonedToolUse) return true;
+				const candidateSignatureUntrustworthy =
+					abandonedToolUse || (invalidStopReason && candidateIndex === lastBlockIndex);
+				const replaySignature =
+					candidateSignatureUntrustworthy && candidate.thinkingSignature
+						? undefined
+						: candidate.thinkingSignature;
+				if (!replaySignature && (!candidate.thinking || candidate.thinking.trim() === "")) return false;
+				if (isSameModel && isSigningAnthropicTarget && (!replaySignature || replaySignature.trim() === "")) {
+					return false;
+				}
+				return true;
+			};
+			const hasVisibleThinking = assistantMsg.content.some(candidate => candidate.type === "thinking");
+			const dropsAllSameModelVisibleThinking =
 				isAnthropicReplay &&
 				isSameModel &&
 				isSigningAnthropicTarget &&
-				!(isLatestSurvivingAssistant && abandonedToolUse) &&
-				assistantMsg.content.some((candidate, candidateIndex) => {
-					if (candidate.type !== "thinking") return false;
-					const candidateSignatureUntrustworthy =
-						abandonedToolUse || (invalidStopReason && candidateIndex === lastBlockIndex);
-					const replaySignature =
-						candidateSignatureUntrustworthy && candidate.thinkingSignature
-							? undefined
-							: candidate.thinkingSignature;
-					return !replaySignature || replaySignature.trim() === "";
-				});
+				hasVisibleThinking &&
+				!assistantMsg.content.some(anthropicVisibleThinkingSurvivesReplay);
 
 			const transformedContent = assistantMsg.content.flatMap((block, blockIndex) => {
 				if (block.type === "thinking") {
@@ -832,11 +840,11 @@ export function transformMessages<TApi extends Api>(
 					// Redacted thinking is native-only. Keep it for same-model
 					// signed replay, the latest byte-for-byte Anthropic turn, or
 					// compatible targets that will also emit sibling unsigned
-					// thinking natively. Drop it whenever the visible thinking from
-					// this same-model turn was discarded, and when cross-model
-					// stripped visible thinking will be demoted to text.
+					// thinking natively. Drop it only when every visible thinking
+					// block from this same-model turn was discarded, and when
+					// cross-model stripped visible thinking will be demoted to text.
 					if (isAnthropicReplay) {
-						if (dropsSameModelUnsignedThinking) return [];
+						if (dropsAllSameModelVisibleThinking) return [];
 						if (isSameModel || isLatestSurvivingAssistant || replaysUnsignedAnthropicThinking) return block;
 						return [];
 					}

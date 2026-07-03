@@ -442,6 +442,48 @@ describe("Anthropic prior-turn thinking preservation (#2257)", () => {
 		expect(toolUse?.id).toBe(toolCallId);
 	});
 
+	it("keeps redacted siblings when signed same-model thinking survives beside a discarded final block", () => {
+		// Error/aborted turns strip only the final in-flight thinking block.
+		// Earlier completed signed thinking still survives replay, so its
+		// redacted sibling must survive too; dropping every redacted block just
+		// because one later visible thinking block was discarded violates
+		// Anthropic's all-thinking-blocks replay contract in the opposite
+		// direction.
+		const target = makeAnthropicModel({
+			provider: "anthropic",
+			id: "claude-sonnet-4-6",
+			baseUrl: "https://api.anthropic.com",
+		});
+		const messages: Message[] = [
+			makeUser("Fix the layout"),
+			makeAssistant(
+				[
+					{ type: "thinking", thinking: "Completed signed reasoning.", thinkingSignature: "sig_complete" },
+					{ type: "redactedThinking", data: "encrypted-complete-sibling" },
+					{ type: "text", text: "Visible anchor." },
+					{ type: "thinking", thinking: "Partial final reasoning.", thinkingSignature: "sig_partial" },
+				],
+				{
+					provider: "anthropic",
+					model: "claude-sonnet-4-6",
+					stopReason: "error",
+				},
+			),
+			makeUser("Continue."),
+		];
+
+		const params = convertAnthropicMessages(messages, target, false);
+		const assistant = params.find(p => p.role === "assistant");
+		if (!assistant) throw new Error("expected assistant wire message");
+		const blocks = assistant.content as WireBlock[];
+		const thinking = blocks.find(b => b.type === "thinking") as WireThinkingBlock | undefined;
+		expect(thinking?.thinking).toBe("Completed signed reasoning.");
+		expect(thinking?.signature).toBe("sig_complete");
+		const redacted = blocks.find(b => b.type === "redacted_thinking") as WireRedactedBlock | undefined;
+		expect(redacted?.data).toBe("encrypted-complete-sibling");
+		expect(blocks.some(b => b.type === "thinking" && b.thinking === "Partial final reasoning.")).toBe(false);
+	});
+
 	it("drops same-model unsigned thinking when the runtime clone flips signingEndpoint after a signing 400 (#4428 review)", () => {
 		// When `buildParams` detects a signing proxy at runtime (via the `400
 		// Invalid signature in thinking block` retry path), it clones the model
