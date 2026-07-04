@@ -235,7 +235,19 @@ async function loadImpl<T>(
 /**
  * Filter providers based on options and disabled state.
  */
+function syncDisabledExtensionProvidersFromSettings(): void {
+	if (!settings) return;
+	disabledExtensionProviders.clear();
+	const source = settings.isConfigured("disabledExtensionProviders")
+		? settings.get("disabledExtensionProviders")
+		: settings.get("disabledProviders");
+	for (const id of source) {
+		disabledExtensionProviders.add(id);
+	}
+}
+
 function filterProviders<T>(capability: Capability<T>, options: LoadOptions): Provider<T>[] {
+	syncDisabledExtensionProvidersFromSettings();
 	let providers = (capability.providers as Provider<T>[]).filter(p => !disabledExtensionProviders.has(p.id));
 
 	if (options.providers) {
@@ -289,18 +301,12 @@ export async function loadCapability<T>(
  */
 export function initializeWithSettings(activeSettings: Settings): void {
 	settings = activeSettings;
-	disabledExtensionProviders.clear();
 	// Legacy read-through: fall back to `disabledProviders` ONLY when the new
 	// key has never been configured. An explicitly-empty configured value is a
 	// deliberate "extension list is empty" signal (e.g. the user re-enabled
 	// the last provider from `/extensions`) and must NOT roll back to the
 	// model-side list on the next boot.
-	const source = settings.isConfigured("disabledExtensionProviders")
-		? settings.get("disabledExtensionProviders")
-		: settings.get("disabledProviders");
-	for (const id of source) {
-		disabledExtensionProviders.add(id);
-	}
+	syncDisabledExtensionProvidersFromSettings();
 }
 
 /**
@@ -318,6 +324,7 @@ function persistDisabledExtensionProviders(): void {
  * discovery or `/login`; those honor the separate `disabledProviders` list.
  */
 export function disableProvider(providerId: string): void {
+	syncDisabledExtensionProvidersFromSettings();
 	disabledExtensionProviders.add(providerId);
 	persistDisabledExtensionProviders();
 }
@@ -326,6 +333,7 @@ export function disableProvider(providerId: string): void {
  * Re-enable a previously disabled extension provider.
  */
 export function enableProvider(providerId: string): void {
+	syncDisabledExtensionProvidersFromSettings();
 	disabledExtensionProviders.delete(providerId);
 	persistDisabledExtensionProviders();
 }
@@ -334,6 +342,7 @@ export function enableProvider(providerId: string): void {
  * Check if an extension provider is enabled (capability-registry scope).
  */
 export function isProviderEnabled(providerId: string): boolean {
+	syncDisabledExtensionProvidersFromSettings();
 	return !disabledExtensionProviders.has(providerId);
 }
 
@@ -341,6 +350,7 @@ export function isProviderEnabled(providerId: string): boolean {
  * Get list of all disabled extension provider IDs.
  */
 export function getDisabledProviders(): string[] {
+	syncDisabledExtensionProvidersFromSettings();
 	return Array.from(disabledExtensionProviders);
 }
 
@@ -353,6 +363,12 @@ export function setDisabledProviders(providerIds: string[]): void {
 		disabledExtensionProviders.add(id);
 	}
 	persistDisabledExtensionProviders();
+}
+
+/** Reset provider disable state for tests that tear down the Settings singleton. */
+export function resetProviderStateForTests(): void {
+	settings = null;
+	disabledExtensionProviders.clear();
 }
 
 // =============================================================================
@@ -379,6 +395,7 @@ export function listCapabilities(): string[] {
 export function getCapabilityInfo(capabilityId: string): CapabilityInfo | undefined {
 	const capability = capabilities.get(capabilityId);
 	if (!capability) return undefined;
+	syncDisabledExtensionProvidersFromSettings();
 
 	return {
 		id: capability.id,
@@ -408,6 +425,7 @@ export function getProviderInfo(providerId: string): ProviderInfo | undefined {
 	const meta = providerMeta.get(providerId);
 	const caps = providerCapabilities.get(providerId);
 	if (!meta || !caps) return undefined;
+	syncDisabledExtensionProvidersFromSettings();
 
 	// Find priority from first capability's provider list
 	let priority = 0;

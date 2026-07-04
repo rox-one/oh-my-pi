@@ -14,11 +14,13 @@ import {
 	getDisabledProviders,
 	initializeWithSettings,
 	isProviderEnabled,
+	resetProviderStateForTests,
 } from "@oh-my-pi/pi-coding-agent/capability";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 
 describe("capability registry — extension-provider split (#4507)", () => {
 	afterEach(() => {
+		resetProviderStateForTests();
 		resetSettingsForTest();
 	});
 
@@ -42,9 +44,9 @@ describe("capability registry — extension-provider split (#4507)", () => {
 		const settings = await Settings.init({ inMemory: true });
 		initializeWithSettings(settings);
 
-		// Set the model-side list after initialization so the legacy read-through
-		// migration (which fires only when the extension set is empty at init)
-		// doesn't mirror it into the extension set.
+		// Once the split key is configured, even as an empty list, the model-side
+		// list must stay independent from extension toggles.
+		settings.set("disabledExtensionProviders", []);
 		settings.setDisabledProviders(["github-copilot"]);
 
 		disableProvider("cursor");
@@ -130,8 +132,13 @@ describe("capability registry — extension-provider split (#4507)", () => {
 		});
 
 		expect(settings.get("disabledExtensionProviders")).toEqual(["always", "cursor"]);
+		initializeWithSettings(settings);
+		expect(isProviderEnabled("cursor")).toBe(false);
+		expect(isProviderEnabled("windsurf")).toBe(true);
 
 		await settings.reloadForCwd(otherDir);
 		expect(settings.get("disabledExtensionProviders")).toEqual(["always", "windsurf"]);
+		expect(isProviderEnabled("cursor")).toBe(true);
+		expect(isProviderEnabled("windsurf")).toBe(false);
 	});
 });
