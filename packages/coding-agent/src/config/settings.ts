@@ -929,6 +929,12 @@ export class Settings {
 		const prevModelRoles = this.get("modelRoles");
 		const prevCodeModeValues = this.#codeModeSignalSnapshot();
 		this.#cwd = normalized;
+		// `#loadProjectSettings()` uses the capability registry, whose provider
+		// filter reads path-scoped settings such as `disabledExtensionProviders`.
+		// Clear cwd-derived cached values before discovery so provider filtering
+		// resolves against the destination cwd instead of the previous project.
+		this.#resolvedCache.clear();
+		this.#editVariantCache = undefined;
 		if (this.#persist) {
 			this.#project = await this.#loadProjectSettings();
 		}
