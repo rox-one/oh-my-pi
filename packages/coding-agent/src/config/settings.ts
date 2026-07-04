@@ -197,7 +197,11 @@ export function validateProviderMaxInFlightRequests(value: unknown): Record<stri
 	return normalized;
 }
 
-const PATH_SCOPED_ARRAY_SETTINGS = new Set<SettingPath>(["enabledModels", "disabledProviders"]);
+const PATH_SCOPED_ARRAY_SETTINGS: Partial<Record<SettingPath, true>> = {
+	enabledModels: true,
+	disabledProviders: true,
+	disabledExtensionProviders: true,
+};
 type PathScopedStringArrayEntry = {
 	path?: unknown;
 	paths?: unknown;
@@ -323,7 +327,7 @@ type EditVariantEntry = {
 };
 
 function resolvePathScopedStringArray(settingPath: SettingPath, value: unknown, cwd: string): string[] | undefined {
-	if (!PATH_SCOPED_ARRAY_SETTINGS.has(settingPath) || !Array.isArray(value)) return undefined;
+	if (!PATH_SCOPED_ARRAY_SETTINGS[settingPath] || !Array.isArray(value)) return undefined;
 
 	const resolved: string[] = [];
 	for (const entry of value) {

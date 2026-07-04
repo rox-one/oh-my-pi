@@ -36,8 +36,8 @@ const providerCapabilities = new Map<string, Set<string>>();
 /** Provider display metadata (shared across capabilities) */
 const providerMeta = new Map<string, { displayName: string; description: string }>();
 
-/** Disabled providers (by ID) */
-const disabledProviders = new Set<string>();
+/** Disabled extension providers (by ID). Controls capability-registry loading only. */
+const disabledExtensionProviders = new Set<string>();
 
 /** Settings manager for persistence (if set) */
 let settings: Settings | null = null;
@@ -235,8 +235,8 @@ async function loadImpl<T>(
 /**
  * Filter providers based on options and disabled state.
  */
-function filterProviders<T>(capability: Capability<T>, options: LoadOptions<T>): Provider<T>[] {
-	let providers = (capability.providers as Provider<T>[]).filter(p => !disabledProviders.has(p.id));
+function filterProviders<T>(capability: Capability<T>, options: LoadOptions): Provider<T>[] {
+	let providers = (capability.providers as Provider<T>[]).filter(p => !disabledExtensionProviders.has(p.id));
 
 	if (options.providers) {
 		const allowed = new Set(options.providers);
@@ -278,65 +278,75 @@ export async function loadCapability<T>(
 /**
  * Initialize capability system with settings manager for persistence.
  * Call this once on startup to enable persistent provider state.
+ *
+ * Reads the extension-provider disable list from `disabledExtensionProviders`
+ * (added in this change to decouple the `/extensions` provider toggle from the
+ * model/login `disabledProviders` list). For legacy configs where only the
+ * older `disabledProviders` key is set, its value is copied into the new list
+ * so users who set `disabledProviders: [cursor]` intending "hide all cursor
+ * stuff" keep the joint behavior; toggles from the `/extensions` UI then only
+ * mutate the new key.
  */
 export function initializeWithSettings(activeSettings: Settings): void {
 	settings = activeSettings;
-	// Load disabled providers from settings
-	const disabled = settings.get("disabledProviders");
-	disabledProviders.clear();
-	for (const id of disabled) {
-		disabledProviders.add(id);
+	disabledExtensionProviders.clear();
+	const explicitExt = settings.get("disabledExtensionProviders");
+	const source = explicitExt.length > 0 ? explicitExt : settings.get("disabledProviders");
+	for (const id of source) {
+		disabledExtensionProviders.add(id);
 	}
 }
 
 /**
- * Persist current disabled providers to settings.
+ * Persist current disabled extension providers to settings.
  */
-function persistDisabledProviders(): void {
+function persistDisabledExtensionProviders(): void {
 	if (settings) {
-		settings.set("disabledProviders", Array.from(disabledProviders));
+		settings.set("disabledExtensionProviders", Array.from(disabledExtensionProviders));
 	}
 }
 
 /**
- * Disable a provider globally (across all capabilities).
+ * Disable an extension provider (hides its capability contributions from
+ * `/extensions` and everywhere `loadCapability` runs). Does not affect model
+ * discovery or `/login`; those honor the separate `disabledProviders` list.
  */
 export function disableProvider(providerId: string): void {
-	disabledProviders.add(providerId);
-	persistDisabledProviders();
+	disabledExtensionProviders.add(providerId);
+	persistDisabledExtensionProviders();
 }
 
 /**
- * Enable a previously disabled provider.
+ * Re-enable a previously disabled extension provider.
  */
 export function enableProvider(providerId: string): void {
-	disabledProviders.delete(providerId);
-	persistDisabledProviders();
+	disabledExtensionProviders.delete(providerId);
+	persistDisabledExtensionProviders();
 }
 
 /**
- * Check if a provider is enabled.
+ * Check if an extension provider is enabled (capability-registry scope).
  */
 export function isProviderEnabled(providerId: string): boolean {
-	return !disabledProviders.has(providerId);
+	return !disabledExtensionProviders.has(providerId);
 }
 
 /**
- * Get list of all disabled provider IDs.
+ * Get list of all disabled extension provider IDs.
  */
 export function getDisabledProviders(): string[] {
-	return Array.from(disabledProviders);
+	return Array.from(disabledExtensionProviders);
 }
 
 /**
- * Set disabled providers from a list (replaces current set).
+ * Set disabled extension providers from a list (replaces current set).
  */
 export function setDisabledProviders(providerIds: string[]): void {
-	disabledProviders.clear();
+	disabledExtensionProviders.clear();
 	for (const id of providerIds) {
-		disabledProviders.add(id);
+		disabledExtensionProviders.add(id);
 	}
-	persistDisabledProviders();
+	persistDisabledExtensionProviders();
 }
 
 // =============================================================================
@@ -373,7 +383,7 @@ export function getCapabilityInfo(capabilityId: string): CapabilityInfo | undefi
 			displayName: p.displayName,
 			description: p.description,
 			priority: p.priority,
-			enabled: !disabledProviders.has(p.id),
+			enabled: !disabledExtensionProviders.has(p.id),
 		})),
 	};
 }
@@ -410,7 +420,7 @@ export function getProviderInfo(providerId: string): ProviderInfo | undefined {
 		description: meta.description,
 		priority,
 		capabilities: Array.from(caps),
-		enabled: !disabledProviders.has(providerId),
+		enabled: !disabledExtensionProviders.has(providerId),
 	};
 }
 
