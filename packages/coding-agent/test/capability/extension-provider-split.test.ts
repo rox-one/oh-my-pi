@@ -93,6 +93,26 @@ describe("capability registry — extension-provider split (#4507)", () => {
 		expect(getDisabledProviders()).toEqual(["windsurf"]);
 	});
 
+	test("explicitly-empty disabledExtensionProviders is honored over legacy disabledProviders", async () => {
+		// Reproduces the review scenario: user runs with model-side
+		// `disabledProviders: ["cursor"]`, then re-enables the last extension
+		// provider from the `/extensions` UI, which persists
+		// `disabledExtensionProviders: []`. The next boot MUST NOT roll that
+		// choice back by falling through to the legacy list — an explicitly
+		// configured empty value is a deliberate signal.
+		const settings = await Settings.init({
+			inMemory: true,
+			overrides: {
+				disabledProviders: ["cursor"],
+				disabledExtensionProviders: [],
+			},
+		});
+		initializeWithSettings(settings);
+
+		expect(isProviderEnabled("cursor")).toBe(true);
+		expect(getDisabledProviders()).toEqual([]);
+	});
+
 	test("path-scoped disabledExtensionProviders resolves against cwd", async () => {
 		const projectDir = "/tmp/omp-4507-project";
 		const otherDir = "/tmp/omp-4507-other";

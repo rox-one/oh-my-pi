@@ -290,8 +290,14 @@ export async function loadCapability<T>(
 export function initializeWithSettings(activeSettings: Settings): void {
 	settings = activeSettings;
 	disabledExtensionProviders.clear();
-	const explicitExt = settings.get("disabledExtensionProviders");
-	const source = explicitExt.length > 0 ? explicitExt : settings.get("disabledProviders");
+	// Legacy read-through: fall back to `disabledProviders` ONLY when the new
+	// key has never been configured. An explicitly-empty configured value is a
+	// deliberate "extension list is empty" signal (e.g. the user re-enabled
+	// the last provider from `/extensions`) and must NOT roll back to the
+	// model-side list on the next boot.
+	const source = settings.isConfigured("disabledExtensionProviders")
+		? settings.get("disabledExtensionProviders")
+		: settings.get("disabledProviders");
 	for (const id of source) {
 		disabledExtensionProviders.add(id);
 	}
