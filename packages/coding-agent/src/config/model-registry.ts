@@ -60,11 +60,6 @@ const LOCAL_PROVIDER_PLACEHOLDERS = new Set<string>(["llama-cpp-local", "lm-stud
  * so a successful fast path does not leave an armed timeout signal for concurrent GC.
  */
 const RUNTIME_DYNAMIC_MODEL_FETCH_TIMEOUT_MS = 15_000;
-// Built-in discovery preflight mirror of the catalog model-manager's private
-// cache timings (model-manager.ts: DEFAULT_CACHE_TTL_MS / NON_AUTHORITATIVE_RETRY_MS).
-// Built-in descriptors never override cacheTtlMs, so agreeing with these values
-// makes the OAuth-refresh preflight fire exactly when the manager will fetch.
-const BUILT_IN_DISCOVERY_CACHE_TTL_MS = 2 * 60 * 60 * 1000;
 const BUILT_IN_DISCOVERY_NON_AUTHORITATIVE_RETRY_MS = 5 * 60 * 1000;
 
 import type { ApiKeyResolver, FetchImpl } from "@oh-my-pi/pi-ai";
@@ -1931,7 +1926,6 @@ export class ModelRegistry {
 		providerId: string,
 		strategy: ModelRefreshStrategy,
 		cacheProviderId: string,
-		authoritative: boolean,
 	): Promise<string | undefined> {
 		const peekedKey = await this.#peekApiKeyForProvider(providerId);
 		if (isAuthenticated(peekedKey) || strategy === "offline") {
@@ -1941,21 +1935,8 @@ export class ModelRegistry {
 		if (oauthCredentials.length === 0) {
 			return peekedKey;
 		}
-		// Authoritative providers prune bundled models only when their manager is
-		// actually constructed, which needs an authenticated key. A fresh cache does
-		// not let us skip the refresh here: with an expired OAuth token peekedKey is
-		// undefined, the manager is never added, and stale bundled models survive the
-		// full cache TTL. So only take the no-refresh shortcut for non-authoritative
-		// providers, whose bundled models stay visible regardless.
-		if (strategy === "online-if-uncached" && !authoritative) {
-			// Mirror shouldFetchRemoteSources: built-in managers use the catalog's
-			// default TTL, so only refresh when the manager will actually fetch.
-			const cache = readModelCache<Api>(
-				cacheProviderId,
-				BUILT_IN_DISCOVERY_CACHE_TTL_MS,
-				Date.now,
-				this.#cacheDbPath,
-			);
+		if (strategy === "online-if-uncached") {
+			const cache = readModelCache<Api>(cacheProviderId, 24 * 60 * 60 * 1000, Date.now, this.#cacheDbPath);
 			const cacheAgeMs = cache ? Date.now() - cache.updatedAt : Number.POSITIVE_INFINITY;
 			if (cache?.fresh && (cache.authoritative || cacheAgeMs < BUILT_IN_DISCOVERY_NON_AUTHORITATIVE_RETRY_MS)) {
 				return peekedKey;
@@ -1970,20 +1951,6 @@ export class ModelRegistry {
 			});
 			return peekedKey;
 		}
-	}
-
-	/**
-	 * Resolve the GCP project id for Gemini CLI quota discovery from the stored
-	 * OAuth credential matched to the token in use. Used only as a fallback for
-	 * the discovery fast path, where `peekApiKey` returns the bare access token
-	 * (stripping the structured identity); matching strictly by `access` avoids
-	 * attaching an unrelated account's project. Workspace/Standard accounts
-	 * require the id because project-less `loadCodeAssist` cannot resolve one.
-	 */
-	#resolveGeminiCliDiscoveryProjectId(oauthToken: string): string | undefined {
-		const credentials = getOAuthCredentialsForProvider(this.authStorage, "google-gemini-cli");
-		const projectId = credentials.find(credential => credential.access === oauthToken)?.projectId?.trim();
-		return projectId ? projectId : undefined;
 	}
 
 	async #collectBuiltInModelManagerOptions(
@@ -2031,7 +1998,7 @@ export class ModelRegistry {
 					}),
 			},
 		];
-		const disabledProviders = getDisabledProviderIdsFromSettings(this.#settings);
+		const disabledProviders = getDisabledProviderIdsFromSettings();
 		const standardProviderDescriptors = PROVIDER_DESCRIPTORS.filter(descriptor => {
 			if (disabledProviders.has(descriptor.providerId)) return false;
 			if (configuredDiscoveryProviders.has(descriptor.providerId)) return false;
@@ -2039,28 +2006,23 @@ export class ModelRegistry {
 		});
 		const enabledSpecialProviderDescriptors = specialProviderDescriptors.filter(descriptor => {
 			if (disabledProviders.has(descriptor.providerId)) return false;
-			if (configuredDiscoveryProviders.has(descriptor.providerId)) return false;
 			return providerFilter ? providerFilter.has(descriptor.providerId) : true;
 		});
 		const standardProviderKeys = await Promise.all(
 			standardProviderDescriptors.map(descriptor => {
-				const cacheProviderId = this.#resolveStartupModelCacheProviderId(descriptor.providerId);
-				return this.#resolveBuiltInDiscoveryApiKey(
-					descriptor.providerId,
-					strategy,
-					cacheProviderId,
-					descriptor.dynamicModelsAuthoritative ?? false,
-				);
+				const discoveryBaseUrl =
+					this.#runtimeProviderOverrides.get(descriptor.providerId)?.baseUrl ??
+					this.#providerOverrides.get(descriptor.providerId)?.baseUrl ??
+					this.getProviderBaseUrl(descriptor.providerId);
+				const cacheProviderId =
+					descriptor.createModelManagerOptions({ baseUrl: discoveryBaseUrl, fetch: this.#fetch })
+						.cacheProviderId ?? descriptor.providerId;
+				return this.#resolveBuiltInDiscoveryApiKey(descriptor.providerId, strategy, cacheProviderId);
 			}),
 		);
 		const specialKeys = await Promise.all(
 			enabledSpecialProviderDescriptors.map(descriptor =>
-				this.#resolveBuiltInDiscoveryApiKey(
-					descriptor.providerId,
-					strategy,
-					descriptor.providerId,
-					descriptor.authoritative,
-				),
+				this.#resolveBuiltInDiscoveryApiKey(descriptor.providerId, strategy, descriptor.providerId),
 			),
 		);
 		const options: ModelManagerOptions<Api>[] = [];
@@ -2095,10 +2057,7 @@ export class ModelRegistry {
 		}
 		// Append runtime model managers registered by extensions via fetchDynamicModels.
 		for (const { options: managerOpts } of this.#runtimeModelManagers.values()) {
-			if (
-				!configuredDiscoveryProviders.has(managerOpts.providerId) &&
-				(!providerFilter || providerFilter.has(managerOpts.providerId))
-			) {
+			if (!providerFilter || providerFilter.has(managerOpts.providerId)) {
 				options.push(managerOpts);
 			}
 		}
