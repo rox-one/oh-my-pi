@@ -246,6 +246,42 @@ describe("ModelRegistry runtime discovery", () => {
 		expect(authStorage.getOAuthCredential("anthropic")?.access).toBe("sk-ant-oat-expired-anthropic");
 	});
 
+	test("configured discovery suppresses built-in special OAuth discovery", async () => {
+		await authStorage.set("google-gemini-cli", {
+			type: "oauth",
+			access: "fresh-google-gemini-cli",
+			refresh: "refresh-google-gemini-cli",
+			expires: Date.now() + 3_600_000,
+		});
+		writeRawModelsJson({
+			"google-gemini-cli": {
+				baseUrl: "http://127.0.0.1:4893",
+				api: "openai-completions",
+				auth: "none",
+				discovery: { type: "openai-models-list" },
+			},
+		});
+		const unexpectedUrls: string[] = [];
+		const fetchMock: FetchImpl = async input => {
+			const url = String(input);
+			if (url === "http://127.0.0.1:4893/v1/models") {
+				return Response.json({
+					data: [{ id: "configured-gemini-cli-model", context_length: 65_536 }],
+				});
+			}
+			unexpectedUrls.push(url);
+			throw new Error(`Unexpected URL: ${url}`);
+		};
+		const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
+
+		await registry.refreshProvider("google-gemini-cli", "online");
+
+		expect(unexpectedUrls).toEqual([]);
+		const configuredModel = registry.find("google-gemini-cli", "configured-gemini-cli-model");
+		expect(configuredModel?.baseUrl).toBe("http://127.0.0.1:4893");
+		expect(configuredModel?.contextWindow).toBe(65_536);
+	});
+
 	test("auto-discovers ollama models without provider config", async () => {
 		const fetchMock = mockOllamaDiscovery(["phi4-mini"]);
 		const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
