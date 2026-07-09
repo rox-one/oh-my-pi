@@ -7,6 +7,11 @@ describe("formatThinkingForDisplay", () => {
 		expect(formatThinkingForDisplay(text, false)).toBe(text);
 	});
 
+	it("preserves fenced code verbatim in raw thinking display", () => {
+		const text = "```html\n<!-- -->\n<div></div>\n```";
+		expect(formatThinkingForDisplay(text, false)).toBe(text);
+	});
+
 	it("should replace fully enclosed code blocks with an ellipsis", () => {
 		const text = "Let me rewrite readString:\n```go\nfunc foo() {}\n```\nAnd then test it.";
 		expect(formatThinkingForDisplay(text, true)).toBe("Let me rewrite readString:...\nAnd then test it.");

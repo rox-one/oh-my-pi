@@ -130,8 +130,9 @@ function renderFold(state: FoldState): string {
  * mode additionally elides fenced code down to a trailing ellipsis.
  */
 export function formatThinkingForDisplay(text: string, proseOnly: boolean): string {
+	if (!proseOnly || !text) return text;
 	const cleanedText = stripEmptyHtmlCommentSeparators(text);
-	if (!proseOnly || !cleanedText) return cleanedText;
+	if (!cleanedText) return cleanedText;
 	if (text === formatCacheKey) return formatCacheValue;
 
 	const lines = cleanedText.split("\n");
