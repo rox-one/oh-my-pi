@@ -189,40 +189,47 @@ function renderFold(state: FoldState): string {
  * mode additionally elides fenced code down to a trailing ellipsis.
  */
 export function formatThinkingForDisplay(text: string, proseOnly: boolean): string {
-	if (!text) return text;
-	const cache = proseOnly ? proseCache : rawCache;
-	// Identity memo first: the 2nd and 3rd renders of one streaming tick pass
-	// the same text and must not pay the prefix verification below.
-	if (text === cache.text) return cache.value;
-	let hasComment: boolean;
-	let fromByte: number;
-	let state: FoldState;
-	if (cache.resumable && isAppend(cache, text)) {
-		// Append: a `<!--` introduced by the suffix flips the noise gate, and a
-		// marker straddling the seam can start at most 3 bytes back — identical
-		// to rescanning the full text, at O(delta).
-		hasComment = cache.hadComment || text.indexOf("<!--", Math.max(0, cache.text.length - 3)) !== -1;
-		fromByte = cache.startLineByte;
-		state = { ...cache.state };
-	} else {
-		hasComment = text.includes("<!--");
-		fromByte = 0;
-		state = freshFoldState();
-	}
-	// Raw mode without comments is the identity (fences pass through
-	// verbatim), so skip the fold entirely, as the previous full-scan shortcut
-	// did. Record the slot but leave the checkpoint cleared/non-resumable: no
-	// fold state entering the last line was ever computed, so a later append
-	// must recompute from scratch rather than resume from a stale checkpoint.
-	if (!proseOnly && !hasComment) {
-		cache.text = text;
-		cache.value = text;
-		cache.hadComment = false;
-		cache.startLineByte = 0;
-		cache.state = freshFoldState();
-		cache.resumable = false;
-		return text;
-	}
+	if (!proseOnly || !text) return text;
+	if (text === formatCacheKey) return formatCacheValue;
+
+	const lines = text.split("\n");
+	const resultLines: string[] = [];
+	let inFence = false;
+	let fenceChar = "";
+	let fenceLen = 0;
+
+	const FENCE = /^( {0,3})([`~]{3,})/;
+	const EMPTY_HTML_COMMENT = /^\s*<!--\s*-->\s*$/;
+	const hasRenderableLineAfter = (index: number): boolean => {
+		for (let j = index + 1; j < lines.length; j++) {
+			const next = lines[j]!;
+			if (next.trim() === "" || EMPTY_HTML_COMMENT.test(next)) continue;
+			return true;
+		}
+		return false;
+	};
+
+	let suppressBlankAfterComment = false;
+	const appendEllipsis = () => {
+		let lastLineIdx = resultLines.length - 1;
+		while (lastLineIdx >= 0 && resultLines[lastLineIdx]!.trim() === "") {
+			lastLineIdx--;
+		}
+
+		if (lastLineIdx >= 0) {
+			const lastLine = resultLines[lastLineIdx]!;
+			const trimmed = lastLine.trimEnd();
+			if (trimmed.endsWith("...")) {
+				resultLines[lastLineIdx] = trimmed;
+			} else if (trimmed.endsWith(".")) {
+				resultLines[lastLineIdx] = `${trimmed.slice(0, -1)}...`;
+			} else {
+				resultLines[lastLineIdx] = `${trimmed}...`;
+			}
+		} else {
+			resultLines.push("...");
+		}
+	};
 
 	const lines = text.slice(fromByte).split("\n");
 	const last = lines.length - 1;
@@ -245,17 +252,17 @@ export function formatThinkingForDisplay(text: string, proseOnly: boolean): stri
 				state.fenceChar = "";
 				state.fenceLen = 0;
 			}
-			// Prose mode skips all fence lines; raw mode keeps them verbatim
-			// (comment markers inside fences are code, not noise).
-			if (!proseOnly) pushFoldLine(state, line);
-			continue;
-		}
-
-		// Drop the whole line so `**Headline**\n\n<!-- -->` leaves no blank tail.
-		if (hasComment && isCommentNoise(line, i === last)) continue;
-
-		const open = FENCE.exec(line);
-		if (open) {
+			suppressBlankAfterComment = false;
+			// We skip all internal lines of a code fence.
+		} else if (EMPTY_HTML_COMMENT.test(line)) {
+			if (hasRenderableLineAfter(i)) {
+				const last = resultLines[resultLines.length - 1];
+				if (last !== undefined && last.trim() !== "") resultLines.push("");
+			}
+			suppressBlankAfterComment = true;
+		} else if (suppressBlankAfterComment && line.trim() === "") {
+		} else if (open) {
+			suppressBlankAfterComment = false;
 			const marker = open[2]!;
 			const ch = marker[0]!;
 			// A backtick fence's info string may not contain a backtick.
@@ -270,6 +277,9 @@ export function formatThinkingForDisplay(text: string, proseOnly: boolean): stri
 				}
 				continue;
 			}
+		} else {
+			suppressBlankAfterComment = false;
+			resultLines.push(line);
 		}
 		pushFoldLine(state, line);
 	}
@@ -292,11 +302,9 @@ export function hasDisplayableThinking(
 	text: string | null | undefined,
 	formattedText: string | null | undefined,
 ): boolean {
-	if (!text || !formattedText) return false;
-	// Visibility keys off the formatted text: a block whose raw text is only
-	// comment noise (`<!-- -->\n`) formats to whitespace and stays hidden. The
-	// raw canonicalize check still hides dot/ellipsis-only placeholder blocks.
-	return formattedText.trim().length > 0 && canonicalizeMessage(text).length > 0;
+	if (!text) return false;
+	if (!formattedText) return false;
+	return canonicalizeMessage(formattedText).length > 0 && canonicalizeMessage(text).length > 0;
 }
 
 /** Whether an assistant message contains thinking content the TUI can reveal. */
