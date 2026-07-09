@@ -304,7 +304,7 @@ export function hasDisplayableThinking(
 ): boolean {
 	if (!text) return false;
 	if (!formattedText) return false;
-	return canonicalizeMessage(formattedText).length > 0 && canonicalizeMessage(text).length > 0;
+	return formattedText.trim().length > 0 && canonicalizeMessage(text).length > 0;
 }
 
 /** Whether an assistant message contains thinking content the TUI can reveal. */
