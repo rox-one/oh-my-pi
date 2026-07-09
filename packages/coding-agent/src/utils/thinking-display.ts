@@ -1,91 +1,32 @@
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 
-// Single-slot-per-mode memo for formatThinkingForDisplay. During a streaming
-// tick the same growing thinking text is formatted up to three times (reveal
-// count, reveal slice, component render); this collapses them to one
-// computation. Prose and raw modes produce different output for the same text,
-// so each mode keeps its own slot. One entry per mode is enough for the common
-// case of one active thinking block and never regresses (a miss recomputes
-// exactly as before).
-//
-// Each slot also carries the fold state for incremental extension: when the
-// incoming text is an append of the previously formatted text (streaming only
-// ever extends the trailing partial line), the fold resumes at the stored
-// line boundary — only the appended suffix is re-scanned, reusing the
-// committed output and the fence state captured entering that line. Append
-// detection is exact: the stored text must be a verbatim prefix of the
-// incoming text, checked with `startsWith` (memcmp speed, O(previous text)
-// per genuinely-new text — deterministic, no unchecked byte a stream switch
-// could hide in; the repeated renders within one tick are answered by the
-// identity memo without rescanning). Anything else takes the full-recompute
-// path. A partial line that grows past {@link MAX_RESUME_PARTIAL_BYTES} with
-// no newline (seam stuck at 0) would otherwise refold the entire text every
-// tick; past the cap the checkpoint is retired and the slot degrades to the
-// identity memo — the pre-incremental asymptotics for that pathological
-// shape, bounded per call. The last input line is always
-// re-folded (never committed), so its transient effects — comment-noise
-// skipping, the prose ellipsis — are replayed under the new context instead
-// of leaking into the committed prefix. The committed output keeps the last
-// non-blank line in a mutable tail slot so the prose ellipsis can rewrite it
-// without re-joining (or even touching) the committed prefix.
+const EMPTY_HTML_COMMENT_SEPARATOR = /^\s*<!--[\s-]*-->\s*$/;
 
-/**
- * Fold accumulator for the output produced so far. Output lines are appended
- * once and frozen into `committed`; only the trailing region stays mutable.
- */
-interface FoldState {
-	/** joined output lines before the last non-blank line, fully finalized */
-	committed: string;
-	/** whether a non-blank output line exists (kept in {@link tailLine}) */
-	hasTail: boolean;
-	/** the last non-blank output line — rewritten in place by the prose ellipsis */
-	tailLine: string;
-	/** raw blank output lines after `tailLine`, each prefixed by its separator */
-	tailBlankSep: string;
-	/** whether any output line precedes `tailLine` (a lone leading blank line leaves `committed` empty) */
-	tailPred: boolean;
-	/** output lines emitted so far */
-	emitted: number;
-	inFence: boolean;
-	fenceChar: string;
-	fenceLen: number;
+function stripEmptyHtmlCommentSeparators(text: string): string {
+	if (!text.includes("<!--")) return text;
+	const lines = text.split("\n");
+	const resultLines: string[] = [];
+	for (let i = 0; i < lines.length; i++) {
+		const line = lines[i]!;
+		if (!EMPTY_HTML_COMMENT_SEPARATOR.test(line)) {
+			resultLines.push(line);
+			continue;
+		}
+		const prevBlank = resultLines.length > 0 && resultLines[resultLines.length - 1]!.trim() === "";
+		const nextBlank = i + 1 < lines.length && lines[i + 1]!.trim() === "";
+		if ((prevBlank || resultLines.length === 0) && nextBlank) i += 1;
+	}
+	return resultLines.join("\n");
 }
 
-interface DisplayCache {
-	/** last formatted text */
-	text: string;
-	/** formatted output for `text` */
-	value: string;
-	/** whether `text` contains `<!--` (extended incrementally on appends) */
-	hadComment: boolean;
-	/** byte offset of the start of the last (possibly partial) line of `text` */
-	startLineByte: number;
-	/** fold state ENTERING that last line — the resume point for appends */
-	state: FoldState;
-	/** whether the fold checkpoint in {@link state} is valid to resume from */
-	resumable: boolean;
-}
-
-function freshFoldState(): FoldState {
-	return {
-		committed: "",
-		hasTail: false,
-		tailLine: "",
-		tailBlankSep: "",
-		tailPred: false,
-		emitted: 0,
-		inFence: false,
-		fenceChar: "",
-		fenceLen: 0,
-	};
-}
-
-function freshDisplayCache(): DisplayCache {
-	return { text: "", value: "", hadComment: false, startLineByte: 0, state: freshFoldState(), resumable: true };
-}
-
-const proseCache = freshDisplayCache();
-const rawCache = freshDisplayCache();
+// Single-entry memo for the proseOnly formatting path. During a streaming tick
+// the same growing thinking text is formatted up to three times (reveal count,
+// reveal slice, component render); this collapses them to one computation. The
+// non-prose branch skips code-fence elision and never consults the cache. A
+// single entry is enough for the common case of one active thinking block and
+// never regresses (a miss recomputes exactly as before).
+let formatCacheKey = "";
+let formatCacheValue = "";
 
 export function canonicalizeMessage(text: string | null | undefined): string {
 	if (!text) return "";
@@ -189,10 +130,11 @@ function renderFold(state: FoldState): string {
  * mode additionally elides fenced code down to a trailing ellipsis.
  */
 export function formatThinkingForDisplay(text: string, proseOnly: boolean): string {
-	if (!proseOnly || !text) return text;
+	const cleanedText = stripEmptyHtmlCommentSeparators(text);
+	if (!proseOnly || !cleanedText) return cleanedText;
 	if (text === formatCacheKey) return formatCacheValue;
 
-	const lines = text.split("\n");
+	const lines = cleanedText.split("\n");
 	const resultLines: string[] = [];
 	let inFence = false;
 	let fenceChar = "";
@@ -304,7 +246,7 @@ export function hasDisplayableThinking(
 ): boolean {
 	if (!text) return false;
 	if (!formattedText) return false;
-	return formattedText.trim().length > 0 && canonicalizeMessage(text).length > 0;
+	return formattedText.length > 0 && canonicalizeMessage(stripEmptyHtmlCommentSeparators(text)).length > 0;
 }
 
 /** Whether an assistant message contains thinking content the TUI can reveal. */
