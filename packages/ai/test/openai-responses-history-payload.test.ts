@@ -10,6 +10,7 @@ import type { Context, Model, ModelSpec, ProviderSessionState, Tool } from "@oh-
 import { createOpenAIResponsesHistoryPayload, truncateResponseItemId } from "@oh-my-pi/pi-ai/utils";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { type GeneratedProvider, getBundledModel } from "@oh-my-pi/pi-catalog/models";
+import { type } from "arktype";
 
 function createAbortedSignal(): AbortSignal {
 	const controller = new AbortController();
@@ -52,6 +53,13 @@ const issue5002ZeroUsage = {
 	cacheWrite: 0,
 	totalTokens: 0,
 	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+};
+const issue5002EditTool: Tool = {
+	name: "edit",
+	customWireName: "apply_patch",
+	description: "Apply a hashline patch",
+	parameters: type({ input: "string" }),
+	customFormat: { syntax: "lark", definition: 'start: "*** Begin Patch" LF\nLF: /\\n/' },
 };
 
 const preservedHistoryItems = [
@@ -432,7 +440,7 @@ describe("OpenAI responses history payload", () => {
 						{
 							type: "toolCall",
 							id: "call_apply",
-							name: "edit",
+							name: "apply_patch",
 							arguments: { input: ISSUE_5002_PATCH },
 							customWireName: "apply_patch",
 						},
@@ -453,6 +461,7 @@ describe("OpenAI responses history payload", () => {
 					timestamp: Date.now(),
 				},
 			],
+			tools: [issue5002EditTool],
 		};
 
 		const xaiInput = buildResponsesInput({
