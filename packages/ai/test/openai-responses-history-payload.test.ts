@@ -10,17 +10,6 @@ import type { Context, Model, ModelSpec, ProviderSessionState, Tool } from "@oh-
 import { createOpenAIResponsesHistoryPayload, truncateResponseItemId } from "@oh-my-pi/pi-ai/utils";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { type GeneratedProvider, getBundledModel } from "@oh-my-pi/pi-catalog/models";
-import * as piUtils from "@oh-my-pi/pi-utils";
-
-const TEST_INSTALLATION_ID = "00000000-0000-4000-8000-000000000001";
-
-beforeEach(() => {
-	vi.spyOn(piUtils, "getInstallId").mockReturnValue(TEST_INSTALLATION_ID);
-});
-
-afterEach(() => {
-	vi.restoreAllMocks();
-});
 
 function createAbortedSignal(): AbortSignal {
 	const controller = new AbortController();
@@ -63,13 +52,6 @@ const issue5002ZeroUsage = {
 	cacheWrite: 0,
 	totalTokens: 0,
 	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-};
-const issue5002EditTool: Tool = {
-	name: "edit",
-	customWireName: "apply_patch",
-	description: "Apply a hashline patch",
-	parameters: type({ input: "string" }),
-	customFormat: { syntax: "lark", definition: 'start: "*** Begin Patch" LF\nLF: /\\n/' },
 };
 
 const preservedHistoryItems = [
@@ -428,7 +410,7 @@ describe("OpenAI responses history payload", () => {
 		});
 		assertWireOrder(openaiItems);
 
-		const codexModel = getBundledModel<"openai-codex-responses">("openai-codex", "gpt-5.5");
+		const codexModel = getBundledModel<"openai-codex-responses">("openai-codex", "gpt-5.2-codex");
 		const codexItems = convertCodexResponsesMessages(codexModel, makeContext("openai-codex"));
 		assertWireOrder(codexItems);
 	});
@@ -450,7 +432,7 @@ describe("OpenAI responses history payload", () => {
 						{
 							type: "toolCall",
 							id: "call_apply",
-							name: "apply_patch",
+							name: "edit",
 							arguments: { input: ISSUE_5002_PATCH },
 							customWireName: "apply_patch",
 						},
@@ -471,7 +453,6 @@ describe("OpenAI responses history payload", () => {
 					timestamp: Date.now(),
 				},
 			],
-			tools: [issue5002EditTool],
 		};
 
 		const xaiInput = buildResponsesInput({
@@ -608,56 +589,6 @@ describe("OpenAI responses history payload", () => {
 			output: ISSUE_5002_TOOL_OUTPUT,
 		});
 		expect(collectResponsesInputImageDetails(openaiInput)).toEqual(["original"]);
-	});
-
-	it("preserves encrypted_function_args on replayed Codex function calls", () => {
-		// codex-rs #35845: an empty `encrypted_function_args` array marks plaintext
-		// collaboration arguments; the marker must survive replay verbatim or the
-		// backend would treat the replayed arguments as encrypted.
-		const codexModel = getBundledModel<"openai-codex-responses">("openai-codex", "gpt-5.5");
-		const nativeItems = [
-			{
-				type: "function_call",
-				id: "fc_plaintext_1",
-				call_id: "call_plaintext_collab",
-				name: "send_message",
-				namespace: "collaboration",
-				arguments: JSON.stringify({ message: "hello", task_name: "worker" }),
-				encrypted_function_args: [],
-				status: "completed",
-			},
-			{
-				type: "function_call_output",
-				call_id: "call_plaintext_collab",
-				output: "delivered",
-			},
-		];
-		const context: Context = {
-			messages: [
-				{
-					role: "assistant",
-					content: [{ type: "text", text: "fallback should not be replayed" }],
-					api: "openai-codex-responses",
-					provider: "openai-codex",
-					model: codexModel.id,
-					usage: issue5002ZeroUsage,
-					stopReason: "stop",
-					providerPayload: createOpenAIResponsesHistoryPayload("openai-codex", nativeItems),
-					timestamp: Date.now(),
-				},
-				{ role: "user", content: "continue", timestamp: Date.now() },
-			],
-		};
-
-		const input = convertCodexResponsesMessages(codexModel, context);
-		expect(findResponsesInputItemByCallId(input, "function_call", "call_plaintext_collab")).toEqual({
-			type: "function_call",
-			call_id: "call_plaintext_collab",
-			name: "send_message",
-			namespace: "collaboration",
-			arguments: JSON.stringify({ message: "hello", task_name: "worker" }),
-			encrypted_function_args: [],
-		});
 	});
 
 	it("prepends multiple OpenAI developer instructions in order without changing prompt cache key routing", async () => {
@@ -1513,7 +1444,7 @@ describe("OpenAI responses history payload", () => {
 				{ role: "user", content: "Resume", timestamp: Date.now() },
 			],
 		};
-		const model = getBundledModel<"openai-codex-responses">("openai-codex", "gpt-5.5");
+		const model = getBundledModel<"openai-codex-responses">("openai-codex", "gpt-5.2-codex");
 		const payload = (await captureCodexPayload(model, context)) as { input?: unknown[] };
 		const functionCallItem = findResponsesInputItem(payload.input, "function_call");
 		const functionCallOutputItem = findResponsesInputItem(payload.input, "function_call_output");

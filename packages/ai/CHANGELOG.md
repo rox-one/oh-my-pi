@@ -851,6 +851,10 @@
 - Fixed Codex OAuth credential selection to re-check blocked accounts during ranking and clear stale usage-limit blocks once live usage indicates recovery.
 - Fixed sequential-cutoff reasoning summaries duplicating section headers across Codex reasoning items by tracking the cumulative summary response-globally, so replayed sections and replay-only items no longer re-emit text earlier thinking blocks already streamed.
 
+### Fixed
+
+- Fixed xAI OAuth Responses continuations replaying OpenAI-only `custom_tool_call`/`custom_tool_call_output` history and `input_image.detail: "original"` frames; replay now downgrades those to xAI-compatible function calls and `detail: "auto"`. ([#5002](https://github.com/can1357/oh-my-pi/issues/5002))
+
 ## [16.3.15] - 2026-07-09
 
 ### Breaking Changes

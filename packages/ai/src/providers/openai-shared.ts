@@ -1817,72 +1817,48 @@ export function convertResponsesInputContent(
 	return normalizedContent.length > 0 ? normalizedContent : undefined;
 }
 
-/**
- * Map freeform custom-tool wire names back to the internal tool name for
- * providers that only accept function_call / function_call_output.
- * Built once per request; `apply_patch` → `edit` is the OMP default.
- */
-function buildCustomToolWireNameMap(tools: readonly Tool[] | undefined): ReadonlyMap<string, string> | undefined {
-	if (!tools?.length) return undefined;
-	const map = new Map<string, string>();
-	for (const tool of tools) {
-		if (tool.customWireName) map.set(tool.customWireName, tool.name);
+interface ResponsesReplayCompatibilityOptions {
+	supportsCustomToolCalls: boolean;
+	tools: readonly Tool[] | undefined;
+}
+
+function resolveReplayCustomToolName(wireName: string, tools: readonly Tool[] | undefined): string {
+	if (tools) {
+		for (const tool of tools) {
+			if (tool.customWireName === wireName) return tool.name;
+		}
 	}
-	return map.size > 0 ? map : undefined;
+	if (wireName === "apply_patch") return "edit";
+	return wireName;
 }
 
-function resolveReplayCustomToolName(wireName: string, wireNameMap: ReadonlyMap<string, string> | undefined): string {
-	return wireNameMap?.get(wireName) ?? (wireName === "apply_patch" ? "edit" : wireName);
-}
-
-/**
- * Downgrade OpenAI-only custom tool items when the target model does not
- * advertise freeform custom tools (`applyPatchToolType === "freeform"`).
- * No-op (returns the same array reference) when freeform is supported.
- */
 function adaptResponsesReplayItemsForModel(
 	input: ResponseInput,
-	supportsCustomToolCalls: boolean,
-	wireNameMap: ReadonlyMap<string, string> | undefined,
-	supportsComputerUse: boolean,
+	options: ResponsesReplayCompatibilityOptions,
 ): ResponseInput {
-	if (supportsCustomToolCalls && supportsComputerUse) return input;
-
 	let changed = false;
 	const adapted: ResponseInput = [];
 	for (const item of input) {
-		if (!supportsCustomToolCalls && item.type === "custom_tool_call") {
+		let next = item;
+		if (!options.supportsCustomToolCalls && item.type === "custom_tool_call") {
 			changed = true;
-			adapted.push({
+			next = {
 				type: "function_call",
 				...(item.id ? { id: item.id } : {}),
 				call_id: item.call_id,
-				name: resolveReplayCustomToolName(item.name, wireNameMap),
+				name: resolveReplayCustomToolName(item.name, options.tools),
 				arguments: JSON.stringify({ input: item.input }),
 				...(item.namespace ? { namespace: item.namespace } : {}),
-			});
-			continue;
-		}
-		if (!supportsCustomToolCalls && item.type === "custom_tool_call_output") {
+			};
+		} else if (!options.supportsCustomToolCalls && item.type === "custom_tool_call_output") {
 			changed = true;
-			adapted.push({
+			next = {
 				type: "function_call_output",
 				call_id: item.call_id,
 				output: item.output,
-			});
-			continue;
+			};
 		}
-		if (!supportsComputerUse && (item.type === "computer_call" || item.type === "computer_call_output")) {
-			changed = true;
-			const callId = responseInputCallId(item) ?? "unknown";
-			adapted.push({
-				type: "message",
-				role: "assistant",
-				content: `[Previous computer ${item.type === "computer_call" ? "call" : "result"}; call_id=${callId}]: ${stringifyJson(item) ?? ""}`,
-			} as ResponseInput[number]);
-			continue;
-		}
-		adapted.push(item);
+		adapted.push(next);
 	}
 	return changed ? adapted : input;
 }
@@ -2007,15 +1983,13 @@ export function buildResponsesInput<TApi extends Api>(options: BuildResponsesInp
 		messages.push({ role: options.systemRole as "system" | "developer", content: systemPrompt });
 	}
 
-	// Compat is resolved by the catalog (e.g. Copilot / xai-oauth reject
-	// `detail: "original"`). Do not re-branch on provider id here.
-	const supportsImageDetailOriginal = options.supportsImageDetailOriginal;
-	// Freeform custom tools (`custom_tool_call`) only when the catalog says so;
-	// same gate as tool conversion (`applyPatchToolType === "freeform"`).
+	const supportsImageDetailOriginal =
+		options.model.provider === "xai-oauth" ? false : options.supportsImageDetailOriginal;
 	const supportsCustomToolCalls = options.model.applyPatchToolType === "freeform";
-	const customToolWireNameMap = supportsCustomToolCalls
-		? undefined
-		: buildCustomToolWireNameMap(options.context.tools);
+	const replayCompatibility: ResponsesReplayCompatibilityOptions = {
+		supportsCustomToolCalls,
+		tools: options.context.tools,
+	};
 	let knownCallIds = new Set<string>();
 	const customCallIds = new Set<string>();
 	const computerCallIds = new Set<string>();
@@ -2051,15 +2025,8 @@ export function buildResponsesInput<TApi extends Api>(options: BuildResponsesInp
 			if (historyItems && shouldReplayPayloadItems) {
 				const sanitizedItems = sanitizeOpenAIResponsesHistoryItemsForReplay(filterReasoning(historyItems), {
 					supportsImageDetailOriginal,
-					supportsComputerUse: options.model.supportsComputerUse === true,
 				});
-				const replayItems = adaptResponsesReplayItemsForModel(
-					sanitizedItems,
-					supportsCustomToolCalls,
-					customToolWireNameMap,
-					options.model.supportsComputerUse === true,
-				);
-				messages.push(...(escapeControlTokens ? escapeReplayedControlTokens(replayItems) : replayItems));
+				messages.push(...adaptResponsesReplayItemsForModel(sanitizedItems, replayCompatibility));
 				knownCallIds = collectKnownCallIds(messages);
 				for (const id of collectCustomCallIds(messages)) customCallIds.add(id);
 				for (const id of collectComputerCallIds(messages)) computerCallIds.add(id);
@@ -2070,7 +2037,6 @@ export function buildResponsesInput<TApi extends Api>(options: BuildResponsesInp
 				msg.content,
 				options.model.input.includes("image"),
 				supportsImageDetailOriginal,
-				escapeControlTokens,
 			);
 			if (!content) continue;
 			const developerText =
@@ -2106,18 +2072,10 @@ export function buildResponsesInput<TApi extends Api>(options: BuildResponsesInp
 			if (historyItems) {
 				const rawSanitizedHistoryItems = sanitizeOpenAIResponsesAssistantHistoryItemsForReplay(
 					filterReasoning(historyItems),
-					{
-						supportsImageDetailOriginal,
-						supportsComputerUse: options.model.supportsComputerUse === true,
-					},
+					{ supportsImageDetailOriginal },
 				);
 				const sanitizedHistoryItems = rawSanitizedHistoryItems
-					? adaptResponsesReplayItemsForModel(
-							rawSanitizedHistoryItems,
-							supportsCustomToolCalls,
-							customToolWireNameMap,
-							options.model.supportsComputerUse === true,
-						)
+					? adaptResponsesReplayItemsForModel(rawSanitizedHistoryItems, replayCompatibility)
 					: undefined;
 				if (nativeReplayEnabled && sanitizedHistoryItems) {
 					// Model-owned replay items can carry reserved control-token
@@ -2151,10 +2109,6 @@ export function buildResponsesInput<TApi extends Api>(options: BuildResponsesInp
 				customCallIds,
 				options.preserveAssistantMessageIds,
 				supportsCustomToolCalls,
-				customToolWireNameMap,
-				computerCallIds,
-				options.requiresReasoningReplayForAllTurns ?? false,
-				options.requiresReasoningReplayForToolCalls ?? false,
 			);
 			const outputItems = suppressHiddenEmptyFallback
 				? sanitizeOpenAIResponsesAssistantFallbackItemsForReplay(convertedOutputItems)
@@ -2171,7 +2125,6 @@ export function buildResponsesInput<TApi extends Api>(options: BuildResponsesInp
 				knownCallIds,
 				customCallIds,
 				supportsCustomToolCalls,
-				computerCallIds,
 			);
 		}
 		msgIndex++;
@@ -2207,10 +2160,6 @@ export function convertResponsesAssistantMessage<TApi extends Api>(
 	customCallIds?: Set<string>,
 	preserveMessageIds = false,
 	supportsCustomToolCalls = true,
-	customToolWireNameMap?: ReadonlyMap<string, string>,
-	computerCallIds?: Set<string>,
-	requiresReasoningReplayForAllTurns = false,
-	requiresReasoningReplayForToolCalls = false,
 ): ResponseInput {
 	const outputItems: ResponseInput = [];
 	let unsignedTextBlocks = 0;
@@ -2443,7 +2392,6 @@ export function appendResponsesToolResultMessages<TApi extends Api>(
 	knownCallIds: ReadonlySet<string>,
 	customCallIds?: ReadonlySet<string>,
 	supportsCustomToolCalls = true,
-	computerCallIds?: ReadonlySet<string>,
 ): void {
 	const { output, outputText } = encodeResponsesToolResultOutput(toolResult, model, supportsImageDetailOriginal);
 	const normalized = normalizeResponsesToolCallId(toolResult.toolCallId);

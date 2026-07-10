@@ -70,57 +70,49 @@ export function truncateResponseItemId(id: string, prefix: string): string {
 
 interface OpenAIResponsesReplaySanitizeOptions {
 	supportsImageDetailOriginal?: boolean;
-	supportsComputerUse?: boolean;
-}
-/**
- * Removes response-only lifecycle status from item types that reject it when replayed as input.
- *
- * Returns the original array when no item needs sanitization.
- */
-export function stripOpenAIResponsesOutputOnlyStatusesForReplay<TItem extends { type?: unknown; status?: unknown }>(
-	items: TItem[],
-): TItem[] {
-	let sanitized: TItem[] | undefined;
-	for (let index = 0; index < items.length; index++) {
-		const item = items[index]!;
-		const rejectsOutputStatus =
-			item.type === "message" || item.type === "function_call" || item.type === "custom_tool_call";
-		if (!rejectsOutputStatus || !Object.hasOwn(item, "status")) {
-			sanitized?.push(item);
-			continue;
-		}
-		if (!sanitized) sanitized = items.slice(0, index);
-		const withoutStatus = { ...item };
-		delete withoutStatus.status;
-		sanitized.push(withoutStatus);
-	}
-	return sanitized ?? items;
 }
 
-/**
- * Clamp `detail: "original"` only where Responses input_image parts live —
- * top-level items and `message.content[]`. Avoids a deep tree walk/clone of
- * every history node on providers that reject native-resolution images.
- */
-function clampReplayItemImageDetail(
-	item: Record<string, unknown>,
-	supportsImageDetailOriginal: boolean,
-): Record<string, unknown> {
-	if (supportsImageDetailOriginal) return item;
+function isReplayRecord(value: unknown): value is Record<string, unknown> {
+	if (!value || typeof value !== "object") return false;
+	return !Array.isArray(value);
+}
 
-	if (item.type === "input_image" && item.detail === "original") {
-		return { ...item, detail: "auto" };
+function sanitizeReplayValueForCompatibility(value: unknown, options: OpenAIResponsesReplaySanitizeOptions): unknown {
+	if (options.supportsImageDetailOriginal !== false) return value;
+	if (Array.isArray(value)) {
+		let changed = false;
+		const sanitized = value.map(item => {
+			const next = sanitizeReplayValueForCompatibility(item, options);
+			if (next !== item) changed = true;
+			return next;
+		});
+		return changed ? sanitized : value;
 	}
-
-	if (item.type !== "message" || !Array.isArray(item.content)) return item;
+	if (!isReplayRecord(value)) return value;
 
 	let changed = false;
-	const content = item.content.map(part => {
-		if (!part || typeof part !== "object" || Array.isArray(part)) return part;
-		const record = part as Record<string, unknown>;
-		if (record.type !== "input_image" || record.detail !== "original") return part;
+	const sanitized: Record<string, unknown> = {};
+	for (const key in value) {
+		const child = value[key];
+		const next = sanitizeReplayValueForCompatibility(child, options);
+		if (next !== child) changed = true;
+		sanitized[key] = next;
+	}
+	if (value.type === "input_image" && value.detail === "original") {
+		sanitized.detail = "auto";
 		changed = true;
-		return { ...record, detail: "auto" };
+	}
+	return changed ? sanitized : value;
+}
+
+export function sanitizeOpenAIResponsesHistoryItemsForReplay(
+	items: Array<Record<string, unknown>>,
+	options: OpenAIResponsesReplaySanitizeOptions = {},
+): ResponseInput {
+	const normalizedCallIds = new Map<string, string>();
+	return items.flatMap(item => {
+		const sanitized = sanitizeOpenAIResponsesHistoryItemForReplay(item, normalizedCallIds, options);
+		return sanitized ? [sanitized] : [];
 	});
 	return changed ? { ...item, content } : item;
 }
@@ -386,8 +378,7 @@ export function sanitizeOpenAIResponsesAssistantFallbackItemsForReplay(items: Re
 function sanitizeOpenAIResponsesHistoryItemForReplay(
 	item: Record<string, unknown>,
 	normalizedCallIds: Map<string, string>,
-	supportsImageDetailOriginal: boolean,
-	preserveReasoningItemIds: boolean,
+	options: OpenAIResponsesReplaySanitizeOptions,
 ): OpenAIResponsesReplayItem | undefined {
 	if (item.type === "item_reference") return undefined;
 	if (item.type === "image_generation_call") return sanitizeOpenAIResponsesImageGenerationCallForReplay(item);
@@ -400,10 +391,8 @@ function sanitizeOpenAIResponsesHistoryItemForReplay(
 		sanitizedItem.call_id = normalizeReplayedResponsesHistoryCallId(item.call_id, normalizedCallIds);
 	}
 
-	return clampReplayItemImageDetail(
-		sanitizedItem,
-		supportsImageDetailOriginal,
-	) as unknown as OpenAIResponsesReplayItem;
+	const compatibleItem = sanitizeReplayValueForCompatibility(sanitizedItem, options);
+	return compatibleItem as unknown as OpenAIResponsesReplayItem;
 }
 
 function sanitizeOpenAIResponsesReasoningItemForReplay(

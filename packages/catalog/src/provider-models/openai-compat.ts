@@ -1666,8 +1666,8 @@ const XAI_NON_CHAT_PREFIXES = ["grok-imagine-", "grok-stt-", "grok-voice-"] as c
 function withXaiOAuthCompatDefaults(model: ModelSpec<"openai-responses">): ModelSpec<"openai-responses"> {
 	const compat = {
 		...(model.compat ?? {}),
-		includeEncryptedReasoning: model.compat?.includeEncryptedReasoning ?? true,
-		filterReasoningHistory: model.compat?.filterReasoningHistory ?? false,
+		includeEncryptedReasoning: model.compat?.includeEncryptedReasoning ?? false,
+		filterReasoningHistory: model.compat?.filterReasoningHistory ?? true,
 		supportsImageDetailOriginal: model.compat?.supportsImageDetailOriginal ?? false,
 		omitReasoningEffort: model.compat?.omitReasoningEffort ?? !isGrokReasoningEffortCapable(model.id),
 	};
