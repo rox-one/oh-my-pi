@@ -1734,11 +1734,12 @@ function mergeCuratedIntoModel(
 	const effortCapable = curated.supportsReasoningEffort ?? isGrokReasoningEffortCapable(curated.id);
 	const compat = {
 		...(base.compat ?? {}),
-		includeEncryptedReasoning: base.compat?.includeEncryptedReasoning ?? true,
-		filterReasoningHistory: false,
+		reasoningEffortMap: { ...XAI_REASONING_EFFORT_MAP, ...(base.compat?.reasoningEffortMap ?? {}) },
+		includeEncryptedReasoning: base.compat?.includeEncryptedReasoning ?? false,
+		filterReasoningHistory: base.compat?.filterReasoningHistory ?? true,
 		supportsImageDetailOriginal: base.compat?.supportsImageDetailOriginal ?? false,
-		omitReasoningEffort: !effortCapable,
-		supportsReasoningEffort: effortCapable,
+		omitReasoningEffort: base.compat?.omitReasoningEffort ?? !isGrokReasoningEffortCapable(base.id),
+		...(effort === undefined ? {} : { supportsReasoningEffort: effort }),
 	};
 	if (effortCapable) {
 		compat.reasoningEffortMap = { ...xaiResponsesReasoningEffortMap(curated.id) };
