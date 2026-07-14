@@ -3207,7 +3207,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			});
 		}
 
-		if (isAutoQaEnabled(settings) && toolRegistry.has("report_tool_issue")) {
+		if (isAutoQaEnabled(settings) && builtInRegistryToolNames.has("report_tool_issue")) {
 			const reportableToolNames = initialToolNames.filter(
 				name => builtInRegistryToolNames.has(name) || reportableCustomToolNames.has(name),
 			);

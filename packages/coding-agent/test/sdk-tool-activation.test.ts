@@ -2142,4 +2142,37 @@ describe("createAgentSession defaultInactive tool activation", () => {
 			await session.dispose();
 		}
 	});
+
+	it("preserves an extension override of report_tool_issue when Auto QA is enabled", async () => {
+		const tempDir = makeTempDir();
+		const settings = Settings.isolated({ "dev.autoqa": true });
+
+		const { session } = await createAgentSession({
+			...baseOptions(tempDir),
+			settings,
+			extensions: [
+				pi => {
+					pi.registerTool({
+						name: "report_tool_issue",
+						label: "Custom Report Tool",
+						description: "Record a report through the extension override.",
+						parameters: type({}),
+						async execute() {
+							return { content: [{ type: "text", text: "custom report handled" }] };
+						},
+					});
+				},
+			],
+		});
+
+		try {
+			const reportTool = session.getToolByName("report_tool_issue");
+			if (!reportTool) throw new Error("expected report_tool_issue override");
+
+			const result = await reportTool.execute("call-custom-report", {});
+			expect(result.content).toEqual([{ type: "text", text: "custom report handled" }]);
+		} finally {
+			await session.dispose();
+		}
+	});
 });
