@@ -2175,4 +2175,32 @@ describe("createAgentSession defaultInactive tool activation", () => {
 			await session.dispose();
 		}
 	});
+
+	it("keeps discovery-all built-ins reportable even when hidden from the initial active set", async () => {
+		const tempDir = makeTempDir();
+		const settings = Settings.isolated({ "dev.autoqa": true, "tools.discoveryMode": "all" });
+
+		const { session } = await createAgentSession({
+			...baseOptions(tempDir),
+			settings,
+		});
+
+		try {
+			// discovery-all hides discoverable built-ins from the initial active set.
+			expect(session.getActiveToolNames()).not.toContain("grep");
+			expect(session.getAllToolNames()).toContain("grep");
+
+			const reportTool = session.agent.state.tools.find(tool => tool.name === "report_tool_issue");
+			if (!reportTool) throw new Error("expected report_tool_issue");
+			const parameters = type(reportTool.parameters);
+			expect(
+				parameters({
+					tool: "grep",
+					report: "A discoverable built-in returned output inconsistent with its schema.",
+				}) instanceof type.errors,
+			).toBe(false);
+		} finally {
+			await session.dispose();
+		}
+	});
 });

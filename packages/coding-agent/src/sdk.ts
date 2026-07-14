@@ -3208,9 +3208,13 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		}
 
 		if (isAutoQaEnabled(settings) && builtInRegistryToolNames.has("report_tool_issue")) {
-			const reportableToolNames = initialToolNames.filter(
-				name => builtInRegistryToolNames.has(name) || reportableCustomToolNames.has(name),
-			);
+			// Snapshot from the full constructed registry, not `initialToolNames`:
+			// `tools.discoveryMode: "all"` strips discoverable built-ins (grep,
+			// browser, github, …) from the initial active set until the model
+			// activates them via `search_tool_bm25`. Those tools stay in the
+			// registry, so keying the allowlist off `initialToolNames` would
+			// silently drop their reports once activated.
+			const reportableToolNames = [...builtInRegistryToolNames, ...reportableCustomToolNames];
 			const qaTool = createReportToolIssueTool(toolSession, reportableToolNames);
 			toolRegistry.set(
 				qaTool.name,
