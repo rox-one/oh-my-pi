@@ -746,19 +746,20 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 		}
 	}
 
-	// Ordinary sessions use xd:// for discoverable built-ins, custom tools, and
-	// MCP tools. Structured children must expose only their host-provided names,
-	// so never allocate a registry that later SDK assembly could populate.
-	// Explicitly requested built-ins retain their top-level presentation.
-	const xdevEnabled = xdevRequested && tools.some(tool => tool.name === "write");
-	const mountBuiltinTools = requestedTools === undefined;
-	if (xdevEnabled) {
-		const mountedNames = new Set<string>();
-		const kept: Tool[] = [];
-		for (const tool of tools) {
-			const mountable = mountBuiltinTools && isMountableUnderXdev(tool) && tool.name in BUILTIN_TOOLS;
-			if (mountable) mountedNames.add(tool.name);
-			else kept.push(tool);
+	// Auto-inject report_tool_issue when autoqa is enabled (env or setting).
+	// Injected unconditionally into every agent, regardless of requested tool list.
+	const autoQA = isAutoQaEnabled(session.settings);
+	if (autoQA && !tools.some(t => t.name === "report_tool_issue")) {
+		// Build the provisional enum from tools constructed via BUILTIN_TOOLS /
+		// HIDDEN_TOOLS. `createAgentSession` rebuilds this tool after the complete
+		// registry exists so active OMP-shipped custom tools join the allowlist
+		// without admitting MCP or user-extension tools.
+		const activeBuiltinNames = tools
+			.map(t => t.name)
+			.filter(name => (name in BUILTIN_TOOLS || name in HIDDEN_TOOLS) && name !== "report_tool_issue");
+		const qaTool = createReportToolIssueTool(session, activeBuiltinNames);
+		if (qaTool) {
+			tools.push(wrapToolWithMetaNotice(qaTool));
 		}
 		session.xdev = {
 			tools: toolRegistry,

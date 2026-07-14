@@ -195,6 +195,8 @@ import {
 import {
 	BashTool,
 	BUILTIN_TOOLS,
+	computeEssentialBuiltinNames,
+	createReportToolIssueTool,
 	createTools,
 	createVibeTools,
 	type DeferredDiagnosticsEntry,
@@ -206,7 +208,10 @@ import {
 	GrepTool,
 	getSearchTools,
 	HIDDEN_TOOLS,
-	isMountableUnderXdev,
+	isAutoQaEnabled,
+	isImageProviderPreference,
+	isSearchProviderId,
+	isSearchProviderPreference,
 	type LspStartupServerInfo,
 	listXdevTools,
 	ReadTool,
@@ -1894,8 +1899,10 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		toolSession.enableMCP = enableMCP;
 		const deferMCPDiscoveryForUI = enableMCP && !mcpManager && options.hasUI === true;
 		const customTools: CustomTool[] = [];
-		const initialMcpManagerTools: CustomTool[] = [];
-		let startDeferredMCPDiscovery: ((liveSession: AgentSession) => void) | undefined;
+		const reportableCustomToolNames = new Set<string>();
+		let startDeferredMCPDiscovery:
+			| ((liveSession: AgentSession, activation: DeferredMCPActivation) => void)
+			| undefined;
 		const startupQuiet = settings.get("startup.quiet");
 		const onMCPStatus = (event: McpConnectionStatusEvent) => {
 			if (!options.hasUI || startupQuiet) return;
@@ -1979,63 +1986,49 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		// to mirror the AsyncJobManager ownership rule.
 		if (mcpManager && !options.parentTaskPrefix) MCPManager.setInstance(mcpManager);
 
-		const builtInToolNames = [...toolRegistry.keys()];
-		let customToolPaths: ToolPathWithSource[] = [];
-		const inlineExtensions: ExtensionFactory[] = [];
-		if (!restrictToolNames) {
-			// Add image tools when generation is enabled and either no explicit tool
-			// whitelist was given or it names `generate_image`. Unlike built-in tools
-			// (filtered in `createTools`), custom tools are force-activated via
-			// `alwaysInclude` below, so an explicit `--no-tools`/whitelist must be
-			// honored here or image-gen would leak past every filter (issue #5305).
-			const imageGenRequested = !options.toolNames || options.toolNames.includes("generate_image");
-			if (settings.get("generate_image.enabled") && imageGenRequested) {
-				const imageGenTools = await logger.time("getImageGenTools", () => getImageGenTools(modelRegistry, model));
-				if (imageGenTools.length > 0) {
-					customTools.push(...(imageGenTools as unknown as CustomTool[]));
-				}
+		// Add image tools when the active model or configured image providers can generate images.
+		const imageGenTools = await logger.time("getImageGenTools", () => getImageGenTools(modelRegistry, model));
+		if (imageGenTools.length > 0) {
+			for (const tool of imageGenTools) {
+				reportableCustomToolNames.add(tool.name);
 			}
+			customTools.push(...(imageGenTools as unknown as CustomTool[]));
+		}
 
-			if (settings.get("speechgen.enabled")) {
-				customTools.push(ttsTool as unknown as CustomTool);
-			}
+		if (settings.get("speechgen.enabled")) {
+			reportableCustomToolNames.add(ttsTool.name);
+			customTools.push(ttsTool as unknown as CustomTool);
+		}
 
-			// Add web search tools
-			if (options.toolNames?.includes("web_search")) {
-				customTools.push(...getSearchTools());
+		// Add web search tools
+		if (options.toolNames?.includes("web_search")) {
+			const searchTools = getSearchTools();
+			for (const tool of searchTools) {
+				reportableCustomToolNames.add(tool.name);
 			}
+			customTools.push(...searchTools);
+		}
 
-			// Discover custom tools from `.omp/tools/`, `.claude/tools/`, plugins, etc.
-			// Subagents reuse the parent's scan via `preloadedCustomToolPaths` to skip
-			// the FS walk, but ALWAYS re-call `loadCustomTools` here so factories bind
-			// to THIS session's `CustomToolAPI` (cwd, exec, pushPendingAction, UI).
-			// Forwarding the parent's `LoadedCustomTool[]` directly would route tool
-			// execution back through the parent — wrong for isolated tasks and for
-			// pending-action queueing.
-			customToolPaths =
-				options.preloadedCustomToolPaths ??
-				(await logger.time("discoverCustomToolPaths", () => discoverCustomToolPaths([], cwd)));
-			const customToolsLoadResult = await logger.time("loadCustomTools", () =>
-				loadCustomTools(customToolPaths, cwd, builtInToolNames, action => queueResolveHandler(toolSession, action)),
-			);
-			for (const { path, error } of customToolsLoadResult.errors) {
-				logger.error("Custom tool load failed", { path, error });
-			}
-			const customToolSourcePaths = new Map<string, string>();
-			if (customToolsLoadResult.tools.length > 0) {
-				for (const loaded of customToolsLoadResult.tools) {
-					customTools.push(loaded.tool);
-					if (isFilesystemSourcePath(loaded.resolvedPath)) {
-						customToolSourcePaths.set(loaded.tool.name, loaded.resolvedPath);
-					}
-				}
-			}
-
-			inlineExtensions.push(...(options.extensions ?? []));
-			inlineExtensions.push(createAutoresearchExtension);
-			if (customTools.length > 0) {
-				inlineExtensions.push(createCustomToolsExtension(customTools, customToolSourcePaths));
-			}
+		// Discover custom tools from `.omp/tools/`, `.claude/tools/`, plugins, etc.
+		// Subagents reuse the parent's scan via `preloadedCustomToolPaths` to skip
+		// the FS walk, but ALWAYS re-call `loadCustomTools` here so factories bind
+		// to THIS session's `CustomToolAPI` (cwd, exec, pushPendingAction, UI).
+		// Forwarding the parent's `LoadedCustomTool[]` directly would route tool
+		// execution back through the parent — wrong for isolated tasks and for
+		// pending-action queueing.
+		const builtInToolNames = builtinTools.map(t => t.name);
+		const customToolPaths: ToolPathWithSource[] =
+			options.preloadedCustomToolPaths ??
+			(await logger.time("discoverCustomToolPaths", () => discoverCustomToolPaths([], cwd)));
+		const customToolsLoadResult = await logger.time("loadCustomTools", () =>
+			loadCustomTools(customToolPaths, cwd, builtInToolNames, action => queueResolveHandler(toolSession, action)),
+		);
+		for (const { path, error } of customToolsLoadResult.errors) {
+			logger.error("Custom tool load failed", { path, error });
+		}
+		for (const { tool } of customToolsLoadResult.tools) {
+			reportableCustomToolNames.delete(tool.name);
+			customTools.push(tool);
 		}
 		// Forward the path list (NOT the loaded tools) to subagents so they
 		// re-bind under their own `CustomToolAPI` while skipping the FS scan.
@@ -2731,13 +2724,11 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		// stay unwrapped. The extension runner exposes it to re-registered tools via createContext.
 		const nativeToolsByName = new Map<string, Tool>(toolSession.xdev?.tools ?? undefined);
 
-		const registeredTools = restrictToolNames ? [] : extensionRunner.getAllRegisteredTools();
-		const initialRegisteredTools = new WeakSet(registeredTools);
-		const sdkCustomTools =
-			restrictToolNames && options.allowRestrictedCustomTools !== true
-				? []
-				: (options.customTools?.filter(tool => !isLegacyBuiltinToolDefinition(tool)) ?? []);
-		const sdkCustomToolNames = new Set(sdkCustomTools.map(tool => tool.name));
+		const registeredTools = extensionRunner.getAllRegisteredTools();
+		const sdkCustomTools = options.customTools?.filter(tool => !isLegacyBuiltinToolDefinition(tool)) ?? [];
+		for (const tool of sdkCustomTools) {
+			reportableCustomToolNames.delete(tool.name);
+		}
 		const allCustomTools = [
 			...registeredTools,
 			...sdkCustomTools.map(tool => {
@@ -3186,6 +3177,45 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			if (toolRegistry.has(name) && !initialToolNames.includes(name)) {
 				initialToolNames.push(name);
 			}
+		}
+
+		// When tools.discoveryMode === "all", hide non-essential built-in discoverable tools
+		// from the initial set unless they were explicitly requested or restored from persistence.
+		// The model finds them via search_tool_bm25 and activates them on demand.
+		if (effectiveDiscoveryMode === "all") {
+			// Tools a forced tool_choice will target must stay active, or the named
+			// choice references a tool absent from the request (provider 400). Eager
+			// todos force a named `todo` choice on the first turn. `task` is also kept
+			// active under discovery-all when `task.eager` is not `default`, so eager delegation is
+			// possible and the Eager Tasks prompt section renders, even though nothing
+			// forces a `task` tool_choice.
+			const forceActive = new Set<string>();
+			if (settings.get("todo.eager") !== "default" && settings.get("todo.enabled") && toolRegistry.has("todo")) {
+				forceActive.add("todo");
+			}
+			if (settings.get("task.eager") !== "default" && toolRegistry.has("task")) {
+				forceActive.add("task");
+			}
+			initialToolNames = filterInitialToolsForDiscoveryAll(initialToolNames, {
+				loadModeOf: name => toolRegistry.get(name)?.loadMode,
+				essentialNames: new Set(computeEssentialBuiltinNames(settings)),
+				explicitlyRequested: new Set(options.toolNames ? normalizeToolNames(options.toolNames) : []),
+				// Back-compat: persisted activations live under selectedMCPToolNames today (built-in
+				// activation persistence is a follow-up). MCP names won't collide with built-in names.
+				restored: new Set(existingSession.selectedMCPToolNames.map(normalizeRenamedBuiltinToolName)),
+				forceActive,
+			});
+		}
+
+		if (isAutoQaEnabled(settings) && toolRegistry.has("report_tool_issue")) {
+			const reportableToolNames = initialToolNames.filter(
+				name => builtInRegistryToolNames.has(name) || reportableCustomToolNames.has(name),
+			);
+			const qaTool = createReportToolIssueTool(toolSession, reportableToolNames);
+			toolRegistry.set(
+				qaTool.name,
+				new ExtensionToolWrapper(wrapToolWithMetaNotice(qaTool), extensionRunner) as Tool,
+			);
 		}
 
 		// Pre-register in the global agent registry BEFORE building the system prompt,

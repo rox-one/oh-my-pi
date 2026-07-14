@@ -3057,6 +3057,7 @@ Older entries are archived in [packages/coding-agent/CHANGELOG.md@c821261d1018](
 - Fixed native Windows binary compatibility on older Windows 10 CPUs by building the `omp-windows-x64.exe` release asset with a baseline x64 runtime instead of AVX2. (#5172)
 - Fixed `GenerateImage` rejecting OpenAI Codex-compatible proxy bearer keys when the token does not expose a `chatgpt-account-id`. (#5174)
 - Fixed context promotion documentation to accurately reflect the `contextPromotionTarget` runtime behavior and `contextPromotion.enabled` default. (#5163)
+- Fixed `report_tool_issue` rejecting reports for active OMP-shipped custom tools such as `generate_image`. ([#5175](https://github.com/can1357/oh-my-pi/issues/5175))
 
 ## [16.4.3] - 2026-07-11
 

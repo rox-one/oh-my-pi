@@ -1,18 +1,21 @@
 import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import * as reportIssue from "@oh-my-pi/pi-coding-agent/tools/report-tool-issue";
 import {
-	__awaitAutoQaRecordPipelineForTests,
-	__resetAutoQaConsentForTests,
+	__resetAutoQaDbForTests,
 	__resetAutoQaFlushStateForTests,
-	dispatchReportIssueDevice,
+	createReportToolIssueTool,
 	flushGrievances,
 	isAutoQaEnabled,
-	reportIssueDeviceUsage,
+	openAutoQaDb,
 } from "@oh-my-pi/pi-coding-agent/tools/report-tool-issue";
 import * as piUtils from "@oh-my-pi/pi-utils";
+import { type } from "arktype";
 import { mockFetch } from "../helpers/fetch-mock";
 
 function openTempDb(): Database {
@@ -77,6 +80,82 @@ function restoreAutoQaEnv(): void {
 	}
 	Bun.env.PI_AUTO_QA = originalPiAutoQa;
 }
+
+describe("createReportToolIssueTool", () => {
+	let autoQaTempDir: string | null = null;
+
+	afterEach(() => {
+		__resetAutoQaDbForTests();
+		vi.restoreAllMocks();
+		if (autoQaTempDir) {
+			fs.rmSync(autoQaTempDir, { recursive: true, force: true });
+			autoQaTempDir = null;
+		}
+	});
+
+	it("accepts reportable built-in custom tools in its parameter schema", () => {
+		const tool = createReportToolIssueTool(
+			{
+				cwd: "/tmp",
+				hasUI: false,
+				settings: Settings.isolated(),
+				getSessionFile: () => null,
+				getSessionSpawns: () => "*",
+			},
+			["read", "generate_image"],
+		);
+		const parameters = type(tool.parameters);
+
+		expect(
+			parameters({
+				tool: "generate_image",
+				report: "A schema-valid image generation request failed before reaching the provider.",
+			}) instanceof type.errors,
+		).toBe(false);
+		expect(
+			parameters({
+				tool: "extension_tool",
+				report: "A schema-valid image generation request failed before reaching the provider.",
+			}) instanceof type.errors,
+		).toBe(true);
+	});
+
+	it("records reportable custom tools and silently drops extension names at runtime", async () => {
+		autoQaTempDir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-report-tool-issue-"));
+		vi.spyOn(piUtils, "getAutoQaDbDir").mockReturnValue(path.join(autoQaTempDir, "autoqa.db"));
+		const tool = createReportToolIssueTool(
+			{
+				cwd: "/tmp",
+				hasUI: false,
+				settings: Settings.isolated(),
+				getActiveModelString: () => "test-model",
+				getSessionFile: () => null,
+				getSessionSpawns: () => "*",
+			},
+			["read", "generate_image"],
+		);
+
+		await tool.execute("call-image", {
+			tool: "generate_image",
+			report: "A schema-valid image generation request failed before reaching the provider.",
+		});
+		await tool.execute("call-extension", {
+			tool: "extension_tool",
+			report: "Extension tool names must not be collected by Auto QA.",
+		});
+
+		const db = openAutoQaDb();
+		if (!db) throw new Error("expected auto-QA database");
+		const rows = db.prepare("SELECT model, tool, report FROM grievances ORDER BY id ASC").all();
+		expect(rows).toEqual([
+			{
+				model: "test-model",
+				tool: "generate_image",
+				report: "A schema-valid image generation request failed before reaching the provider.",
+			},
+		]);
+	});
+});
 
 describe("flushGrievances", () => {
 	let db: Database;

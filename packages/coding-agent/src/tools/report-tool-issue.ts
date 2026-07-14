@@ -44,12 +44,17 @@ import { replaceTabs } from "./render-utils";
 import { ToolError } from "./tool-errors";
 import type { XdevDispatch } from "./xdev";
 
-export const REPORT_ISSUE_DEVICE_NAME = "report_issue";
-export const REPORT_ISSUE_DEVICE_PATH = `xd://${REPORT_ISSUE_DEVICE_NAME}`;
-
-/** Usage text for `read xd://report_issue`. */
-export function reportIssueDeviceUsage(): string {
-	return `Write \`<tool>: <concise description>\` as plain text to ${REPORT_ISSUE_DEVICE_PATH}. A two-line fallback also works: tool name on line 1, report body below.`;
+function buildReportToolIssueParams(reportableToolNames: readonly string[]) {
+	// Enum gives the model a tight schema; the runtime check in `execute` is the
+	// source of truth (handles models that ignore the enum and the empty-list
+	// fallback used by call sites that don't know the active set yet).
+	const toolSchema = reportableToolNames.length > 0 ? type.enumerated(...reportableToolNames) : type("string");
+	return type({
+		tool: toolSchema.describe("tool name"),
+		report: type("string").describe(
+			"unexpected behavior; generic, NEVER PII (paths, file contents, identifiers, prompt text)",
+		),
+	});
 }
 
 /** Whether a tool call writes to `xd://report_issue`. */
@@ -252,6 +257,12 @@ export async function resolveAutoQaConsent(settings: Settings | undefined): Prom
 }
 
 let cachedDb: Database | null = null;
+
+/** Test-only: close and forget the cached auto-QA database handle. */
+export function __resetAutoQaDbForTests(): void {
+	cachedDb?.close();
+	cachedDb = null;
+}
 
 /**
  * Open (or return the cached handle for) the auto-QA SQLite database at
@@ -507,12 +518,15 @@ export async function flushGrievances(
 	}
 }
 
-/**
- * Most recently scheduled record pipeline. Never rejects (the pipeline
- * swallows its own errors); retained so tests can await the fire-and-forget
- * work deterministically via {@link __awaitAutoQaRecordPipelineForTests}.
- */
-let lastRecordPipeline: Promise<void> = Promise.resolve();
+export function createReportToolIssueTool(
+	session: ToolSession,
+	reportableToolNames: readonly string[] = [],
+): AgentTool {
+	const getModel = () => session.getActiveModelString?.() ?? "unknown";
+	// Snapshotted at construction time. The model's enum is built from the same
+	// snapshot; mid-session drift (extensions registering later, etc.) is caught
+	// by the silent-drop guard below.
+	const allowedToolNames = new Set(reportableToolNames);
 
 /** Test-only: await the last consent → insert → flush pipeline. */
 export function __awaitAutoQaRecordPipelineForTests(): Promise<void> {
@@ -562,7 +576,66 @@ export async function dispatchReportIssueDevice(
 		logger.error("Failed to record tool issue", { error });
 	}
 	return {
-		result: { content: [{ type: "text", text: "Noted, thanks!" }] },
-		xdev: { tool: REPORT_ISSUE_DEVICE_NAME, mode: "execute", args: { report: text.trim() } },
+		name: "report_tool_issue",
+		label: "Report Tool Issue",
+		strict: false,
+		approval: "write",
+		description: "Report unexpected tool behavior for automated QA tracking.",
+		parameters: buildReportToolIssueParams(reportableToolNames),
+		intent: "omit",
+		async execute(_toolCallId, rawParams) {
+			// Save is unconditional: the row lives in the user's own SQLite
+			// at ~/.omp/agent/autoqa.db regardless of consent — they always
+			// own their local data and can inspect or wipe it via `omp grievances`.
+			// Consent only gates whether the row is *shipped* to the shared
+			// backend; that decision rides on `dev.autoqa.consent` and is
+			// enforced inside `flushGrievances` via `resolvePushConfig`.
+			try {
+				const params = rawParams as { tool: string; report: string };
+				// Some models emit `proxy_<name>` for tools routed through a
+				// passthrough wrapper. Strip the prefix before allowlist check so
+				// `proxy_read` lands as a report against `read`, not a silent drop.
+				const canonicalTool = params.tool.startsWith("proxy_") ? params.tool.slice("proxy_".length) : params.tool;
+				// Silently drop reports targeting tools that aren't OMP-shipped
+				// reportable tools (MCP servers, extensions, typos).
+				// Not the model's fault — no error, no DB row, just acknowledge.
+				// Empty allowlist means the factory was called without a known active
+				// set, so behave as before and record everything.
+				if (allowedToolNames.size > 0 && !allowedToolNames.has(canonicalTool)) {
+					return { content: [{ type: "text", text: "Noted, thanks!" }] };
+				}
+				const db = openAutoQaDb();
+				if (db) {
+					db.prepare("INSERT INTO grievances (model, version, tool, report) VALUES (?, ?, ?, ?)").run(
+						getModel(),
+						VERSION,
+						canonicalTool,
+						params.report,
+					);
+					// Fire-and-forget background pipeline:
+					//   1. Trigger the consent popup if it hasn't been answered
+					//      (single-flight inside `resolveAutoQaConsent`; subagents
+					//      share the same module-level state).
+					//   2. Attempt a flush — `resolvePushConfig` no-ops when consent
+					//      isn't granted, so a "no" leaves the row local for later
+					//      `omp grievances push` or a future consent change.
+					// Tool execution returns immediately; the model never waits
+					// on the dialog.
+					void (async () => {
+						try {
+							await resolveAutoQaConsent(session.settings);
+							await flushGrievances(db, session.settings);
+						} catch (error) {
+							logger.debug("autoqa post-insert pipeline failed", { error: String(error) });
+						}
+					})();
+				}
+			} catch (error) {
+				logger.error("Failed to record tool issue", { error });
+			}
+			return {
+				content: [{ type: "text", text: "Noted, thanks!" }],
+			};
+		},
 	};
 }
