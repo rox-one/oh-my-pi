@@ -6,6 +6,7 @@ import { clearCustomApis } from "@oh-my-pi/pi-ai/api-registry";
 import { createMockModel, registerMockApi } from "@oh-my-pi/pi-ai/providers/mock";
 import { __providerInFlightForTesting, streamSimple } from "@oh-my-pi/pi-ai/stream";
 import type { Context } from "@oh-my-pi/pi-ai/types";
+import { disableProvider, enableProvider, initializeWithSettings } from "@oh-my-pi/pi-coding-agent/capability";
 import {
 	onAppendOnlyModeChanged,
 	onCodeModeChanged,
@@ -724,19 +725,17 @@ describe("Settings", () => {
 			expect(settings.get("disabledProviders")).toEqual(["always-provider", "other-provider"]);
 		});
 
-		it("clears path-scoped provider cache before reloading project settings for a new cwd", async () => {
+		it("clears stale project settings before provider-filtered reloads", async () => {
 			const otherDir = path.join(tempDir.toString(), "other-project");
 			fs.mkdirSync(getProjectAgentDir(otherDir), { recursive: true });
+			await Bun.write(
+				path.join(getProjectAgentDir(projectDir), "settings.json"),
+				JSON.stringify({ disabledExtensionProviders: ["native"] }),
+			);
 			await Bun.write(
 				path.join(getProjectAgentDir(otherDir), "settings.json"),
 				JSON.stringify({ terminal: { showProgress: true } }),
 			);
-			await writeSettings({
-				disabledExtensionProviders: [
-					{ pathPrefix: projectDir, providers: ["native"] },
-					{ pathPrefix: otherDir, providers: [] },
-				],
-			});
 
 			const settings = await Settings.init({ cwd: projectDir, agentDir });
 			expect(settings.get("disabledExtensionProviders")).toEqual(["native"]);
@@ -745,6 +744,30 @@ describe("Settings", () => {
 
 			expect(settings.get("disabledExtensionProviders")).toEqual([]);
 			expect(settings.get("terminal.showProgress")).toBe(true);
+		});
+
+		it("preserves unmatched scoped extension-provider rules when toggling", async () => {
+			const otherDir = path.join(tempDir.toString(), "other-project");
+			await writeSettings({
+				disabledExtensionProviders: [
+					{ pathPrefix: projectDir, providers: ["cursor"] },
+					{ pathPrefix: otherDir, providers: ["windsurf"] },
+				],
+			});
+
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+			initializeWithSettings(settings);
+			enableProvider("cursor");
+			disableProvider("claude");
+			await settings.flush();
+
+			expect((await readSettings()).disabledExtensionProviders).toEqual([
+				{ pathPrefix: projectDir, providers: ["claude"] },
+				{ pathPrefix: otherDir, providers: ["windsurf"] },
+			]);
+
+			await settings.reloadForCwd(otherDir);
+			expect(settings.get("disabledExtensionProviders")).toEqual(["windsurf"]);
 		});
 
 		it("migrates legacy snapcompact system prompt booleans to scoped modes", () => {

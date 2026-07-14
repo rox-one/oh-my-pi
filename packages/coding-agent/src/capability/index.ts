@@ -314,7 +314,7 @@ export function initializeWithSettings(activeSettings: Settings): void {
  */
 function persistDisabledExtensionProviders(): void {
 	if (settings) {
-		settings.set("disabledExtensionProviders", Array.from(disabledExtensionProviders));
+		settings.setDisabledExtensionProviders(Array.from(disabledExtensionProviders));
 	}
 }
 

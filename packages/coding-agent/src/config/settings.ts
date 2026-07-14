@@ -929,13 +929,14 @@ export class Settings {
 		const prevModelRoles = this.get("modelRoles");
 		const prevCodeModeValues = this.#codeModeSignalSnapshot();
 		this.#cwd = normalized;
-		// `#loadProjectSettings()` uses the capability registry, whose provider
-		// filter reads path-scoped settings such as `disabledExtensionProviders`.
-		// Clear cwd-derived cached values before discovery so provider filtering
-		// resolves against the destination cwd instead of the previous project.
-		this.#resolvedCache.clear();
-		this.#editVariantCache = undefined;
 		if (this.#persist) {
+			// Project-settings discovery is provider-filtered. Remove the previous
+			// project layer before loading the destination so its
+			// `disabledExtensionProviders` cannot hide the provider needed to read
+			// the new project's settings. Rebuilding also clears cwd-derived caches
+			// while retaining global, overlay, and runtime-override layers.
+			this.#project = {};
+			this.#rebuildMerged();
 			this.#project = await this.#loadProjectSettings();
 		}
 		this.#rebuildMerged();
@@ -1331,6 +1332,80 @@ export class Settings {
 	 */
 	setDisabledProviders(ids: string[]): void {
 		this.set("disabledProviders", ids);
+	}
+
+	/**
+	 * Persist the effective extension-provider denylist without flattening
+	 * path-scoped rules for other projects.
+	 */
+	setDisabledExtensionProviders(ids: string[]): void {
+		const settingPath = "disabledExtensionProviders";
+		const raw = getByPath(this.#global, SETTING_PATH_SEGMENTS[settingPath]);
+		if (!Array.isArray(raw) || !raw.some(isRecord)) {
+			this.set(settingPath, ids);
+			return;
+		}
+
+		const prev = this.get(settingPath);
+		const desired = new Set(ids);
+		const current = new Set(resolvePathScopedStringArray(settingPath, raw, this.#cwd) ?? []);
+		const removed = new Set(Array.from(current).filter(id => !desired.has(id)));
+		let additions = ids.filter(id => !current.has(id));
+		let wroteAdditions = false;
+		const updated: unknown[] = [];
+
+		for (const entry of raw) {
+			if (typeof entry === "string") {
+				if (!removed.has(entry)) updated.push(entry);
+				continue;
+			}
+			if (!isRecord(entry)) {
+				updated.push(entry);
+				continue;
+			}
+
+			const prefixes = [
+				...stringArrayFromUnknown(entry.path),
+				...stringArrayFromUnknown(entry.paths),
+				...stringArrayFromUnknown(entry.pathPrefix),
+				...stringArrayFromUnknown(entry.pathPrefixes),
+			];
+			if (prefixes.length === 0 || !prefixes.some(prefix => pathMatchesPrefix(this.#cwd, prefix))) {
+				updated.push(entry);
+				continue;
+			}
+
+			const next = { ...entry };
+			if (next.values !== undefined) {
+				next.values = stringArrayFromUnknown(next.values).filter(id => !removed.has(id));
+			}
+			if (next.items !== undefined) {
+				next.items = stringArrayFromUnknown(next.items).filter(id => !removed.has(id));
+			}
+			if (next.providers !== undefined) {
+				next.providers = stringArrayFromUnknown(next.providers).filter(id => !removed.has(id));
+			}
+
+			if (!wroteAdditions && additions.length > 0) {
+				const target = next.providers !== undefined ? "providers" : next.values !== undefined ? "values" : "items";
+				const existing = stringArrayFromUnknown(next[target]);
+				next[target] = Array.from(new Set([...existing, ...additions]));
+				additions = [];
+				wroteAdditions = true;
+			}
+			updated.push(next);
+		}
+
+		if (!wroteAdditions && additions.length > 0) {
+			updated.push({ path: this.#cwd, providers: additions });
+		}
+
+		setByPath(this.#global, [settingPath], updated);
+		this.#modified.add(settingPath);
+		this.#rebuildMerged();
+		const next = this.get(settingPath);
+		this.#queueSave();
+		this.#fireEffectiveSettingChanged(settingPath, next, prev);
 	}
 
 	// ─────────────────────────────────────────────────────────────────────────
