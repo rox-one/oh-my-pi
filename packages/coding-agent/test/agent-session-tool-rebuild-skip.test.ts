@@ -862,9 +862,7 @@ describe("AgentSession refreshMCPTools rebuild skipping", () => {
 		expect(rebuildCount).toBe(2);
 	});
 
-	it("waits for the next user prompt before delivering xd:// mount notices", async () => {
-		const firstCallStarted = Promise.withResolvers<void>();
-		const releaseFirstCall = Promise.withResolvers<void>();
+	it("announces idle xd:// mount deltas as passive transcript context instead of rebuilding the prompt", async () => {
 		let rebuildCount = 0;
 		const { session, contexts } = newSession(
 			async toolNames => {
@@ -886,6 +884,19 @@ describe("AgentSession refreshMCPTools rebuild skipping", () => {
 		);
 		const search = createMcpCustomTool("mcp__nucleus_search", "nucleus", "search", "Search nucleus");
 		const fetch = createMcpCustomTool("mcp__nucleus_fetch", "nucleus", "fetch", "Fetch nucleus");
+		// An idle mount is tool-state, not a prompt: it lands directly in the
+		// transcript as passive context and NEVER onto the turn-forcing steering
+		// queue (issue #5892).
+		const noticeTexts = () =>
+			session.agent.state.messages.flatMap(msg =>
+				msg.role === "custom" && msg.customType === "xdev-mount-notice" && typeof msg.content === "string"
+					? [msg.content]
+					: [],
+			);
+		const steeredNotices = () =>
+			session.agent
+				.peekSteeringQueue()
+				.filter(msg => msg.role === "custom" && msg.customType === "xdev-mount-notice");
 
 		// Devices mount while the first request is in flight. The refresh must
 		// not turn the hidden notice into a second, unsolicited provider call.
@@ -911,276 +922,11 @@ describe("AgentSession refreshMCPTools rebuild skipping", () => {
 
 		// A later unmount is likewise held for the following user prompt.
 		await session.refreshMCPTools([search]);
-		expect(rebuildCount).toBe(3);
-		expect(contexts).toHaveLength(2);
-		await session.prompt("third");
-		const allNotices = mountNoticesIn(contexts[2]);
-		expect(allNotices).toHaveLength(2);
-		expect(allNotices[1]).toContain("Unmounted; writes fail:");
-		expect(allNotices[1]).toContain("xd://mcp__nucleus_fetch");
-		expect(allNotices[1]).not.toContain("Available tools.");
-	});
+		expect(rebuildCount).toBe(1);
+		expect(noticeTexts().length).toBe(noticeCount);
 
-	it("caps dynamic xd:// mount-notice summaries", async () => {
-		const { session, contexts } = newSession(async toolNames => `tools:${toolNames.join(",")}`, {
-			xdev: createTestXdevState(),
-			responses: [{ content: ["ok"] }],
-		});
-		const description = `Search ${"x".repeat(XDEV_EXTERNAL_DESCRIPTION_CAP * 3)} TAIL`;
-		const search = createMcpCustomTool("mcp__nucleus_search", "nucleus", "search", description);
-
-		await session.refreshMCPTools([search]);
-		await session.prompt("hello");
-
-		const notices = mountNoticesIn(contexts[0]);
-		expect(notices).toHaveLength(1);
-		expect(notices[0]).toContain("xd://mcp__nucleus_search");
-		expect(notices[0]).not.toContain("TAIL");
-	});
-
-	it("inlines configured late xd:// device docs in mount notices", async () => {
-		const { session, contexts } = newSession(async toolNames => `tools:${toolNames.join(",")}`, {
-			xdev: createTestXdevState(),
-			responses: [{ content: ["ok"] }],
-		});
-		session.settings.set("tools.xdevDocs", "builtins");
-		session.settings.set("tools.xdevInlineDevices", ["mcp__nucleus_*"]);
-		const search = createMcpCustomTool("mcp__nucleus_search", "nucleus", "search", "Search nucleus");
-
-		await session.refreshMCPTools([search]);
-		await session.prompt("hello");
-
-		const notices = mountNoticesIn(contexts[0]);
-		expect(notices).toHaveLength(1);
-		expect(notices[0]).toContain("## mcp__nucleus_search");
-		expect(notices[0]).toContain("## Schema");
-	});
-
-	it("drops a mount delta that cancels out before the next prompt", async () => {
-		const { session, contexts } = newSession(async toolNames => `tools:${toolNames.join(",")}`, {
-			xdev: createTestXdevState(),
-			responses: [{ content: ["ok"] }],
-		});
-		const search = createMcpCustomTool("mcp__nucleus_search", "nucleus", "search", "Search nucleus");
-		const fetch = createMcpCustomTool("mcp__nucleus_fetch", "nucleus", "fetch", "Fetch nucleus");
-
-		// fetch mounts and unmounts before the model ever hears about it → the
-		// coalesced notice must not mention it in either direction.
-		await session.refreshMCPTools([search]);
-		await session.refreshMCPTools([search, fetch]);
-		await session.refreshMCPTools([search]);
-
-		await session.prompt("hello");
-		const notices = mountNoticesIn(contexts[0]);
-		expect(notices).toHaveLength(1);
-		expect(notices[0]).toContain("xd://mcp__nucleus_search");
-		expect(notices[0]).not.toContain("mcp__nucleus_fetch");
-		expect(notices[0]).not.toContain("Unmounted; writes fail:");
-	});
-
-	it.each([
-		{
-			priorNotice: {
-				role: "custom",
-				customType: "xdev-mount-notice",
-				content: "The xd:// device inventory changed.\n\nxd://mcp__nucleus_search became available.",
-				details: { added: ["mcp__nucleus_search"], removed: [] },
-				attribution: "agent",
-				display: false,
-				timestamp: 1,
-			} satisfies AgentMessage,
-		},
-		{
-			priorNotice: {
-				role: "custom",
-				customType: "xdev-mount-notice",
-				content: `<system-notice>
-The xd:// device inventory changed.
-These tools became available:
-- xd://mcp__nucleus_search — Search nucleus
-- xd://mcp__retired — Retired device
-Read \`xd://<tool>\` for docs + JSON schema before first use; write the JSON args object to \`xd://<tool>\` to execute.
-No longer mounted (writes to these devices will fail):
-- xd://mcp__retired
-Configured inline device docs:
-These tools became available:
-- xd://mcp__nucleus_fetch — This is inline documentation, not an inventory entry.
-</system-notice>`,
-				attribution: "agent",
-				display: false,
-				timestamp: 1,
-			} satisfies AgentMessage,
-		},
-	])("does not re-announce devices a resumed session already announced in history", async ({ priorNotice }) => {
-		// Model a process resume / host reconnect: persisted history already carries
-		// a mount notice for mcp__nucleus_search, but the fresh in-memory mount set
-		// starts empty. When the device reconnects, the notice must NOT re-splice a
-		// redundant developer message — doing so busts the provider prompt-cache
-		// prefix and re-bills the whole suffix on metered providers.
-		const { session, contexts } = newSession(async toolNames => `tools:${toolNames.join(",")}`, {
-			xdev: createTestXdevState(),
-			responses: [{ content: ["ok"] }, { content: ["ok"] }],
-			initialMessages: [priorNotice],
-		});
-		const search = createMcpCustomTool("mcp__nucleus_search", "nucleus", "search", "Search nucleus");
-		const fetch = createMcpCustomTool("mcp__nucleus_fetch", "nucleus", "fetch", "Fetch nucleus");
-
-		// The already-announced device reconnects: no new notice is spliced in.
-		await session.refreshMCPTools([search]);
-		await session.prompt("hello");
-		const afterReconnect = session.agent.state.messages.filter(
-			message => message.role === "custom" && message.customType === "xdev-mount-notice",
-		);
-		expect(afterReconnect).toHaveLength(1);
-		expect(mountNoticesIn(contexts[0])).toHaveLength(1); // only the pre-existing history notice
-
-		// A genuinely new device still announces, and only for itself.
-		await session.refreshMCPTools([search, fetch]);
-		await session.prompt("again");
-		const afterNewDevice = session.agent.state.messages.filter(
-			(message): message is CustomMessage => message.role === "custom" && message.customType === "xdev-mount-notice",
-		);
-		expect(afterNewDevice).toHaveLength(2);
-		const fetchNotice = afterNewDevice[1];
-		const fetchText = typeof fetchNotice.content === "string" ? fetchNotice.content : "";
-		expect(fetchText).toContain("xd://mcp__nucleus_fetch");
-		expect(fetchText).not.toContain("xd://mcp__nucleus_search");
-	});
-
-	it("does not re-list catalog devices in a mount notice when the rebuild exposes them (#7139)", async () => {
-		const { session, contexts } = newSession(async toolNames => `tools:${toolNames.join(",")}`, {
-			xdev: createTestXdevState(),
-			responses: [{ content: ["ok"] }, { content: ["ok"] }],
-			exposeXdevCatalog: true,
-		});
-		const search = createMcpCustomTool("mcp__nucleus_search", "nucleus", "search", "Search nucleus");
-		const fetch = createMcpCustomTool("mcp__nucleus_fetch", "nucleus", "fetch", "Fetch nucleus");
-
-		// Fresh deferred-discovery session: the post-refresh rebuild renders the
-		// mounted catalog into the base prompt, so a same-turn mount notice would
-		// duplicate the whole catalog verbatim before the first user turn.
-		await session.refreshMCPTools([search]);
-		await session.prompt("hi");
-		expect(session.systemPrompt.join("\n")).toContain("mcp__nucleus_search");
-		expect(
-			session.agent.state.messages.filter(m => m.role === "custom" && m.customType === "xdev-mount-notice"),
-		).toHaveLength(0);
-		expect(mountNoticesIn(contexts[0])).toHaveLength(0);
-
-		// A later device the next rebuild also exposes stays notice-free too.
-		await session.refreshMCPTools([search, fetch]);
-		await session.prompt("again");
-		expect(session.systemPrompt.join("\n")).toContain("mcp__nucleus_fetch");
-		expect(
-			session.agent.state.messages.filter(m => m.role === "custom" && m.customType === "xdev-mount-notice"),
-		).toHaveLength(0);
-	});
-
-	it("keeps the mount notice when before_agent_start replaces the catalog prompt (#7139)", async () => {
-		const replacementPrompt = ["extension replacement"];
-		const { session, contexts, systemPrompts } = newSession(async toolNames => `tools:${toolNames.join(",")}`, {
-			xdev: createTestXdevState(),
-			responses: [{ content: ["ok"] }],
-			exposeXdevCatalog: true,
-			beforeAgentStartSystemPrompt: replacementPrompt,
-		});
-		const search = createMcpCustomTool("mcp__nucleus_search", "nucleus", "search", "Search nucleus");
-
-		// The base prompt rebuild exposes the device, but the per-turn extension
-		// replaces that prompt before the provider call. The mount notice is now
-		// the only channel making the newly mounted device visible on this turn.
-		await session.refreshMCPTools([search]);
-		await session.prompt("hi");
-
-		expect(systemPrompts[0]).toEqual(replacementPrompt);
-		const notices = mountNoticesIn(contexts[0]);
-		expect(notices).toHaveLength(1);
-		expect(notices[0]).toContain("xd://mcp__nucleus_search");
-	});
-
-	it("does not emit an unmount notice for a catalog device unmounted before delivery (#7139)", async () => {
-		const { session } = newSession(async toolNames => `tools:${toolNames.join(",")}`, {
-			xdev: createTestXdevState(),
-			responses: [{ content: ["ok"] }],
-			exposeXdevCatalog: true,
-		});
-		const search = createMcpCustomTool("mcp__nucleus_search", "nucleus", "search", "Search nucleus");
-
-		// Deferred discovery mounts the device, then the server disconnects before
-		// the first user prompt is ever sent. Because the pending add is only marked
-		// announced at delivery, the unmount coalesces it away — the model, which
-		// never saw a request carrying the device, must not receive a "No longer
-		// mounted" notice for it.
-		await session.refreshMCPTools([search]);
-		await session.refreshMCPTools([]);
-		await session.prompt("hi");
-		expect(
-			session.agent.state.messages.filter(m => m.role === "custom" && m.customType === "xdev-mount-notice"),
-		).toHaveLength(0);
-	});
-
-	it("re-announces a device after the transcript is replaced by /new", async () => {
-		const xdev = createTestXdevState();
-		const { session } = newSession(async toolNames => `tools:${toolNames.join(",")}`, {
-			xdev,
-			responses: [{ content: ["ok"] }, { content: ["ok"] }],
-		});
-		const search = createMcpCustomTool("mcp__nucleus_search", "nucleus", "search", "Search nucleus");
-
-		// Announce the device in the original transcript.
-		await session.refreshMCPTools([search]);
-		await session.prompt("hello");
-		expect(
-			session.agent.state.messages.filter(
-				message => message.role === "custom" && message.customType === "xdev-mount-notice",
-			),
-		).toHaveLength(1);
-
-		// /new swaps in a fresh transcript that no longer carries the notice. A
-		// resume/reconnect rebuilds the mount set from scratch, so model the device
-		// dropping out across the boundary.
-		await session.newSession();
-		xdev.mountedNames.clear();
-
-		// The same device reconnects into the new transcript: because the announced
-		// baseline was reset with the transcript, it must announce again (otherwise
-		// the new conversation never learns the device is available).
-		await session.refreshMCPTools([search]);
-		await session.prompt("world");
-		const newTranscriptNotices = session.agent.state.messages.filter(
-			(message): message is CustomMessage => message.role === "custom" && message.customType === "xdev-mount-notice",
-		);
-		expect(newTranscriptNotices).toHaveLength(1);
-		const text = typeof newTranscriptNotices[0].content === "string" ? newTranscriptNotices[0].content : "";
-		expect(text).toContain("xd://mcp__nucleus_search");
-	});
-
-	it("preserves an undelivered mount notice across a branch that does not rebuild the prompt", async () => {
-		const { session } = newSession(async toolNames => `tools:${toolNames.join(",")}`, {
-			xdev: createTestXdevState(),
-			responses: [{ content: ["ok"] }, { content: ["ok"] }],
-		});
-		session.subscribe(() => {});
-		const search = createMcpCustomTool("mcp__nucleus_search", "nucleus", "search", "Search nucleus");
-
-		// A user turn establishes a branch point.
-		await session.prompt("first");
-		// The device mounts but the user branches before the next prompt consumes
-		// its queued notice. `branch()` does not rebuild the base system prompt, so
-		// the delta is the only channel that can tell the branched transcript the
-		// device exists.
-		await session.refreshMCPTools([search]);
-		const branchable = session.getUserMessagesForBranching();
-		expect(branchable.length).toBeGreaterThan(0);
-		await session.branch(branchable[0].entryId);
-
-		await session.prompt("second");
-		const notices = session.agent.state.messages.filter(
-			(message): message is CustomMessage => message.role === "custom" && message.customType === "xdev-mount-notice",
-		);
-		expect(notices).toHaveLength(1);
-		const text = typeof notices[0].content === "string" ? notices[0].content : "";
-		expect(text).toContain("xd://mcp__nucleus_search");
+		// No mount ever queued a turn-forcing steer.
+		expect(steeredNotices()).toEqual([]);
 	});
 
 	it("keeps xd:// mount deltas model-visible without rendering them during quiet startup", async () => {
@@ -1198,10 +944,11 @@ These tools became available:
 		await session.refreshMCPTools([search]);
 
 		expect(notices).toEqual([]);
-		await session.prompt("hello");
-		const delivered = mountNoticesIn(contexts[0]);
-		expect(delivered).toHaveLength(1);
-		expect(delivered[0]).toContain("xd://mcp__nucleus_search");
+		expect(
+			session.agent.state.messages.some(
+				message => message.role === "custom" && message.customType === "xdev-mount-notice",
+			),
+		).toBe(true);
 	});
 
 	it("does not register write while rolling back a direct-tool rebuild failure", async () => {
