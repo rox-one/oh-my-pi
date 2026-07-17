@@ -1389,6 +1389,37 @@ describe("normalizeSchemaForMoonshot", () => {
 		expect(normalizeSchemaForMoonshot(false)).toEqual({});
 	});
 
+	it("coerces an accept-anything `true` property subschema to `{}` (#5918)", () => {
+		// `normalizeEmptySchemas` widens `z.unknown()`'s `{}` to boolean `true`
+		// (issue #1179); Moonshot's MFJS validator rejects the boolean form but
+		// accepts the equivalent empty object.
+		const normalized = normalizeSchemaForMoonshot({
+			type: "object",
+			properties: {
+				tasks: {
+					type: "array",
+					items: {
+						type: "object",
+						properties: { task: { type: "string" }, outputSchema: true },
+						required: ["task"],
+					},
+				},
+			},
+			required: ["tasks"],
+		}) as Record<string, Record<string, Record<string, Record<string, Record<string, unknown>>>>>;
+		expect(normalized.properties.tasks.items.properties.outputSchema).toEqual({});
+	});
+
+	it("coerces a `true` subschema in items/additionalProperties positions", () => {
+		expect(normalizeSchemaForMoonshot({ type: "array", items: true })).toEqual({ type: "array", items: {} });
+		// `additionalProperties: true` is a keyword slot, not a subschema slot, so
+		// the boolean stays (MFJS accepts it — see the additionalProperties test).
+		expect(normalizeSchemaForMoonshot({ type: "object", additionalProperties: true })).toEqual({
+			type: "object",
+			additionalProperties: true,
+		});
+	});
+
 	it("folds oneOf into anyOf (the only MFJS combinator)", () => {
 		const normalized = normalizeSchemaForMoonshot({
 			oneOf: [{ type: "string" }, { type: "array", items: { type: "string" } }],

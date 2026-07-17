@@ -466,6 +466,7 @@
 ### Changed
 
 - Kimi-family models now use MFJS tool schema on all hosts, including proxies like OpenRouter that forward schemas to Moonshot
+- Fixed Moonshot/Kimi models routed through OpenRouter not receiving the Moonshot Flavored JSON Schema (MFJS) tool-schema flavor: `toolSchemaFlavor: "moonshot-mfjs"` now resolves for Kimi ids on the `openrouter` provider (both the chat-completions and Responses transports), so tool parameters get sanitized before hitting Moonshot's stricter validator. ([#5918](https://github.com/can1357/oh-my-pi/issues/5918))
 
 ## [17.0.3] - 2026-07-17
 

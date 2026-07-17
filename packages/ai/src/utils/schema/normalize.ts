@@ -28,11 +28,16 @@ import { isJsonObject, isJsonObjectEmpty, type JsonObject } from "./types";
 export type ResidualSchemaIncompatibility = "type-array" | "type-null" | "nullable" | "combiners" | "not";
 
 export interface NormalizeSchemaOptions {
+	/** Coerce JSON Schema boolean subschemas for providers whose wire cannot encode them. */
+	coerceBooleanSubschemas?: boolean;
 	/**
-	 * Coerce boolean subschemas to object forms. `standard` preserves `false`
-	 * with `not`; `permissive` uses `{}` when the provider cannot express it.
+	 * Coerce an accept-anything `true` subschema to `{}`. Moonshot Flavored JSON
+	 * Schema rejects boolean subschemas but accepts the equivalent empty-object
+	 * form; `false` is left untouched (the `{ not: {} }` equivalent would
+	 * synthesize an MFJS-forbidden `not`, and empty-schema widening never emits
+	 * `false` anyway). See issue #5918.
 	 */
-	coerceBooleanSubschemas?: "standard" | "permissive";
+	coerceTrueSubschemaToEmpty?: boolean;
 	unsupportedFields: (key: string) => boolean;
 	normalizeFieldNames: boolean;
 	collapseNullFields: boolean;
@@ -351,12 +356,16 @@ function normalizeSchemaNode(value: unknown, options: NormalizeSchemaWalkOptions
 	}
 	if (typeof value === "boolean") {
 		// A bare boolean is a JSON Schema subschema only in a subschema slot.
-		// Some provider wires have no boolean-schema representation: `true`
-		// becomes `{}`; `false` uses `not` when supported, or the permissive
-		// `{}` fallback when the provider cannot express an impossible schema.
-		const mode = options.coerceBooleanSubschemas;
-		if (!mode || !options.booleanIsSubschema) return value;
-		return value || mode === "permissive" ? {} : { not: {} };
+		// The Google/CCA protobuf Schema wire has no representation for it
+		// (issue #5604): `true` accepts anything -> `{}`, `false` accepts nothing
+		// -> `{ not: {} }`. In a keyword slot (`nullable`, `enum` entry, …) a
+		// boolean is a plain value and is left untouched.
+		if (!options.booleanIsSubschema) return value;
+		// MFJS accepts `{}` but not the boolean form; coerce `true` -> `{}` while
+		// leaving `false` intact (its `{ not: {} }` equivalent is MFJS-forbidden).
+		if (options.coerceTrueSubschemaToEmpty && value === true) return {};
+		if (!options.coerceBooleanSubschemas) return value;
+		return value ? {} : { not: {} };
 	}
 	if (!isJsonObject(value)) {
 		return value;
@@ -1193,7 +1202,7 @@ export function normalizeSchemaForMCP(value: unknown): unknown {
  */
 export function normalizeSchemaForMoonshot(value: unknown): unknown {
 	return normalizeSchema(value, {
-		coerceBooleanSubschemas: "permissive",
+		coerceTrueSubschemaToEmpty: true,
 		unsupportedFields: isMoonshotUnsupportedSchemaField,
 		normalizeFieldNames: false,
 		collapseNullFields: false,
