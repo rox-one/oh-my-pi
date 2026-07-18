@@ -682,7 +682,7 @@
 
 ### Fixed
 
-- Fixed Moonshot/Kimi rejecting every request carrying the built-in `task` tool with HTTP 400 (`tools.function.parameters is not a valid moonshot flavored json schema … property schema for 'outputSchema' must be an object`). The tool's `outputSchema` (`z.unknown()`) serialized as the boolean JSON Schema `true` (empty-schema widening, #1179), which Moonshot's MFJS validator rejects. `normalizeSchemaForMoonshot` now coerces an accept-anything `true` subschema to `{}`, the Moonshot schema flavor is detected for Kimi models routed via OpenRouter, and the `openai-responses` transport (used for OpenRouter) now runs MFJS normalization. ([#5918](https://github.com/can1357/oh-my-pi/issues/5918))
+- Fixed Moonshot/Kimi rejecting every request carrying the built-in `task` tool with HTTP 400 (`tools.function.parameters is not a valid moonshot flavored json schema … property schema for 'outputSchema' must be an object`). The tool's `outputSchema` (`z.unknown()`) serialized as the boolean JSON Schema `true` (empty-schema widening, #1179), which Moonshot's MFJS validator rejects. `normalizeSchemaForMoonshot` now coerces boolean subschemas to their object equivalents (`true` → `{}`, `false` → `{ not: {} }`, both accepted by Moonshot in every subschema slot — the latter also fixes third-party closed-tuple schemas like `{ prefixItems: [...], items: false }`), the Moonshot schema flavor is detected for Kimi models routed via OpenRouter, and the `openai-responses` transport (used for OpenRouter) now runs MFJS normalization. ([#5918](https://github.com/can1357/oh-my-pi/issues/5918))
 
 ## [17.0.3] - 2026-07-17
 

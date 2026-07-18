@@ -1358,12 +1358,17 @@ describe("normalizeSchemaForMoonshot", () => {
 		expect(props.limit).toEqual({ type: "integer", default: 10 });
 	});
 
-	it("normalizes schema-valued additionalProperties without walking literal payload objects", () => {
-		const literal = { oneOf: [{ const: "literal-a" }, { const: "literal-b" }] };
-		const normalized = normalizeSchemaForMoonshot({
+	it("coerces a `false` subschema to `{ not: {} }` (accept-nothing; #5918)", () => {
+		// Moonshot rejects the bare boolean but accepts `{ not: {} }` in every
+		// subschema slot; the draft-2020-12 closed-tuple `items: false` idiom is
+		// the common third-party source of a `false` subschema.
+		expect(normalizeSchemaForMoonshot({ type: "object", properties: { forbidden: false } })).toEqual({
 			type: "object",
-			additionalProperties: { oneOf: [{ const: 1 }, { const: 2 }] },
-			default: literal,
+			properties: { forbidden: { not: {} } },
+		});
+		expect(normalizeSchemaForMoonshot({ type: "array", prefixItems: [{ type: "string" }], items: false })).toEqual({
+			type: "array",
+			items: { not: {} },
 		});
 
 		expect(normalized).toEqual({
