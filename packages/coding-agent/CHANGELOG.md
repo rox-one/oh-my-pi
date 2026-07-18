@@ -2524,6 +2524,7 @@ Older entries are archived in [packages/coding-agent/CHANGELOG.md@c821261d1018](
 - Fixed bash command timeouts rendering with an incorrect error border, and resolved Windows bash crashes when piped commands time out.
 - Migrated legacy nested/quoted-dotted config keys (e.g., `dev.autoqa.consent` -> `dev.autoqaConsent`) on settings load.
 - Added managed `ctx.setInterval` / `ctx.setTimeout` / `ctx.clearTimer` helpers on extension contexts to prevent uncaught exceptions from crashing sessions.
+- Fixed the resumed transcript vanishing from the viewport shortly after `omp --resume` (only reappearing on a Ctrl+O full replay). The startup resume paint clears native scrollback before any ordinary compaction frame runs, so `TranscriptContainer.prepareNativeScrollbackReplay` early-returned without suppressing compaction; the replay compose then compacted the committed prefix against the stale pre-clear commit boundary and dropped the leading finalized blocks from the very frame meant to reprint them onto the cleared tape. The replay now suppresses that compose's compaction unconditionally, so the complete transcript is repainted; steady-state compaction (issue #5930) is unchanged ([#5990](https://github.com/can1357/oh-my-pi/issues/5990)).
 
 ## [17.0.4] - 2026-07-18
 

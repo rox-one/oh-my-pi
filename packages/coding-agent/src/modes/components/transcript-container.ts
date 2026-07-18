@@ -104,14 +104,73 @@ export class TranscriptContainer extends Container {
 		this.invalidate();
 	}
 
-	/** Whether a transient block may be discarded without leaving tape history. */
-	canRemoveBlock(component: Component): boolean {
-		// Active and settled blocks only live in the mutable viewport, so removing
-		// them leaves no trace. Committed blocks are immutable terminal history,
-		// and blocks inside the offered-but-unacknowledged batch are mid-write —
-		// removing one would desync the offer's entry range.
-		this.#syncEntries();
-		const index = this.#entries.findIndex(entry => entry.component === component);
+	override prepareNativeScrollbackReplay(): void {
+		// Replay retires the old terminal tape, so descendants may discard layout
+		// locks whose only purpose was keeping that immutable history byte-stable.
+		super.prepareNativeScrollbackReplay();
+		// The next compose must paint the COMPLETE frame onto the freshly cleared
+		// tape, so suppress its committed-prefix compaction unconditionally — even
+		// when nothing has been compacted yet (#compactedChildStart === 0). The
+		// pre-clear commit boundary still points at rows the ED3 just erased;
+		// letting compaction run against that stale #committedRows would drop the
+		// leading finalized blocks from the very frame meant to reprint them,
+		// leaving them on neither the tape nor the frame until the next replay
+		// (the resume-paint transcript-vanish, issue #5990). Rehydrating already
+		// compacted children additionally rewinds #compactedChildStart and clears
+		// the assembled rows so the whole history recomposes.
+		this.#replayPending = true;
+		if (this.#compactedChildStart === 0) return;
+		this.#compactedChildStart = 0;
+		this.#generation++;
+		this.#lines.length = 0;
+		this.#stableRowsFloor = 0;
+	}
+
+	getRenderStablePrefixRows(): number {
+		const value = Math.min(this.#stableRowsFloor, this.#lines.length);
+		this.#stableRowsFloor = this.#lines.length;
+		return value;
+	}
+
+	getNativeScrollbackLiveRegionStart(): number | undefined {
+		return this.#nativeScrollbackLiveRegionStart;
+	}
+
+	/**
+	 * Whether none of `component`'s rows (per the most recent render) have
+	 * entered native scrollback. Callers that retract ephemeral blocks (IRC
+	 * cards, displaceable todo/job snapshots) must check this: removing a
+	 * block whose rows are already on the tape is an interior deletion of
+	 * committed history the engine cannot express — the block must be sealed
+	 * in place as history instead. A component that has never rendered has no
+	 * committed rows and is safely removable.
+	 */
+	isBlockUncommitted(component: Component): boolean {
+		const index = this.children.indexOf(component);
+		// Compacted prefix is already committed native history and must not be
+		// retracted. Compacted slots may be sparse holes after a later re-render
+		// (render only fills from #compactedChildStart), so the loop below must
+		// skip undefined entries.
+		if (index >= 0 && index < this.#compactedChildStart) return false;
+		for (const segment of this.#segments) {
+			if (segment === undefined || segment.component !== component) continue;
+			return segment.rowCount === 0 || segment.startRow >= this.#committedRows;
+		}
+		return true;
+	}
+
+	/**
+	 * Whether `component` is inside the live (repaintable) region exactly as
+	 * {@link render} computes it: at/after the first still-mutating block, or
+	 * the transcript tail when every block has finalized. Self-animating
+	 * finalized blocks (a detached task's shimmering progress rows) poll this
+	 * to stop animating — and settle on static bytes — the moment they sit
+	 * above the seam, where their rows become commit-eligible native-scrollback
+	 * history.
+	 */
+	isBlockInLiveRegion(component: Component): boolean {
+		const children = this.children;
+		const index = children.indexOf(component);
 		if (index < 0) return false;
 		if (this.#entries[index]!.state === "committed") return false;
 		return this.#offered === undefined || index >= this.#offered.end;
