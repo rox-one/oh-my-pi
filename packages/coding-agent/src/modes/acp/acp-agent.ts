@@ -1214,11 +1214,12 @@ export class AcpAgent implements Agent {
 			case "_omp/extensions/toggle": {
 				const providerId = params.providerId;
 				if (typeof providerId !== "string") throw new Error("providerId required");
+				const cwd = typeof params.cwd === "string" ? (params.cwd as string) : undefined;
 				if (params.enabled === false) {
-					disableProvider(providerId);
+					disableProvider(providerId, cwd);
 					return { enabled: false };
 				}
-				enableProvider(providerId);
+				enableProvider(providerId, cwd);
 				return { enabled: true };
 			}
 			default:

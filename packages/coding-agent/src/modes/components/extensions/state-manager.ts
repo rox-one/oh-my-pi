@@ -604,12 +604,12 @@ export async function createInitialState(cwd?: string, disabledIds?: string[]): 
 /**
  * Toggle provider enabled state.
  */
-export function toggleProvider(providerId: string): boolean {
-	if (isProviderEnabled(providerId)) {
-		disableProvider(providerId);
+export function toggleProvider(providerId: string, cwd?: string): boolean {
+	if (isProviderEnabled(providerId, cwd)) {
+		disableProvider(providerId, cwd);
 		return false;
 	} else {
-		enableProvider(providerId);
+		enableProvider(providerId, cwd);
 		return true;
 	}
 }

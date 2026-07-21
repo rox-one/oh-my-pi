@@ -300,12 +300,7 @@ export class ExtensionDashboard implements Component {
 	}
 
 	#handleProviderToggle(providerId: string): void {
-		const enabling = this.#state.tabs.find(tab => tab.id === providerId)?.enabled === false;
-		toggleProvider(providerId);
-		if (!enabling) {
-			void this.#disconnectProviderMcpServers(providerId);
-			return;
-		}
+		toggleProvider(providerId, this.cwd);
 		void this.#refreshFromState();
 	}
 

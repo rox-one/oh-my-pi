@@ -309,9 +309,9 @@ export function initializeWithSettings(activeSettings: Settings): void {
 /**
  * Persist current disabled extension providers to settings.
  */
-function persistDisabledExtensionProviders(): void {
+function persistDisabledExtensionProviders(cwd?: string): void {
 	if (settings) {
-		settings.setDisabledExtensionProviders(Array.from(disabledExtensionProviders));
+		settings.setDisabledExtensionProviders(Array.from(disabledExtensionProviders), cwd);
 	}
 }
 
@@ -319,20 +319,26 @@ function persistDisabledExtensionProviders(): void {
  * Disable an extension provider (hides its capability contributions from
  * `/extensions` and everywhere `loadCapability` runs). Does not affect model
  * discovery or `/login`; those honor the separate `disabledProviders` list.
+ *
+ * `cwd` selects the workspace whose path-scoped `disabledExtensionProviders`
+ * rules are read and written; omit it for the active session scope. Toggles for
+ * a different workspace (ACP `_omp/extensions/toggle`) MUST pass the target cwd
+ * so the sync and the persisted edit both land in that project.
  */
-export function disableProvider(providerId: string): void {
-	syncDisabledExtensionProvidersFromSettings();
+export function disableProvider(providerId: string, cwd?: string): void {
+	syncDisabledExtensionProvidersFromSettings(cwd);
 	disabledExtensionProviders.add(providerId);
-	persistDisabledExtensionProviders();
+	persistDisabledExtensionProviders(cwd);
 }
 
 /**
- * Re-enable a previously disabled extension provider.
+ * Re-enable a previously disabled extension provider, resolved against `cwd`
+ * (defaults to the active session scope).
  */
-export function enableProvider(providerId: string): void {
-	syncDisabledExtensionProvidersFromSettings();
+export function enableProvider(providerId: string, cwd?: string): void {
+	syncDisabledExtensionProvidersFromSettings(cwd);
 	disabledExtensionProviders.delete(providerId);
-	persistDisabledExtensionProviders();
+	persistDisabledExtensionProviders(cwd);
 }
 
 /**

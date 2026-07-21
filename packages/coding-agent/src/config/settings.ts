@@ -1354,10 +1354,14 @@ export class Settings {
 
 	/**
 	 * Persist the effective extension-provider denylist without flattening
-	 * path-scoped rules for other projects.
+	 * path-scoped rules for other projects. `cwd` selects the workspace whose
+	 * scoped rules are edited (defaults to the active scope); toggles that target
+	 * a different workspace than the live session MUST pass it so the change
+	 * lands in the intended project.
 	 */
-	setDisabledExtensionProviders(ids: string[]): void {
+	setDisabledExtensionProviders(ids: string[], cwd?: string): void {
 		const settingPath = "disabledExtensionProviders";
+		const scope = cwd ? path.normalize(cwd) : this.#cwd;
 		// Base the edit on whichever raw array currently drives the effective
 		// list: the new key when configured, otherwise the legacy
 		// `disabledProviders` shape the registry reads through. Seeding from the
@@ -1372,7 +1376,7 @@ export class Settings {
 
 		const prev = this.get(settingPath);
 		const desired = new Set(ids);
-		const current = new Set(resolvePathScopedStringArray(settingPath, raw, this.#cwd) ?? []);
+		const current = new Set(resolvePathScopedStringArray(settingPath, raw, scope) ?? []);
 		const removed = new Set(Array.from(current).filter(id => !desired.has(id)));
 		let additions = ids.filter(id => !current.has(id));
 		let wroteAdditions = false;
@@ -1394,7 +1398,7 @@ export class Settings {
 				...stringArrayFromUnknown(entry.pathPrefix),
 				...stringArrayFromUnknown(entry.pathPrefixes),
 			];
-			if (prefixes.length === 0 || !prefixes.some(prefix => pathMatchesPrefix(this.#cwd, prefix))) {
+			if (prefixes.length === 0 || !prefixes.some(prefix => pathMatchesPrefix(scope, prefix))) {
 				updated.push(entry);
 				continue;
 			}
@@ -1421,7 +1425,7 @@ export class Settings {
 		}
 
 		if (!wroteAdditions && additions.length > 0) {
-			updated.push({ path: this.#cwd, providers: additions });
+			updated.push({ path: scope, providers: additions });
 		}
 
 		setByPath(this.#global, [settingPath], updated);

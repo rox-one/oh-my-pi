@@ -795,6 +795,30 @@ describe("Settings", () => {
 			expect(settings.get("disabledExtensionProviders")).toEqual(["windsurf"]);
 		});
 
+		it("toggling with a target cwd writes into that workspace's scope, not the active one", async () => {
+			const otherDir = path.join(tempDir.toString(), "other-project");
+			await writeSettings({
+				disabledExtensionProviders: [
+					{ pathPrefix: projectDir, providers: ["cursor"] },
+					{ pathPrefix: otherDir, providers: ["windsurf"] },
+				],
+			});
+
+			// Active session is scoped to projectDir; an ACP toggle targets otherDir.
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+			initializeWithSettings(settings);
+			disableProvider("claude", otherDir);
+			await settings.flush();
+
+			// projectDir's rule is untouched; the change lands in otherDir's scope.
+			expect((await readSettings()).disabledExtensionProviders).toEqual([
+				{ pathPrefix: projectDir, providers: ["cursor"] },
+				{ pathPrefix: otherDir, providers: ["windsurf", "claude"] },
+			]);
+			expect(settings.disabledExtensionProvidersForCwd(otherDir)).toEqual(["windsurf", "claude"]);
+			expect(settings.disabledExtensionProvidersForCwd(projectDir)).toEqual(["cursor"]);
+		});
+
 		it("resolves extension-provider mask against an explicit cwd", async () => {
 			const otherDir = path.join(tempDir.toString(), "other-project");
 			await writeSettings({
