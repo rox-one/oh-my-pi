@@ -235,19 +235,16 @@ async function loadImpl<T>(
 /**
  * Filter providers based on options and disabled state.
  */
-function syncDisabledExtensionProvidersFromSettings(): void {
+function syncDisabledExtensionProvidersFromSettings(cwd?: string): void {
 	if (!settings) return;
 	disabledExtensionProviders.clear();
-	const source = settings.isConfigured("disabledExtensionProviders")
-		? settings.get("disabledExtensionProviders")
-		: settings.get("disabledProviders");
-	for (const id of source) {
+	for (const id of settings.disabledExtensionProvidersForCwd(cwd)) {
 		disabledExtensionProviders.add(id);
 	}
 }
 
 function filterProviders<T>(capability: Capability<T>, options: LoadOptions): Provider<T>[] {
-	syncDisabledExtensionProvidersFromSettings();
+	syncDisabledExtensionProvidersFromSettings(options.cwd);
 	let providers = (capability.providers as Provider<T>[]).filter(p => !disabledExtensionProviders.has(p.id));
 
 	if (options.providers) {

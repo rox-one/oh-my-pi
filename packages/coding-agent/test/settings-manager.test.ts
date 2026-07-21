@@ -770,6 +770,45 @@ describe("Settings", () => {
 			expect(settings.get("disabledExtensionProviders")).toEqual(["windsurf"]);
 		});
 
+		it("materializes new key from legacy scoped disabledProviders without dropping other-project rules", async () => {
+			const otherDir = path.join(tempDir.toString(), "other-project");
+			await writeSettings({
+				disabledProviders: [
+					{ pathPrefix: projectDir, providers: ["cursor"] },
+					{ pathPrefix: otherDir, providers: ["windsurf"] },
+				],
+			});
+
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+			initializeWithSettings(settings);
+			// First /extensions toggle while scoped to project A must not flatten
+			// the legacy scoped shape and lose project B's rule.
+			disableProvider("claude");
+			await settings.flush();
+
+			expect((await readSettings()).disabledExtensionProviders).toEqual([
+				{ pathPrefix: projectDir, providers: ["cursor", "claude"] },
+				{ pathPrefix: otherDir, providers: ["windsurf"] },
+			]);
+
+			await settings.reloadForCwd(otherDir);
+			expect(settings.get("disabledExtensionProviders")).toEqual(["windsurf"]);
+		});
+
+		it("resolves extension-provider mask against an explicit cwd", async () => {
+			const otherDir = path.join(tempDir.toString(), "other-project");
+			await writeSettings({
+				disabledExtensionProviders: [
+					{ pathPrefix: projectDir, providers: ["cursor"] },
+					{ pathPrefix: otherDir, providers: ["windsurf"] },
+				],
+			});
+
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+			expect(settings.disabledExtensionProvidersForCwd(projectDir)).toEqual(["cursor"]);
+			expect(settings.disabledExtensionProvidersForCwd(otherDir)).toEqual(["windsurf"]);
+		});
+
 		it("migrates legacy snapcompact system prompt booleans to scoped modes", () => {
 			expect(Settings.isolated({ "snapcompact.systemPrompt": true }).get("snapcompact.systemPrompt")).toBe("all");
 			const nestedLegacy = { snapcompact: { systemPrompt: false } } as Partial<Record<SettingPath, unknown>>;

@@ -1335,12 +1335,36 @@ export class Settings {
 	}
 
 	/**
+	 * Resolve the effective extension-provider denylist against `cwd` (defaults
+	 * to the active scope). Falls back to the legacy `disabledProviders` list
+	 * only while `disabledExtensionProviders` is unconfigured, mirroring the
+	 * capability registry's read-through migration. Resolving against an explicit
+	 * cwd lets provider filtering honor a target workspace's path-scoped rules
+	 * even when the live singleton is scoped elsewhere (e.g. ACP `cloneForCwd`).
+	 */
+	disabledExtensionProvidersForCwd(cwd?: string): string[] {
+		const key: SettingPath = this.isConfigured("disabledExtensionProviders")
+			? "disabledExtensionProviders"
+			: "disabledProviders";
+		const raw = getByPath(this.#merged, SETTING_PATH_SEGMENTS[key]);
+		if (raw === undefined) return [];
+		const target = cwd ? path.normalize(cwd) : this.#cwd;
+		return resolvePathScopedStringArray(key, raw, target) ?? stringArrayFromUnknown(raw);
+	}
+
+	/**
 	 * Persist the effective extension-provider denylist without flattening
 	 * path-scoped rules for other projects.
 	 */
 	setDisabledExtensionProviders(ids: string[]): void {
 		const settingPath = "disabledExtensionProviders";
-		const raw = getByPath(this.#global, SETTING_PATH_SEGMENTS[settingPath]);
+		// Base the edit on whichever raw array currently drives the effective
+		// list: the new key when configured, otherwise the legacy
+		// `disabledProviders` shape the registry reads through. Seeding from the
+		// legacy *raw* structure (not just the active-cwd ids) preserves scoped
+		// rules authored for other projects when the new key is first written.
+		const rawNew = getByPath(this.#global, SETTING_PATH_SEGMENTS[settingPath]);
+		const raw = Array.isArray(rawNew) ? rawNew : getByPath(this.#global, SETTING_PATH_SEGMENTS.disabledProviders);
 		if (!Array.isArray(raw) || !raw.some(isRecord)) {
 			this.set(settingPath, ids);
 			return;
