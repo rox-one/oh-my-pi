@@ -141,4 +141,29 @@ describe("capability registry — extension-provider split (#4507)", () => {
 		expect(isProviderEnabled("cursor")).toBe(true);
 		expect(isProviderEnabled("windsurf")).toBe(false);
 	});
+
+	test("isProviderEnabled(cwd) labels providers against the requested workspace", async () => {
+		const projectDir = "/tmp/omp-4507-active";
+		const otherDir = "/tmp/omp-4507-target";
+
+		const settings = await Settings.init({
+			cwd: projectDir,
+			inMemory: true,
+			overrides: {
+				disabledExtensionProviders: [
+					{ pathPrefix: projectDir, providers: ["cursor"] },
+					{ pathPrefix: otherDir, providers: ["windsurf"] },
+				],
+			},
+		});
+		initializeWithSettings(settings);
+
+		// Session stays scoped to projectDir; a display load for otherDir must
+		// label providers against otherDir's mask, not the active singleton cwd.
+		expect(isProviderEnabled("windsurf", otherDir)).toBe(false);
+		expect(isProviderEnabled("cursor", otherDir)).toBe(true);
+		// Active scope still reflects projectDir when cwd is omitted.
+		expect(isProviderEnabled("cursor")).toBe(false);
+		expect(isProviderEnabled("windsurf")).toBe(true);
+	});
 });

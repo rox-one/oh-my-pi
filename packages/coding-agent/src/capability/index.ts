@@ -337,17 +337,23 @@ export function enableProvider(providerId: string): void {
 
 /**
  * Check if an extension provider is enabled (capability-registry scope).
+ *
+ * `cwd` selects the workspace whose path-scoped `disabledExtensionProviders`
+ * rules apply; omit it for the active session scope. Display paths that load a
+ * different workspace (`loadAllExtensions`, ACP `_omp/extensions`) MUST pass the
+ * loaded cwd so labels match the target project, not the live singleton.
  */
-export function isProviderEnabled(providerId: string): boolean {
-	syncDisabledExtensionProvidersFromSettings();
+export function isProviderEnabled(providerId: string, cwd?: string): boolean {
+	syncDisabledExtensionProvidersFromSettings(cwd);
 	return !disabledExtensionProviders.has(providerId);
 }
 
 /**
- * Get list of all disabled extension provider IDs.
+ * Get list of all disabled extension provider IDs, resolved against `cwd`
+ * (defaults to the active session scope).
  */
-export function getDisabledProviders(): string[] {
-	syncDisabledExtensionProvidersFromSettings();
+export function getDisabledProviders(cwd?: string): string[] {
+	syncDisabledExtensionProvidersFromSettings(cwd);
 	return Array.from(disabledExtensionProviders);
 }
 
@@ -387,12 +393,13 @@ export function listCapabilities(): string[] {
 }
 
 /**
- * Get capability info for UI display.
+ * Get capability info for UI display, resolved against `cwd` (defaults to the
+ * active session scope).
  */
-export function getCapabilityInfo(capabilityId: string): CapabilityInfo | undefined {
+export function getCapabilityInfo(capabilityId: string, cwd?: string): CapabilityInfo | undefined {
 	const capability = capabilities.get(capabilityId);
 	if (!capability) return undefined;
-	syncDisabledExtensionProvidersFromSettings();
+	syncDisabledExtensionProvidersFromSettings(cwd);
 
 	return {
 		id: capability.id,
@@ -409,20 +416,21 @@ export function getCapabilityInfo(capabilityId: string): CapabilityInfo | undefi
 }
 
 /**
- * Get all capabilities info for UI display.
+ * Get all capabilities info for UI display, resolved against `cwd`.
  */
-export function getAllCapabilitiesInfo(): CapabilityInfo[] {
-	return listCapabilities().map(id => getCapabilityInfo(id)!);
+export function getAllCapabilitiesInfo(cwd?: string): CapabilityInfo[] {
+	return listCapabilities().map(id => getCapabilityInfo(id, cwd)!);
 }
 
 /**
- * Get provider info for UI display.
+ * Get provider info for UI display, resolved against `cwd` (defaults to the
+ * active session scope).
  */
-export function getProviderInfo(providerId: string): ProviderInfo | undefined {
+export function getProviderInfo(providerId: string, cwd?: string): ProviderInfo | undefined {
 	const meta = providerMeta.get(providerId);
 	const caps = providerCapabilities.get(providerId);
 	if (!meta || !caps) return undefined;
-	syncDisabledExtensionProvidersFromSettings();
+	syncDisabledExtensionProvidersFromSettings(cwd);
 
 	// Find priority from first capability's provider list
 	let priority = 0;
@@ -446,13 +454,14 @@ export function getProviderInfo(providerId: string): ProviderInfo | undefined {
 }
 
 /**
- * Get all providers info for UI display (deduplicated across capabilities).
+ * Get all providers info for UI display (deduplicated across capabilities),
+ * resolved against `cwd`.
  */
-export function getAllProvidersInfo(): ProviderInfo[] {
+export function getAllProvidersInfo(cwd?: string): ProviderInfo[] {
 	const providers: ProviderInfo[] = [];
 
 	for (const providerId of providerMeta.keys()) {
-		const info = getProviderInfo(providerId);
+		const info = getProviderInfo(providerId, cwd);
 		if (info) {
 			providers.push(info);
 		}
