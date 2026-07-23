@@ -102,6 +102,21 @@ describe("Settings", () => {
 			expect(await Bun.file(getConfigPath()).exists()).toBe(false);
 		});
 
+		it("writes through a symlinked config file without replacing the link", async () => {
+			const targetPath = tempDir.join("dotfiles", "config.yml");
+			fs.mkdirSync(path.dirname(targetPath), { recursive: true });
+			await Bun.write(targetPath, YAML.stringify({ setupVersion: 1 }, null, 2));
+			fs.symlinkSync(targetPath, getConfigPath());
+
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+			settings.set("setupVersion", 2);
+			await settings.flush();
+
+			expect(fs.lstatSync(getConfigPath()).isSymbolicLink()).toBe(true);
+			const savedSettings = YAML.parse(await Bun.file(targetPath).text()) as Record<string, unknown>;
+			expect(savedSettings.setupVersion).toBe(2);
+		});
+
 		it("clones the selected config.yaml path for persisted settings", async () => {
 			const yamlConfigPath = path.join(agentDir, "config.yaml");
 			await Bun.write(yamlConfigPath, YAML.stringify({ setupVersion: 1 }, null, 2));

@@ -67,30 +67,15 @@ export interface RawSettings {
 	[key: string]: unknown;
 }
 
-/** Persistent configuration layer edited by the settings UI. */
-export type SettingsScope = "global" | "project";
-
-type YamlLoadResult =
-	| { kind: "missing" }
-	| { kind: "loaded"; settings: RawSettings }
-	| { kind: "invalid"; error: unknown; backupPath?: string }
-	| { kind: "unreadable"; error: unknown };
-
-type MainYamlReadResult = {
-	settings: RawSettings | null;
-	configPath: string | null;
-};
-
-type ProjectSettingsReadResult = {
-	settings: RawSettings;
-	fileSettings: RawSettings;
-	shellPathSource: string | undefined;
-};
-
-type ConfigOverlayReadResult = {
-	settings: RawSettings;
-	shellPathSource: string | undefined;
-};
+async function writeConfigFile(configPath: string, settings: RawSettings): Promise<void> {
+	let writePath = configPath;
+	try {
+		writePath = await fs.promises.realpath(configPath);
+	} catch (error) {
+		if (!isEnoent(error)) throw error;
+	}
+	await Bun.write(writePath, YAML.stringify(settings, null, 2));
+}
 
 export interface SettingsOptions {
 	/** Current working directory for project settings discovery */
@@ -1787,7 +1772,7 @@ export class Settings {
 		// 3. Write merged settings
 		if (migrated && Object.keys(settings).length > 0) {
 			try {
-				await this.#writeYamlAtomically(this.#configPath, settings);
+				await writeConfigFile(this.#configPath, settings);
 				logger.debug("Settings: migrated to config.yml", { path: this.#configPath });
 			} catch {}
 		}
@@ -2653,8 +2638,7 @@ export class Settings {
 
 				// Update our global with any external changes we preserved
 				this.#global = current;
-				await this.#writeYamlAtomically(writePath, this.#global);
-				this.#quarantinedYamlTargets.delete(configPath);
+				await writeConfigFile(configPath, this.#global);
 				// These pending roles were included in this write. Remove each
 				// only if no newer local change arrived while the write was in flight.
 				const globalRolesAfterWrite = this.#modelRolesFromLayer(this.#global);
@@ -2740,30 +2724,7 @@ export class Settings {
 					}
 				}
 
-				await this.#writeYamlAtomically(writePath, projectSettings);
-				this.#projectConfigExists = true;
-				this.#quarantinedYamlTargets.delete(projectConfigPath);
-
-				// Retain changes queued while the write lock was pending in the
-				// in-memory source for the follow-up save.
-				for (const pendingPath of this.#modifiedProject) {
-					const segments = pendingPath.split(".");
-					const value = getByPath(this.#projectFileSettings, segments);
-					if (value === undefined) {
-						deleteByPath(projectSettings, segments);
-					} else {
-						setByPath(projectSettings, segments, value);
-					}
-				}
-				const latestProjectRoles = this.#modelRolesFromLayer(this.#project);
-				for (const role of this.#modifiedProjectModelRoles) {
-					if (Object.hasOwn(latestProjectRoles, role)) {
-						setByPath(projectSettings, ["modelRoles", role], latestProjectRoles[role]);
-					} else {
-						deleteByPath(projectSettings, ["modelRoles", role]);
-					}
-				}
-				this.#projectFileSettings = structuredClone(projectSettings);
+				await writeConfigFile(projectConfigPath, projectSettings);
 			});
 			invalidateCapabilityFsCache(projectConfigPath);
 		} catch (error) {
