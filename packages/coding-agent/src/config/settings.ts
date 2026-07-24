@@ -1364,6 +1364,25 @@ export class Settings {
 	}
 
 	/**
+	 * Resolve the effective extension-provider denylist against `cwd`, loading the
+	 * target workspace's own project settings layer when `cwd` differs from the
+	 * active scope. Use this from display/listing paths (ACP `_omp/extensions`,
+	 * cross-project dashboard loads) so a target project's local
+	 * `.omp/settings.json` `disabledExtensionProviders` is honored instead of the
+	 * synchronous {@link disabledExtensionProvidersForCwd}, which can only see
+	 * global/overlay path-scoped rules for a foreign cwd. Falls back to the sync
+	 * resolution for the active scope and for non-persisted (in-memory) instances.
+	 */
+	async disabledExtensionProvidersForCwdAsync(cwd?: string): Promise<string[]> {
+		const target = cwd ? path.normalize(cwd) : this.#cwd;
+		if (target === this.#cwd || !this.#persist) {
+			return this.disabledExtensionProvidersForCwd(cwd);
+		}
+		const scoped = await this.cloneForCwd(target);
+		return scoped.disabledExtensionProvidersForCwd();
+	}
+
+	/**
 	 * Persist the effective extension-provider denylist without flattening
 	 * path-scoped rules for other projects. `cwd` selects the workspace whose
 	 * scoped rules are edited (defaults to the active scope); toggles that target

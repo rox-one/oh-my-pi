@@ -849,6 +849,24 @@ describe("Settings", () => {
 			expect(settings.disabledExtensionProvidersForCwd(otherDir)).toEqual([]);
 		});
 
+		it("honors a target workspace's project-local disabledExtensionProviders via the async resolver", async () => {
+			const otherDir = path.join(tempDir.toString(), "other-project");
+			fs.mkdirSync(getProjectAgentDir(otherDir), { recursive: true });
+			// otherDir has its OWN project-local rule; the active session is in projectDir.
+			await Bun.write(
+				path.join(getProjectAgentDir(otherDir), "settings.json"),
+				JSON.stringify({ disabledExtensionProviders: ["cursor"] }),
+			);
+
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+			// The sync accessor cannot see otherDir's project file from projectDir's scope.
+			expect(settings.disabledExtensionProvidersForCwd(otherDir)).toEqual([]);
+			// The async resolver loads otherDir's project layer and honors its rule.
+			expect(await settings.disabledExtensionProvidersForCwdAsync(otherDir)).toEqual(["cursor"]);
+			// The active scope is unaffected.
+			expect(await settings.disabledExtensionProvidersForCwdAsync(projectDir)).toEqual([]);
+		});
+
 		it("migrates legacy snapcompact system prompt booleans to scoped modes", () => {
 			expect(Settings.isolated({ "snapcompact.systemPrompt": true }).get("snapcompact.systemPrompt")).toBe("all");
 			const nestedLegacy = { snapcompact: { systemPrompt: false } } as Partial<Record<SettingPath, unknown>>;

@@ -15,6 +15,7 @@ import type { Skill } from "../../../capability/skill";
 import type { SlashCommand } from "../../../capability/slash-command";
 import type { CustomTool } from "../../../capability/tool";
 import type { SourceMeta } from "../../../capability/types";
+import { Settings } from "../../../config/settings";
 import {
 	disableProvider,
 	enableProvider,
@@ -47,11 +48,33 @@ export interface ExtensionSettingsManager {
 }
 
 /**
- * Load all extensions from all capabilities.
+ * Resolve the extension-provider denylist for `cwd`, honoring the target
+ * workspace's own project settings when it differs from the active scope.
+ * Returns an empty set when Settings is uninitialized (mirrors the enabled
+ * default of the singleton-backed provider checks).
  */
-export async function loadAllExtensions(cwd?: string, disabledIds?: string[]): Promise<Extension[]> {
+async function resolveDisabledProviderIds(cwd?: string): Promise<Set<string>> {
+	try {
+		return new Set(await Settings.instance.disabledExtensionProvidersForCwdAsync(cwd));
+	} catch {
+		return new Set<string>();
+	}
+}
+
+/**
+ * Load all extensions from all capabilities. Provider enable/disable labeling is
+ * resolved against `cwd` (honoring a target workspace's project-local rules);
+ * callers that already resolved the set may pass it via `disabledProviderIds` to
+ * avoid a redundant lookup.
+ */
+export async function loadAllExtensions(
+	cwd?: string,
+	disabledIds?: string[],
+	disabledProviderIds?: ReadonlySet<string>,
+): Promise<Extension[]> {
 	const extensions: Extension[] = [];
 	const disabledExtensions = new Set<string>(disabledIds ?? []);
+	const providerDisabled = disabledProviderIds ?? (await resolveDisabledProviderIds(cwd));
 
 	// Helper to convert capability items to extensions
 	function addItems<T extends { name: string; path: string; _source: SourceMeta }>(
@@ -67,7 +90,7 @@ export async function loadAllExtensions(cwd?: string, disabledIds?: string[]): P
 			const id = makeExtensionId(kind, item.name);
 			const isDisabled = disabledExtensions.has(id);
 			const isShadowed = (item as { _shadowed?: boolean })._shadowed;
-			const providerEnabled = isProviderEnabled(item._source.provider, cwd);
+			const providerEnabled = !providerDisabled.has(item._source.provider);
 
 			let state: ExtensionState;
 			let disabledReason: "shadowed" | "provider-disabled" | "item-disabled" | undefined;
@@ -173,7 +196,7 @@ export async function loadAllExtensions(cwd?: string, disabledIds?: string[]): P
 			const sourceSaysDisabled = server.enabled === false && !forced;
 			const isDisabled = mcpDisabledNames.has(server.name) || disabledExtensions.has(id) || sourceSaysDisabled;
 			const isShadowed = (server as { _shadowed?: boolean })._shadowed;
-			const providerEnabled = isProviderEnabled(server._source.provider, cwd);
+			const providerEnabled = !providerDisabled.has(server._source.provider);
 
 			let state: ExtensionState;
 			let disabledReason: "shadowed" | "provider-disabled" | "item-disabled" | undefined;
@@ -243,7 +266,7 @@ export async function loadAllExtensions(cwd?: string, disabledIds?: string[]): P
 			const id = makeExtensionId("hook", `${hook.type}:${hook.tool}:${hook.name}`);
 			const isDisabled = disabledExtensions.has(id);
 			const isShadowed = (hook as { _shadowed?: boolean })._shadowed;
-			const providerEnabled = isProviderEnabled(hook._source.provider, cwd);
+			const providerEnabled = !providerDisabled.has(hook._source.provider);
 
 			let state: ExtensionState;
 			let disabledReason: "shadowed" | "provider-disabled" | "item-disabled" | undefined;
@@ -288,7 +311,7 @@ export async function loadAllExtensions(cwd?: string, disabledIds?: string[]): P
 			const id = makeExtensionId("context-file", `${file.level}:${name}`);
 			const isDisabled = disabledExtensions.has(id);
 			const isShadowed = (file as { _shadowed?: boolean })._shadowed;
-			const providerEnabled = isProviderEnabled(file._source.provider, cwd);
+			const providerEnabled = !providerDisabled.has(file._source.provider);
 
 			let state: ExtensionState;
 			let disabledReason: "shadowed" | "provider-disabled" | "item-disabled" | undefined;
@@ -330,8 +353,8 @@ export async function loadAllExtensions(cwd?: string, disabledIds?: string[]): P
  * Build sidebar tree from extensions.
  * Groups by provider → kind.
  */
-export function buildSidebarTree(extensions: Extension[], cwd?: string): TreeNode[] {
-	const providers = getAllProvidersInfo(cwd);
+export function buildSidebarTree(extensions: Extension[], disabledProviderIds?: ReadonlySet<string>): TreeNode[] {
+	const providers = getAllProvidersInfo();
 	const tree: TreeNode[] = [];
 
 	// Group extensions by provider and kind
@@ -354,6 +377,7 @@ export function buildSidebarTree(extensions: Extension[], cwd?: string): TreeNod
 		// Skip the 'native' provider as it cannot be toggled
 		if (provider.id === "native") continue;
 
+		const providerEnabled = disabledProviderIds ? !disabledProviderIds.has(provider.id) : provider.enabled;
 		const byKind = byProvider.get(provider.id);
 		const kindNodes: TreeNode[] = [];
 		let totalCount = 0;
@@ -365,7 +389,7 @@ export function buildSidebarTree(extensions: Extension[], cwd?: string): TreeNod
 					id: `${provider.id}:${kind}`,
 					label: getKindDisplayName(kind),
 					type: "kind",
-					enabled: provider.enabled,
+					enabled: providerEnabled,
 					collapsed: true,
 					children: [],
 					count: exts.length,
@@ -380,7 +404,7 @@ export function buildSidebarTree(extensions: Extension[], cwd?: string): TreeNod
 			id: provider.id,
 			label: provider.displayName,
 			type: "provider",
-			enabled: provider.enabled,
+			enabled: providerEnabled,
 			collapsed: false,
 			children: kindNodes,
 			count: totalCount,
@@ -473,8 +497,8 @@ function getKindDisplayName(kind: ExtensionKind): string {
 /**
  * Build provider tabs from extensions.
  */
-export function buildProviderTabs(extensions: Extension[], cwd?: string): ProviderTab[] {
-	const providers = getAllProvidersInfo(cwd);
+export function buildProviderTabs(extensions: Extension[], disabledProviderIds?: ReadonlySet<string>): ProviderTab[] {
+	const providers = getAllProvidersInfo();
 	const tabs: ProviderTab[] = [];
 
 	// Count extensions per provider
@@ -499,7 +523,7 @@ export function buildProviderTabs(extensions: Extension[], cwd?: string): Provid
 		tabs.push({
 			id: provider.id,
 			label: provider.displayName,
-			enabled: provider.enabled,
+			enabled: disabledProviderIds ? !disabledProviderIds.has(provider.id) : provider.enabled,
 			count,
 		});
 	}
@@ -583,8 +607,9 @@ export function applyDisabledExtensionsToState(
  * Create initial dashboard state.
  */
 export async function createInitialState(cwd?: string, disabledIds?: string[]): Promise<DashboardState> {
-	const extensions = await loadAllExtensions(cwd, disabledIds);
-	const tabs = buildProviderTabs(extensions, cwd);
+	const providerDisabled = await resolveDisabledProviderIds(cwd);
+	const extensions = await loadAllExtensions(cwd, disabledIds, providerDisabled);
+	const tabs = buildProviderTabs(extensions, providerDisabled);
 	const tabFiltered = extensions; // "all" tab by default
 	const searchFiltered = tabFiltered;
 
@@ -622,8 +647,9 @@ export async function refreshState(
 	cwd?: string,
 	disabledIds?: string[],
 ): Promise<DashboardState> {
-	const extensions = await loadAllExtensions(cwd, disabledIds);
-	const tabs = buildProviderTabs(extensions, cwd);
+	const providerDisabled = await resolveDisabledProviderIds(cwd);
+	const extensions = await loadAllExtensions(cwd, disabledIds, providerDisabled);
+	const tabs = buildProviderTabs(extensions, providerDisabled);
 
 	// Get current provider from tabs
 	const activeTab = state.tabs[state.activeTabIndex];
