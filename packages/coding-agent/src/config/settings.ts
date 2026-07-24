@@ -1338,17 +1338,28 @@ export class Settings {
 	 * Resolve the effective extension-provider denylist against `cwd` (defaults
 	 * to the active scope). Falls back to the legacy `disabledProviders` list
 	 * only while `disabledExtensionProviders` is unconfigured, mirroring the
-	 * capability registry's read-through migration. Resolving against an explicit
-	 * cwd lets provider filtering honor a target workspace's path-scoped rules
-	 * even when the live singleton is scoped elsewhere (e.g. ACP `cloneForCwd`).
+	 * capability registry's read-through migration.
+	 *
+	 * When `cwd` differs from the active scope (ACP `_omp/extensions`,
+	 * `cloneForCwd` opening another workspace), the active `#project` layer is
+	 * excluded: its values were loaded for a different workspace and a
+	 * project-local `disabledExtensionProviders` there must not leak into another
+	 * project's resolution. Path-scoped rules in global/overlay config — the
+	 * intended cross-project mechanism — still resolve against the target cwd.
 	 */
 	disabledExtensionProvidersForCwd(cwd?: string): string[] {
-		const key: SettingPath = this.isConfigured("disabledExtensionProviders")
-			? "disabledExtensionProviders"
-			: "disabledProviders";
-		const raw = getByPath(this.#merged, SETTING_PATH_SEGMENTS[key]);
-		if (raw === undefined) return [];
 		const target = cwd ? path.normalize(cwd) : this.#cwd;
+		const source =
+			target === this.#cwd
+				? this.#merged
+				: this.#deepMerge(this.#deepMerge(this.#deepMerge({}, this.#global), this.#configOverlay), this.#overrides);
+		let key: SettingPath = "disabledExtensionProviders";
+		let raw = getByPath(source, SETTING_PATH_SEGMENTS[key]);
+		if (raw === undefined) {
+			key = "disabledProviders";
+			raw = getByPath(source, SETTING_PATH_SEGMENTS[key]);
+		}
+		if (raw === undefined) return [];
 		return resolvePathScopedStringArray(key, raw, target) ?? stringArrayFromUnknown(raw);
 	}
 
