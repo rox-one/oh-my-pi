@@ -261,6 +261,7 @@ describe("ACP lazy startup", () => {
 			"todo.enabled": false,
 			"todo.reminders": false,
 			"todo.eager": "always",
+			"advisor.lateConcern": "steer",
 		} as const;
 		const rpcOnlyExplicit = {
 			"async.enabled": false,
