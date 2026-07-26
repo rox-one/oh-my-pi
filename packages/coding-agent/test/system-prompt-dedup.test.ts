@@ -259,6 +259,36 @@ describe("SYSTEM.md prompt assembly", () => {
 
 		await expect(loadSystemPromptFiles({ cwd: projectDir })).resolves.toBe("Project SYSTEM prompt");
 	});
+
+	it("does not activate an ancestor SYSTEM.md through secondary discovery", async () => {
+		const projectDir = path.join(tempDir, "project");
+		const childDir = path.join(projectDir, "packages", "app");
+		const ancestorPrompt = "ANCESTOR SYSTEM MUST NOT ACTIVATE";
+		fs.mkdirSync(path.join(projectDir, ".omp"), { recursive: true });
+		fs.mkdirSync(childDir, { recursive: true });
+		fs.writeFileSync(path.join(projectDir, ".omp", "SYSTEM.md"), ancestorPrompt);
+
+		await expect(loadSystemPromptFiles({ cwd: childDir })).resolves.toBe(ancestorPrompt);
+		const { systemPrompt } = await buildSystemPrompt({
+			cwd: childDir,
+			contextFiles: [],
+			skills: [],
+			rules: [],
+			toolNames: [],
+			workspaceTree: {
+				rootPath: childDir,
+				rendered: "",
+				truncated: false,
+				totalLines: 0,
+				agentsMdFiles: [],
+			},
+			activeRepoContext: null,
+		});
+
+		const promptText = systemPrompt.join("\n\n");
+		expect(promptText).not.toContain(ancestorPrompt);
+		expect(promptText).toContain("You are a helpful assistant the team trusts with load-bearing changes");
+	});
 	it("drops identical explicit context entries even when file names differ", async () => {
 		const farPath = path.join(tempDir, "far", "AGENTS.md");
 		const nearPath = path.join(tempDir, "near", "CLAUDE.md");

@@ -154,7 +154,7 @@ There is no built-in way to inherit selected subsections of the bundled System b
 
 ## 5) Deduplication
 
-When a CLI flag or discovered `SYSTEM.md` provides a custom System zone, `applyResolvedSystemPromptInputs` sets `options.customSystemPrompt`. `callerControlsCustomPrompt` then suppresses secondary capability discovery, so the same `SYSTEM.md` is not loaded twice.
+When a CLI flag or discovered `SYSTEM.md` provides a custom System zone, `applyResolvedSystemPromptInputs` sets `options.customSystemPrompt`. `buildSystemPrompt` consumes only caller-supplied custom text and never invokes secondary capability discovery, so the same or an ancestor `SYSTEM.md` cannot be injected implicitly.
 
 Always-apply rules are deduplicated against the custom prompt, append prompt, and context files. A rule whose body is already present in one of those sources is omitted from Runtime injection.
 
@@ -162,10 +162,10 @@ Always-apply rules are deduplicated against the custom prompt, append prompt, an
 
 ## 6) Discovery paths
 
-Only one path actually drives the customization a CLI user sees: the primary CLI path. The capability layer exists but its `SYSTEM.md` output never reaches the rendered prompt under normal CLI startup.
+Only the primary CLI path drives the customization a CLI user sees. `buildSystemPrompt` does not invoke capability-based `SYSTEM.md` discovery.
 
 - The primary CLI path (`discoverSystemPromptFile` / `discoverAppendSystemPromptFile` in `main.ts`, which feeds `resolvedSystemPrompt` / `resolvedAppendPrompt`) calls `findConfigFile`. `findConfigFile` checks only `<cwd>/.omp`, `<cwd>/.claude`, `<cwd>/.codex`, `<cwd>/.gemini`, and the user-level equivalents — it does **not** walk up ancestors. Files in `<ancestor>/.omp/SYSTEM.md` are ignored when `omp` is started from a subdirectory.
-- The secondary capability path (`loadSystemPromptFiles` → builtin discovery) does walk up via `findNearestProjectConfigDir` and requires the project `.omp/` directory to be non-empty. Under normal CLI startup, `callerControlsCustomPrompt` suppresses this path entirely when the primary path found a custom prompt.
+- The exported `loadSystemPromptFiles` capability helper can walk up via `findNearestProjectConfigDir`, but callers must invoke it explicitly; its result never becomes the effective custom System zone as a `buildSystemPrompt` fallback.
 
 Net effect for CLI users: put `SYSTEM.md` / `APPEND_SYSTEM.md` directly under `<cwd>/.omp` (or another supported config base under cwd) or in the user-level location (`~/.omp/agent/SYSTEM.md` etc.). Ancestor paths are not searched.
 

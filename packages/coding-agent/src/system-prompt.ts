@@ -749,16 +749,16 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		return result.value;
 	}
 
-	// Resolve custom prompt: CLI/SDK takes precedence over SYSTEM.md.
-	// When the caller provides a custom prompt, SYSTEM.md discovery is skipped.
-	const callerControlsCustomPrompt =
-		(typeof providedResolvedCustomPrompt === "string" && providedResolvedCustomPrompt.length > 0) ||
-		(typeof customPrompt === "string" && customPrompt.length > 0);
-	const customPromptPromise = callerControlsCustomPrompt
-		? providedResolvedCustomPrompt !== undefined
+	// CLI startup owns SYSTEM.md discovery and passes the selected text as
+	// resolvedCustomPrompt. buildSystemPrompt must not activate the capability
+	// walk-up path: doing so would let an ancestor SYSTEM.md override the default
+	// System zone when the primary cwd-scoped discovery intentionally found none.
+	const customPromptPromise =
+		providedResolvedCustomPrompt !== undefined
 			? Promise.resolve(providedResolvedCustomPrompt)
-			: resolvePromptInput(customPrompt, "system prompt")
-		: logger.time("loadSystemPromptFiles", loadSystemPromptFiles, { cwd: resolvedCwd });
+			: customPrompt !== undefined
+				? resolvePromptInput(customPrompt, "system prompt")
+				: Promise.resolve(undefined);
 	const contextFilesPromise = (async () => {
 		const primary = providedContextFiles
 			? providedContextFiles
