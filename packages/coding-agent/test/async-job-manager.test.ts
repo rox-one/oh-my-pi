@@ -1,6 +1,9 @@
 import { describe, expect, test } from "bun:test";
-import { scheduler } from "node:timers/promises";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
 import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async/job-manager";
+import { OutputSink } from "@oh-my-pi/pi-coding-agent/session/streaming-output";
 
 async function waitForJobEviction(manager: AsyncJobManager, jobId: string): Promise<void> {
 	const deadline = Date.now() + 2_000;
@@ -40,6 +43,72 @@ describe("AsyncJobManager", () => {
 		expect(progressEvents).toEqual([{ text: "running step", details: { async: { state: "running" } } }]);
 		expect(completions).toEqual([{ jobId, text: "final output" }]);
 		expect(manager.getJob(jobId)?.status).toBe("completed");
+	});
+
+	test("rebases every resource path inside a moved artifact root regardless of job owner", async () => {
+		const oldRoot = path.join("/tmp", "session");
+		const newRoot = path.join("/tmp", "moved-session");
+		const external = path.join("/tmp", "outside.txt");
+		const manager = new AsyncJobManager({});
+		const jobId = manager.register(
+			"task",
+			"ReviewBot",
+			async ({ reportProgress }) => {
+				await reportProgress("running", {
+					progress: [{ sessionFile: path.join(oldRoot, "ReviewBot.jsonl") }],
+					outputPaths: [path.join(oldRoot, "raw-output.txt"), external],
+				});
+				return "done";
+			},
+			{
+				ownerId: "NestedAgent",
+				linkPath: path.join(oldRoot, "ReviewBot.jsonl"),
+			},
+		);
+		await manager.waitForAll();
+
+		manager.rebaseResourcePaths(oldRoot, newRoot);
+
+		const job = manager.getJob(jobId);
+		expect(job?.linkPath).toBe(path.join(newRoot, "ReviewBot.jsonl"));
+		expect(job?.latestDetails).toEqual({
+			progress: [{ sessionFile: path.join(newRoot, "ReviewBot.jsonl") }],
+			outputPaths: [path.join(newRoot, "raw-output.txt"), external],
+		});
+	});
+
+	test("rebases a running writer before its artifact sink opens", async () => {
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-job-rebase-"));
+		const oldRoot = path.join(tempDir, "session");
+		const newRoot = path.join(tempDir, "moved-session");
+		await fs.mkdir(newRoot, { recursive: true });
+		const gate = Promise.withResolvers<void>();
+		const manager = new AsyncJobManager({});
+		const artifactName = "bash-output.txt";
+		const jobId = manager.register(
+			"bash",
+			"delayed output",
+			async ({ getLinkPath }) => {
+				await gate.promise;
+				const sink = new OutputSink({
+					artifactPath: getLinkPath,
+					artifactId: "bash-output",
+					spillThreshold: 1,
+				});
+				sink.push("output written after move");
+				await sink.dump();
+				return "done";
+			},
+			{ linkPath: path.join(oldRoot, artifactName) },
+		);
+
+		manager.rebaseResourcePaths(oldRoot, newRoot);
+		gate.resolve();
+		await manager.getJob(jobId)?.promise;
+
+		expect(await fs.readFile(path.join(newRoot, artifactName), "utf8")).toBe("output written after move");
+		await expect(fs.stat(path.join(oldRoot, artifactName))).rejects.toThrow();
+		await fs.rm(tempDir, { recursive: true, force: true });
 	});
 
 	test("swallows progress callback errors without failing the job", async () => {

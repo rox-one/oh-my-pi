@@ -11,7 +11,7 @@ import { prompt } from "@oh-my-pi/pi-utils";
 import taskSummaryTemplate from "../src/prompts/tools/task-summary.md" with { type: "text" };
 import { hubToolRenderer } from "../src/tools/hub";
 
-function renderLines(resultText: string): string {
+function renderLines(resultText: string, linkPath?: string): string {
 	const result = {
 		content: [{ type: "text", text: "" }],
 		details: {
@@ -24,6 +24,7 @@ function renderLines(resultText: string): string {
 					label: "SpawnProbe",
 					durationMs: 8_700,
 					resultText,
+					...(linkPath ? { linkPath } : {}),
 				},
 			],
 		},
@@ -64,6 +65,18 @@ describe("job renderer task-result preview", () => {
 		expect(output).toContain("Probe finished: spawned worker, ping ok.");
 		expect(output).not.toContain("<task-result");
 		expect(output).not.toContain("<output>");
+	});
+
+	it("links the visible job id to its durable target", () => {
+		Settings.instance.override("tui.hyperlinks", "always");
+		try {
+			const output = renderLines("done", "/tmp/SpawnProbe.jsonl");
+			expect(output).toContain("\x1b]8;");
+			expect(output).toContain("file:///tmp/SpawnProbe.jsonl");
+			expect(output).toContain("SpawnProbe");
+		} finally {
+			Settings.instance.override("tui.hyperlinks", "auto");
+		}
 	});
 
 	it("previews the truncated <preview> body the same way", () => {

@@ -13,7 +13,15 @@ import type { RenderResultOptions } from "../../extensibility/custom-tools/types
 import { shimmerEnabled, shimmerText } from "../../modes/theme/shimmer";
 import type { Theme } from "../../modes/theme/theme";
 import { USER_INTERRUPT_LABEL } from "../../session/messages";
-import { Ellipsis, Hasher, type RenderCache, renderStatusLine, renderTreeList, truncateToWidth } from "../../tui";
+import {
+	Ellipsis,
+	fileHyperlink,
+	Hasher,
+	type RenderCache,
+	renderStatusLine,
+	renderTreeList,
+	truncateToWidth,
+} from "../../tui";
 import type { ToolSession } from "..";
 import {
 	formatBadge,
@@ -143,29 +151,16 @@ function describeAgents(agents: AgentActivitySnapshot[]): string[] {
 	return lines;
 }
 
-/**
- * Row suffix for a settled job whose body the `jobs` poll withholds: size plus
- * where to read it. Without this the caller cannot tell an empty result from a
- * large one it should go fetch.
- */
-function describeWithheldBody(job: JobSnapshot): string {
-	if (job.type === "task") {
-		if (job.outputMeta) {
-			return ` — artifact ${job.outputMeta.bytes} B at \`${job.outputMeta.uri}\``;
-		}
-		const body = job.resultText ?? job.errorText;
-		if (body) {
-			return ` — result ${Buffer.byteLength(body, "utf8")} B, read it with \`wait\` on this id`;
-		}
-	}
-	const error = job.errorText?.trim();
-	if (error) {
-		const firstLine = error.split("\n", 1)[0] ?? error;
-		return ` — error: ${truncateToWidth(firstLine, 160)}`;
-	}
-	const bytes = job.resultText ? Buffer.byteLength(job.resultText, "utf8") : 0;
-	if (bytes === 0) return " — empty result";
-	return ` — result ${bytes} B, read it with \`wait\` on this id`;
+interface TrackedJobLike {
+	id: string;
+	type: "bash" | "task";
+	status: string;
+	label: string;
+	startTime: number;
+	linkPath?: string;
+	latestDetails?: Record<string, unknown>;
+	resultText?: string;
+	errorText?: string;
 }
 
 type TrackedJobLike = Pick<
@@ -216,6 +211,10 @@ export function snapshotJobs(session: JobSnapshotSession, jobs: TrackedJobLike[]
 			status: latest.status,
 			label: latest.label,
 			durationMs: Math.max(0, now - latest.startTime),
+			...(latest.linkPath ? { linkPath: latest.linkPath } : {}),
+			...(resolvedModel ? { resolvedModel } : {}),
+			...(latest.resultText ? { resultText: latest.resultText } : {}),
+			...(latest.errorText ? { errorText: latest.errorText } : {}),
 		};
 		if (resolvedModel) snapshot.resolvedModel = resolvedModel;
 		if (latest.resultText) snapshot.resultText = latest.resultText;
@@ -685,8 +684,10 @@ export function jobsRenderResult(
 						);
 						const typeBadge = formatBadge(job.type, statusToColor(job.status), uiTheme);
 						// Task jobs label themselves with their agent id, which is also
-						// the job id — drop the id column instead of stuttering it twice.
-						const idPart = job.label.trim() === job.id ? "" : ` ${uiTheme.fg("muted", job.id)}`;
+						// the job id — link the label instead of rendering the id twice.
+						const idIsLabel = job.label.trim() === job.id;
+						const displayId = job.linkPath ? fileHyperlink(job.linkPath, job.id) : job.id;
+						const idPart = idIsLabel ? "" : ` ${uiTheme.fg("muted", displayId)}`;
 						const rawLabelLines = (job.label || "(no label)").split(/\r?\n/);
 						const maxLabelLines = expanded ? LABEL_LINES_EXPANDED : LABEL_LINES_COLLAPSED;
 						const visibleLabelLines = rawLabelLines
@@ -717,11 +718,13 @@ export function jobsRenderResult(
 						// shimmer band.
 						const live = job.status === "running" && options.spinnerFrame !== undefined;
 						const headRaw = visibleLabelLines[0] ?? "";
-						const headLabel = live
+						const styledHeadLabel = live
 							? shimmerEnabled()
 								? shimmerText(headRaw, uiTheme)
 								: uiTheme.fg("accent", headRaw)
 							: uiTheme.fg("toolOutput", headRaw);
+						const headLabel =
+							idIsLabel && job.linkPath ? fileHyperlink(job.linkPath, styledHeadLabel) : styledHeadLabel;
 						lines.push(
 							`${icon}${idPart} ${typeBadge} ${headLabel}${modelText}${modelText ? uiTheme.sep.dot : " "}${durationText}`,
 						);

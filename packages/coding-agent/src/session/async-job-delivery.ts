@@ -43,6 +43,7 @@ type AsyncResultJobDetails = {
 	jobId: string;
 	type?: AsyncJobType;
 	label?: string;
+	linkPath?: string;
 	durationMs?: number;
 };
 
@@ -57,6 +58,7 @@ export function buildAsyncResultBatchMessage(entries: AsyncResultEntry[]): Custo
 		result: entry.result,
 		type: entry.job?.type,
 		label: entry.job?.label,
+		linkPath: entry.job?.linkPath,
 		durationMs: entry.durationMs,
 	}));
 	const details: AsyncResultDetails = {
@@ -64,6 +66,7 @@ export function buildAsyncResultBatchMessage(entries: AsyncResultEntry[]): Custo
 			jobId: job.jobId,
 			type: job.type,
 			label: job.label,
+			linkPath: job.linkPath,
 			durationMs: job.durationMs,
 		})),
 	};

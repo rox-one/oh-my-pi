@@ -46,6 +46,7 @@ export interface JobSnapshot {
 	type: AsyncJobType;
 	status: "running" | "completed" | "failed" | "cancelled";
 	label: string;
+	linkPath?: string;
 	durationMs: number;
 	/** Effective task model selector, including an explicit reasoning suffix when configured. */
 	resolvedModel?: string;

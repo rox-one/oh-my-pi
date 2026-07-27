@@ -7,6 +7,52 @@ import { resolveWorkspaceStorageIdentity, type WorkspaceIdentifierMode } from ".
 import type { SessionStorage } from "./session-storage";
 
 const migratedSessionRoots = new Set<string>();
+const RESOURCE_PATH_KEYS: Record<string, true> = {
+	linkPath: true,
+	outputPath: true,
+	patchPath: true,
+	sessionFile: true,
+};
+const RESOURCE_PATH_ARRAY_KEYS: Record<string, true> = {
+	outputPaths: true,
+};
+
+/** Rebase one absolute path only when it is inside `oldRoot`. */
+export function rebasePathWithinRoot(filePath: string, oldRoot: string, newRoot: string): string {
+	const relative = path.relative(path.resolve(oldRoot), path.resolve(filePath));
+	if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) return filePath;
+	return path.join(newRoot, relative);
+}
+
+/**
+ * Rebase persisted/render metadata without touching arbitrary user strings.
+ * Only the dedicated file-target keys participate, and only below `oldRoot`.
+ */
+export function rebaseResourcePathMetadata(value: unknown, oldRoot: string, newRoot: string): void {
+	const seen = new Set<object>();
+	const visit = (candidate: unknown): void => {
+		if (!candidate || typeof candidate !== "object" || seen.has(candidate)) return;
+		seen.add(candidate);
+		if (Array.isArray(candidate)) {
+			for (const item of candidate) visit(item);
+			return;
+		}
+		if (Object.getPrototypeOf(candidate) !== Object.prototype && Object.getPrototypeOf(candidate) !== null) return;
+		const record = candidate as Record<string, unknown>;
+		for (const [key, item] of Object.entries(record)) {
+			if (Object.hasOwn(RESOURCE_PATH_KEYS, key) && typeof item === "string") {
+				record[key] = rebasePathWithinRoot(item, oldRoot, newRoot);
+			} else if (Object.hasOwn(RESOURCE_PATH_ARRAY_KEYS, key) && Array.isArray(item)) {
+				record[key] = item.map(pathItem =>
+					typeof pathItem === "string" ? rebasePathWithinRoot(pathItem, oldRoot, newRoot) : pathItem,
+				);
+			} else {
+				visit(item);
+			}
+		}
+	};
+	visit(value);
+}
 
 /**
  * Merge or rename a legacy session directory into its canonical target.

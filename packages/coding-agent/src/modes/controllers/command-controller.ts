@@ -1213,19 +1213,10 @@ export class CommandController {
 	}
 
 	async #moveInteractiveCwd(resolvedPath: string): Promise<void> {
-		const previousState = this.ctx.sessionManager.captureState();
-		await this.ctx.sessionManager.moveTo(resolvedPath);
-		if (await this.ctx.applyCwdChange(resolvedPath)) {
-			this.ctx.updateEditorBorderColor();
-			await this.ctx.reloadTodos();
-			return;
-		}
-		try {
-			await this.ctx.sessionManager.moveTo(previousState.cwd, previousState.sessionDir);
-			this.ctx.sessionManager.restoreState(previousState);
-		} catch (err) {
-			this.ctx.showError(`Failed to roll back move: ${err instanceof Error ? err.message : String(err)}`);
-		}
+		await this.ctx.session.moveSession(resolvedPath);
+		await this.ctx.applyCwdChange(resolvedPath);
+		this.ctx.updateEditorBorderColor();
+		await this.ctx.reloadTodos();
 	}
 
 	async #applyBashResultCwd(result: BashResult): Promise<void> {

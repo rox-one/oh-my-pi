@@ -1,4 +1,5 @@
 import { logger } from "@oh-my-pi/pi-utils";
+import { rebasePathWithinRoot, rebaseResourcePathMetadata } from "../session/session-paths";
 
 const DELIVERY_RETRY_BASE_MS = 500;
 const DELIVERY_RETRY_MAX_MS = 30_000;
@@ -53,6 +54,7 @@ export interface AsyncJob extends AsyncJobArtifactOutcome {
 	status: "running" | "completed" | "failed" | "cancelled";
 	startTime: number;
 	label: string;
+	linkPath?: string;
 	abortController: AbortController;
 	promise: Promise<void>;
 	resultText?: string;
@@ -128,6 +130,8 @@ export interface AsyncJobRegisterOptions {
 	ownerId?: string;
 	/** Registry id of the subagent this job runs; see {@link AsyncJob.agentId}. */
 	agentId?: string;
+	/** File-backed target rendered as the job's OSC 8 hyperlink. */
+	linkPath?: string;
 	onProgress?: (text: string, details?: Record<string, unknown>) => void | Promise<void>;
 	/** Register the job in queued state; see {@link AsyncJob.queued}. */
 	queued?: boolean;
@@ -191,6 +195,14 @@ export class AsyncJobManager {
 		this.#retentionMs = Math.max(0, Math.floor(options.retentionMs ?? DEFAULT_RETENTION_MS));
 	}
 
+	/** Keep retained and running job resource paths valid after an artifact tree moves. */
+	rebaseResourcePaths(oldRoot: string, newRoot: string): void {
+		for (const job of this.#jobs.values()) {
+			if (job.linkPath) job.linkPath = rebasePathWithinRoot(job.linkPath, oldRoot, newRoot);
+			rebaseResourcePathMetadata(job.latestDetails, oldRoot, newRoot);
+		}
+	}
+
 	/** True when the running-job count has reached the configured cap. */
 	get atCapacity(): boolean {
 		if (this.#disposed) return true;
@@ -211,6 +223,10 @@ export class AsyncJobManager {
 			reportProgress: (text: string, details?: Record<string, unknown>) => Promise<void>;
 			/** Clear the queued flag once the job actually starts executing. */
 			markRunning: () => void;
+			/** Attach a file-backed result target once the running job allocates one. */
+			setLinkPath: (linkPath: string | undefined) => void;
+			/** Read the job's current file-backed target after session moves rebase it. */
+			getLinkPath: () => string | undefined;
 		}) => Promise<string>,
 		options?: AsyncJobRegisterOptions,
 	): string {
@@ -244,6 +260,7 @@ export class AsyncJobManager {
 			promise: Promise.resolve(),
 			ownerId: options?.ownerId,
 			agentId: options?.agentId,
+			linkPath: options?.linkPath,
 			queued: options?.queued === true,
 		};
 
@@ -259,6 +276,11 @@ export class AsyncJobManager {
 				});
 			}
 		};
+		const setLinkPath = (linkPath: string | undefined): void => {
+			job.linkPath = linkPath;
+		};
+		const getLinkPath = (): string | undefined => job.linkPath;
+
 		job.promise = (async () => {
 			try {
 				const text = await run({
@@ -268,6 +290,8 @@ export class AsyncJobManager {
 					markRunning: () => {
 						job.queued = false;
 					},
+					setLinkPath,
+					getLinkPath,
 				});
 				if (job.status === "cancelled") {
 					job.resultText = text;

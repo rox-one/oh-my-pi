@@ -221,6 +221,46 @@ describe("SessionManager.moveTo", () => {
 		expect(header?.cwd).toBe(path.resolve(cwdB));
 	});
 
+	it("rebases persisted resource targets with the moved artifact tree", async () => {
+		const session = SessionManager.create(cwdA);
+		const oldFile = session.getSessionFile()!;
+		const oldArtifactsDir = oldFile.slice(0, -6);
+		const transcript = path.join(oldArtifactsDir, "ReviewBot.jsonl");
+		const output = path.join(oldArtifactsDir, "raw-output.txt");
+		const external = path.join(testAgentDir, "outside.txt");
+		session.appendCustomMessageEntry("async-result", "done", true, {
+			jobs: [{ linkPath: output, outputPath: output, patchPath: path.join(oldArtifactsDir, "change.diff") }],
+			progress: [{ sessionFile: transcript }],
+			outputPaths: [output, external],
+			unrelated: { linkPath: external, constructor: output },
+		});
+		session.appendMessage(makeAssistantMessage());
+		await session.flush();
+
+		await session.moveTo(cwdB);
+
+		const newFile = session.getSessionFile()!;
+		const newArtifactsDir = newFile.slice(0, -6);
+		const entries = await loadEntriesFromFile(newFile);
+		const message = entries.find(entry => entry.type === "custom_message" && entry.customType === "async-result") as
+			| {
+					details?: {
+						jobs?: Array<{ linkPath?: string; outputPath?: string; patchPath?: string }>;
+						progress?: Array<{ sessionFile?: string }>;
+						outputPaths?: string[];
+						unrelated?: { linkPath?: string; constructor?: string };
+					};
+			  }
+			| undefined;
+		expect(message?.details?.jobs?.[0]?.linkPath).toBe(path.join(newArtifactsDir, "raw-output.txt"));
+		expect(message?.details?.jobs?.[0]?.outputPath).toBe(path.join(newArtifactsDir, "raw-output.txt"));
+		expect(message?.details?.jobs?.[0]?.patchPath).toBe(path.join(newArtifactsDir, "change.diff"));
+		expect(message?.details?.progress?.[0]?.sessionFile).toBe(path.join(newArtifactsDir, "ReviewBot.jsonl"));
+		expect(message?.details?.outputPaths).toEqual([path.join(newArtifactsDir, "raw-output.txt"), external]);
+		expect(message?.details?.unrelated?.linkPath).toBe(external);
+		expect(message?.details?.unrelated?.constructor).toBe(output);
+	});
+
 	it("moves artifact dir independently when session file does not exist", async () => {
 		const session = SessionManager.create(cwdA);
 		// Allocate an artifact — creates dir via ArtifactManager

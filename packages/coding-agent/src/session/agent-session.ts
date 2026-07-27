@@ -183,6 +183,7 @@ import planModeToolDecisionReminderPrompt from "../prompts/system/plan-mode-tool
 import rewindReportTemplate from "../prompts/system/rewind-report.md" with { type: "text" };
 import sideChannelNoToolsReminder from "../prompts/system/side-channel-no-tools.md" with { type: "text" };
 import vibeModeActivePrompt from "../prompts/system/vibe-mode-active.md" with { type: "text" };
+import { AgentRegistry } from "../registry/agent-registry";
 import {
 	deobfuscateAssistantContent,
 	deobfuscateSessionContext,
@@ -1483,6 +1484,8 @@ export class AgentSession {
 	 */
 	#asyncDeliveryEpoch = 0;
 
+	readonly #agentRegistry: AgentRegistry;
+
 	readonly #irc: IrcBridge;
 	#ircWakeTurnObserver:
 		| ((records: CustomMessage[]) => ((error?: unknown) => void | Promise<void>) | undefined)
@@ -1957,6 +1960,7 @@ export class AgentSession {
 		this.#codeModeState = config.codeModeState ?? {};
 		this.sessionManager = config.sessionManager;
 		this.settings = config.settings;
+		this.#agentRegistry = config.agentRegistry ?? AgentRegistry.global();
 		this.#modelRegistry = config.modelRegistry;
 		this.#codexResetCoordinator = config.codexResetCoordinator ?? defaultCodexAutoRedeemCoordinator;
 		const bashHost: BashRunnerHost = {
@@ -8469,10 +8473,15 @@ export class AgentSession {
 		}
 	}
 
-	/** Move the active session and artifacts after enforcing mode transition invariants. */
+	/** Move the active session and keep every live transcript/artifact reference aligned. */
 	async moveSession(newCwd: string, targetSessionDir?: string): Promise<void> {
 		this.#assertVibeSessionTransitionAllowed("move the session");
+		const oldArtifactsDir = this.sessionManager.getArtifactsDir();
 		await this.sessionManager.moveTo(newCwd, targetSessionDir);
+		const newArtifactsDir = this.sessionManager.getArtifactsDir();
+		if (!oldArtifactsDir || !newArtifactsDir || oldArtifactsDir === newArtifactsDir) return;
+		this.#asyncJobManager?.rebaseResourcePaths(oldArtifactsDir, newArtifactsDir);
+		await this.#agentRegistry.rebaseSessionFiles(oldArtifactsDir, newArtifactsDir);
 	}
 
 	// =========================================================================

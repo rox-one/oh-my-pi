@@ -1062,6 +1062,7 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 	const progress: AgentProgress = {
 		index,
 		id,
+		sessionFile: args.sessionFile,
 		agent: agent.name,
 		agentSource: agent.source,
 		status: "running",
@@ -2267,15 +2268,17 @@ async function finalizeRunResult(args: FinalizeRunArgs): Promise<SingleResult> {
 	// (followUpTurn is unset), preserving the documented missing-yield artifact.
 	let outputMeta: AgentOutputArtifact | undefined;
 	let outputPath: string | undefined;
-	let artifactError: string | undefined;
-	if (args.artifactsDir && (!args.followUpTurn || hasYield)) {
-		const written = await writeVerifiedAgentOutput(args.artifactsDir, id, rawOutput);
-		if (written.ok) {
-			outputMeta = written.artifact;
-			outputPath = written.artifact.path;
-		} else {
-			artifactError = written.error;
-			logger.warn("task: subagent output artifact could not be verified", { id, error: written.error });
+	if (args.artifactsDir) {
+		const candidateOutputPath = path.join(args.artifactsDir, `${id}.md`);
+		try {
+			await Bun.write(candidateOutputPath, rawOutput);
+			outputPath = candidateOutputPath;
+			outputMeta = {
+				lineCount: rawOutput.split("\n").length,
+				charCount: rawOutput.length,
+			};
+		} catch {
+			// Non-fatal
 		}
 	}
 

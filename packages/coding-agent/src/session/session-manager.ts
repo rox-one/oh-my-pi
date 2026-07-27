@@ -71,6 +71,8 @@ import { generateId, migrateToCurrentVersion } from "./session-migrations";
 import {
 	computeDefaultSessionDir,
 	readTerminalBreadcrumbEntry,
+	rebasePathWithinRoot,
+	rebaseResourcePathMetadata,
 	resolveManagedSessionRoot,
 	writeTerminalBreadcrumb,
 } from "./session-paths";
@@ -1475,6 +1477,18 @@ export class SessionManager {
 	}
 
 	/**
+	 * Adopt a session file that moved because an ancestor artifact directory
+	 * was relocated. `moveTo` closes any live writer before switching paths, so
+	 * a later append cannot recreate the old tree.
+	 */
+	async rebaseMovedSessionFile(oldRoot: string, newRoot: string): Promise<void> {
+		if (!this.#sessionFile) return;
+		const rebasedFile = rebasePathWithinRoot(this.#sessionFile, oldRoot, newRoot);
+		if (rebasedFile === this.#sessionFile) return;
+		await this.moveTo(this.#cwd, path.dirname(rebasedFile));
+	}
+
+	/**
 	 * Move the session to a new working directory: relocate the session file and
 	 * artifacts on disk, update internal references, and rewrite the header cwd.
 	 */
@@ -1577,6 +1591,7 @@ export class SessionManager {
 					];
 				}
 
+				rebaseResourcePathMetadata(this.#entries, oldArtifactsDir, newArtifactsDir);
 				this.#sessionFile = newSessionFile;
 				this.#artifactManager = null;
 				this.#artifactManagerSessionFile = null;
