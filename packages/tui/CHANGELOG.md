@@ -231,7 +231,7 @@
 - Fixed unbounded memory growth and potential host freezes when a PTY consumer stalls by capping the pending stdout backlog and treating undrained consumers as a disconnect.
 ### Fixed
 
-- Fixed the `Loader` spinner pegging a CPU core during idle waits: advancing the braille glyph baked it into the underlying `Text` via `setText`, invalidating the wrap cache every 80 ms tick so `wrapTextWithAnsi` and per-line width measurement re-ran over the whole message. The wrapped text now carries a stable sentinel glyph and only the visible glyph is swapped at render time, so the wrap/width pipeline runs only when the message changes ([#6940](https://github.com/can1357/oh-my-pi/issues/6940)).
+- Fixed the `Loader` spinner pegging a CPU core during idle waits: advancing the braille glyph baked it into the underlying `Text` via `setText`, invalidating the wrap cache every 80 ms tick so `wrapTextWithAnsi` and per-line width measurement re-ran over the whole message. The wrapped text now carries a stable representative for each frame display width and only the visible glyph is swapped at render time, so same-width frames reuse the wrap/width pipeline while custom themes with mixed-width frames remain correctly wrapped ([#6940](https://github.com/can1357/oh-my-pi/issues/6940)).
 
 ## [17.1.8] - 2026-07-28
 

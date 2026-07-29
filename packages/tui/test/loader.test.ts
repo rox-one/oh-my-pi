@@ -202,6 +202,28 @@ describe("Loader component", () => {
 		loader.stop();
 	});
 
+	it("rewraps custom spinner frames when their display widths differ", () => {
+		vi.useFakeTimers();
+		const ui = { synchronizedOutput: true, requestDirectWrite: vi.fn(), requestComponentRender: vi.fn() };
+		const loader = new Loader(
+			ui as unknown as TUI,
+			s => s,
+			m => m,
+			"Load",
+			["*", ">>>>"],
+		);
+
+		loader.render(8);
+		vi.advanceTimersByTime(80);
+		const widerFrame = loader.render(8);
+
+		expect(widerFrame.join("\n")).toContain(">>>>");
+		for (const line of widerFrame) {
+			expect(visibleWidth(line)).toBeLessThanOrEqual(8);
+		}
+		loader.stop();
+	});
+
 	it("holds animated message-only frames when synchronized output is unavailable", () => {
 		vi.useFakeTimers();
 		setSystemTime(new Date(1_000));

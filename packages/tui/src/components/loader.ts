@@ -72,11 +72,10 @@ export class Loader extends Text {
 		}
 
 		const frame = this.#frames[this.#currentFrame];
-		// The wrapped text carries a fixed sentinel glyph (frames[0]); advancing
-		// the spinner swaps only the visible glyph here, so the wrap/width cache
-		// stays valid across ticks. Assumes every frame shares one display width
-		// (true for the default braille set and all in-repo callers).
-		const sentinel = this.#frames[0];
+		// The wrapped text carries one stable representative per frame width.
+		// Same-width frames swap only the visible glyph here; crossing widths
+		// rewraps against the representative selected by #syncText.
+		const sentinel = this.#layoutFrame;
 		const lines = [""];
 		const layout = this.#layout ?? [];
 		for (let i = 0; i < layout.length; i++) {
@@ -108,6 +107,7 @@ export class Loader extends Text {
 				const steps = Math.floor(elapsed / SPINNER_ADVANCE_MS);
 				this.#currentFrame = (this.#currentFrame + steps) % this.#frames.length;
 				this.#lastSpinnerTick += steps * SPINNER_ADVANCE_MS;
+				this.#syncText();
 			}
 			if (shouldAdvanceSpinner || this.#ui?.synchronizedOutput === true) {
 				this.#requestPaint();
@@ -136,9 +136,11 @@ export class Loader extends Text {
 		this.#requestPaint();
 	}
 
-	/** Re-wrap the underlying Text with the stable sentinel glyph plus message. */
+	/** Re-wrap the underlying Text only when its message or frame width changes. */
 	#syncText(): boolean {
-		return this.setText(`${this.#frames[0]} ${this.message}`);
+		const layoutFrame = this.#layoutFrames[this.#currentFrame];
+		this.#layoutFrame = layoutFrame;
+		return this.setText(`${layoutFrame} ${this.message}`);
 	}
 
 	#requestPaint() {
