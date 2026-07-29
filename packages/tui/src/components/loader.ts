@@ -72,10 +72,11 @@ export class Loader extends Text {
 		}
 
 		const frame = this.#frames[this.#currentFrame];
-		// The wrapped text carries one stable representative per frame width.
-		// Same-width frames swap only the visible glyph here; crossing widths
-		// rewraps against the representative selected by #syncText.
-		const sentinel = this.#layoutFrame;
+		// The wrapped text carries a fixed sentinel glyph (frames[0]); advancing
+		// the spinner swaps only the visible glyph here, so the wrap/width cache
+		// stays valid across ticks. Assumes every frame shares one display width
+		// (true for the default braille set and all in-repo callers).
+		const sentinel = this.#frames[0];
 		const lines = [""];
 		const layout = this.#layout ?? [];
 		for (let i = 0; i < layout.length; i++) {
@@ -99,7 +100,19 @@ export class Loader extends Text {
 		this.#syncText();
 		this.#requestPaint();
 		const intervalMs = this.messageColorFn.animated === true ? RENDER_INTERVAL_MS : SPINNER_ADVANCE_MS;
-		this.#scheduleTick(intervalMs, intervalMs);
+		this.#intervalId = setInterval(() => {
+			const now = performance.now();
+			const elapsed = now - this.#lastSpinnerTick;
+			const shouldAdvanceSpinner = elapsed >= SPINNER_ADVANCE_MS;
+			if (shouldAdvanceSpinner) {
+				const steps = Math.floor(elapsed / SPINNER_ADVANCE_MS);
+				this.#currentFrame = (this.#currentFrame + steps) % this.#frames.length;
+				this.#lastSpinnerTick += steps * SPINNER_ADVANCE_MS;
+			}
+			if (shouldAdvanceSpinner || this.#ui?.synchronizedOutput === true) {
+				this.#requestPaint();
+			}
+		}, intervalMs);
 	}
 
 	stop() {
@@ -123,42 +136,23 @@ export class Loader extends Text {
 		this.#requestPaint();
 	}
 
-	#scheduleTick(intervalMs: number, delayMs: number): void {
-		const timer = setTimeout(() => {
-			if (this.#intervalId !== timer) return;
-			const startedAt = performance.now();
-			const elapsed = startedAt - this.#lastSpinnerTick;
-			const shouldAdvanceSpinner = elapsed >= SPINNER_ADVANCE_MS;
-			if (shouldAdvanceSpinner) {
-				const steps = Math.floor(elapsed / SPINNER_ADVANCE_MS);
-				this.#currentFrame = (this.#currentFrame + steps) % this.#frames.length;
-				this.#lastSpinnerTick += steps * SPINNER_ADVANCE_MS;
-				this.#syncText();
-			}
-			if (shouldAdvanceSpinner || this.#ui?.synchronizedOutput === true) {
-				this.#requestPaint();
-			}
-
-			const frameCostMs = performance.now() - startedAt;
-			if (this.#intervalId !== timer) return;
-			const cadenceDelayMs = Math.max(0, intervalMs - frameCostMs);
-			// Idle for nine times the paint cost to keep animation at or below
-			// 10% CPU, even when a slow ConPTY write exceeds the normal cadence.
-			const backpressureDelayMs = frameCostMs * RENDER_BACKPRESSURE_MULTIPLIER;
-			this.#scheduleTick(intervalMs, Math.max(cadenceDelayMs, backpressureDelayMs));
-		}, delayMs);
-		this.#intervalId = timer;
-	}
-	/** Re-wrap the underlying Text only when its message or frame width changes. */
+	/** Re-wrap the underlying Text with the stable sentinel glyph plus message. */
 	#syncText(): boolean {
-		const layoutFrame = this.#layoutFrames[this.#currentFrame];
-		this.#layoutFrame = layoutFrame;
-		return this.setText(`${layoutFrame} ${this.message}`);
+		return this.setText(`${this.#frames[0]} ${this.message}`);
 	}
 
 	#requestPaint() {
 		if (!this.#ui) {
 			return;
+		}
+		// Direct write: a loader tick changes only this component, so the TUI can
+		// update the already-positioned rows without driving the full
+		// compose/prepare/diff pipeline. Lightweight test stubs may not carry the
+		// newer API; keep their legacy component-scoped path working.
+		if (typeof this.#ui.requestDirectWrite === "function") {
+			this.#ui.requestDirectWrite(this);
+		} else {
+			this.#ui.requestComponentRender(this);
 		}
 		this.#ui.requestComponentRender(this);
 	}
