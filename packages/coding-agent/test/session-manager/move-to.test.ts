@@ -6,6 +6,7 @@ import * as path from "node:path";
 import type { SessionHeader } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import { loadEntriesFromFile } from "@oh-my-pi/pi-coding-agent/session/session-loader";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { rebasePathWithinRoot } from "@oh-my-pi/pi-coding-agent/session/session-paths";
 import { stripOuterDoubleQuotes } from "@oh-my-pi/pi-coding-agent/tools/path-utils";
 import { getConfigRootDir, setAgentDir } from "@oh-my-pi/pi-utils";
 
@@ -524,5 +525,30 @@ describe("SessionManager.moveTo", () => {
 					entry.message.content === "during move crash window",
 			),
 		).toBe(true);
+	});
+
+	it("rebases live writer targets immediately before renaming the artifact tree", async () => {
+		const session = SessionManager.create(cwdA);
+		const { path: artifactPath } = await session.allocateArtifactPath("bash");
+		if (!artifactPath) throw new Error("Expected artifact path");
+		await Bun.write(artifactPath, "before move");
+		const oldArtifactsDir = path.dirname(artifactPath);
+		let writerTarget = artifactPath;
+		let callbackCount = 0;
+
+		await session.moveTo(cwdB, undefined, {
+			rebaseLiveArtifactResources: (oldRoot, newRoot) => {
+				callbackCount++;
+				expect(oldRoot).toBe(oldArtifactsDir);
+				expect(fs.existsSync(oldRoot)).toBe(true);
+				expect(fs.existsSync(newRoot)).toBe(false);
+				writerTarget = rebasePathWithinRoot(writerTarget, oldRoot, newRoot);
+			},
+		});
+
+		expect(callbackCount).toBe(1);
+		expect(writerTarget).toBe(path.join(session.getArtifactsDir()!, path.basename(artifactPath)));
+		expect(fs.readFileSync(writerTarget, "utf8")).toBe("before move");
+		expect(fs.existsSync(oldArtifactsDir)).toBe(false);
 	});
 });

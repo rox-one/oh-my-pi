@@ -416,6 +416,14 @@ interface AtomicEntryBatch {
 	externalLeafId: string | null;
 }
 
+export interface SessionMoveOptions {
+	/**
+	 * Rebase live artifact metadata, including writer destinations, immediately
+	 * before the tree is renamed. Invoked with reversed roots if the rename fails.
+	 */
+	rebaseLiveArtifactResources?: (oldRoot: string, newRoot: string) => void;
+}
+
 /**
  * The storage may have published a write that rejected, and an authoritative
  * repair could not be proven durable. Callers must fail closed until recovery.
@@ -1492,7 +1500,7 @@ export class SessionManager {
 	 * Move the session to a new working directory: relocate the session file and
 	 * artifacts on disk, update internal references, and rewrite the header cwd.
 	 */
-	async moveTo(newCwd: string, targetSessionDir?: string): Promise<void> {
+	async moveTo(newCwd: string, targetSessionDir?: string, options?: SessionMoveOptions): Promise<void> {
 		const resolvedCwd = path.resolve(newCwd);
 		const resolvedTargetDir = targetSessionDir ? path.resolve(targetSessionDir) : undefined;
 		if (
@@ -1543,6 +1551,7 @@ export class SessionManager {
 
 				let sessionMoved = false;
 				let artifactsMoved = false;
+				let artifactWritersRebased = false;
 
 				try {
 					if (sessionFileExisted && sessionPathChanged) {
@@ -1551,25 +1560,36 @@ export class SessionManager {
 					}
 
 					if (artifactPathChanged) {
+						let artifactStat: fs.Stats | undefined;
 						try {
-							const artifactStat = await fs.promises.stat(oldArtifactsDir);
-							if (artifactStat.isDirectory()) {
-								await fs.promises.rename(oldArtifactsDir, newArtifactsDir);
-								artifactsMoved = true;
-							}
+							artifactStat = fs.statSync(oldArtifactsDir);
 						} catch (err) {
 							if (!isEnoent(err)) throw err;
+						}
+						options?.rebaseLiveArtifactResources?.(oldArtifactsDir, newArtifactsDir);
+						artifactWritersRebased = true;
+						if (artifactStat?.isDirectory()) {
+							// Keep the destination switch and directory rename in one
+							// synchronous turn so a running sink cannot open either
+							// stale root in between them.
+							fs.renameSync(oldArtifactsDir, newArtifactsDir);
+							artifactsMoved = true;
 						}
 					}
 				} catch (err) {
 					if (artifactsMoved && oldArtifactsDir && newArtifactsDir) {
 						try {
-							await fs.promises.rename(newArtifactsDir, oldArtifactsDir);
+							fs.renameSync(newArtifactsDir, oldArtifactsDir);
+							options?.rebaseLiveArtifactResources?.(newArtifactsDir, oldArtifactsDir);
+							artifactWritersRebased = false;
 						} catch (rollbackErr) {
 							throw new Error(
 								`Failed to move artifacts and rollback: ${rollbackErr instanceof Error ? rollbackErr.message : String(rollbackErr)}`,
 							);
 						}
+					} else if (artifactWritersRebased) {
+						options?.rebaseLiveArtifactResources?.(newArtifactsDir, oldArtifactsDir);
+						artifactWritersRebased = false;
 					}
 
 					if (sessionMoved) {

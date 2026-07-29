@@ -354,6 +354,7 @@ import {
 import { cleanupEmptyMoveSession, copySessionArtifacts, type SessionManager } from "./session-manager";
 import { SessionMemory, type SessionMemoryHost } from "./session-memory";
 import { buildSessionMetadata } from "./session-metadata";
+import { rebaseResourcePathMetadata } from "./session-paths";
 import { SessionProviderBoundary, type SessionProviderBoundaryHost } from "./session-provider-boundary";
 import { SessionStatsTracker, type SessionStatsTrackerHost } from "./session-stats";
 import { SessionTools, type SessionToolsHost } from "./session-tools";
@@ -8477,10 +8478,13 @@ export class AgentSession {
 	async moveSession(newCwd: string, targetSessionDir?: string): Promise<void> {
 		this.#assertVibeSessionTransitionAllowed("move the session");
 		const oldArtifactsDir = this.sessionManager.getArtifactsDir();
-		await this.sessionManager.moveTo(newCwd, targetSessionDir);
+		await this.sessionManager.moveTo(newCwd, targetSessionDir, {
+			rebaseLiveArtifactResources: (oldRoot, newRoot) =>
+				this.#asyncJobManager?.rebaseResourcePaths(oldRoot, newRoot),
+		});
 		const newArtifactsDir = this.sessionManager.getArtifactsDir();
 		if (!oldArtifactsDir || !newArtifactsDir || oldArtifactsDir === newArtifactsDir) return;
-		this.#asyncJobManager?.rebaseResourcePaths(oldArtifactsDir, newArtifactsDir);
+		rebaseResourcePathMetadata(this.#pendingNextTurnMessages, oldArtifactsDir, newArtifactsDir);
 		await this.#agentRegistry.rebaseSessionFiles(oldArtifactsDir, newArtifactsDir);
 	}
 
