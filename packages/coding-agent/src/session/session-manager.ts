@@ -1567,6 +1567,8 @@ export class SessionManager {
 							if (!isEnoent(err)) throw err;
 						}
 						options?.rebaseLiveArtifactResources?.(oldArtifactsDir, newArtifactsDir);
+						this.#artifactManager?.rebaseDirectory(oldArtifactsDir, newArtifactsDir);
+						this.#adoptedArtifactManager?.rebaseDirectory(oldArtifactsDir, newArtifactsDir);
 						artifactWritersRebased = true;
 						if (artifactStat?.isDirectory()) {
 							// Keep the destination switch and directory rename in one
@@ -1581,6 +1583,8 @@ export class SessionManager {
 						try {
 							fs.renameSync(newArtifactsDir, oldArtifactsDir);
 							options?.rebaseLiveArtifactResources?.(newArtifactsDir, oldArtifactsDir);
+							this.#artifactManager?.rebaseDirectory(newArtifactsDir, oldArtifactsDir);
+							this.#adoptedArtifactManager?.rebaseDirectory(newArtifactsDir, oldArtifactsDir);
 							artifactWritersRebased = false;
 						} catch (rollbackErr) {
 							throw new Error(
@@ -1589,6 +1593,8 @@ export class SessionManager {
 						}
 					} else if (artifactWritersRebased) {
 						options?.rebaseLiveArtifactResources?.(newArtifactsDir, oldArtifactsDir);
+						this.#artifactManager?.rebaseDirectory(newArtifactsDir, oldArtifactsDir);
+						this.#adoptedArtifactManager?.rebaseDirectory(newArtifactsDir, oldArtifactsDir);
 						artifactWritersRebased = false;
 					}
 
@@ -1613,8 +1619,7 @@ export class SessionManager {
 
 				rebaseResourcePathMetadata(this.#entries, oldArtifactsDir, newArtifactsDir);
 				this.#sessionFile = newSessionFile;
-				this.#artifactManager = null;
-				this.#artifactManagerSessionFile = null;
+				if (this.#artifactManager) this.#artifactManagerSessionFile = newSessionFile;
 				// Path is repointed; hot-path appends may use `#sessionFile` again.
 				this.#sessionFileRelocating = null;
 			}

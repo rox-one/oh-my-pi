@@ -551,4 +551,30 @@ describe("SessionManager.moveTo", () => {
 		expect(fs.readFileSync(writerTarget, "utf8")).toBe("before move");
 		expect(fs.existsSync(oldArtifactsDir)).toBe(false);
 	});
+
+	it("rebinds an adopted artifact manager with its moved parent tree", async () => {
+		const parent = SessionManager.create(cwdA);
+		parent.appendMessage({ role: "user", content: "hello", timestamp: 1 });
+		parent.appendMessage(makeAssistantMessage());
+		await parent.flush();
+		const artifactManager = parent.getArtifactManager();
+		if (!artifactManager) throw new Error("Expected parent artifact manager");
+		const oldArtifactsDir = artifactManager.dir;
+
+		const child = SessionManager.create(cwdA);
+		child.adoptArtifactManager(artifactManager);
+
+		await parent.moveTo(cwdB);
+		const newArtifactsDir = parent.getArtifactsDir();
+		if (!newArtifactsDir) throw new Error("Expected moved artifact directory");
+		expect(child.getArtifactsDir()).toBe(newArtifactsDir);
+
+		const saved = await child.saveArtifact("after move", "bash");
+		if (!saved) throw new Error("Expected saved artifact");
+		expect(path.dirname(saved)).toBe(newArtifactsDir);
+		expect(fs.existsSync(oldArtifactsDir)).toBe(false);
+		expect(fs.readFileSync(saved, "utf8")).toBe("after move");
+		await child.close();
+		await parent.close();
+	});
 });
