@@ -2170,7 +2170,7 @@ function b() {
 			expect(getTextOutput(result)).toContain("Command exited with code 1");
 		});
 
-		it("should attach async bash jobs to their output artifact path", async () => {
+		it("should not link short async bash output before an artifact exists", async () => {
 			const artifactPath = path.join(testDir, "async-bash-output.log");
 			const asyncJobManager = new AsyncJobManager({
 				onJobComplete: async () => {},
@@ -2200,7 +2200,8 @@ function b() {
 			expect(job).toBeDefined();
 			await job?.promise;
 
-			expect(asyncJobManager.getJob(jobId)?.linkPath).toBe(artifactPath);
+			expect(asyncJobManager.getJob(jobId)?.linkPath).toBeUndefined();
+			expect(fs.existsSync(artifactPath)).toBe(false);
 			await asyncJobManager.dispose();
 		});
 

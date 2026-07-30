@@ -845,6 +845,7 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 						},
 						onMinimizedSave: originalText => saveBashOriginalArtifact(this.session, originalText),
 					});
+					if (!result.artifactId) setLinkPath(undefined);
 					const wallTimeMs = performance.now() - wallTimeStart;
 					const finalResult = await this.#buildCompletedResult(result, options.timeoutSec, {
 						requestedTimeoutSec: options.requestedTimeoutSec,
@@ -866,6 +867,8 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 					await reportProgress(finalText, { async: { state: "completed", jobId, type: "bash" } });
 					return finalText;
 				} catch (error) {
+					const linkPath = getLinkPath();
+					if (linkPath && !(await Bun.file(linkPath).exists())) setLinkPath(undefined);
 					const message = error instanceof Error ? error.message : String(error);
 					latestText = message;
 					completion.resolve({ kind: "failed", error });
