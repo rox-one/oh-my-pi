@@ -569,11 +569,15 @@ describe("SessionManager.moveTo", () => {
 		if (!newArtifactsDir) throw new Error("Expected moved artifact directory");
 		expect(child.getArtifactsDir()).toBe(newArtifactsDir);
 
-		const saved = await child.saveArtifact("after move", "bash");
-		if (!saved) throw new Error("Expected saved artifact");
-		expect(path.dirname(saved)).toBe(newArtifactsDir);
+		// `saveArtifact` yields the artifact id; resolve it through the shared
+		// manager to prove the write landed under the moved tree.
+		const savedId = await child.saveArtifact("after move", "bash");
+		if (!savedId) throw new Error("Expected saved artifact");
+		const savedPath = await artifactManager.getPath(savedId);
+		if (!savedPath) throw new Error("Expected saved artifact path");
+		expect(path.dirname(savedPath)).toBe(newArtifactsDir);
 		expect(fs.existsSync(oldArtifactsDir)).toBe(false);
-		expect(fs.readFileSync(saved, "utf8")).toBe("after move");
+		expect(fs.readFileSync(savedPath, "utf8")).toBe("after move");
 		await child.close();
 		await parent.close();
 	});
