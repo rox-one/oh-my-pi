@@ -11,7 +11,8 @@ import { EventLoopKeepalive, type ThinkingLevel } from "@oh-my-pi/pi-agent-core"
 import type { ImageContent, Model } from "@oh-my-pi/pi-ai";
 import {
 	$env,
-	directoryIsMissing,
+	APP_NAME,
+	directoryExists,
 	getLogPath,
 	getProjectDir,
 	isBunTestRuntime,
@@ -94,6 +95,13 @@ import {
 import type { AgentSession } from "./session/agent-session";
 import { describeAuthBrokerStartupError } from "./session/auth-broker-config";
 import type { AuthStorage } from "./session/auth-storage";
+import {
+	AUTO_RESTART_SESSION_FILE_ENV,
+	buildAutoRestartCommand,
+	defaultAutoRestartWatchPaths,
+	ExecutableUpdateMonitor,
+	prepareAutoRestartArgs,
+} from "./session/auto-restart";
 import { describePendingToolCalls } from "./session/exit-diagnostics";
 import {
 	createForeignSessionStore,
@@ -122,6 +130,10 @@ type RunRpcMode = (
 	eventBus?: EventBus,
 	input?: ReadableStream<Uint8Array>,
 ) => Promise<never>;
+
+interface InteractiveModeOutcome {
+	autoRestartSessionFile?: string;
+}
 
 export function writeStartupNotice(parsedArgs: Pick<Args, "mode">, text: string): void {
 	(parsedArgs.mode === "json" ? process.stderr : process.stdout).write(text);
@@ -506,26 +518,16 @@ async function runInteractiveMode(
 	initialMessage?: string,
 	initialImages?: ImageContent[],
 	joinLink?: string,
-	startBackgroundModelDiscovery?: () => Promise<void>,
-	startupLease?: ComposerLease,
-): Promise<void> {
-	let mode: InteractiveMode;
-	try {
-		mode = new InteractiveMode(
-			session,
-			version,
-			startupChangelog,
-			setExtensionUIContext,
-			lspServers,
-			mcpManager,
-			eventBus,
-			startupLease?.composer,
-		);
-		startupLease?.adopt();
-	} catch (error) {
-		startupLease?.dispose();
-		throw error;
-	}
+): Promise<InteractiveModeOutcome> {
+	const mode = new InteractiveMode(
+		session,
+		version,
+		startupChangelog,
+		setExtensionUIContext,
+		lspServers,
+		mcpManager,
+		eventBus,
+	);
 
 	let setupWizard: typeof SetupWizardModule | undefined;
 	let setupScenes: SetupScene[] = [];
@@ -562,6 +564,24 @@ async function runInteractiveMode(
 	} catch (error) {
 		mode.stop();
 		throw error;
+	}
+
+	let autoRestart: ExecutableUpdateMonitor | undefined;
+	if (session.sessionManager.getSessionFile()) {
+		autoRestart = new ExecutableUpdateMonitor({
+			paths: defaultAutoRestartWatchPaths({
+				argv: process.argv,
+				execPath: process.execPath,
+				env: process.env,
+			}),
+			isEnabled: () => session.settings.get("settings.autoRestartOnUpdate"),
+			onUpdate: () => {
+				mode.showStatus("OMP update detected. Restarting this session…");
+				mode.interruptIdleInputForAutoRestart();
+			},
+		});
+		await autoRestart.prime();
+		autoRestart.start();
 	}
 
 	if (setupWizard && playStartupSplash) {
@@ -634,9 +654,21 @@ async function runInteractiveMode(
 		}
 	}
 
-	while (true) {
-		const input = await mode.getUserInput();
-		await submitInteractiveInput(mode, session, input);
+	try {
+		while (true) {
+			if (autoRestart?.updatePending) {
+				const sessionFile = session.sessionManager.getSessionFile();
+				if (sessionFile) {
+					await mode.shutdownForAutoRestart();
+					return { autoRestartSessionFile: sessionFile };
+				}
+			}
+			const input = await mode.getUserInput();
+			if (autoRestart?.updatePending && input.cancelled) continue;
+			await submitInteractiveInput(mode, session, input);
+		}
+	} finally {
+		autoRestart?.stop();
 	}
 }
 
@@ -1396,7 +1428,27 @@ export async function runRootCommand(
 		// already initialized its cached theme synchronously for the first frame.
 		await logger.time("initTheme:initial", ensureTheme);
 
-		const parsedArgs = parsed;
+	// Initialize theme early with defaults (CLI commands need symbols)
+	// Will be re-initialized with user preferences later
+	await logger.time("initTheme:initial", initTheme);
+
+	const parsedArgs = parsed;
+	const autoRestartSessionFile = process.env[AUTO_RESTART_SESSION_FILE_ENV];
+	if (autoRestartSessionFile) {
+		delete process.env[AUTO_RESTART_SESSION_FILE_ENV];
+		prepareAutoRestartArgs(parsedArgs, autoRestartSessionFile);
+	}
+	await logger.time("applyStartupCwd", applyStartupCwd, parsedArgs);
+
+	const notifs: (InteractiveModeNotify | null)[] = [];
+
+	if (parsedArgs.version) {
+		writeStartupNotice(parsedArgs, `${VERSION}\n`);
+		process.exit(0);
+	}
+
+	if (parsedArgs.export) {
+		let result: string;
 		try {
 			await logger.time("applyStartupCwd", applyStartupCwd, parsedArgs);
 		} catch (error: unknown) {
@@ -1611,17 +1663,191 @@ export async function runRootCommand(
 				cwd,
 				parsedArgs.sessionDir,
 			);
-			let preloadedAllSessions: SessionInfo[] | undefined;
-			if (folderSessions.length === 0) {
-				// Probe globally so we can exit fast when the user has no sessions at
-				// all, but never auto-switch the picker into all-projects scope — that
-				// silently surfaced other projects' history when the cwd was empty
-				// (issue #3099). The preloaded list also makes the user's Tab switch
-				// instant on the way in.
-				preloadedAllSessions = await logger.time("SessionManager.listAll", SessionManager.listAll);
-				if (preloadedAllSessions.length === 0) {
-					writeStartupNotice(parsedArgs, `${chalk.dim("No sessions found")}\n`);
-					stopStartupWatchdog();
+			process.exit(1);
+		}
+		if (sessionOptions.model) {
+			authStorage.setRuntimeApiKey(sessionOptions.model.provider, parsedArgs.apiKey);
+		}
+	}
+
+	const createAgentSessionImpl = deps.createAgentSession ?? createAgentSession;
+	const createSession = async (options: CreateAgentSessionOptions): Promise<CreateAgentSessionResult> => {
+		const result = await logger.time("createAgentSession", createAgentSessionImpl, options);
+		// Kick off background model discovery only after createAgentSession finishes its parallel
+		// discovery arms; running these concurrently contends for the event loop and stretches
+		// every parallel arm by ~30ms.
+		modelRegistry.refreshInBackground();
+		return result;
+	};
+
+	if (mode === "acp") {
+		const createAcpSession = createAcpSessionFactory({
+			baseOptions: sessionOptions,
+			settings: settingsInstance,
+			sessionDir: parsedArgs.sessionDir,
+			authStorage,
+			modelRegistry,
+			parsedArgs,
+			rawArgs,
+			createSession,
+		});
+		// Branch-only protocol runner: keep ACP server code out of normal interactive startup.
+		const runAcpMode = deps.runAcpMode ?? (await import("./modes/acp/acp-mode")).runAcpMode;
+		stopStartupWatchdog();
+		await runAcpMode(createAcpSession);
+	} else {
+		// Resolve extension-registered CLI flags before creating the session so a
+		// bad `@file` fails fast WITHOUT leaving a junk session/breadcrumb
+		// (createAgentSession writes the terminal breadcrumb eagerly). Loading the
+		// extensions here also makes `@file` classification extension-aware — e.g. a
+		// string-flag value such as `--target @notes.md` is the flag's value, not a
+		// file — and the same result is handed to createAgentSession via
+		// `preloadedExtensions` so the discovery work is not repeated.
+		if (isInteractive) {
+			sessionOptions.extensions = [...(sessionOptions.extensions ?? []), createWarpEventBridgeExtension()];
+		}
+
+		const eventBus = new EventBus();
+		const extensionsResult = await loadSessionExtensions(sessionOptions, cwd, settingsInstance, eventBus);
+		const extensionFlagSink: ExtensionFlagSink = {
+			getFlags: () => ExtensionRunner.aggregateFlags(extensionsResult.extensions),
+			setFlagValue: (name, value) => {
+				extensionsResult.runtime.flagValues.set(name, value);
+			},
+		};
+		const initialArgs = applyExtensionFlags(extensionFlagSink, rawArgs) ?? parsedArgs;
+		normalizeContinueSessionArgs(initialArgs, rawArgs);
+		if (autoRestartSessionFile) {
+			prepareAutoRestartArgs(initialArgs, autoRestartSessionFile);
+		}
+		for (const message of formatExtensionLoadNotifications(extensionsResult.errors)) {
+			if (isInteractive) {
+				notifs.push({ kind: "warn", message });
+			} else {
+				process.stderr.write(`${chalk.yellow(`${message}\n`)}`);
+			}
+		}
+		// Fail fast on stale/typo flags (e.g. `omp --list-models`) now that we
+		// know the real extension flag set. Without this check the unrecognized
+		// token gets silently consumed and any following positional leaks as the
+		// initial prompt — kicking off a real LLM session, MCP connection, and
+		// tool calls (issue #2459). Exit code 2 matches the conventional
+		// "command line usage error" convention.
+		if (reportUnrecognizedFlags(initialArgs)) {
+			process.exit(2);
+		}
+		const processedFiles =
+			initialArgs.fileArgs.length > 0
+				? await logger.time("processFileArguments", () =>
+						processFileArguments(initialArgs.fileArgs, {
+							autoResizeImages: settingsInstance.get("images.autoResize"),
+						}),
+					)
+				: undefined;
+		const { initialMessage, initialImages } = buildInitialMessage({
+			parsed: initialArgs,
+			fileText: processedFiles?.text,
+			fileImages: processedFiles?.images,
+			stdinContent: pipedInput,
+		});
+
+		const showStartupSplash = shouldShowStartupSplash({
+			configured: settingsInstance.get("startup.showSplash"),
+			isInteractive,
+			resuming: Boolean(parsedArgs.continue || parsedArgs.resume || parsedArgs.fork || foreignSource),
+			quiet: settingsInstance.get("startup.quiet"),
+			timing: Boolean($env.PI_TIMING),
+			stdinIsTTY: process.stdin.isTTY,
+			stdoutIsTTY: process.stdout.isTTY,
+		});
+
+		// Startup changelog is only consumed by interactive mode below; kick the
+		// CHANGELOG.md parse off now so it overlaps session creation instead of
+		// serializing after it.
+		const startupChangelogPromise = isInteractive
+			? logger.time(
+					"main:getChangelogForDisplay",
+					getChangelogForDisplay,
+					parsedArgs,
+					settingsInstance.get("startup.changelogMode"),
+				)
+			: undefined;
+
+		const { session, setToolUIContext, modelFallbackMessage, lspServers, mcpManager } = await createSession({
+			...sessionOptions,
+			eventBus,
+			preloadedExtensions: extensionsResult,
+		});
+
+		// Cold-revive support: a `parked` subagent ref restored from disk (Agent Hub
+		// scan, collab mirror, resumed process) has a sessionFile but no in-memory
+		// reviver, so `ensureLive` (IRC sends, hub focus) would refuse it. Install a
+		// factory — bound to THIS top-level session — that rebuilds the subagent from
+		// its persisted JSONL (see persisted-revive.ts). Scoped to the non-ACP
+		// bootstrap: ACP keeps several concurrent top-level sessions and a single
+		// process-global factory must not be clobbered by the most recent one.
+		AgentLifecycleManager.global().setPersistedSubagentReviverFactory(
+			createPersistedSubagentReviverFactory({
+				session,
+				authStorage,
+				modelRegistry,
+				settings: settingsInstance,
+				enableLsp: sessionOptions.enableLsp ?? true,
+				eventBus,
+			}),
+			Math.trunc(Number(settingsInstance.get("task.agentIdleTtlMs") ?? 420_000) || 0),
+		);
+		if (parsedArgs.apiKey && !sessionOptions.model && session.model) {
+			authStorage.setRuntimeApiKey(session.model.provider, parsedArgs.apiKey);
+		}
+
+		if (modelFallbackMessage) {
+			notifs.push({ kind: "warn", message: modelFallbackMessage });
+		}
+
+		const modelRegistryError = modelRegistry.getError();
+		if (modelRegistryError) {
+			notifs.push({ kind: "error", message: modelRegistryError.message });
+		}
+
+		if (!isInteractive && !session.model) {
+			if (modelRegistryError) {
+				process.stderr.write(`${chalk.red(modelRegistryError.message)}\n\n`);
+			}
+			if (modelFallbackMessage) {
+				process.stderr.write(`${chalk.red(modelFallbackMessage)}\n`);
+			} else {
+				process.stderr.write(`${chalk.red("No models available.")}\n`);
+			}
+			process.stderr.write(`${chalk.yellow("\nSet an API key environment variable:")}\n`);
+			process.stderr.write("  ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY, etc.\n");
+			process.stderr.write(`${chalk.yellow(`\nOr create ${ModelsConfigFile.path()}`)}\n`);
+			process.exit(1);
+		}
+
+		if (mode === "rpc" || mode === "rpc-ui") {
+			// Branch-only protocol runner: keep RPC host code out of normal interactive startup.
+			const runRpcMode: RunRpcMode = (await import("./modes/rpc/rpc-mode")).runRpcMode;
+			stopStartupWatchdog();
+			await runRpcMode(session, mode === "rpc-ui" ? setToolUIContext : undefined, eventBus, rpcInput);
+		} else if (isInteractive) {
+			const versionCheckPromise = checkForNewVersion(VERSION).catch(() => undefined);
+			const startupChangelog = await startupChangelogPromise;
+
+			const modelScopeNotification = buildModelScopeNotification(
+				scopedModels,
+				settingsInstance.get("startup.quiet"),
+			);
+			if (modelScopeNotification) {
+				// Routed through the TUI (not stdout): the startup capture owns the
+				// terminal in raw mode here, and the TUI's first clearScrollback paint
+				// would wipe a pre-TUI line anyway.
+				notifs.push(modelScopeNotification);
+			}
+
+			if ($env.PI_TIMING) {
+				logger.printTimings();
+				if (logger.shouldExitAfterTimings()) {
 					process.exit(0);
 				}
 			}
@@ -1749,90 +1975,8 @@ export async function runRootCommand(
 			// Branch-only protocol runner: keep ACP server code out of normal interactive startup.
 			const runAcpMode = deps.runAcpMode ?? (await import("./modes/acp/acp-mode")).runAcpMode;
 			stopStartupWatchdog();
-			await runAcpMode(createAcpSession);
-		} else {
-			// Resolve extension-registered CLI flags before creating the session so a
-			// bad `@file` fails fast WITHOUT leaving a junk session/breadcrumb
-			// (createAgentSession writes the terminal breadcrumb eagerly). Loading the
-			// extensions here also makes `@file` classification extension-aware — e.g. a
-			// string-flag value such as `--target @notes.md` is the flag's value, not a
-			// file — and the same result is handed to createAgentSession via
-			// `preloadedExtensions` so the discovery work is not repeated.
-			if (isInteractive && !parsedArgs.trustedExtensions?.length) {
-				sessionOptions.extensions = [...(sessionOptions.extensions ?? []), createWarpEventBridgeExtension()];
-			}
-
-			const eventBus = new EventBus();
-			const extensionsResult = parsedArgs.trustedExtensions?.length
-				? await loadTrustedSessionExtensions(sessionOptions, cwd, eventBus)
-				: await loadSessionExtensions(sessionOptions, cwd, settingsInstance, eventBus);
-			const extensionFlagSink: ExtensionFlagSink = {
-				getFlags: () => ExtensionRunner.aggregateFlags(extensionsResult.extensions),
-				setFlagValue: (name, value) => {
-					extensionsResult.runtime.flagValues.set(name, value);
-				},
-			};
-			const initialArgs = applyExtensionFlags(extensionFlagSink, rawArgs) ?? parsedArgs;
-			normalizeContinueSessionArgs(initialArgs, rawArgs);
-			if ((parsedArgs.trustedExtensions?.length ?? 0) > 0 && extensionsResult.errors.length > 0) {
-				throw new Error(
-					`Trusted extension failed to load: ${extensionsResult.errors.map(item => item.error).join("; ")}`,
-				);
-			}
-			for (const message of formatExtensionLoadNotifications(extensionsResult.errors)) {
-				if (isInteractive) {
-					notifs.push({ kind: "warn", message });
-				} else {
-					process.stderr.write(`${chalk.yellow(`${message}\n`)}`);
-				}
-			}
-			// Fail fast on stale/typo flags (e.g. `omp --list-models`) now that we
-			// know the real extension flag set. Without this check the unrecognized
-			// token gets silently consumed and any following positional leaks as the
-			// initial prompt — kicking off a real LLM session, MCP connection, and
-			// tool calls (issue #2459). Exit code 2 matches the conventional
-			// "command line usage error" convention.
-			if (reportUnrecognizedFlags(initialArgs)) {
-				process.exit(2);
-			}
-			const processedFiles =
-				initialArgs.fileArgs.length > 0
-					? await logger.time("processFileArguments", () =>
-							processFileArguments(initialArgs.fileArgs, {
-								autoResizeImages: settingsInstance.get("images.autoResize"),
-							}),
-						)
-					: undefined;
-			const { initialMessage, initialImages } = buildInitialMessage({
-				parsed: initialArgs,
-				fileText: processedFiles?.text,
-				fileImages: processedFiles?.images,
-				stdinContent: pipedInput,
-			});
-
-			const showStartupSplash = shouldShowStartupSplash({
-				configured: settingsInstance.get("startup.showSplash"),
-				isInteractive,
-				resuming: Boolean(parsedArgs.continue || parsedArgs.resume || parsedArgs.fork || foreignSource),
-				quiet: settingsInstance.get("startup.quiet"),
-				timing: Boolean($env.PI_TIMING),
-				stdinIsTTY: process.stdin.isTTY,
-				stdoutIsTTY: process.stdout.isTTY,
-			});
-
-			// Startup changelog is only consumed by interactive mode below; kick the
-			// CHANGELOG.md parse off now so it overlaps session creation instead of
-			// serializing after it.
-			const startupChangelogPromise = isInteractive
-				? logger.time(
-						"main:getChangelogForDisplay",
-						getChangelogForDisplay,
-						parsedArgs,
-						settingsInstance.get("startup.changelogMode"),
-					)
-				: undefined;
-
-			const {
+			logger.endTiming();
+			const autoRestartOutcome = await runInteractiveMode(
 				session,
 				setToolUIContext,
 				modelFallbackMessage,
@@ -1842,7 +1986,48 @@ export async function runRootCommand(
 			} = await createSession({
 				...sessionOptions,
 				eventBus,
-				preloadedExtensions: extensionsResult,
+				initialMessage,
+				initialImages,
+				parsedArgs.join,
+			);
+			if (autoRestartOutcome.autoRestartSessionFile) {
+				try {
+					const cmd = buildAutoRestartCommand({
+						argv: process.argv,
+						execPath: process.execPath,
+						execArgv: process.execArgv,
+						env: process.env,
+					});
+					Bun.spawn({
+						cmd,
+						cwd: process.cwd(),
+						env: {
+							...process.env,
+							[AUTO_RESTART_SESSION_FILE_ENV]: autoRestartOutcome.autoRestartSessionFile,
+						},
+						stdin: "inherit",
+						stdout: "inherit",
+						stderr: "inherit",
+					});
+				} catch (error) {
+					process.stderr.write(
+						`\nAuto-restart failed: ${error instanceof Error ? error.message : String(error)}\n` +
+							`Resume this session with ${APP_NAME} --resume ${autoRestartOutcome.autoRestartSessionFile}\n`,
+					);
+					await postmortem.quit(1);
+				}
+				await postmortem.quit(0);
+			}
+		} else {
+			// Branch-only single-shot runner: keep print-mode code out of normal interactive startup.
+			stopStartupWatchdog();
+			const runPrintMode: RunPrintMode = (await import("./modes/print-mode")).runPrintMode;
+			await runPrintMode(session, {
+				mode,
+				messages: initialArgs.messages,
+				initialMessage,
+				initialImages,
+				printThoughts: initialArgs.printThoughts,
 			});
 
 			try {
