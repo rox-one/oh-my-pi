@@ -348,6 +348,9 @@
 - Fixed an issue where Codex Responses dropped native image-generation results from assistant content and replays due to stale `generating` statuses.
 - Fixed Anthropic stream truncation handling where unexpected connection closures were incorrectly treated as clean stops, causing the agent loop to halt silently mid-sentence.
 - Optimized Anthropic prompt caching to prevent unnecessary cache invalidation of the entire system prefix when volatile project footer details (such as current working directory, date, or workspace tree) change.
+### Added
+
+- Added a reusable configured authorization-code OAuth provider with PKCE, localhost callbacks, token refresh, and configurable token response fields.
 
 ## [17.2.4] - 2026-08-01
 

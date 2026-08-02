@@ -332,6 +332,15 @@ export const getModelsConfigSchemaBundle = once(() => {
 			}
 			if (value.callbackPort !== undefined) return ctx.mustBe("redirectUri or callbackPort, not both");
 		}
+		if (value.callbackPath !== undefined) {
+			if (
+				!value.callbackPath.startsWith("/") ||
+				value.callbackPath.includes("?") ||
+				value.callbackPath.includes("#")
+			) {
+				return ctx.mustBe("callbackPath an absolute pathname without a query or fragment");
+			}
+		}
 		return true;
 	});
 

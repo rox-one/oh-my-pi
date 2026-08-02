@@ -50,7 +50,7 @@ function optionalTokenField(payload: TokenPayload, field: string): string | unde
 	return typeof value === "string" && value.length > 0 ? value : undefined;
 }
 
-function expiresAt(payload: TokenPayload, field: string, providerId: string, accessToken: string): number {
+function expiresAt(payload: TokenPayload, field: string, accessToken: string): number {
 	const value = payload[field];
 	const seconds = typeof value === "number" ? value : typeof value === "string" ? Number(value) : Number.NaN;
 	if (Number.isFinite(seconds) && seconds > 0) return Date.now() + seconds * 1000;
@@ -213,7 +213,7 @@ function credentialsFromPayload(
 	return {
 		access,
 		refresh: optionalTokenField(payload, refreshField) ?? previousRefresh ?? "",
-		expires: expiresAt(payload, expiresField, providerId, access),
+		expires: expiresAt(payload, expiresField, access),
 	};
 }
 
