@@ -13,6 +13,7 @@ import type {
 } from "./types";
 
 export * from "./anthropic";
+export * from "./configured";
 export * from "./device-code";
 export type * from "./types";
 
@@ -46,6 +47,13 @@ export function unregisterOAuthProvider(id: string): void {
  */
 export function getOAuthProvider(id: OAuthProviderId): OAuthProviderInterface | undefined {
 	return customOAuthProviders.get(id);
+}
+
+/**
+ * Remove one custom OAuth provider by ID.
+ */
+export function unregisterOAuthProvider(id: OAuthProviderId): void {
+	customOAuthProviders.delete(id);
 }
 
 /**

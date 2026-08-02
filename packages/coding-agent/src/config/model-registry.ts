@@ -32,10 +32,58 @@ import {
 	resolveModelCacheProviderId,
 	resolveOllamaModelCacheProviderId,
 } from "@oh-my-pi/pi-catalog/provider-models";
-import { toModelSpec } from "@oh-my-pi/pi-catalog/provider-models/bundled-references";
-import { collapseBuiltModelVariants } from "@oh-my-pi/pi-catalog/variant-collapse";
-import { getAgentDir, isBunTestRuntime, logger, wrapFetchForExtraCa } from "@oh-my-pi/pi-utils";
-import { resolveProviderModelReference } from "../config/model-resolver";
+import {
+	collapseBuiltModelVariants,
+	getVariantAliasSources,
+	resolveVariantAlias,
+} from "@oh-my-pi/pi-catalog/variant-collapse";
+
+const SPECIAL_MODEL_MANAGER_PROVIDER_IDS: readonly string[] = [
+	"google-antigravity",
+	"google-gemini-cli",
+	"openai-codex",
+];
+
+const STARTUP_MODEL_CACHE_PROVIDER_IDS: readonly string[] = [
+	...PROVIDER_DESCRIPTORS.map(descriptor => descriptor.providerId),
+	...SPECIAL_MODEL_MANAGER_PROVIDER_IDS,
+];
+
+// Sentinels for local-only OAuth tokens — declared inline to avoid loading
+// provider modules at startup. Must match packages/ai/src/registry/llama-cpp.ts,
+// packages/ai/src/registry/lm-studio.ts, and packages/ai/src/registry/vllm.ts.
+const LOCAL_PROVIDER_PLACEHOLDERS = new Set<string>(["llama-cpp-local", "lm-studio-local", "vllm-local"]);
+
+/**
+ * Hard bound for extension-provided fetchDynamicModels to prevent indefinite hangs
+ * during runtime provider discovery. Uses a cancellable manual timer (not AbortSignal.timeout)
+ * so a successful fast path does not leave an armed timeout signal for concurrent GC.
+ */
+const RUNTIME_DYNAMIC_MODEL_FETCH_TIMEOUT_MS = 15_000;
+// Built-in discovery preflight mirror of the catalog model-manager's private
+// cache timings (model-manager.ts: DEFAULT_CACHE_TTL_MS / NON_AUTHORITATIVE_RETRY_MS).
+// Built-in descriptors never override cacheTtlMs, so agreeing with these values
+// makes the OAuth-refresh preflight fire exactly when the manager will fetch.
+const BUILT_IN_DISCOVERY_CACHE_TTL_MS = 2 * 60 * 60 * 1000;
+const BUILT_IN_DISCOVERY_NON_AUTHORITATIVE_RETRY_MS = 5 * 60 * 1000;
+
+import type { ApiKeyResolver, FetchImpl } from "@oh-my-pi/pi-ai";
+import {
+	createConfiguredOAuthProvider,
+	registerOAuthProvider,
+	unregisterOAuthProvider,
+	unregisterOAuthProviders,
+} from "@oh-my-pi/pi-ai/oauth";
+import type { OAuthCredentials, OAuthLoginCallbacks } from "@oh-my-pi/pi-ai/oauth/types";
+import { setCodexAttestationProvider } from "@oh-my-pi/pi-ai/providers/openai-codex-responses";
+import { getProviderDefinition } from "@oh-my-pi/pi-ai/registry";
+import {
+	getBundledModelReferenceIndex,
+	inheritReferenceThinking,
+	resolveModelReference,
+} from "@oh-my-pi/pi-catalog/identity";
+import { $envExact, isBunTestRuntime, isRecord, logger, wrapFetchForExtraCa } from "@oh-my-pi/pi-utils";
+import { parseModelString, resolveProviderModelReference } from "../config/model-resolver";
 import { generateCodexAttestation } from "../live/attestation";
 import type { AuthStorage } from "../session/auth-storage";
 import { type ApiKeyResolverModel, type ApiKeyResolverOptions, createApiKeyResolver } from "./api-key-resolver";
@@ -142,6 +190,286 @@ interface CustomModelsResult {
 	found: boolean;
 }
 
+const commandValueCache = new Map<string, string>();
+// Failed `!command` resolutions (non-zero exit, empty stdout) are negative-cached
+// with a TTL instead of forever: a transient failure (locked password manager,
+// network hiccup) must not disable the key until process restart, but re-running
+// the command on every resolution would restore the execSync storm this cache
+// exists to prevent. One probe per TTL window bounds both.
+const COMMAND_FAILURE_RETRY_MS = 30_000;
+const commandFailureRetryAt = new Map<string, number>();
+
+function isCommandConfigValue(valueConfig: string | undefined): valueConfig is string {
+	return valueConfig?.startsWith("!") === true;
+}
+
+function resolveCommandConfig(command: string): string | undefined {
+	const cached = commandValueCache.get(command);
+	if (cached !== undefined) return cached;
+	const retryAt = commandFailureRetryAt.get(command);
+	if (retryAt !== undefined && Date.now() < retryAt) return undefined;
+	try {
+		const stdout = execSync(command, { encoding: "utf8", timeout: 10_000, windowsHide: true });
+		const trimmed = stdout.trim();
+		if (trimmed.length === 0) {
+			commandFailureRetryAt.set(command, Date.now() + COMMAND_FAILURE_RETRY_MS);
+			return undefined;
+		}
+		commandFailureRetryAt.delete(command);
+		commandValueCache.set(command, trimmed);
+		return trimmed;
+	} catch {
+		commandFailureRetryAt.set(command, Date.now() + COMMAND_FAILURE_RETRY_MS);
+		return undefined;
+	}
+}
+
+interface CommandApiKeyResolution {
+	configured: boolean;
+	value?: string;
+}
+/**
+ * Resolve a models.yml/models.yaml secret/config value to an actual value.
+ * `!cmd` runs a shell command and returns trimmed stdout, otherwise env vars are
+ * checked first and the input falls back to a literal value.
+ */
+function resolveConfigValue(valueConfig: string): string | undefined {
+	if (valueConfig.startsWith("!")) return resolveCommandConfig(valueConfig.slice(1).trim());
+	const envValue = $envExact(valueConfig);
+	if (envValue) return envValue;
+	return valueConfig;
+}
+
+type HeaderSource = Record<string, string> | undefined;
+
+interface HeaderResolutionOptions {
+	authHeader?: boolean;
+	apiKeyConfig?: string;
+}
+
+function materializeConfigHeaderSources(
+	sources: readonly HeaderSource[],
+	options?: HeaderResolutionOptions,
+): Record<string, string> | undefined {
+	const resolved: Record<string, string> = {};
+	for (const source of sources) {
+		if (!source) continue;
+		for (const [key, value] of Object.entries(source)) {
+			const next = resolveConfigValue(value);
+			if (next) resolved[key] = next;
+		}
+	}
+	if (options?.authHeader && options.apiKeyConfig) {
+		const resolvedKey = resolveConfigValue(options.apiKeyConfig);
+		if (resolvedKey) resolved.Authorization = `Bearer ${resolvedKey}`;
+	}
+	return Object.keys(resolved).length > 0 ? resolved : undefined;
+}
+
+function createLiveConfigHeaders(
+	sources: readonly HeaderSource[],
+	options?: HeaderResolutionOptions,
+): Record<string, string> | undefined {
+	const liveSources = sources.filter((source): source is Record<string, string> => source !== undefined);
+	if (liveSources.length === 0 && (!options?.authHeader || !options.apiKeyConfig)) return undefined;
+
+	const localHeaders: Record<string, string> = {};
+	const allSources = [...liveSources, localHeaders];
+	const current = () => materializeConfigHeaderSources(allSources, options) ?? {};
+	return new Proxy(localHeaders, {
+		get(target, property, receiver) {
+			if (typeof property !== "string") return Reflect.get(target, property, receiver);
+			return current()[property];
+		},
+		set(target, property, value) {
+			if (typeof property !== "string" || typeof value !== "string") return false;
+			target[property] = value;
+			return true;
+		},
+		deleteProperty(target, property) {
+			if (typeof property !== "string") return false;
+			delete target[property];
+			return true;
+		},
+		has(_target, property) {
+			if (typeof property !== "string") return false;
+			return Object.hasOwn(current(), property);
+		},
+		ownKeys() {
+			return Reflect.ownKeys(current());
+		},
+		getOwnPropertyDescriptor(_target, property) {
+			if (typeof property !== "string") return undefined;
+			const headers = current();
+			if (!Object.hasOwn(headers, property)) return undefined;
+			return {
+				configurable: true,
+				enumerable: true,
+				value: headers[property],
+				writable: true,
+			};
+		},
+	});
+}
+
+function resolveConfigHeaders(headers: Record<string, string> | undefined): Record<string, string> | undefined {
+	return materializeConfigHeaderSources([headers]);
+}
+
+function resolveConfigRecord(values: Record<string, string> | undefined): Record<string, string> | undefined {
+	if (!values) return undefined;
+	const resolved: Record<string, string> = {};
+	for (const [key, value] of Object.entries(values)) {
+		const next = resolveConfigValue(value);
+		if (next) resolved[key] = next;
+	}
+	return Object.keys(resolved).length > 0 ? resolved : undefined;
+}
+
+function resolveConfiguredOAuth(config: NonNullable<ModelsConfig["providers"]>[string]["oauth"]) {
+	if (!config) return undefined;
+	const clientId = resolveConfigValue(config.clientId);
+	const clientSecret = config.clientSecret ? resolveConfigValue(config.clientSecret) : undefined;
+	if (!clientId) return undefined;
+	return {
+		...config,
+		clientId,
+		clientSecret,
+		authorizationParams: resolveConfigRecord(config.authorizationParams),
+		tokenParams: resolveConfigRecord(config.tokenParams),
+	};
+}
+
+function extractGoogleOAuthToken(value: string | undefined): string | undefined {
+	if (!isAuthenticated(value)) return undefined;
+	try {
+		const parsed = JSON.parse(value) as { token?: unknown };
+		if (Object.hasOwn(parsed, "token")) {
+			if (typeof parsed.token !== "string") {
+				return undefined;
+			}
+			const token = parsed.token.trim();
+			return token.length > 0 ? token : undefined;
+		}
+	} catch {
+		// OAuth values for Google providers are expected to be JSON, but custom setups may already provide raw token.
+	}
+	return value;
+}
+
+function getOAuthCredentialsForProvider(authStorage: AuthStorage, provider: string): OAuthCredential[] {
+	const providerEntry = authStorage.getAll()[provider];
+	if (!providerEntry) {
+		return [];
+	}
+	const entries = Array.isArray(providerEntry) ? providerEntry : [providerEntry];
+	return entries.filter((entry): entry is OAuthCredential => entry.type === "oauth");
+}
+
+/**
+ * Resolve every configured Codex OAuth account for catalog discovery, refreshing
+ * each credential exactly once. Codex `/models` is account-scoped, so discovery
+ * must fetch per account and union the results; resolving a single access token
+ * (as before) hid models available only through a sibling account (#6265).
+ *
+ * Returns `null` when any stored account fails to resolve (e.g. a transient
+ * refresh failure): the Codex manager is authoritative, so unioning only the
+ * accounts that resolved would cache a partial catalog and hide the failed
+ * account's models for the cache TTL. Aborting keeps the previous/bundled
+ * catalog instead.
+ */
+async function resolveCodexDiscoveryAccounts(
+	authStorage: AuthStorage,
+	resolvedAccessToken: string,
+): Promise<OpenAICodexAccount[] | null> {
+	const accesses = await authStorage.getOAuthAccesses("openai-codex");
+	const accounts: OpenAICodexAccount[] = [];
+	for (const access of accesses) {
+		if (!access.ok) return null;
+		accounts.push({ accessToken: access.accessToken, accountId: access.accountId });
+	}
+	if (!accounts.some(account => account.accessToken === resolvedAccessToken)) {
+		const matchingCredential = getOAuthCredentialsForProvider(authStorage, "openai-codex").find(
+			credential => credential.access === resolvedAccessToken,
+		);
+		accounts.push({ accessToken: resolvedAccessToken, accountId: matchingCredential?.accountId });
+	}
+	return accounts;
+}
+
+function mergeCompat<TBase extends object, TOverride extends object>(
+	baseCompat: TBase | null | undefined,
+	overrideCompat: TOverride | null | undefined,
+): (TBase & TOverride) | TBase | TOverride | undefined {
+	if (!baseCompat) return overrideCompat ?? undefined;
+	if (!overrideCompat) return baseCompat;
+
+	const merged: Record<string, unknown> = { ...(baseCompat as Record<string, unknown>) };
+	for (const [key, overrideValue] of Object.entries(overrideCompat)) {
+		const baseValue = (baseCompat as Record<string, unknown>)[key];
+		merged[key] =
+			isRecord(baseValue) && isRecord(overrideValue) ? mergeCompat(baseValue, overrideValue) : overrideValue;
+	}
+	return merged as TBase & TOverride;
+}
+
+function mergeRemoteCompactionConfig(
+	baseConfig: RemoteCompactionConfig<Api> | undefined,
+	overrideConfig: RemoteCompactionConfig<Api> | undefined,
+): RemoteCompactionConfig<Api> | undefined {
+	if (!baseConfig) return overrideConfig;
+	if (!overrideConfig) return baseConfig;
+	return { ...baseConfig, ...overrideConfig };
+}
+
+function mergeProviderRemoteCompactionConfig(
+	modelConfig: RemoteCompactionConfig<Api> | undefined,
+	providerConfig: RemoteCompactionConfig<Api> | undefined,
+): RemoteCompactionConfig<Api> | undefined {
+	return mergeRemoteCompactionConfig(providerConfig, modelConfig);
+}
+
+/**
+ * Project a built model back to spec shape for the model-manager/cache
+ * boundary: sparse compat comes from `compatConfig`, never from the resolved
+ * record.
+ */
+function toModelSpec<TApi extends Api>(model: Model<TApi>): ModelSpec<TApi> {
+	return { ...model, compat: model.compatConfig } as ModelSpec<TApi>;
+}
+
+/**
+ * The patchable subset of `Model` fields shared by `modelOverrides` entries,
+ * custom model definitions, and parsed custom-model overlays. `undefined`
+ * always means "leave the base value alone".
+ */
+interface ModelPatch {
+	name?: string;
+	reasoning?: boolean;
+	thinking?: ThinkingConfig;
+	input?: ("text" | "image")[];
+	supportsTools?: boolean;
+	cost?: Partial<Model<Api>["cost"]>;
+	contextWindow?: number;
+	maxTokens?: number;
+	omitMaxOutputTokens?: boolean;
+	headers?: Record<string, string>;
+	compat?: ModelSpec<Api>["compat"];
+	contextPromotionTarget?: string;
+	compactionModel?: string;
+	remoteCompaction?: RemoteCompactionConfig<Api>;
+	premiumMultiplier?: number;
+}
+
+/**
+ * How a patch treats the base model's transport metadata (headers/compat):
+ * - `merge`: fold the patch into the base's (modelOverrides semantics).
+ * - `replace`: the patch owns transport wholesale — same-id custom definitions
+ *   already folded provider-level headers/compat in during parsing, so bundled
+ *   transport metadata must not be re-merged (see `#mergeCustomModels`).
+ */
+type ModelTransportPolicy = "merge" | "replace";
+
 /**
  * Credential-aware model projection supplied by an extension provider. Receives
  * the fully composed catalog and returns the list the host should serve.
@@ -156,17 +484,7 @@ function getDisabledProviderIdsFromSettings(settingsInstance?: Settings): Set<st
 	}
 }
 
-/**
- * Whether premium long-context windows are enabled. Defaults to true when no
- * settings source is available (SDK embedding, early boot).
- */
-function isExtendedContextEnabledFromSettings(settingsInstance?: Settings): boolean {
-	try {
-		return (settingsInstance ?? settings).get("extendedContext");
-	} catch {
-		return true;
-	}
-}
+const configOAuthSourceOwners = new Map<string, string>();
 
 /** Authentication material returned to legacy extensions for one model request. */
 export type ResolvedRequestAuth =
@@ -231,7 +549,7 @@ export class ModelRegistry {
 	#runtimeModelManagers: Map<string, { options: ModelManagerOptions<Api>; sourceId: string }> = new Map();
 	#ignoreLocalModelConfig: boolean;
 	#fetch: FetchImpl;
-	#settings: Settings | undefined;
+	readonly #configOAuthSourceId: string;
 
 	#resolveCommandBackedApiKey(provider: string, options?: { forceCommandRefresh?: boolean }): CommandApiKeyResolution {
 		const keyConfig = this.#customProviderApiKeys.get(provider);
@@ -289,9 +607,9 @@ export class ModelRegistry {
 			(isBunTestRuntime()
 				? () => Promise.reject(new Error("network disabled in model-registry runtime test"))
 				: wrapFetchForExtraCa(fetch));
-		this.#modelsConfigFile = ModelsConfigFile.relocate(modelsPath ?? path.join(getAgentDir(), "models.yml"));
-		this.#cacheDbPath =
-			options?.cacheDbPath ?? (modelsPath ? path.join(path.dirname(modelsPath), "models.db") : undefined);
+		this.#modelsConfigFile = ModelsConfigFile.relocate(modelsPath);
+		this.#configOAuthSourceId = `models-config:${this.#modelsConfigFile.path()}`;
+		this.#cacheDbPath = modelsPath ? path.join(path.dirname(modelsPath), "models.db") : undefined;
 		// Set up fallback resolver for custom provider API keys
 		this.authStorage.setFallbackResolver(provider => {
 			const keyConfig = this.#customProviderApiKeys.get(provider);
@@ -572,6 +890,10 @@ export class ModelRegistry {
 		this.#customProviderApiKeys.clear();
 		this.#keylessProviders.clear();
 		this.#discoverableProviders = [];
+		unregisterOAuthProviders(this.#configOAuthSourceId);
+		for (const [provider, sourceId] of configOAuthSourceOwners) {
+			if (sourceId === this.#configOAuthSourceId) configOAuthSourceOwners.delete(provider);
+		}
 		// Drop config-sourced apiKeys from AuthStorage before reload; entries
 		// removed from models.yml must actually disappear from the resolver, not
 		// linger from the previous parse. The post-load setters below repopulate.
@@ -1191,6 +1513,18 @@ export class ModelRegistry {
 			const authMode = (providerConfig.auth ?? "apiKey") as ProviderAuthMode;
 			if (authMode === "none") {
 				keylessProviders.add(providerName);
+			}
+			const oauth = resolveConfiguredOAuth(providerConfig.oauth);
+			if (oauth) {
+				const previousSourceId = configOAuthSourceOwners.get(providerName);
+				if (previousSourceId && previousSourceId !== this.#configOAuthSourceId)
+					unregisterOAuthProvider(providerName);
+				registerOAuthProvider({
+					...createConfiguredOAuthProvider(providerName, { ...oauth, fetch: this.#fetch }),
+					id: providerName,
+					sourceId: this.#configOAuthSourceId,
+				});
+				configOAuthSourceOwners.set(providerName, this.#configOAuthSourceId);
 			}
 
 			if (providerConfig.discovery && (providerConfig.api || providerConfig.discovery.type === "proxy")) {
