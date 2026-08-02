@@ -103,7 +103,12 @@ describe("models.yml provider OAuth", () => {
 				onPrompt: async () => "",
 				fetch: async (_input, init) => {
 					requestBody = String(init?.body);
-					return Response.json({ access_token: "access", refresh_token: "refresh", expires_in: 3600 });
+					return Response.json({
+						access_token: "access",
+						refresh_token: "refresh",
+						expires_in: 3600,
+						token_type: "Bearer",
+					});
 				},
 			});
 			expect(new URLSearchParams(requestBody).get("client_secret")).toBe("resolved-secret");

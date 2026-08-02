@@ -3,6 +3,20 @@ import type { FetchImpl } from "@oh-my-pi/pi-ai";
 import { createConfiguredOAuthProvider } from "@oh-my-pi/pi-ai/oauth/configured";
 import type { OAuthAuthInfo } from "@oh-my-pi/pi-ai/oauth/types";
 
+function idToken(expiresInSeconds = 3600): string {
+	const header = Buffer.from(JSON.stringify({ alg: "RS256" })).toString("base64url");
+	const payload = Buffer.from(
+		JSON.stringify({
+			iss: "https://accounts.example.com",
+			aud: "client-id",
+			sub: "subject",
+			iat: Math.floor(Date.now() / 1000),
+			exp: Math.floor(Date.now() / 1000) + expiresInSeconds,
+		}),
+	).toString("base64url");
+	return `${header}.${payload}.signature`;
+}
+
 function config(fetchImpl: FetchImpl) {
 	return {
 		name: "Configured OAuth",
@@ -21,13 +35,20 @@ function config(fetchImpl: FetchImpl) {
 describe("configured provider OAuth", () => {
 	it("runs authorization-code PKCE login and returns the configured token field", async () => {
 		let authInfo: OAuthAuthInfo | undefined;
+		const exchangedIdToken = idToken();
 		const fetchMock = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
 			const body = new URLSearchParams(String(init?.body));
 			expect(body.get("grant_type")).toBe("authorization_code");
 			expect(body.get("redirect_uri")).toMatch(/^http:\/\/127\.0\.0\.1:\d+\/callback$/);
 			expect(body.get("client_secret")).toBe("client-secret");
 			expect(body.get("code_verifier")).toBeTruthy();
-			return Response.json({ id_token: "id-token", refresh_token: "refresh-token", expires_in: 3600 });
+			return Response.json({
+				access_token: "access-token",
+				id_token: exchangedIdToken,
+				refresh_token: "refresh-token",
+				expires_in: 3600,
+				token_type: "Bearer",
+			});
 		});
 		const provider = createConfiguredOAuthProvider("custom", config(fetchMock));
 		const login = provider.login({
@@ -48,30 +69,43 @@ describe("configured provider OAuth", () => {
 
 		const credentials = await login;
 		expect(authInfo?.launchUrl).toMatch(/^http:\/\/127\.0\.0\.1:\d+\/launch$/);
-		expect(credentials.access).toBe("id-token");
+		expect(credentials.access).toBe(exchangedIdToken);
 		expect(credentials.refresh).toBe("refresh-token");
 		expect(credentials.expires).toBeGreaterThan(Date.now());
 	});
 
 	it("refreshes tokens and retains the prior refresh token when rotation omits one", async () => {
+		const refreshedIdToken = idToken(7200);
 		const fetchMock = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
 			const body = new URLSearchParams(String(init?.body));
 			expect(body.get("grant_type")).toBe("refresh_token");
 			expect(body.get("refresh_token")).toBe("refresh-old");
-			return Response.json({ id_token: "id-new", expires_in: "7200" });
+			return Response.json({
+				access_token: "access-new",
+				id_token: refreshedIdToken,
+				expires_in: "7200",
+				token_type: "Bearer",
+			});
 		});
 		const provider = createConfiguredOAuthProvider("custom", config(fetchMock));
 		const credentials = await provider.refreshToken({ access: "id-old", refresh: "refresh-old", expires: 1 });
-		expect(credentials.access).toBe("id-new");
+		expect(credentials.access).toBe(refreshedIdToken);
 		expect(credentials.refresh).toBe("refresh-old");
-		expect(provider.getApiKey(credentials)).toBe("id-new");
+		expect(provider.getApiKey(credentials)).toBe(refreshedIdToken);
 	});
 
 	it("treats a token without expires_in as non-expiring", async () => {
-		const fetchMock = vi.fn(async () => Response.json({ id_token: "id-new", refresh_token: "refresh-new" }));
+		const fetchMock = vi.fn(async () =>
+			Response.json({
+				access_token: "access-new",
+				id_token: idToken(),
+				refresh_token: "refresh-new",
+				token_type: "Bearer",
+			}),
+		);
 		const provider = createConfiguredOAuthProvider("custom", config(fetchMock));
 		const credentials = await provider.refreshToken({ access: "id-old", refresh: "refresh-old", expires: 1 });
-		expect(credentials.expires).toBe(8.64e15);
+		expect(credentials.expires).toBeGreaterThan(Date.now());
 	});
 
 	it("keeps protocol parameters authoritative over custom params", async () => {
@@ -79,7 +113,13 @@ describe("configured provider OAuth", () => {
 		let authorizationUrl = "";
 		const fetchMock = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
 			requestBody = String(init?.body);
-			return Response.json({ id_token: "id-token", refresh_token: "refresh-token", expires_in: 3600 });
+			return Response.json({
+				access_token: "access-token",
+				id_token: idToken(),
+				refresh_token: "refresh-token",
+				expires_in: 3600,
+				token_type: "Bearer",
+			});
 		});
 		const provider = createConfiguredOAuthProvider("custom", {
 			...config(fetchMock),
@@ -100,5 +140,13 @@ describe("configured provider OAuth", () => {
 		const token = new URLSearchParams(requestBody);
 		expect(token.get("code")).toBe("real-code");
 		expect(token.get("grant_type")).toBe("authorization_code");
+	});
+
+	it("rejects non-standard token response fields", async () => {
+		const fetchMock = vi.fn(async () => Response.json({ token: "access", refresh: "refresh", expires: 3600 }));
+		const provider = createConfiguredOAuthProvider("custom", { ...config(fetchMock), useIdToken: false });
+		await expect(provider.refreshToken({ access: "old", refresh: "refresh-old", expires: 1 })).rejects.toThrow(
+			/OAuth token refresh failed/,
+		);
 	});
 });

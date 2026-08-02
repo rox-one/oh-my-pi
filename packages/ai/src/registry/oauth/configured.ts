@@ -1,10 +1,11 @@
+import * as oauth from "oauth4webapi";
 import * as AIError from "../../error";
 import type { FetchImpl } from "../../types";
 import { OAuthCallbackFlow } from "./callback-server";
-import { generatePKCE } from "./pkce";
 import type { OAuthCredentials, OAuthLoginCallbacks } from "./types";
 
 const OAUTH_REQUEST_TIMEOUT_MS = 30_000;
+const NEVER_EXPIRES = 8.64e15;
 
 export interface ConfiguredOAuthProvider {
 	name: string;
@@ -16,9 +17,6 @@ export interface ConfiguredOAuthProvider {
 	redirectUri?: string;
 	callbackPort?: number;
 	callbackPath?: string;
-	accessTokenField?: string;
-	refreshTokenField?: string;
-	expiresInField?: string;
 	useIdToken?: boolean;
 	pkce?: boolean;
 	authorizationParams?: Record<string, string>;
@@ -26,113 +24,13 @@ export interface ConfiguredOAuthProvider {
 	fetch?: FetchImpl;
 }
 
-type TokenPayload = Record<string, unknown>;
-
-function configuredProviderError(
-	providerId: string,
-	message: string,
-	kind: "configuration" | "token-exchange" | "token-refresh" | "validation",
-	status?: number,
-): AIError.OAuthError {
-	return new AIError.OAuthError(message, { kind, provider: providerId, status });
-}
-
-function requireTokenField(payload: TokenPayload, field: string, providerId: string, label: string): string {
-	const value = payload[field];
-	if (typeof value !== "string" || value.length === 0) {
-		throw configuredProviderError(providerId, `OAuth ${label} response missing ${field}`, "validation");
-	}
-	return value;
-}
-
-function optionalTokenField(payload: TokenPayload, field: string): string | undefined {
-	const value = payload[field];
-	return typeof value === "string" && value.length > 0 ? value : undefined;
-}
-
-function expiresAt(payload: TokenPayload, field: string, accessToken: string): number {
-	const value = payload[field];
-	const seconds = typeof value === "number" ? value : typeof value === "string" ? Number(value) : Number.NaN;
-	if (Number.isFinite(seconds) && seconds > 0) return Date.now() + seconds * 1000;
-	const encodedPayload = accessToken.split(".")[1];
-	if (encodedPayload) {
-		try {
-			const claims = JSON.parse(Buffer.from(encodedPayload, "base64url").toString("utf8")) as { exp?: unknown };
-			if (typeof claims.exp === "number" && Number.isFinite(claims.exp)) return claims.exp * 1000;
-		} catch {
-			// Non-JWT tokens may omit expires_in and remain valid until revoked.
-		}
-	}
-	return 8.64e15;
-}
-
-async function postToken(
-	providerId: string,
-	config: ConfiguredOAuthProvider,
-	body: URLSearchParams,
-	kind: "token-exchange" | "token-refresh",
-	fetchImpl: FetchImpl,
-	signal?: AbortSignal,
-): Promise<TokenPayload> {
-	const timeoutSignal = AbortSignal.timeout(OAUTH_REQUEST_TIMEOUT_MS);
-	const requestSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
-	let response: Response;
-	try {
-		response = await fetchImpl(config.tokenUrl, {
-			method: "POST",
-			headers: { "Content-Type": "application/x-www-form-urlencoded" },
-			body,
-			signal: requestSignal,
-		});
-	} catch (cause) {
-		if (signal?.aborted) throw new AIError.LoginCancelledError(`OAuth login cancelled: ${String(signal.reason)}`);
-		const operation = kind === "token-exchange" ? "exchange" : "refresh";
-		throw new AIError.OAuthError(`OAuth token ${operation} request failed for ${providerId}`, {
-			kind,
-			provider: providerId,
-			cause,
-		});
-	}
-	const text = await response.text();
-	if (!response.ok) {
-		throw configuredProviderError(
-			providerId,
-			`OAuth token ${kind === "token-exchange" ? "exchange" : "refresh"} failed: ${response.status}${text ? ` ${text}` : ""}`,
-			kind,
-			response.status,
-		);
-	}
-	try {
-		const payload = JSON.parse(text) as unknown;
-		if (!payload || typeof payload !== "object" || Array.isArray(payload)) throw new Error("not an object");
-		return payload as TokenPayload;
-	} catch (cause) {
-		throw new AIError.OAuthError(`OAuth token response returned invalid JSON for ${providerId}`, {
-			kind: "validation",
-			provider: providerId,
-			cause,
-		});
-	}
-}
-
 function callbackOptions(config: ConfiguredOAuthProvider) {
 	if (config.redirectUri) {
-		let parsed: URL;
-		try {
-			parsed = new URL(config.redirectUri);
-		} catch (cause) {
-			throw new AIError.ConfigurationError(`Invalid OAuth redirectUri: ${config.redirectUri}`, { cause });
-		}
-		if (parsed.protocol !== "http:" || (parsed.hostname !== "localhost" && parsed.hostname !== "127.0.0.1")) {
-			throw new AIError.ConfigurationError(
-				"Configured provider OAuth redirectUri must use a localhost HTTP callback.",
-			);
-		}
-		const port = Number(parsed.port || "80");
+		const redirectUri = new URL(config.redirectUri);
 		return {
-			preferredPort: port,
-			callbackHostname: parsed.hostname,
-			callbackPath: parsed.pathname,
+			preferredPort: Number(redirectUri.port),
+			callbackHostname: redirectUri.hostname,
+			callbackPath: redirectUri.pathname,
 			redirectUri: config.redirectUri,
 			allowPortFallback: false,
 		};
@@ -145,8 +43,66 @@ function callbackOptions(config: ConfiguredOAuthProvider) {
 	};
 }
 
+function authorizationServer(config: ConfiguredOAuthProvider): oauth.AuthorizationServer {
+	return {
+		issuer: new URL(config.authorizationUrl).origin,
+		authorization_endpoint: config.authorizationUrl,
+		token_endpoint: config.tokenUrl,
+	};
+}
+
+function client(config: ConfiguredOAuthProvider): oauth.Client {
+	return { client_id: config.clientId };
+}
+
+function clientAuth(config: ConfiguredOAuthProvider): oauth.ClientAuth {
+	return config.clientSecret ? oauth.ClientSecretPost(config.clientSecret) : oauth.None();
+}
+
+function requestOptions(fetchImpl: FetchImpl, signal?: AbortSignal) {
+	const timeoutSignal = AbortSignal.timeout(OAUTH_REQUEST_TIMEOUT_MS);
+	return {
+		signal: signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal,
+		[oauth.customFetch]: fetchImpl,
+	};
+}
+
+function tokenExpiry(token: string, expiresIn: number | undefined): number {
+	if (expiresIn !== undefined) return Date.now() + expiresIn * 1000;
+	const payload = token.split(".")[1];
+	if (payload) {
+		try {
+			const claims = JSON.parse(Buffer.from(payload, "base64url").toString("utf8")) as { exp?: unknown };
+			if (typeof claims.exp === "number" && Number.isFinite(claims.exp)) return claims.exp * 1000;
+		} catch {
+			// Opaque bearer tokens may remain valid until revoked.
+		}
+	}
+	return NEVER_EXPIRES;
+}
+
+function credentialsFromTokens(
+	providerId: string,
+	config: ConfiguredOAuthProvider,
+	tokens: oauth.TokenEndpointResponse,
+	previousRefresh?: string,
+): OAuthCredentials {
+	const access = config.useIdToken ? tokens.id_token : tokens.access_token;
+	if (!access) {
+		throw new AIError.OAuthError(`OAuth token response missing ${config.useIdToken ? "id_token" : "access_token"}`, {
+			kind: "validation",
+			provider: providerId,
+		});
+	}
+	return {
+		access,
+		refresh: tokens.refresh_token ?? previousRefresh ?? "",
+		expires: tokenExpiry(access, tokens.expires_in),
+	};
+}
+
 class ConfiguredOAuthFlow extends OAuthCallbackFlow {
-	#verifier?: string;
+	#verifier: string | typeof oauth.nopkce = oauth.nopkce;
 	readonly #providerId: string;
 	readonly #config: ConfiguredOAuthProvider;
 	readonly #fetch: FetchImpl;
@@ -159,18 +115,15 @@ class ConfiguredOAuthFlow extends OAuthCallbackFlow {
 	}
 
 	async generateAuthUrl(state: string, redirectUri: string): Promise<{ url: string; instructions?: string }> {
-		const params = new URLSearchParams({
-			...this.#config.authorizationParams,
-			client_id: this.#config.clientId,
-			redirect_uri: redirectUri,
-			response_type: "code",
-			scope: this.#config.scopes.join(" "),
-			state,
-		});
+		const params = new URLSearchParams(this.#config.authorizationParams);
+		params.set("client_id", this.#config.clientId);
+		params.set("redirect_uri", redirectUri);
+		params.set("response_type", "code");
+		params.set("scope", this.#config.scopes.join(" "));
+		params.set("state", state);
 		if (this.#config.pkce !== false) {
-			const pkce = await generatePKCE();
-			this.#verifier = pkce.verifier;
-			params.set("code_challenge", pkce.challenge);
+			this.#verifier = oauth.generateRandomCodeVerifier();
+			params.set("code_challenge", await oauth.calculatePKCECodeChallenge(this.#verifier));
 			params.set("code_challenge_method", "S256");
 		}
 		const url = new URL(this.#config.authorizationUrl);
@@ -178,43 +131,42 @@ class ConfiguredOAuthFlow extends OAuthCallbackFlow {
 		return { url: url.toString(), instructions: `Complete ${this.#config.name} sign-in in your browser.` };
 	}
 
-	async exchangeToken(code: string, _state: string, redirectUri: string): Promise<OAuthCredentials> {
-		const body = new URLSearchParams({
-			...this.#config.tokenParams,
-			client_id: this.#config.clientId,
-			code,
-			grant_type: "authorization_code",
-			redirect_uri: redirectUri,
-		});
-		if (this.#config.clientSecret) body.set("client_secret", this.#config.clientSecret);
-		if (this.#verifier) body.set("code_verifier", this.#verifier);
-		const payload = await postToken(
-			this.#providerId,
-			this.#config,
-			body,
-			"token-exchange",
-			this.#fetch,
-			this.ctrl.signal,
-		);
-		return credentialsFromPayload(this.#providerId, this.#config, payload);
+	async exchangeToken(code: string, state: string, redirectUri: string): Promise<OAuthCredentials> {
+		try {
+			const callbackParams = oauth.validateAuthResponse(
+				authorizationServer(this.#config),
+				client(this.#config),
+				new URLSearchParams({ code, state }),
+				state,
+			);
+			const response = await oauth.authorizationCodeGrantRequest(
+				authorizationServer(this.#config),
+				client(this.#config),
+				clientAuth(this.#config),
+				callbackParams,
+				redirectUri,
+				this.#verifier,
+				{
+					...requestOptions(this.#fetch, this.ctrl.signal),
+					additionalParameters: this.#config.tokenParams,
+				},
+			);
+			const tokens = await oauth.processAuthorizationCodeResponse(
+				authorizationServer(this.#config),
+				client(this.#config),
+				response,
+				{ requireIdToken: this.#config.useIdToken },
+			);
+			return credentialsFromTokens(this.#providerId, this.#config, tokens);
+		} catch (cause) {
+			if (this.ctrl.signal?.aborted) throw new AIError.LoginCancelledError(String(this.ctrl.signal.reason));
+			throw new AIError.OAuthError(`OAuth token exchange failed for ${this.#providerId}`, {
+				kind: "token-exchange",
+				provider: this.#providerId,
+				cause,
+			});
+		}
 	}
-}
-
-function credentialsFromPayload(
-	providerId: string,
-	config: ConfiguredOAuthProvider,
-	payload: TokenPayload,
-	previousRefresh?: string,
-): OAuthCredentials {
-	const accessField = config.useIdToken ? "id_token" : (config.accessTokenField ?? "access_token");
-	const refreshField = config.refreshTokenField ?? "refresh_token";
-	const expiresField = config.expiresInField ?? "expires_in";
-	const access = requireTokenField(payload, accessField, providerId, "token");
-	return {
-		access,
-		refresh: optionalTokenField(payload, refreshField) ?? previousRefresh ?? "",
-		expires: expiresAt(payload, expiresField, access),
-	};
 }
 
 export function createConfiguredOAuthProvider(
@@ -231,21 +183,35 @@ export function createConfiguredOAuthProvider(
 		login: callbacks => new ConfiguredOAuthFlow(providerId, config, callbacks).login(),
 		async refreshToken(credentials) {
 			if (!credentials.refresh) {
-				throw configuredProviderError(
-					providerId,
-					`OAuth credential for ${providerId} has no refresh token`,
-					"validation",
-				);
+				throw new AIError.OAuthError(`OAuth credential for ${providerId} has no refresh token`, {
+					kind: "validation",
+					provider: providerId,
+				});
 			}
-			const body = new URLSearchParams({
-				...config.tokenParams,
-				client_id: config.clientId,
-				refresh_token: credentials.refresh,
-				grant_type: "refresh_token",
-			});
-			if (config.clientSecret) body.set("client_secret", config.clientSecret);
-			const payload = await postToken(providerId, config, body, "token-refresh", config.fetch ?? fetch);
-			return credentialsFromPayload(providerId, config, payload, credentials.refresh);
+			try {
+				const response = await oauth.refreshTokenGrantRequest(
+					authorizationServer(config),
+					client(config),
+					clientAuth(config),
+					credentials.refresh,
+					{
+						...requestOptions(config.fetch ?? fetch),
+						additionalParameters: config.tokenParams,
+					},
+				);
+				const tokens = await oauth.processRefreshTokenResponse(
+					authorizationServer(config),
+					client(config),
+					response,
+				);
+				return credentialsFromTokens(providerId, config, tokens, credentials.refresh);
+			} catch (cause) {
+				throw new AIError.OAuthError(`OAuth token refresh failed for ${providerId}`, {
+					kind: "token-refresh",
+					provider: providerId,
+					cause,
+				});
+			}
 		},
 		getApiKey: credentials => credentials.access,
 	};

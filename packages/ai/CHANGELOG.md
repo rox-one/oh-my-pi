@@ -350,7 +350,7 @@
 - Optimized Anthropic prompt caching to prevent unnecessary cache invalidation of the entire system prefix when volatile project footer details (such as current working directory, date, or workspace tree) change.
 ### Added
 
-- Added a reusable configured authorization-code OAuth provider with PKCE, localhost callbacks, token refresh, and configurable token response fields.
+- Added a reusable configured authorization-code OAuth provider backed by `oauth4webapi`, with PKCE, localhost callbacks, standard token validation, and refresh support.
 
 ## [17.2.4] - 2026-08-01
 

@@ -1167,7 +1167,7 @@
 - Removed hard-coded references to disabled or absent agents in system and tool prompts.
 ### Added
 
-- Added declarative authorization-code OAuth for custom `models.yml` providers, including PKCE browser login, localhost callbacks, token refresh, configurable token fields, and environment or command-resolved client credentials.
+- Added declarative authorization-code OAuth for custom `models.yml` providers, including PKCE browser login, localhost callbacks, validated standard token responses, token refresh, and environment or command-resolved client credentials.
 
 ## [17.2.4] - 2026-08-01
 
