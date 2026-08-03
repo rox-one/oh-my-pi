@@ -168,204 +168,61 @@ describe("InteractiveMode vibe mode toggle", () => {
 		expect(session.getAllToolNames().toSorted()).toEqual(["read", "todo"]);
 	});
 
-	it("cancels an in-flight model turn before removing Vibe tools", async () => {
+	it("publishes vibe mode before rebuilding tools", async () => {
 		const started = Promise.withResolvers<void>();
-		streamFn = (_model, _context, options) => {
-			const stream = new AssistantMessageEventStream();
-			queueMicrotask(() => {
-				stream.push({ type: "start", partial: createAssistantMessage("") });
-				options?.signal?.addEventListener(
-					"abort",
-					() => stream.push({ type: "error", reason: "aborted", error: createAssistantMessage("Aborted") }),
-					{ once: true },
-				);
-				started.resolve();
-			});
-			return stream;
-		};
-		await mode.handleVibeModeCommand();
-		const prompt = session.prompt("Delegate this");
+		const release = Promise.withResolvers<void>();
+		const activateVibeTools = session.activateVibeTools.bind(session);
+		vi.spyOn(session, "activateVibeTools").mockImplementation(async toolNames => {
+			started.resolve();
+			await release.promise;
+			await activateVibeTools(toolNames);
+		});
+
+		const entering = mode.handleVibeModeCommand();
 		await started.promise;
-		expect(session.isStreaming).toBe(true);
 
-		await mode.handleVibeModeCommand();
-		await prompt;
+		expect(session.getVibeModeState()).toEqual({ enabled: true });
 
-		expect(session.isStreaming).toBe(false);
-		expect(session.getToolByName("vibe_spawn")).toBeUndefined();
+		release.resolve();
+		await entering;
 	});
 
-	it("holds a user steer queued during Vibe teardown until the tools are removed", async () => {
-		const toolNamesPerCall: string[][] = [];
-		const firstStarted = Promise.withResolvers<void>();
-		streamFn = (_model, context, options) => {
-			toolNamesPerCall.push((context.tools ?? []).map(tool => tool.name));
-			const isFirst = toolNamesPerCall.length === 1;
-			const stream = new AssistantMessageEventStream();
-			queueMicrotask(() => {
-				stream.push({ type: "start", partial: createAssistantMessage("") });
-				if (isFirst) {
-					options?.signal?.addEventListener(
-						"abort",
-						() => stream.push({ type: "error", reason: "aborted", error: createAssistantMessage("Aborted") }),
-						{ once: true },
-					);
-					firstStarted.resolve();
-				} else {
-					stream.push({ type: "done", reason: "stop", message: createAssistantMessage("Resumed") });
-				}
-			});
-			return stream;
-		};
-
-		await mode.handleVibeModeCommand();
-		const prompt = session.prompt("Delegate this");
-		await firstStarted.promise;
-
-		const abortSettled = Promise.withResolvers<void>();
-		const releaseTeardown = Promise.withResolvers<void>();
-		const abort = session.abort.bind(session);
-		vi.spyOn(session, "abort").mockImplementation(async options => {
-			await abort(options);
-			abortSettled.resolve();
-			await releaseTeardown.promise;
+	it("does not submit a vibe prompt when a goal races tool activation", async () => {
+		const started = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const activateVibeTools = session.activateVibeTools.bind(session);
+		vi.spyOn(session, "activateVibeTools").mockImplementation(async toolNames => {
+			started.resolve();
+			await release.promise;
+			await activateVibeTools(toolNames);
 		});
-		const exit = mode.handleVibeModeCommand();
-		await abortSettled.promise;
-		// Queue while teardown is still guarded. The regular queue path clears its
-		// retry block, but must not clear the independent mode-exit suppression.
-		await session.steer("and then do the other thing");
-		// Drain the microtasks in which an unguarded schedule calls
-		// agent.continue(). The queued steer must remain owned by the queue until
-		// teardown releases.
-		for (let index = 0; index < 5; index++) await Promise.resolve();
-		expect(session.agent.peekSteeringQueue()).toHaveLength(1);
-		expect(toolNamesPerCall.length).toBe(1);
-		releaseTeardown.resolve();
+		const submit = vi.fn();
+		mode.onInputCallback = submit;
 
-		await exit;
-		await prompt;
-		await session.waitForIdle();
+		const entering = mode.handleVibeModeCommand("draft the implementation");
+		await started.promise;
+		await session.goalRuntime.createGoal({ objective: "Ship the release", tokenBudget: 100 });
+		release.resolve();
+		await entering;
 
-		expect(toolNamesPerCall.length).toBe(2);
-		for (const name of VIBE_TOOL_NAMES) {
-			expect(toolNamesPerCall[1]).not.toContain(name);
-		}
+		expect(mode.vibeModeEnabled).toBe(false);
+		const lastMode = session.sessionManager
+			.getEntries()
+			.filter(entry => entry.type === "mode_change")
+			.at(-1);
+		expect(lastMode).toMatchObject({ type: "mode_change", mode: "goal" });
+		expect(submit).not.toHaveBeenCalled();
+	});
+
+	it("rolls back vibe mode when rebuilding tools fails", async () => {
+		vi.spyOn(session, "activateVibeTools").mockRejectedValue(new Error("vibe tool rebuild failed"));
+		const deactivate = vi.spyOn(session, "deactivateVibeTools");
+
+		await expect(mode.handleVibeModeCommand()).rejects.toThrow("vibe tool rebuild failed");
+
+		expect(mode.vibeModeEnabled).toBe(false);
 		expect(session.getVibeModeState()).toBeUndefined();
-		expect(session.getToolByName("vibe_spawn")).toBeUndefined();
-	});
-
-	it("holds IRC wakes during Vibe teardown until the tools are removed", async () => {
-		const toolNamesPerCall: string[][] = [];
-		const firstStarted = Promise.withResolvers<void>();
-		streamFn = (_model, context, options) => {
-			toolNamesPerCall.push((context.tools ?? []).map(tool => tool.name));
-			const isFirst = toolNamesPerCall.length === 1;
-			const stream = new AssistantMessageEventStream();
-			queueMicrotask(() => {
-				stream.push({ type: "start", partial: createAssistantMessage("") });
-				if (isFirst) {
-					options?.signal?.addEventListener(
-						"abort",
-						() => stream.push({ type: "error", reason: "aborted", error: createAssistantMessage("Aborted") }),
-						{ once: true },
-					);
-					firstStarted.resolve();
-				} else {
-					stream.push({ type: "done", reason: "stop", message: createAssistantMessage("Resumed") });
-				}
-			});
-			return stream;
-		};
-
-		await mode.handleVibeModeCommand();
-		const prompt = session.prompt("Delegate this");
-		await firstStarted.promise;
-		await session.deliverIrcMessage({ id: "m1", from: "peer", to: "me", body: "first", ts: Date.now() });
-
-		const abortSettled = Promise.withResolvers<void>();
-		const releaseTeardown = Promise.withResolvers<void>();
-		const abort = session.abort.bind(session);
-		vi.spyOn(session, "abort").mockImplementation(async options => {
-			await abort(options);
-			abortSettled.resolve();
-			await releaseTeardown.promise;
-		});
-		const exit = mode.handleVibeModeCommand();
-		await abortSettled.promise;
-		await session.deliverIrcMessage({ id: "m2", from: "peer", to: "me", body: "second", ts: Date.now() });
-		for (let index = 0; index < 5; index++) await Promise.resolve();
-		expect(toolNamesPerCall).toHaveLength(1);
-		releaseTeardown.resolve();
-
-		await exit;
-		await prompt;
-		await session.waitForIdle();
-
-		expect(toolNamesPerCall).toHaveLength(2);
-		for (const name of VIBE_TOOL_NAMES) {
-			expect(toolNamesPerCall[1]).not.toContain(name);
-		}
-		expect(
-			session.agent.state.messages.filter(
-				message => message.role === "custom" && message.customType === "irc:incoming",
-			),
-		).toHaveLength(2);
-	});
-	it("grants configured vibe.directorTools to the director and strips them on exit", async () => {
-		const model = session.model;
-		if (!model) throw new Error("Expected active model");
-		const grantedSession = new AgentSession({
-			agent: new Agent({
-				initialState: {
-					model,
-					systemPrompt: ["Test"],
-					tools: [],
-					messages: [],
-				},
-			}),
-			sessionManager: SessionManager.create(tempDir.path(), tempDir.path()),
-			settings: Settings.isolated({ "vibe.directorTools": ["bash", "write", "no-such-tool"] }),
-			modelRegistry,
-			toolRegistry: new Map(["read", "todo", "bash", "write"].map(name => [name, stubTool(name)])),
-			builtInToolNames: ["read", "todo", "bash", "write"],
-			createVibeTools: () => VIBE_TOOL_NAMES.map(stubTool),
-		});
-		const grantedMode = new InteractiveMode(
-			grantedSession,
-			"test",
-			undefined,
-			undefined,
-			undefined,
-			undefined,
-			new EventBus(),
-		);
-
-		try {
-			await grantedMode.handleVibeModeCommand();
-			expect(grantedMode.vibeModeEnabled).toBe(true);
-			// Granted tools are active; the unknown name never lands in the set.
-			expect(grantedSession.getActiveToolNames().toSorted()).toEqual(
-				["read", "todo", "bash", "write", ...VIBE_TOOL_NAMES].toSorted(),
-			);
-
-			// The injected director prompt advertises only the granted tools.
-			const sendCustomMessage = vi.spyOn(grantedSession, "sendCustomMessage");
-			await grantedSession.sendVibeModeContext({ deliverAs: "steer" });
-			const message = normalizeCustomMessagePayload(sendCustomMessage.mock.calls[0]?.[0]);
-			const content = typeof message.content === "string" ? message.content : "";
-			expect(content).toContain("`bash`");
-			expect(content).toContain("`write`");
-			expect(content).not.toContain("no-such-tool");
-
-			await grantedMode.handleVibeModeCommand();
-			expect(grantedMode.vibeModeEnabled).toBe(false);
-			expect(grantedSession.getActiveToolNames()).toEqual([]);
-			expect(grantedSession.getAllToolNames().toSorted()).toEqual(["read", "todo", "bash", "write"].toSorted());
-		} finally {
-			grantedMode.stop();
-			await grantedSession.dispose();
-		}
+		expect(deactivate).toHaveBeenCalledTimes(1);
 	});
 
 	it("keeps a same-named non-built-in Todo tool unavailable in Vibe mode", async () => {

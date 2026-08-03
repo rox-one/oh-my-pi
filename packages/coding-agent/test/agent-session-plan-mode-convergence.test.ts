@@ -142,7 +142,7 @@ describe("AgentSession plan-mode convergence", () => {
 			initialPlanTools?: string[];
 			xdev?: boolean;
 			rebuildGate?: { fail: boolean };
-			deviceOnlyWrite?: boolean;
+			includeGoal?: boolean;
 		},
 	): Promise<PlanHarness> {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
@@ -151,27 +151,7 @@ describe("AgentSession plan-mode convergence", () => {
 		const askTool = makeTool("ask");
 		const writeTool = makeTool("write");
 		const readTool = makeTool("read");
-		const toolRegistry = new Map<string, AgentTool>([
-			["ask", askTool],
-			["write", writeTool],
-			["read", readTool],
-		]);
-		const initialTools = options?.planYolo
-			? options.initialPlanTools?.includes("write")
-				? [readTool, writeTool]
-				: [readTool]
-			: [askTool, writeTool, readTool];
-		let deviceOnlyWrite = options?.deviceOnlyWrite === true;
-		let pendingFullWriteDescription = false;
-		let currentAgent: Agent | undefined;
-		const xdev: XdevState | undefined = options?.xdev
-			? {
-					tools: toolRegistry,
-					mountedNames: new Set<string>(),
-					builtInNames: new Set(["ask", "write", "read"]),
-					isActive: name => currentAgent?.state.tools.some(tool => tool.name === name) ?? false,
-				}
-			: undefined;
+		const goalTool = makeTool("goal");
 
 		const mock = createMockModel({ responses });
 		const agent = new Agent({
@@ -179,7 +159,9 @@ describe("AgentSession plan-mode convergence", () => {
 			initialState: {
 				model,
 				systemPrompt: ["Test"],
-				tools: initialTools,
+				tools: options?.planYolo
+					? [readTool, ...(options.includeGoal ? [goalTool] : [])]
+					: [askTool, writeTool, readTool],
 				messages: [],
 			},
 			streamFn: mock.stream,
@@ -208,15 +190,13 @@ describe("AgentSession plan-mode convergence", () => {
 				"retry.enabled": false,
 			}),
 			modelRegistry,
-			toolRegistry,
-			builtInToolNames: ["ask", "write", "read"],
-			isDeviceOnlyWrite: () => deviceOnlyWrite,
-			setDeviceOnlyWrite: enabled => {
-				deviceOnlyWrite = enabled;
-			},
-			setPendingFullWriteDescription: enabled => {
-				pendingFullWriteDescription = enabled;
-			},
+			toolRegistry: new Map<string, AgentTool>([
+				["ask", askTool],
+				["write", writeTool],
+				["read", readTool],
+				...(options?.includeGoal ? ([["goal", goalTool]] as const) : []),
+			]),
+			builtInToolNames: ["ask", "write", "read", ...(options?.includeGoal ? ["goal"] : [])],
 			advisorTools: [],
 			advisorStreamFn,
 			sideStreamFn,
@@ -448,106 +428,14 @@ describe("AgentSession plan-mode convergence", () => {
 		expect(harness.session.getActiveToolNames()).toEqual(["read"]);
 	});
 
-	it("retains MCP devices discovered while PlanYolo is active", async () => {
-		const harness = await createPlanSession(
-			[{ content: ["planning A"] }, { content: ["planning B"] }, { content: ["planning C"] }],
-			{ planYolo: true, initialPlanTools: ["read", "write"], xdev: true },
-		);
+	it("removes the built-in goal tool from PlanYolo", async () => {
+		const harness = await createPlanSession([{ content: ["planning"] }], { planYolo: true, includeGoal: true });
+
 		await harness.session.prompt("make a plan");
 		await harness.session.waitForIdle();
 
-		const chromeTool = makeMcpTool("mcp__chrome_devtools_list_pages", "discoverable");
-		const contextTool = makeMcpTool("mcp__context_query_docs", "essential");
-		await harness.session.refreshMCPTools([chromeTool, contextTool]);
-		expect(harness.session.getSelectedMCPToolNames()).toEqual([
-			"mcp__context_query_docs",
-			"mcp__chrome_devtools_list_pages",
-		]);
-		expect(harness.session.getActiveToolNames()).toContain("mcp__context_query_docs");
-		expect(harness.session.getMountedXdevToolNames()).toContain("mcp__chrome_devtools_list_pages");
-
-		const planPath = resolveLocalUrlToPath("local://mcp-devices-plan.md", {
-			getArtifactsDir: () => harness.session.sessionManager.getArtifactsDir(),
-			getSessionId: () => harness.session.sessionManager.getSessionId(),
-		});
-		await Bun.write(planPath, "# MCP devices plan\n\nKeep the connected devices.\n");
-		const handler = harness.session.peekPlanProposalHandler();
-		if (!handler) throw new Error("Expected PlanYolo proposal handler");
-		await handler("mcp-devices");
-
-		expect(harness.session.getPlanModeState()).toBeUndefined();
-		expect(harness.session.getActiveToolNames()).toEqual(["read", "write", "mcp__context_query_docs"]);
-		expect(harness.session.getMountedXdevToolNames()).toEqual(["mcp__chrome_devtools_list_pages"]);
-		expect(harness.session.getSelectedMCPToolNames()).toEqual([
-			"mcp__context_query_docs",
-			"mcp__chrome_devtools_list_pages",
-		]);
-	});
-
-	it("serializes PlanYolo restoration after a pending MCP refresh", async () => {
-		const harness = await createPlanSession(
-			[{ content: ["planning A"] }, { content: ["planning B"] }, { content: ["planning C"] }],
-			{ planYolo: true, initialPlanTools: ["read", "write"], xdev: true },
-		);
-		await harness.session.prompt("make a plan");
-		await harness.session.waitForIdle();
-
-		const entered = Promise.withResolvers<void>();
-		const release = Promise.withResolvers<void>();
-		const blocker = harness.session.runToolRegistryMutation(async () => {
-			entered.resolve();
-			await release.promise;
-		});
-		await entered.promise;
-
-		const chromeTool = makeMcpTool("mcp__chrome_devtools_list_pages", "discoverable");
-		const refresh = harness.session.refreshMCPTools([chromeTool]);
-		const planPath = resolveLocalUrlToPath("local://queued-mcp-plan.md", {
-			getArtifactsDir: () => harness.session.sessionManager.getArtifactsDir(),
-			getSessionId: () => harness.session.sessionManager.getSessionId(),
-		});
-		await Bun.write(planPath, "# Queued MCP plan\n\nKeep the connected device.\n");
-		const handler = harness.session.peekPlanProposalHandler();
-		if (!handler) throw new Error("Expected PlanYolo proposal handler");
-		const approval = handler("queued-mcp");
-		release.resolve();
-		await Promise.all([blocker, refresh, approval]);
-
-		expect(harness.session.getPlanModeState()).toBeUndefined();
-		expect(harness.session.getActiveToolNames()).toContain("read");
 		expect(harness.session.getActiveToolNames()).toContain("write");
-		expect(harness.session.getMountedXdevToolNames()).toEqual(["mcp__chrome_devtools_list_pages"]);
-		expect(harness.session.getSelectedMCPToolNames()).toContain("mcp__chrome_devtools_list_pages");
-	});
-
-	it("preserves late MCP selection without leaking plan-only write", async () => {
-		const harness = await createPlanSession(
-			[{ content: ["planning A"] }, { content: ["planning B"] }, { content: ["planning C"] }],
-			{ planYolo: true, xdev: true },
-		);
-		await harness.session.prompt("make a plan");
-		await harness.session.waitForIdle();
-
-		const chromeTool = makeMcpTool("mcp__chrome_devtools_list_pages", "discoverable", "write");
-		await harness.session.refreshMCPTools([chromeTool]);
-		const registeredTool = harness.session.getToolByName("mcp__chrome_devtools_list_pages");
-		expect(registeredTool).toBeDefined();
-
-		const planPath = resolveLocalUrlToPath("local://read-only-mcp-plan.md", {
-			getArtifactsDir: () => harness.session.sessionManager.getArtifactsDir(),
-			getSessionId: () => harness.session.sessionManager.getSessionId(),
-		});
-		await Bun.write(planPath, "# Read-only MCP plan\n\nKeep the selected device.\n");
-		const handler = harness.session.peekPlanProposalHandler();
-		if (!handler) throw new Error("Expected PlanYolo proposal handler");
-		await handler("read-only-mcp");
-
-		expect(harness.session.getPlanModeState()).toBeUndefined();
-		expect(harness.session.getActiveToolNames()).toEqual(["read", "mcp__chrome_devtools_list_pages"]);
-		expect(harness.session.getActiveToolNames()).not.toContain("write");
-		expect(harness.session.getMountedXdevToolNames()).toEqual([]);
-		expect(harness.session.getSelectedMCPToolNames()).toEqual(["mcp__chrome_devtools_list_pages"]);
-		expect(harness.session.getToolByName("mcp__chrome_devtools_list_pages")).toBe(registeredTool);
+		expect(harness.session.getActiveToolNames()).not.toContain("goal");
 	});
 
 	it("keeps PlanYolo retryable when pre-plan tool restoration fails", async () => {

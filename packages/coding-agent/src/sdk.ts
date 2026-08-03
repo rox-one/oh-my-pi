@@ -221,7 +221,7 @@ import {
 	xdevDocsAll,
 	xdevEntries,
 } from "./tools";
-import { isMCPToolName, normalizeToolNames } from "./tools/builtin-names";
+import { isMCPToolName, NO_TOOLS_SENTINEL, normalizeToolNames } from "./tools/builtin-names";
 import { ToolContextStore } from "./tools/context";
 import { isIrcEnabled } from "./tools/hub";
 import { getImageGenTools } from "./tools/image-gen";
@@ -1784,6 +1784,8 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			getServiceTierByFamily: () => session?.serviceTierByFamily,
 			getImageAttachments: () => session?.getImageAttachments() ?? [],
 			getPlanModeState: () => session?.getPlanModeState(),
+			isPlanModePaused: () => session?.isPlanModePaused() ?? false,
+			getVibeModeState: () => session?.getVibeModeState(),
 			getPlanReferencePath: () => session?.getPlanReferencePath() ?? "local://PLAN.md",
 			getGoalModeState: () => session?.getGoalModeState(),
 			getGoalRuntime: () => session?.goalRuntime,
@@ -3112,6 +3114,15 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		) {
 			explicitlyRequestedToolNames.push("yield");
 		}
+		if (
+			explicitlyRequestedToolNames &&
+			explicitlyRequestedToolNames.length > 0 &&
+			!explicitlyRequestedToolNames.includes(NO_TOOLS_SENTINEL) &&
+			settings.get("goal.enabled") &&
+			builtInRegistryToolNames.has("goal")
+		) {
+			if (!explicitlyRequestedToolNames.includes("goal")) explicitlyRequestedToolNames.push("goal");
+		}
 		// Auto-learn builtins are force-included into the registry by `createTools`
 		// for enabled top-level sessions (tools/index.ts), but — like `yield` above —
 		// an explicit `toolNames` list would otherwise drop them from the ACTIVE set,
@@ -3147,7 +3158,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				return tool?.defaultInactive === true || tool?.hidden === true;
 			}),
 		);
-		const requestedActiveToolNames = normalizedRequested.filter(name => name !== "goal");
+		const requestedActiveToolNames = normalizedRequested;
 		const explicitlyRequestedToolNameSet = explicitlyRequestedToolNames
 			? new Set(explicitlyRequestedToolNames)
 			: undefined;

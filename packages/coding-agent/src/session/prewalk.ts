@@ -252,30 +252,26 @@ export class PrewalkCoordinator {
 	async armPlanYoloIfNeeded(): Promise<void> {
 		if (!this.#planYolo || this.#planYoloArmed) return;
 		this.#planYoloArmed = true;
-		const previousEnabledTools = this.#host.getEnabledToolNames();
-		const previousMountedTools = this.#host.getMountedXdevToolNames();
-		const previousPlanModeState = this.#host.getPlanModeState();
-		const planModeState: PlanModeState = {
+		const previousTools = this.#host.getEnabledToolNames();
+		const planBaseTools = this.#host.hasBuiltInTool("goal")
+			? previousTools.filter(name => name !== "goal")
+			: previousTools;
+		const augmentations = this.#host.hasBuiltInTool("write") ? ["write"] : [];
+		this.#planYoloPreviousTools = previousTools;
+		const planModeState = {
 			enabled: true,
 			planFilePath: this.#host.getPlanReferencePath() || "local://PLAN.md",
 			workflow: "parallel",
-		};
-		// PlanYolo's injected write is a plan transport, not a user grant. Publish
-		// plan mode before applying the tool set so SessionTools keeps an existing
-		// device-only write restricted.
+		} as const;
 		this.#host.setPlanModeState(planModeState);
-		const augmentations = this.#host.hasBuiltInTool("write") ? ["write"] : [];
 		try {
-			await this.#host.setActiveToolsByName([...new Set([...previousEnabledTools, ...augmentations])]);
+			await this.#host.setActiveToolsByName([...new Set([...planBaseTools, ...augmentations])]);
 		} catch (error) {
-			this.#host.setPlanModeState(previousPlanModeState);
+			this.#host.setPlanModeState(undefined);
+			this.#planYoloPreviousTools = undefined;
 			this.#planYoloArmed = false;
 			throw error;
 		}
-		this.#planYoloPreviousNonMCPPresentation = {
-			enabled: previousEnabledTools.filter(name => !isMCPToolName(name)),
-			mounted: previousMountedTools.filter(name => !isMCPToolName(name)),
-		};
 		this.#host.setPlanProposalHandler(title => this.#finalizePlanYoloProposal(title));
 	}
 

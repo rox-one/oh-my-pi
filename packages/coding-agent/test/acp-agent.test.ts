@@ -6,7 +6,7 @@ import { AgentBusyError } from "@oh-my-pi/pi-agent-core";
 import type { Model } from "@oh-my-pi/pi-ai";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import type { ExtensionUIContext } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
+import type { GoalModeState } from "@oh-my-pi/pi-coding-agent/goals/state";
 import { resolveLocalUrlToPath } from "@oh-my-pi/pi-coding-agent/internal-urls";
 import {
 	ACP_BOOTSTRAP_RACE_GUARD_MS,
@@ -149,6 +149,11 @@ class FakeAgentSession {
 		this.refreshSkillsCalls++;
 	}
 	planModeState: PlanModeState | undefined;
+	goalModeState: GoalModeState | undefined;
+	activeToolNames: string[] = [];
+	setActiveToolsError: Error | undefined;
+	setActiveToolsBlocker: ((toolNames: string[]) => Promise<void>) | undefined;
+	builtInToolNames = new Set<string>();
 	waitForIdleCalls = 0;
 	waitForIdleBlocker: (() => Promise<void>) | undefined;
 	asyncJobDrain: ((options?: { timeoutMs?: number }) => Promise<boolean>) | undefined;
@@ -343,20 +348,21 @@ class FakeAgentSession {
 	getActiveToolNames(): string[] {
 		return [...this.activeToolNames];
 	}
-
 	getEnabledToolNames(): string[] {
-		return [...this.enabledToolNames];
+		return [...this.activeToolNames];
 	}
 
 	getAllToolNames(): string[] {
-		return [];
+		return [...this.activeToolNames];
 	}
 
 	hasBuiltInTool(name: string): boolean {
-		return name === "write";
+		return this.builtInToolNames.has(name);
 	}
 
-	setActiveToolsByName(toolNames: string[]): void {
+	async setActiveToolsByName(toolNames: string[]): Promise<void> {
+		await this.setActiveToolsBlocker?.(toolNames);
+		if (this.setActiveToolsError) throw this.setActiveToolsError;
 		this.activeToolNames = [...toolNames];
 	}
 
@@ -368,6 +374,10 @@ class FakeAgentSession {
 
 	setPlanModeState(state: PlanModeState | undefined): void {
 		this.planModeState = state;
+	}
+
+	getGoalModeState(): GoalModeState | undefined {
+		return this.goalModeState;
 	}
 
 	planProposalHandler: ((title: string) => Promise<unknown> | unknown) | undefined;
@@ -726,10 +736,10 @@ describe("ACP agent", () => {
 		expect(initialModeConfig?.options?.map(option => option.value)).toEqual(["default", "plan"]);
 
 		const session = harness.findSession(created.sessionId)!;
-		session.enabledToolNames = ["eval", "write"];
-		session.activeToolNames = ["eval"];
+		session.activeToolNames = ["read", "goal"];
+		session.builtInToolNames.add("goal");
 		await harness.agent.setSessionMode({ sessionId: created.sessionId, modeId: "plan" });
-		expect(session.activeToolNames).toContain("write");
+		expect(session.activeToolNames).toEqual(["read"]);
 		expect(session.planModeState).toEqual(
 			expect.objectContaining({ enabled: true, planFilePath: "local://PLAN.md", workflow: "parallel" }),
 		);
@@ -766,12 +776,98 @@ describe("ACP agent", () => {
 		await harness.agent.setSessionMode({ sessionId: created.sessionId, modeId: "default" });
 		expect(session.planModeState).toBeUndefined();
 		expect(session.planProposalHandler).toBeUndefined();
-		expect(session.activeToolNames).toEqual(["eval", "write"]);
+		expect(session.activeToolNames).toEqual(["read", "goal"]);
 
 		harness.abortController.abort();
 		await Bun.sleep(0);
 	});
 
+	it("serializes overlapping plan and default mode transitions", async () => {
+		const harness = await createHarness();
+		Settings.instance.set("plan.enabled", true);
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const session = harness.findSession(created.sessionId)!;
+		session.activeToolNames = ["read", "goal"];
+		session.builtInToolNames.add("goal");
+		const planRebuild = Promise.withResolvers<void>();
+		const planRebuildStarted = Promise.withResolvers<void>();
+		session.setActiveToolsBlocker = async toolNames => {
+			if (toolNames.length === 1 && toolNames[0] === "read") {
+				planRebuildStarted.resolve();
+				await planRebuild.promise;
+			}
+		};
+
+		const enterPlan = harness.agent.setSessionMode({ sessionId: created.sessionId, modeId: "plan" });
+		await planRebuildStarted.promise;
+		const enterDefault = harness.agent.setSessionMode({ sessionId: created.sessionId, modeId: "default" });
+		planRebuild.resolve();
+		await Promise.all([enterPlan, enterDefault]);
+
+		expect(session.planModeState).toBeUndefined();
+		expect(session.planProposalHandler).toBeUndefined();
+		expect(session.activeToolNames).toEqual(["read", "goal"]);
+		harness.abortController.abort();
+		await Bun.sleep(0);
+	});
+
+	it("restores plan approval when default-mode tool restoration fails", async () => {
+		const harness = await createHarness();
+		Settings.instance.set("plan.enabled", true);
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const session = harness.findSession(created.sessionId)!;
+		session.activeToolNames = ["read", "goal"];
+		session.builtInToolNames.add("goal");
+		await harness.agent.setSessionMode({ sessionId: created.sessionId, modeId: "plan" });
+		session.setActiveToolsError = new Error("tool rebuild failed");
+
+		await expect(harness.agent.setSessionMode({ sessionId: created.sessionId, modeId: "default" })).rejects.toThrow(
+			"tool rebuild failed",
+		);
+		expect(session.planModeState?.enabled).toBe(true);
+		expect(typeof session.planProposalHandler).toBe("function");
+		expect(session.activeToolNames).toEqual(["read"]);
+
+		harness.abortController.abort();
+		await Bun.sleep(0);
+	});
+
+	it("rejects plan mode while a goal is active and allows it after completion", async () => {
+		const harness = await createHarness();
+		Settings.instance.set("plan.enabled", true);
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const session = harness.findSession(created.sessionId)!;
+		session.goalModeState = {
+			enabled: true,
+			mode: "active",
+			goal: {
+				id: "goal-1",
+				objective: "finish",
+				status: "active",
+				tokensUsed: 0,
+				timeUsedSeconds: 0,
+				createdAt: Date.now(),
+				updatedAt: Date.now(),
+			},
+		};
+
+		await expect(harness.agent.setSessionMode({ sessionId: created.sessionId, modeId: "plan" })).rejects.toThrow(
+			"Cannot enter plan mode while goal mode is active",
+		);
+		expect(session.planModeState).toBeUndefined();
+		session.goalModeState = {
+			...session.goalModeState!,
+			enabled: false,
+			mode: "exiting",
+			reason: "completed",
+			goal: { ...session.goalModeState!.goal, status: "complete" },
+		};
+		await harness.agent.setSessionMode({ sessionId: created.sessionId, modeId: "plan" });
+		expect(session.planModeState?.enabled).toBe(true);
+
+		harness.abortController.abort();
+		await Bun.sleep(0);
+	});
 	it("plan-proposal handler errors when the plan file is missing", async () => {
 		const harness = await createHarness();
 		Settings.instance.set("plan.enabled", true);
@@ -799,8 +895,8 @@ describe("ACP agent", () => {
 
 		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
 		const session = harness.findSession(created.sessionId)!;
-		session.enabledToolNames = ["eval"];
-		session.activeToolNames = ["eval"];
+		session.activeToolNames = ["read", "goal"];
+		session.builtInToolNames.add("goal");
 		await harness.agent.setSessionMode({ sessionId: created.sessionId, modeId: "plan" });
 		const localOptions = {
 			getArtifactsDir: () => session.sessionManager.getArtifactsDir(),
@@ -830,6 +926,7 @@ describe("ACP agent", () => {
 		expect(session.planModeState).toBeUndefined();
 		expect(session.activeToolNames).toEqual(["eval"]);
 		expect(session.planProposalHandler).toBeUndefined();
+		expect(session.activeToolNames).toEqual(["read", "goal"]);
 		expect(session.planReferencePath).toBe("local://words-counter-plan.md");
 		const approvalUpdates = harness.updates.slice(updatesBefore);
 		// Mode-change notifications reached the client so Zed's UI and config

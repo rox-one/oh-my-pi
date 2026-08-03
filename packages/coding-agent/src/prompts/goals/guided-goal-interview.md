@@ -26,7 +26,19 @@ Objective ready only when all 5 pinned down; probe missing/weak fields:
 
 Re-ask until fixed: vague “done” without checkable signal; uncapped iteration (“until CI is green”, “keep going until it works”); self-graded success without verification command.
 
-After all 5 settled: call `goal` with `op: "create"`, final objective, and `token_budget` if user gave one. Objective MUST use this exact ordered markdown structure:
+1. Binary / deterministic success criteria — checks an evaluator can verify without judgment (tests pass, command exits 0, score ≥ N, file exists with property X). Reject subjective "works well / clean / done".
+2. Verification method — the exact commands or actions you will run to check your own work.
+3. Attempt cap — an explicit max turns/tries ("stop after N attempts").
+4. Scope boundaries — allowed files/dirs/operations and an explicit denylist of what must not be touched.
+5. Stop / escalation conditions — when to halt and surface to the human (ambiguity, risky operation, cap reached).
+
+Anti-patterns to re-ask until fixed:
+
+- Vague "done" without a checkable signal
+- Uncapped iteration ("until CI is green", "keep going until it works")
+- Self-graded success without a verification command
+
+Once all five are settled, call the `goal` tool with `op: "create"` and the final objective. The objective MUST be structured markdown with exactly these sections, in this order:
 
 ## Objective
 ## Success criteria

@@ -107,7 +107,7 @@ describe("guided goal setup", () => {
 		const harness = await createHarness();
 		try {
 			const promptSpy = vi.spyOn(harness.session, "prompt").mockResolvedValue(true);
-			const images: ImageContent[] = [{ type: "image", data: "aW1hZ2U=", mimeType: "image/png" }];
+			await harness.session.setActiveToolsByName(["read", "goal"]);
 
 			await harness.mode.handleGuidedGoalCommand("automate flaky test triage", {
 				images,
@@ -123,6 +123,10 @@ describe("guided goal setup", () => {
 			expect(text).toContain('op: "create"');
 			// The goal tool is activated up front so the agent can create the goal
 			// once the interview concludes.
+			expect(harness.session.getEnabledToolNames()).toContain("goal");
+			await harness.goalTool.execute("create", { op: "create", objective: "Automate triage" });
+			await harness.goalTool.execute("drop", { op: "drop", objective: undefined });
+			await Promise.resolve();
 			expect(harness.session.getEnabledToolNames()).toContain("goal");
 		} finally {
 			await harness.cleanup();
@@ -256,7 +260,7 @@ describe("guided goal setup", () => {
 		}
 	});
 
-	it("allows explicit goal tool activation without an active goal, but keeps it out of the default set", async () => {
+	it("allows explicit goal tool activation without an active goal and includes it in the default set", async () => {
 		const harness = await createHarness();
 		try {
 			const explicit = await createTools(createToolSession(harness.tempDir.path(), harness.settings), [
@@ -266,7 +270,7 @@ describe("guided goal setup", () => {
 			expect(explicit.map(tool => tool.name)).toContain("goal");
 
 			const defaults = await createTools(createToolSession(harness.tempDir.path(), harness.settings));
-			expect(defaults.map(tool => tool.name)).not.toContain("goal");
+			expect(defaults.map(tool => tool.name)).toContain("goal");
 		} finally {
 			await harness.cleanup();
 		}

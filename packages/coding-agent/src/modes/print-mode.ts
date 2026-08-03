@@ -141,12 +141,52 @@ export async function runPrintMode(session: AgentSession, options: PrintModeOpti
 		session.settings.get("plan.defaultOnStartup") &&
 		session.settings.get("plan.enabled") &&
 		session.sessionManager.buildSessionContext().messages.length === 0 &&
-		!session.sessionManager.getEntries().some(entry => entry.type === "mode_change") &&
-		!planYolo;
-	if (planStartupIgnored) {
-		process.stderr.write(
-			"Note: plan.defaultOnStartup is ignored in print mode (no interactive surface to review the plan). Use --plan-yolo for a headless plan flow.\n",
-		);
+		!session.sessionManager.getEntries().some(entry => entry.type === "mode_change");
+	if (planDefaultArmed) {
+		const planFilePath = session.getPlanReferencePath() || "local://PLAN.md";
+		const previousTools = session.getEnabledToolNames();
+		const planBaseTools = session.hasBuiltInTool("goal")
+			? previousTools.filter(name => name !== "goal")
+			: previousTools;
+		const planTools = session.hasBuiltInTool("write") ? [...new Set([...planBaseTools, "write"])] : planBaseTools;
+		const planModeState = {
+			enabled: true,
+			planFilePath,
+			workflow: "parallel",
+		} as const;
+		session.setPlanModeState(planModeState);
+		try {
+			await session.setActiveToolsByName(planTools);
+		} catch (error) {
+			session.setPlanModeState(undefined);
+			throw error;
+		}
+		session.sessionManager.appendModeChange("plan", { planFilePath });
+		abortAfterPlanProposal = true;
+		session.setPlanProposalHandler(async title => {
+			const result = await session.preparePlanForReview(title);
+			const details = result.details;
+			if (details) {
+				const state = session.getPlanModeState();
+				if (state?.enabled) {
+					session.setPlanModeState({ ...state, planFilePath: details.planFilePath });
+				}
+				session.sessionManager.appendModeChange("plan", { planFilePath: details.planFilePath });
+			}
+			return result;
+		});
+
+		const resolved = session.resolveRoleModelWithThinking("plan");
+		const transition = resolvePlanModelTransition(session.model, resolved, false);
+		if (transition.kind === "thinking") {
+			session.setThinkingLevel(transition.thinkingLevel);
+		} else if (transition.kind === "apply") {
+			try {
+				await session.setModelTemporary(transition.model, transition.thinkingLevel);
+			} catch (error) {
+				logger.warn("Failed to switch to plan model for print mode", { error: String(error) });
+			}
+		}
 	}
 
 	// Always subscribe to enable session persistence via _handleAgentEvent

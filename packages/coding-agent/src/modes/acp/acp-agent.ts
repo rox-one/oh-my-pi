@@ -627,6 +627,8 @@ export class AcpAgent implements Agent {
 	#initialSession: AgentSession | undefined;
 	#createSession: CreateAcpSession;
 	#sessions = new Map<string, ManagedSessionRecord>();
+	#planPreviousTools = new WeakMap<AgentSession, string[]>();
+	#modeTransitionTails = new WeakMap<AgentSession, Promise<void>>();
 	#disposePromise: Promise<void> | undefined;
 	#cleanupRegistered = false;
 	#clientCapabilities: ClientCapabilities | undefined;
@@ -785,7 +787,7 @@ export class AcpAgent implements Agent {
 
 	async setSessionMode(params: SetSessionModeRequest): Promise<SetSessionModeResponse> {
 		const record = this.#getSessionRecord(params.sessionId);
-		await this.#applyModeChange(record, params.modeId);
+		await this.#applyModeChange(record.session, params.modeId);
 		await this.#connection.sessionUpdate({
 			sessionId: record.session.sessionId,
 			update: this.#buildCurrentModeUpdate(record.session),
@@ -802,7 +804,7 @@ export class AcpAgent implements Agent {
 
 		switch (params.configId) {
 			case MODE_CONFIG_ID:
-				await this.#applyModeChange(record, params.value);
+				await this.#applyModeChange(record.session, params.value);
 				break;
 			case MODEL_CONFIG_ID:
 				await this.#setModelById(record.session, params.value);
@@ -1929,22 +1931,30 @@ export class AcpAgent implements Agent {
 		return session.getPlanModeState()?.enabled ? ACP_PLAN_MODE_ID : ACP_DEFAULT_MODE_ID;
 	}
 
-	async #applyModeChange(record: ManagedSessionRecord, modeId: string): Promise<void> {
-		const session = record.session;
+	async #applyModeChange(session: AgentSession, modeId: string): Promise<void> {
+		const previous = this.#modeTransitionTails.get(session) ?? Promise.resolve();
+		const transition = previous.catch(() => {}).then(() => this.#applyModeChangeSerial(session, modeId));
+		this.#modeTransitionTails.set(session, transition);
+		try {
+			await transition;
+		} finally {
+			if (this.#modeTransitionTails.get(session) === transition) this.#modeTransitionTails.delete(session);
+		}
+	}
+
+	async #applyModeChangeSerial(session: AgentSession, modeId: string): Promise<void> {
 		const availableModes = this.#getAvailableModes(session);
 		if (!availableModes.some(mode => mode.id === modeId)) {
 			throw new Error(`Unsupported ACP mode: ${modeId}`);
 		}
-		const previous = session.getPlanModeState();
-		const previousPlanProposalHandler = session.peekPlanProposalHandler?.();
+		const goalMode = session.getGoalModeState();
+		if (modeId === ACP_PLAN_MODE_ID && goalMode && (goalMode.enabled || goalMode.goal.status === "paused")) {
+			throw new Error("Cannot enter plan mode while goal mode is active. Exit goal mode first.");
+		}
 		if (modeId === ACP_PLAN_MODE_ID) {
-			const enabledToolNames = session.getEnabledToolNames();
-			const capturedPlanTools = record.planModePreviousTools === undefined;
-			if (capturedPlanTools) record.planModePreviousTools = [...enabledToolNames];
-			const planToolNames =
-				session.hasBuiltInTool("write") && !enabledToolNames.includes("write")
-					? [...enabledToolNames, "write"]
-					: enabledToolNames;
+			const previous = session.getPlanModeState();
+			const previousTools = session.getEnabledToolNames();
+			if (!this.#planPreviousTools.has(session)) this.#planPreviousTools.set(session, previousTools);
 			session.setPlanModeState({
 				enabled: true,
 				planFilePath: previous?.planFilePath ?? DEFAULT_PLAN_FILE_URL,
@@ -1952,18 +1962,37 @@ export class AcpAgent implements Agent {
 				reentry: previous !== undefined,
 			});
 			try {
-				await session.setActiveToolsByName(planToolNames);
+				await session.setActiveToolsByName(
+					session.hasBuiltInTool("goal") ? previousTools.filter(name => name !== "goal") : previousTools,
+				);
+				const currentGoal = session.getGoalModeState();
+				if (currentGoal && (currentGoal.enabled || currentGoal.goal.status === "paused")) {
+					session.setPlanModeState(previous);
+					if (!previous) this.#planPreviousTools.delete(session);
+					await session.setActiveToolsByName(previousTools);
+					throw new Error("Cannot enter plan mode while goal mode is active. Exit goal mode first.");
+				}
 			} catch (error) {
 				session.setPlanModeState(previous);
-				if (capturedPlanTools) record.planModePreviousTools = undefined;
+				if (!previous) this.#planPreviousTools.delete(session);
 				throw error;
 			}
-			// Mirror `InteractiveMode.#enterPlanMode`: register the plan-proposal
-			// handler that consumes `xd://propose` writes from plan mode. Without
-			// this, proposal dispatch falls through and plan mode has no approval
-			// path (issue #1869).
 			session.setPlanProposalHandler?.(title => this.#handleAcpPlanProposal(session, title));
-			return;
+		} else {
+			const previous = session.getPlanModeState();
+			session.setPlanProposalHandler?.(null);
+			session.setPlanModeState(undefined);
+			try {
+				const previousTools = this.#planPreviousTools.get(session);
+				if (previousTools) await session.setActiveToolsByName(previousTools);
+			} catch (error) {
+				session.setPlanModeState(previous);
+				if (previous?.enabled) {
+					session.setPlanProposalHandler?.(title => this.#handleAcpPlanProposal(session, title));
+				}
+				throw error;
+			}
+			this.#planPreviousTools.delete(session);
 		}
 		const restoreToolNames = record.planModePreviousTools ?? session.getEnabledToolNames();
 		session.setPlanModeState(undefined);
@@ -2034,15 +2063,7 @@ export class AcpAgent implements Agent {
 		// content as context (the file keeps its agent-chosen name — no rename),
 		// then exit plan mode so the agent regains full tools.
 		session.setPlanReferencePath(planFilePath);
-		try {
-			await this.#applyModeChange(this.#getSessionRecord(session.sessionId), ACP_DEFAULT_MODE_ID);
-		} catch (error) {
-			logger.warn("Failed to reconcile ACP tools after plan approval", {
-				sessionId: session.sessionId,
-				error,
-			});
-			throw error;
-		}
+		await this.#applyModeChange(session, ACP_DEFAULT_MODE_ID);
 		try {
 			await this.#connection.sessionUpdate({
 				sessionId: session.sessionId,
