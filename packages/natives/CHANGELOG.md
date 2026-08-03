@@ -179,6 +179,10 @@
 - Fixed accessibility snapshots incorrectly marking a window root as focused based on its app-local AXFocused attribute when another application held global focus; the root annotation now correctly reflects the global window-roster focus flag.
 - Improved coordinate-frame error messages for pointer input before capture, out-of-frame coordinates, and between-display points to clearly explain the capture-frame contract and remedy instead of throwing a generic bounds check.
 - Fixed duplicated characters in AppKit targets on macOS caused by background keyboard events being posted through both CoreGraphics and SkyLight; events are now delivered once via the authenticated SkyLight route.
+- Fixed the accessibility snapshot marking a window root `(focused)` from its app-local `AXFocused` attribute even when another application held global focus; the root annotation now reflects the global window-roster focus flag.
+- Fixed installed CLIs losing desktop capture when the resolved prebuilt addon still exposes the pre-parity `DesktopSession` ABI. That ABI is now adapted behind the current session contract, legacy error codes are translated, and the adapter ships in the published native core package.
+- Clarified coordinate-frame errors: pointer input before any capture, out-of-frame coordinates, and between-display points now name the capture-frame contract and the remedy instead of a bare bounds check.
+- Fixed macOS background keyboard events being posted through both CoreGraphics and SkyLight, which duplicated every typed character in AppKit targets; the authenticated SkyLight route now delivers each event once.
 
 ## [17.2.2] - 2026-07-31
 
