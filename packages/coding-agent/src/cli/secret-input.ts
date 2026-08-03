@@ -76,6 +76,8 @@ export function promptSecretInput(prompt: string, options: SecretInputOptions = 
 	}
 
 	activeSecretInputs.add(input);
+	const suppressBufferedLineFeed = inputsAwaitingLineFeed.has(input) && input.readableLength > 0;
+	inputsAwaitingLineFeed.delete(input);
 
 	const { promise, resolve, reject } = Promise.withResolvers<string>();
 	{
@@ -85,6 +87,7 @@ export function promptSecretInput(prompt: string, options: SecretInputOptions = 
 		let rawModeTouched = false;
 		let promptStarted = false;
 		let settled = false;
+		let awaitingBufferedLineFeed = suppressBufferedLineFeed;
 		let value = "";
 
 		const cleanup = (): unknown => {
@@ -143,8 +146,8 @@ export function promptSecretInput(prompt: string, options: SecretInputOptions = 
 			for (let index = 0; index < characters.length; index++) {
 				const character = characters[index]!;
 				if (settled) return;
-				if (inputsAwaitingLineFeed.has(input)) {
-					inputsAwaitingLineFeed.delete(input);
+				if (awaitingBufferedLineFeed) {
+					awaitingBufferedLineFeed = false;
 					if (character === "\n") continue;
 				}
 				if (character === "\r") {

@@ -202,6 +202,18 @@ describe("promptSecretInput", () => {
 		await expect(second).resolves.toBe("second");
 	});
 
+	it("accepts a standalone line feed entered after the next prompt begins", async () => {
+		const input = createInput();
+		const first = promptSecretInput("First: ", { input: input.stream, output: createOutput() });
+		input.stream.write("first\r");
+		await expect(first).resolves.toBe("first");
+
+		const second = promptSecretInput("Second: ", { input: input.stream, output: createOutput() });
+		input.stream.write("\n");
+
+		await expect(second).resolves.toBe("");
+	});
+
 	it("restores terminal state when the input reaches EOF or errors", async () => {
 		for (const event of ["end", "close", "error"] as const) {
 			const input = createInput();
