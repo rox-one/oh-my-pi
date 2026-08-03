@@ -1033,11 +1033,15 @@
 - Added server-owned RPC operation lifecycles with accepted/started timing, exactly-once completed, failed, or cancelled outcomes, targeted idempotent cancellation, and bounded operation snapshots for reconciliation.
 - Added an authoritative RPC `get_state.activityPhase` (`provider`, `maintenance`, or `idle`) so hosts can distinguish provider completion from post-turn maintenance and terminal idle without changing legacy `isStreaming` semantics.
 - Added a runtime-validated RPC command registry and capability manifest with stable command identities, derived input schemas, live availability, execution scope, feature requirements, and serial/concurrent/control scheduling metadata in the ready frame and TypeScript/Python client APIs.
+- Added RPC session and workspace catalog commands (`list_sessions`, `get_session_info`, `list_workspace_roots`, `resume_session`, `fork_session`, `rename_session`, `delete_session`) that share one cursor-paged, cwd- or workspace-scoped view of persisted sessions with the interactive picker.
 
 ### Changed
 
 - Exposed the script-driven computer schema to all models, including those with provider-native Computer Use support.
 - Reduced omp --help cold-start latency and memory usage by rendering lightweight command metadata.
+- Exposed the script-driven `computer` schema to every model, including models with provider-native Computer Use support, because native action declarations cannot express persistent desktop sessions or accessibility handles.
+- Reduced `omp --help` cold-start latency and memory use by rendering lightweight command metadata without loading every runtime command and provider graph.
+- `delete_session` now requires a host confirmation bound to a server-issued `operationId`. A declined, expired, disconnected, or mismatched confirmation fails closed with the `confirmation_required` error code, and the capability manifest advertises `confirmation: "required"` so hosts can prompt before the round trip.
 
 ### Fixed
 
