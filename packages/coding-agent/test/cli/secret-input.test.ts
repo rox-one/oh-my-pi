@@ -13,7 +13,9 @@ interface FakeInput {
 	getRawMode(): boolean;
 }
 
-function createInput(options: { isTTY?: boolean; initiallyRaw?: boolean; failRawMode?: boolean } = {}): FakeInput {
+function createInput(
+	options: { isTTY?: boolean; initiallyRaw?: boolean; failRawMode?: boolean; failRawModeReset?: boolean } = {},
+): FakeInput {
 	const stream = new PassThrough() as PassThrough & NodeJS.ReadStream;
 	const rawModes: boolean[] = [];
 	let rawMode = options.initiallyRaw ?? false;
@@ -22,6 +24,7 @@ function createInput(options: { isTTY?: boolean; initiallyRaw?: boolean; failRaw
 	stream.setRawMode = (mode: boolean) => {
 		rawModes.push(mode);
 		if (mode && options.failRawMode) throw new Error("raw mode denied");
+		if (!mode && options.failRawModeReset) throw new Error("raw mode reset denied");
 		rawMode = mode;
 		return stream;
 	};
@@ -77,6 +80,25 @@ describe("promptSecretInput", () => {
 		expect(input.rawModes).toEqual([true, false]);
 	});
 
+	it("preserves the unavailable error when raw-mode activation and cleanup both fail", async () => {
+		const input = createInput({ failRawMode: true, failRawModeReset: true });
+
+		await expect(
+			promptSecretInput("Token: ", { input: input.stream, output: createOutput() }),
+		).rejects.toBeInstanceOf(SecretInputUnavailableError);
+		expect(input.rawModes).toEqual([true, false]);
+	});
+
+	it("rejects streams that already decode input into strings", async () => {
+		const input = createInput();
+		input.stream.setEncoding("utf8");
+
+		await expect(
+			promptSecretInput("Token: ", { input: input.stream, output: createOutput() }),
+		).rejects.toBeInstanceOf(SecretInputUnavailableError);
+		expect(input.rawModes).toEqual([]);
+	});
+
 	it("collects a line without echoing it and restores terminal state", async () => {
 		const input = createInput();
 		const output = createOutput();
@@ -90,6 +112,15 @@ describe("promptSecretInput", () => {
 		expect(input.rawModes).toEqual([true, false]);
 		expect(input.getRawMode()).toBe(false);
 		expect(input.stream.isPaused()).toBe(true);
+	});
+
+	it("deletes one complete grapheme on backspace", async () => {
+		const input = createInput();
+		const result = promptSecretInput("Token: ", { input: input.stream, output: createOutput() });
+
+		input.stream.write(`a${"e\u0301"}${"👩‍💻"}\u007f\u007f\r`);
+
+		await expect(result).resolves.toBe("a");
 	});
 
 	it("rejects concurrent prompts on one stream and releases ownership after completion", async () => {

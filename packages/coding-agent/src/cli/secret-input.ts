@@ -1,4 +1,5 @@
 const activeSecretInputs = new WeakSet<NodeJS.ReadStream>();
+const graphemeSegmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });
 
 /** Writable terminal surface used by {@link promptSecretInput}. */
 export interface SecretInputOutput {
@@ -49,6 +50,13 @@ export function promptSecretInput(prompt: string, options: SecretInputOptions = 
 
 	if (input.isTTY !== true || typeof input.setRawMode !== "function") {
 		return Promise.reject(new SecretInputUnavailableError());
+	}
+	if (input.readableEncoding !== null) {
+		return Promise.reject(
+			new SecretInputUnavailableError({
+				cause: new Error("Confidential input requires a byte-mode input stream"),
+			}),
+		);
 	}
 	if (signal?.aborted) {
 		return Promise.reject(signal.reason ?? new SecretInputCancelledError());
@@ -109,6 +117,11 @@ export function promptSecretInput(prompt: string, options: SecretInputOptions = 
 				reject(cleanupError ?? error);
 				return;
 			}
+			if ("error" in result && result.error instanceof SecretInputUnavailableError) {
+				value = "";
+				reject(result.error);
+				return;
+			}
 			if (cleanupError !== undefined) {
 				value = "";
 				reject(cleanupError);
@@ -132,7 +145,8 @@ export function promptSecretInput(prompt: string, options: SecretInputOptions = 
 					return;
 				}
 				if (character === "\b" || character === "\u007f") {
-					value = Array.from(value).slice(0, -1).join("");
+					const graphemes = Array.from(graphemeSegmenter.segment(value));
+					value = value.slice(0, graphemes.at(-1)?.index ?? 0);
 					continue;
 				}
 				if (character === "\u001b" || character === "\u0003") {
