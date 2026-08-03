@@ -97,10 +97,10 @@ import { describeAuthBrokerStartupError } from "./session/auth-broker-config";
 import type { AuthStorage } from "./session/auth-storage";
 import {
 	AUTO_RESTART_SESSION_FILE_ENV,
-	awaitAutoRestartExit,
 	buildAutoRestartCommand,
 	defaultAutoRestartWatchPaths,
 	ExecutableUpdateMonitor,
+	handoffAutoRestart,
 	prepareAutoRestartArgs,
 } from "./session/auto-restart";
 import { describePendingToolCalls } from "./session/exit-diagnostics";
@@ -1999,18 +1999,21 @@ export async function runRootCommand(
 						execArgv: process.execArgv,
 						env: process.env,
 					});
-					const child = Bun.spawn({
-						cmd,
-						cwd: process.cwd(),
-						env: {
-							...process.env,
-							[AUTO_RESTART_SESSION_FILE_ENV]: autoRestartOutcome.autoRestartSessionFile,
-						},
-						stdin: "inherit",
-						stdout: "inherit",
-						stderr: "inherit",
-					});
-					await postmortem.quit(await awaitAutoRestartExit(child.exited));
+					await handoffAutoRestart(
+						() =>
+							Bun.spawn({
+								cmd,
+								cwd: process.cwd(),
+								env: {
+									...process.env,
+									[AUTO_RESTART_SESSION_FILE_ENV]: autoRestartOutcome.autoRestartSessionFile,
+								},
+								stdin: "inherit",
+								stdout: "inherit",
+								stderr: "inherit",
+							}),
+						exitCode => postmortem.quit(exitCode),
+					);
 				} catch (error) {
 					process.stderr.write(
 						`\nAuto-restart failed: ${error instanceof Error ? error.message : String(error)}\n` +
