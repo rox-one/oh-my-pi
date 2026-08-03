@@ -1145,6 +1145,7 @@
 - Added an authoritative RPC `get_state.activityPhase` (`provider`, `maintenance`, or `idle`) so hosts can distinguish provider completion from post-turn maintenance and terminal idle without changing legacy `isStreaming` semantics.
 - Added a runtime-validated RPC command registry and capability manifest with stable command identities, derived input schemas, live availability, execution scope, feature requirements, and serial/concurrent/control scheduling metadata in the ready frame and TypeScript/Python client APIs.
 - Added RPC session and workspace catalog commands (`list_sessions`, `get_session_info`, `list_workspace_roots`, `resume_session`, `fork_session`, `rename_session`, `delete_session`) that share one cursor-paged, cwd- or workspace-scoped view of persisted sessions with the interactive picker.
+- Added authoritative RPC advisor state and control: `get_state` reports whether advisors are configured and effectively active, `get_advisor_state` and `set_advisor_enabled` read and toggle the roster, and each advisor carries a `running`, `paused`, `quota_exhausted`, `error`, or `no_model` status instead of a single opaque flag.
 
 ### Changed
 
