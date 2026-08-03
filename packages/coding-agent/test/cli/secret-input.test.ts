@@ -114,6 +114,34 @@ describe("promptSecretInput", () => {
 		expect(input.stream.isPaused()).toBe(true);
 	});
 
+	it("ignores terminal escape sequences but still cancels on bare Escape", async () => {
+		const sequenceInput = createInput();
+		const sequenceResult = promptSecretInput("Token: ", {
+			input: sequenceInput.stream,
+			output: createOutput(),
+		});
+		sequenceInput.stream.write("sec\u001b[Aret\r");
+		await expect(sequenceResult).resolves.toBe("secret");
+
+		const escapeInput = createInput();
+		const escapeResult = promptSecretInput("Token: ", {
+			input: escapeInput.stream,
+			output: createOutput(),
+		});
+		escapeInput.stream.write("\u001b");
+		await expect(escapeResult).rejects.toBeInstanceOf(SecretInputCancelledError);
+	});
+
+	it("preserves bytes received after the submitted line for the next prompt", async () => {
+		const input = createInput();
+		const first = promptSecretInput("First: ", { input: input.stream, output: createOutput() });
+		input.stream.write("first\rsecond\r");
+		await expect(first).resolves.toBe("first");
+
+		const second = promptSecretInput("Second: ", { input: input.stream, output: createOutput() });
+		await expect(second).resolves.toBe("second");
+	});
+
 	it("deletes one complete grapheme on backspace", async () => {
 		const input = createInput();
 		const result = promptSecretInput("Token: ", { input: input.stream, output: createOutput() });
@@ -200,6 +228,21 @@ describe("promptSecretInput", () => {
 		input.stream.write("second\r");
 
 		await expect(second).resolves.toBe("second");
+	});
+
+	it("does not requeue a submitted line after a buffered CRLF suffix", async () => {
+		const input = createInput();
+		const first = promptSecretInput("First: ", { input: input.stream, output: createOutput() });
+		input.stream.write("first\r");
+		await expect(first).resolves.toBe("first");
+
+		input.stream.write("\nsecond\npost");
+		const second = promptSecretInput("Second: ", { input: input.stream, output: createOutput() });
+		await expect(second).resolves.toBe("second");
+
+		const third = promptSecretInput("Third: ", { input: input.stream, output: createOutput() });
+		input.stream.write("\n");
+		await expect(third).resolves.toBe("post");
 	});
 
 	it("accepts a standalone line feed entered after the next prompt begins", async () => {

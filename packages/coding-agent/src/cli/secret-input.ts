@@ -88,6 +88,9 @@ export function promptSecretInput(prompt: string, options: SecretInputOptions = 
 		let promptStarted = false;
 		let settled = false;
 		let awaitingBufferedLineFeed = suppressBufferedLineFeed;
+		let pendingEscape = false;
+		let escapeSequence: "csi" | "ss3" | undefined;
+		let escapeTimer: NodeJS.Timeout | undefined;
 		let value = "";
 
 		const cleanup = (): unknown => {
@@ -96,7 +99,7 @@ export function promptSecretInput(prompt: string, options: SecretInputOptions = 
 			input.off("end", onEnd);
 			input.off("close", onEnd);
 			signal?.removeEventListener("abort", onAbort);
-
+			clearTimeout(escapeTimer);
 			let cleanupError: unknown;
 			if (rawModeTouched) {
 				try {
@@ -110,15 +113,23 @@ export function promptSecretInput(prompt: string, options: SecretInputOptions = 
 			return cleanupError;
 		};
 
-		const finish = (result: { value: string } | { error: unknown }): void => {
+		const finish = (result: { value: string } | { error: unknown }, remainder?: Buffer): void => {
 			if (settled) return;
 			settled = true;
 			const cleanupError = cleanup();
+			let remainderError: unknown;
+			if (remainder && remainder.length > 0) {
+				try {
+					input.unshift(remainder);
+				} catch (error) {
+					remainderError = error;
+				}
+			}
 			try {
 				if (promptStarted) output.write("\n");
 			} catch (error) {
 				value = "";
-				reject(cleanupError ?? error);
+				reject(cleanupError ?? remainderError ?? error);
 				return;
 			}
 			if ("error" in result && result.error instanceof SecretInputUnavailableError) {
@@ -126,9 +137,9 @@ export function promptSecretInput(prompt: string, options: SecretInputOptions = 
 				reject(result.error);
 				return;
 			}
-			if (cleanupError !== undefined) {
+			if (cleanupError !== undefined || remainderError !== undefined) {
 				value = "";
-				reject(cleanupError);
+				reject(cleanupError ?? remainderError);
 				return;
 			}
 			if ("error" in result) {
@@ -141,22 +152,44 @@ export function promptSecretInput(prompt: string, options: SecretInputOptions = 
 		};
 
 		function onData(chunk: Buffer | string): void {
-			const text = typeof chunk === "string" ? chunk : decoder.decode(chunk, { stream: true });
+			const bytes = typeof chunk === "string" ? Buffer.from(chunk) : chunk;
+			const text = decoder.decode(bytes, { stream: true });
 			const characters = Array.from(text);
+			let terminatorSearchStart = 0;
 			for (let index = 0; index < characters.length; index++) {
 				const character = characters[index]!;
 				if (settled) return;
-				if (awaitingBufferedLineFeed) {
-					awaitingBufferedLineFeed = false;
-					if (character === "\n") continue;
-				}
-				if (character === "\r") {
-					if (characters[index + 1] !== "\n") inputsAwaitingLineFeed.add(input);
-					finish({ value });
+				if (pendingEscape) {
+					pendingEscape = false;
+					if (escapeTimer) clearTimeout(escapeTimer);
+					escapeTimer = undefined;
+					if (character === "[" || character === "O") {
+						escapeSequence = character === "[" ? "csi" : "ss3";
+						continue;
+					}
+					finish({ error: new SecretInputCancelledError() }, Buffer.from(characters.slice(index).join("")));
 					return;
 				}
-				if (character === "\n") {
-					finish({ value });
+				if (escapeSequence) {
+					if (escapeSequence === "ss3" || (character >= "@" && character <= "~")) {
+						escapeSequence = undefined;
+					}
+					continue;
+				}
+				if (awaitingBufferedLineFeed) {
+					awaitingBufferedLineFeed = false;
+					if (character === "\n") {
+						terminatorSearchStart = bytes.indexOf(0x0a, terminatorSearchStart) + 1;
+						continue;
+					}
+				}
+				if (character === "\r" || character === "\n") {
+					const terminator = character === "\r" ? 0x0d : 0x0a;
+					const terminatorIndex = bytes.indexOf(terminator, terminatorSearchStart);
+					const hasLineFeed = character === "\r" && bytes[terminatorIndex + 1] === 0x0a;
+					const remainderStart = terminatorIndex + (hasLineFeed ? 2 : 1);
+					if (character === "\r" && remainderStart === bytes.length) inputsAwaitingLineFeed.add(input);
+					finish({ value }, bytes.subarray(remainderStart));
 					return;
 				}
 				if (character === "\b" || character === "\u007f") {
@@ -164,7 +197,22 @@ export function promptSecretInput(prompt: string, options: SecretInputOptions = 
 					value = value.slice(0, graphemes.at(-1)?.index ?? 0);
 					continue;
 				}
-				if (character === "\u001b" || character === "\u0003") {
+				if (character === "\u001b") {
+					const sequencePrefix = characters[index + 1];
+					if (sequencePrefix === "[" || sequencePrefix === "O") {
+						escapeSequence = sequencePrefix === "[" ? "csi" : "ss3";
+						index++;
+						continue;
+					}
+					if (sequencePrefix === undefined) {
+						pendingEscape = true;
+						escapeTimer = setTimeout(() => finish({ error: new SecretInputCancelledError() }), 25);
+						continue;
+					}
+					finish({ error: new SecretInputCancelledError() }, Buffer.from(characters.slice(index + 1).join("")));
+					return;
+				}
+				if (character === "\u0003") {
 					finish({ error: new SecretInputCancelledError() });
 					return;
 				}
