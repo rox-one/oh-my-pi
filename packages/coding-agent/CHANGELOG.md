@@ -1032,6 +1032,7 @@
 - Added turn-aware `/tree` navigation: Alt+Up/Alt+Down traverses previous/next user or assistant turns while skipping tool and bookkeeping entries, Home/End jumps to the first/last visible item, and PageUp/PageDown moves by a visible page.
 - Added server-owned RPC operation lifecycles with accepted/started timing, exactly-once completed, failed, or cancelled outcomes, targeted idempotent cancellation, and bounded operation snapshots for reconciliation.
 - Added an authoritative RPC `get_state.activityPhase` (`provider`, `maintenance`, or `idle`) so hosts can distinguish provider completion from post-turn maintenance and terminal idle without changing legacy `isStreaming` semantics.
+- Added a runtime-validated RPC command registry and capability manifest with stable command identities, derived input schemas, live availability, execution scope, feature requirements, and serial/concurrent/control scheduling metadata in the ready frame and TypeScript/Python client APIs.
 
 ### Changed
 
