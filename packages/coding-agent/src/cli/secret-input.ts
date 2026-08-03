@@ -1,5 +1,3 @@
-import { BracketedPasteHandler, decodeReencodedPasteControls } from "@oh-my-pi/pi-tui/bracketed-paste";
-
 const activeSecretInputs = new WeakSet<NodeJS.ReadStream>();
 const inputsAwaitingLineFeed = new WeakSet<NodeJS.ReadStream>();
 const graphemeSegmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });
@@ -86,7 +84,6 @@ export function promptSecretInput(prompt: string, options: SecretInputOptions = 
 		const wasRaw = input.isRaw === true;
 		const wasFlowing = input.readableFlowing === true;
 		const decoder = new TextDecoder();
-		const pasteHandler = new BracketedPasteHandler();
 		let rawModeTouched = false;
 		let promptStarted = false;
 		let settled = false;
@@ -145,20 +142,6 @@ export function promptSecretInput(prompt: string, options: SecretInputOptions = 
 
 		function onData(chunk: Buffer | string): void {
 			const text = typeof chunk === "string" ? chunk : decoder.decode(chunk, { stream: true });
-			const paste = pasteHandler.process(text);
-			if (paste.handled) {
-				if (paste.pasteContent !== undefined) {
-					value += decodeReencodedPasteControls(paste.pasteContent)
-						.normalize("NFC")
-						.replace(/[\x00-\x1F\x7F]/g, "");
-					if (paste.remaining.length > 0) processCharacters(paste.remaining);
-				}
-				return;
-			}
-			processCharacters(text);
-		}
-
-		function processCharacters(text: string): void {
 			const characters = Array.from(text);
 			for (let index = 0; index < characters.length; index++) {
 				const character = characters[index]!;

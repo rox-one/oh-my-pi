@@ -214,16 +214,6 @@ describe("promptSecretInput", () => {
 		await expect(second).resolves.toBe("");
 	});
 
-	it("accepts bracketed paste without treating its escape envelope as cancellation", async () => {
-		const input = createInput();
-		const result = promptSecretInput("Secret: ", { input: input.stream, output: createOutput() });
-
-		input.stream.write("\x1b[200~pasted-");
-		input.stream.write("secret\x1b[201~\r");
-
-		await expect(result).resolves.toBe("pasted-secret");
-	});
-
 	it("restores terminal state when the input reaches EOF or errors", async () => {
 		for (const event of ["end", "close", "error"] as const) {
 			const input = createInput();
