@@ -189,6 +189,19 @@ describe("promptSecretInput", () => {
 		await expect(second).resolves.toBe("next");
 	});
 
+	it("does not carry a split CRLF line feed into a later prompt", async () => {
+		const input = createInput();
+		const first = promptSecretInput("First: ", { input: input.stream, output: createOutput() });
+		input.stream.write("first\r");
+		await expect(first).resolves.toBe("first");
+
+		input.stream.write("\n");
+		const second = promptSecretInput("Second: ", { input: input.stream, output: createOutput() });
+		input.stream.write("second\r");
+
+		await expect(second).resolves.toBe("second");
+	});
+
 	it("restores terminal state when the input reaches EOF or errors", async () => {
 		for (const event of ["end", "close", "error"] as const) {
 			const input = createInput();
