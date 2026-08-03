@@ -1,4 +1,5 @@
 const activeSecretInputs = new WeakSet<NodeJS.ReadStream>();
+const inputsAwaitingLineFeed = new WeakSet<NodeJS.ReadStream>();
 const graphemeSegmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });
 
 /** Writable terminal surface used by {@link promptSecretInput}. */
@@ -138,9 +139,20 @@ export function promptSecretInput(prompt: string, options: SecretInputOptions = 
 
 		function onData(chunk: Buffer | string): void {
 			const text = typeof chunk === "string" ? chunk : decoder.decode(chunk, { stream: true });
-			for (const character of text) {
+			const characters = Array.from(text);
+			for (let index = 0; index < characters.length; index++) {
+				const character = characters[index]!;
 				if (settled) return;
-				if (character === "\r" || character === "\n") {
+				if (inputsAwaitingLineFeed.has(input)) {
+					inputsAwaitingLineFeed.delete(input);
+					if (character === "\n") continue;
+				}
+				if (character === "\r") {
+					if (characters[index + 1] !== "\n") inputsAwaitingLineFeed.add(input);
+					finish({ value });
+					return;
+				}
+				if (character === "\n") {
 					finish({ value });
 					return;
 				}
