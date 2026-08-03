@@ -7,7 +7,10 @@ from omp_rpc import (
     AutoCompactionEndEvent,
     AutoCompactionStartEvent,
     ExtensionUiRequest,
-    MessageUpdateEvent,
+    OperationCancelledEvent,
+    OperationCompletedEvent,
+    OperationFailedEvent,
+    OperationStartedEvent,
     SessionState,
     TodoReminderEvent,
     assistant_text,
@@ -18,37 +21,56 @@ from omp_rpc import (
 
 
 class ProtocolParsingTests(unittest.TestCase):
-    def test_parse_message_update_preserves_assistant_event_type(self) -> None:
-        assistant = {"role": "assistant"}
-        common = {"contentIndex": 0, "partial": assistant}
-        cases = {
-            "start": {"partial": assistant},
-            "text_start": common,
-            "thinking_start": common,
-            "toolcall_start": common,
-            "text_delta": {**common, "delta": "text"},
-            "thinking_delta": {**common, "delta": "thought"},
-            "toolcall_delta": {**common, "delta": "arguments"},
-            "text_end": {**common, "content": "text"},
-            "thinking_end": {**common, "content": "thought"},
-            "toolcall_end": {**common, "toolCall": {}},
-            "done": {"reason": "stop", "message": assistant},
-            "error": {"reason": "error", "error": assistant},
-        }
+    def test_parse_operation_lifecycle_notifications(self) -> None:
+        started = parse_notification(
+            {
+                "type": "operation_started",
+                "operationId": "operation-1",
+                "requestId": "request-1",
+                "command": "prompt",
+                "startedAt": 10,
+                "futureField": True,
+            }
+        )
+        completed = parse_notification(
+            {
+                "type": "operation_completed",
+                "operationId": "operation-1",
+                "requestId": "request-1",
+                "command": "prompt",
+                "agentInvoked": True,
+                "settledAt": 11,
+            }
+        )
+        failed = parse_notification(
+            {
+                "type": "operation_failed",
+                "operationId": "operation-2",
+                "command": "prompt",
+                "error": "no model",
+                "code": "prompt_scheduling_failed",
+                "settledAt": 12,
+            }
+        )
+        cancelled = parse_notification(
+            {
+                "type": "operation_cancelled",
+                "operationId": "operation-3",
+                "command": "abort_and_prompt",
+                "reason": "user",
+                "code": "cancelled_by_client",
+                "settledAt": 13,
+            }
+        )
 
-        for event_type, event in cases.items():
-            with self.subTest(event_type=event_type):
-                parsed = parse_notification(
-                    {
-                        "type": "message_update",
-                        "message": assistant,
-                        "assistantMessageEvent": {"type": event_type, **event},
-                    }
-                )
-
-                self.assertIsInstance(parsed, MessageUpdateEvent)
-                assert isinstance(parsed, MessageUpdateEvent)
-                self.assertEqual(parsed.assistant_message_event["type"], event_type)
+        self.assertIsInstance(started, OperationStartedEvent)
+        self.assertIsInstance(completed, OperationCompletedEvent)
+        self.assertTrue(completed.agent_invoked)
+        self.assertEqual(completed.request_id, "request-1")
+        self.assertIsInstance(failed, OperationFailedEvent)
+        self.assertEqual(failed.code, "prompt_scheduling_failed")
+        self.assertIsInstance(cancelled, OperationCancelledEvent)
+        self.assertEqual(cancelled.reason, "user")
 
     def test_parse_session_state(self) -> None:
         state = parse_session_state(
@@ -79,6 +101,7 @@ class ProtocolParsingTests(unittest.TestCase):
                 },
                 "thinkingLevel": "medium",
                 "isStreaming": False,
+                "activityPhase": "maintenance",
                 "isCompacting": False,
                 "steeringMode": "one-at-a-time",
                 "followUpMode": "all",
@@ -125,6 +148,7 @@ class ProtocolParsingTests(unittest.TestCase):
         self.assertIsInstance(state, SessionState)
         self.assertEqual(state.session_id, "session-123")
         self.assertEqual(state.follow_up_mode, "all")
+        self.assertEqual(state.activity_phase, "maintenance")
         self.assertEqual(state.model.id if state.model else None, "claude-sonnet-4-5")
         self.assertEqual(state.todo_phases[0].tasks[0].status, "in_progress")
         # Legacy bare-string systemPrompt is accepted and wrapped to a tuple.
@@ -381,6 +405,34 @@ class ProtocolParsingTests(unittest.TestCase):
                     "interruptMode": "immediate",
                 }
             )
+
+    def test_parse_session_state_activity_phases_are_forward_compatible(self) -> None:
+        base_state = {
+            "sessionId": "session-123",
+            "steeringMode": "one-at-a-time",
+            "followUpMode": "one-at-a-time",
+            "interruptMode": "immediate",
+        }
+        for activity_phase in ("provider", "maintenance", "idle"):
+            with self.subTest(activity_phase=activity_phase):
+                state = parse_session_state(
+                    {**base_state, "activityPhase": activity_phase}
+                )
+                self.assertEqual(state.activity_phase, activity_phase)
+
+        future = parse_session_state(
+            {**base_state, "activityPhase": "future-settlement-phase"}
+        )
+        self.assertEqual(future.activity_phase, "maintenance")
+        explicit_null = parse_session_state(
+            {**base_state, "activityPhase": None, "isStreaming": False}
+        )
+        self.assertEqual(explicit_null.activity_phase, "maintenance")
+
+        legacy_streaming = parse_session_state({**base_state, "isStreaming": True})
+        legacy_idle = parse_session_state(base_state)
+        self.assertEqual(legacy_streaming.activity_phase, "maintenance")
+        self.assertEqual(legacy_idle.activity_phase, "idle")
 
     def test_parse_model_info_rejects_unknown_effort(self) -> None:
         with self.assertRaises(ValueError):
