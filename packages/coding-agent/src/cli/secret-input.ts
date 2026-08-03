@@ -1,7 +1,4 @@
-import * as readline from "node:readline";
-
 const activeSecretInputs = new WeakSet<NodeJS.ReadStream>();
-const keypressDataListeners = new WeakMap<NodeJS.ReadStream, Array<(...args: unknown[]) => void>>();
 
 /** Writable terminal surface used by {@link promptSecretInput}. */
 export interface SecretInputOutput {
@@ -71,19 +68,18 @@ export function promptSecretInput(prompt: string, options: SecretInputOptions = 
 
 	activeSecretInputs.add(input);
 
-	return new Promise<string>((resolve, reject) => {
+	const { promise, resolve, reject } = Promise.withResolvers<string>();
+	{
 		const wasRaw = input.isRaw === true;
 		const wasFlowing = input.readableFlowing === true;
+		const decoder = new TextDecoder();
 		let rawModeTouched = false;
 		let promptStarted = false;
 		let settled = false;
 		let value = "";
-		let ownedDataListeners = keypressDataListeners.get(input) ?? [];
 
 		const cleanup = (): unknown => {
-			input.off("keypress", onKeypress);
-			for (const listener of ownedDataListeners) input.off("data", listener);
-			ownedDataListeners = [];
+			input.off("data", onData);
 			input.off("error", onError);
 			input.off("end", onEnd);
 			input.off("close", onEnd);
@@ -127,25 +123,29 @@ export function promptSecretInput(prompt: string, options: SecretInputOptions = 
 			resolve(result.value);
 		};
 
-		function onKeypress(text: string | undefined, key: readline.Key): void {
-			if (key.name === "return" || key.name === "enter") {
-				finish({ value });
-				return;
+		function onData(chunk: Buffer | string): void {
+			const text = typeof chunk === "string" ? chunk : decoder.decode(chunk, { stream: true });
+			for (const character of text) {
+				if (settled) return;
+				if (character === "\r" || character === "\n") {
+					finish({ value });
+					return;
+				}
+				if (character === "\b" || character === "\u007f") {
+					value = Array.from(value).slice(0, -1).join("");
+					continue;
+				}
+				if (character === "\u001b" || character === "\u0003") {
+					finish({ error: new SecretInputCancelledError() });
+					return;
+				}
+				if (character === "\u0004") {
+					finish({ error: new Error("Confidential input ended before submission") });
+					return;
+				}
+				if (character < " ") continue;
+				value += character;
 			}
-			if (key.name === "backspace") {
-				value = Array.from(value).slice(0, -1).join("");
-				return;
-			}
-			if (key.name === "escape" || (key.ctrl === true && key.name === "c")) {
-				finish({ error: new SecretInputCancelledError() });
-				return;
-			}
-			if (key.ctrl === true && key.name === "d") {
-				finish({ error: new Error("Confidential input ended before submission") });
-				return;
-			}
-			if (key.ctrl === true || key.meta === true || text === undefined) return;
-			value += text;
 		}
 
 		function onError(error: Error): void {
@@ -161,13 +161,7 @@ export function promptSecretInput(prompt: string, options: SecretInputOptions = 
 		}
 
 		try {
-			for (const listener of ownedDataListeners) input.on("data", listener);
-			readline.emitKeypressEvents(input);
-			input.on("keypress", onKeypress);
-			if (ownedDataListeners.length === 0) {
-				ownedDataListeners = input.rawListeners("data") as Array<(...args: unknown[]) => void>;
-				keypressDataListeners.set(input, ownedDataListeners);
-			}
+			input.on("data", onData);
 			input.once("error", onError);
 			input.once("end", onEnd);
 			input.once("close", onEnd);
@@ -177,13 +171,15 @@ export function promptSecretInput(prompt: string, options: SecretInputOptions = 
 				input.setRawMode(true);
 			} catch (cause) {
 				finish({ error: new SecretInputUnavailableError({ cause }) });
-				return;
 			}
-			input.resume();
-			promptStarted = true;
-			output.write(prompt);
+			if (!settled) {
+				input.resume();
+				promptStarted = true;
+				output.write(prompt);
+			}
 		} catch (error) {
 			finish({ error });
 		}
-	});
+	}
+	return promise;
 }

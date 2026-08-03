@@ -38,10 +38,6 @@ function createOutput(): SecretInputOutput & { text: string } {
 	};
 }
 
-function press(input: NodeJS.ReadStream, text: string | undefined, key: Record<string, unknown>): void {
-	input.emit("keypress", text, key);
-}
-
 describe("promptSecretInput", () => {
 	it("rejects when raw-mode echo suppression is unavailable", async () => {
 		const input = createInput({ isTTY: false });
@@ -86,10 +82,7 @@ describe("promptSecretInput", () => {
 		const output = createOutput();
 		const result = promptSecretInput("Token: ", { input: input.stream, output });
 
-		press(input.stream, "secx", {});
-		press(input.stream, undefined, { name: "backspace" });
-		press(input.stream, "ret", {});
-		press(input.stream, "\r", { name: "return" });
+		input.stream.write("secx\u007fret\r");
 
 		await expect(result).resolves.toBe("secret");
 		expect(output.text).toBe("Token: \n");
@@ -127,8 +120,7 @@ describe("promptSecretInput", () => {
 		const output = createOutput();
 		const result = promptSecretInput("Secret: ", { input: input.stream, output });
 
-		press(input.stream, "value", {});
-		press(input.stream, "\r", { name: "return" });
+		input.stream.write("value\r");
 
 		await expect(result).resolves.toBe("value");
 		expect(input.rawModes).toEqual([true, true]);
@@ -140,13 +132,30 @@ describe("promptSecretInput", () => {
 		const output = createOutput();
 		const result = promptSecretInput("Secret: ", { input: input.stream, output });
 
-		press(input.stream, "partial", {});
-		press(input.stream, "\u0003", { ctrl: true, name: "c" });
+		input.stream.write("partial\u0003");
 
 		await expect(result).rejects.toBeInstanceOf(SecretInputCancelledError);
 		expect(output.text).toBe("Secret: \n");
 		expect(output.text).not.toContain("partial");
 		expect(input.getRawMode()).toBe(false);
+	});
+
+	it("does not carry an incomplete UTF-8 sequence into a later prompt", async () => {
+		const input = createInput();
+		const firstController = new AbortController();
+		const first = promptSecretInput("First: ", {
+			input: input.stream,
+			output: createOutput(),
+			signal: firstController.signal,
+		});
+
+		input.stream.write(Buffer.from([0xe2]));
+		firstController.abort(new Error("operation cancelled"));
+		await expect(first).rejects.toThrow("operation cancelled");
+
+		const second = promptSecretInput("Second: ", { input: input.stream, output: createOutput() });
+		input.stream.write("next\r");
+		await expect(second).resolves.toBe("next");
 	});
 
 	it("restores terminal state when the input reaches EOF or errors", async () => {
@@ -169,7 +178,7 @@ describe("promptSecretInput", () => {
 		const controller = new AbortController();
 		const result = promptSecretInput("Secret: ", { input: input.stream, output, signal: controller.signal });
 
-		press(input.stream, "partial", {});
+		input.stream.write("partial");
 		controller.abort(new Error("operation cancelled"));
 
 		await expect(result).rejects.toThrow("operation cancelled");
