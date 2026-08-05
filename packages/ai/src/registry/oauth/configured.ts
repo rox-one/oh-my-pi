@@ -14,6 +14,8 @@ export interface ConfiguredOAuthProvider {
 	authorizationUrl: string;
 	tokenUrl: string;
 	scopes: string[];
+	/** OIDC issuer. Defaults to the authorization URL origin when omitted. */
+	issuer?: string;
 	redirectUri?: string;
 	callbackPort?: number;
 	callbackPath?: string;
@@ -45,7 +47,7 @@ function callbackOptions(config: ConfiguredOAuthProvider) {
 
 function authorizationServer(config: ConfiguredOAuthProvider): oauth.AuthorizationServer {
 	return {
-		issuer: new URL(config.authorizationUrl).origin,
+		issuer: config.issuer ?? new URL(config.authorizationUrl).origin,
 		authorization_endpoint: config.authorizationUrl,
 		token_endpoint: config.tokenUrl,
 	};
@@ -67,17 +69,27 @@ function requestOptions(fetchImpl: FetchImpl, signal?: AbortSignal) {
 	};
 }
 
-function tokenExpiry(token: string, expiresIn: number | undefined): number {
-	if (expiresIn !== undefined) return Date.now() + expiresIn * 1000;
+function jwtExpiryMs(token: string): number | undefined {
 	const payload = token.split(".")[1];
-	if (payload) {
-		try {
-			const claims = JSON.parse(Buffer.from(payload, "base64url").toString("utf8")) as { exp?: unknown };
-			if (typeof claims.exp === "number" && Number.isFinite(claims.exp)) return claims.exp * 1000;
-		} catch {
-			// Opaque bearer tokens may remain valid until revoked.
-		}
+	if (!payload) return undefined;
+	try {
+		const claims = JSON.parse(Buffer.from(payload, "base64url").toString("utf8")) as { exp?: unknown };
+		if (typeof claims.exp === "number" && Number.isFinite(claims.exp)) return claims.exp * 1000;
+	} catch {
+		// Opaque bearer tokens may remain valid until revoked.
 	}
+	return undefined;
+}
+
+/**
+ * Prefer the selected bearer token's JWT `exp` when present.
+ * Access-token `expires_in` is the fallback for opaque tokens or when no JWT exp exists.
+ */
+function tokenExpiry(token: string, expiresIn: number | undefined, preferJwtExp: boolean): number {
+	const jwtExpiry = jwtExpiryMs(token);
+	if (preferJwtExp && jwtExpiry !== undefined) return jwtExpiry;
+	if (expiresIn !== undefined) return Date.now() + expiresIn * 1000;
+	if (jwtExpiry !== undefined) return jwtExpiry;
 	return NEVER_EXPIRES;
 }
 
@@ -97,7 +109,7 @@ function credentialsFromTokens(
 	return {
 		access,
 		refresh: tokens.refresh_token ?? previousRefresh ?? "",
-		expires: tokenExpiry(access, tokens.expires_in),
+		expires: tokenExpiry(access, tokens.expires_in, Boolean(config.useIdToken)),
 	};
 }
 
@@ -175,13 +187,13 @@ export function createConfiguredOAuthProvider(
 ): {
 	name: string;
 	login(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials>;
-	refreshToken(credentials: OAuthCredentials): Promise<OAuthCredentials>;
+	refreshToken(credentials: OAuthCredentials, signal?: AbortSignal): Promise<OAuthCredentials>;
 	getApiKey(credentials: OAuthCredentials): string;
 } {
 	return {
 		name: config.name,
 		login: callbacks => new ConfiguredOAuthFlow(providerId, config, callbacks).login(),
-		async refreshToken(credentials) {
+		async refreshToken(credentials, signal) {
 			if (!credentials.refresh) {
 				throw new AIError.OAuthError(`OAuth credential for ${providerId} has no refresh token`, {
 					kind: "validation",
@@ -195,7 +207,7 @@ export function createConfiguredOAuthProvider(
 					clientAuth(config),
 					credentials.refresh,
 					{
-						...requestOptions(config.fetch ?? fetch),
+						...requestOptions(config.fetch ?? fetch, signal),
 						additionalParameters: config.tokenParams,
 					},
 				);
@@ -206,6 +218,9 @@ export function createConfiguredOAuthProvider(
 				);
 				return credentialsFromTokens(providerId, config, tokens, credentials.refresh);
 			} catch (cause) {
+				if (signal?.aborted) {
+					throw new AIError.AbortError("OAuth token refresh aborted by caller");
+				}
 				throw new AIError.OAuthError(`OAuth token refresh failed for ${providerId}`, {
 					kind: "token-refresh",
 					provider: providerId,

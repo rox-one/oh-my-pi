@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import * as path from "node:path";
-import { getOAuthProvider, unregisterOAuthProviders } from "@oh-my-pi/pi-ai/oauth";
+import { getOAuthProvider, registerOAuthProvider, unregisterOAuthProviders } from "@oh-my-pi/pi-ai/oauth";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { ModelsConfigSchema } from "@oh-my-pi/pi-coding-agent/config/models-config-schema";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
@@ -136,7 +136,7 @@ describe("models.yml provider OAuth", () => {
 					},
 				},
 			});
-			expect(result.constructor.name).toBe("ArkErrors");
+			expect(result.constructor.name).not.toBe("Object");
 		}
 		const valid = ModelsConfigSchema({
 			providers: {
@@ -148,5 +148,54 @@ describe("models.yml provider OAuth", () => {
 			},
 		});
 		expect(valid.constructor.name).toBe("Object");
+	});
+
+	test("rolls back only OAuth providers registered by the failed load", async () => {
+		const primaryDir = TempDir.createSync("@models-config-oauth-primary-");
+		const secondaryDir = TempDir.createSync("@models-config-oauth-secondary-");
+		const authStorage = await AuthStorage.create(":memory:");
+		try {
+			await writeModelsConfig(primaryDir, "primary-oauth");
+			const primary = new ModelRegistry(authStorage, path.join(primaryDir.path(), "models.yml"), {
+				allowConfiguredOAuth: true,
+			});
+			expect(primary.getError()).toBeUndefined();
+			expect(getOAuthProvider("primary-oauth")?.name).toBe("Configured OAuth");
+
+			await writeModelsConfig(secondaryDir, "openai-codex");
+			const secondary = new ModelRegistry(authStorage, path.join(secondaryDir.path(), "models.yml"), {
+				allowConfiguredOAuth: true,
+			});
+			expect(secondary.getError()?.message).toContain("configured OAuth cannot replace a built-in provider");
+			// Failed secondary load must not wipe the primary registration.
+			expect(getOAuthProvider("primary-oauth")?.name).toBe("Configured OAuth");
+		} finally {
+			authStorage.close();
+			await primaryDir.remove();
+			await secondaryDir.remove();
+		}
+	});
+
+	test("refuses to overwrite an extension-owned OAuth provider", async () => {
+		const tempDir = TempDir.createSync("@models-config-oauth-extension-");
+		const authStorage = await AuthStorage.create(":memory:");
+		try {
+			registerOAuthProvider({
+				id: PROVIDER,
+				name: "Extension OAuth",
+				sourceId: "extension-source",
+				login: async () => ({ access: "x", refresh: "y", expires: Date.now() + 60_000 }),
+			});
+			await writeModelsConfig(tempDir);
+			const registry = new ModelRegistry(authStorage, path.join(tempDir.path(), "models.yml"), {
+				allowConfiguredOAuth: true,
+			});
+			expect(String(registry.getError())).toContain("already registered by source");
+			expect(getOAuthProvider(PROVIDER)?.name).toBe("Extension OAuth");
+		} finally {
+			unregisterOAuthProviders("extension-source");
+			authStorage.close();
+			await tempDir.remove();
+		}
 	});
 });

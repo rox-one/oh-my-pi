@@ -89,7 +89,6 @@ export interface OAuthProviderInterface {
 	readonly name: string;
 	readonly sourceId?: string;
 	login(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials | string>;
-	/** Refresh a stored grant; the signal bounds provider network work to refresh ownership. */
 	refreshToken?(credentials: OAuthCredentials, signal?: AbortSignal): Promise<OAuthCredentials>;
 	getApiKey?(credentials: OAuthCredentials): string;
 	/** Store resulting OAuth credentials under a different provider id. */

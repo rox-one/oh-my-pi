@@ -149,4 +149,45 @@ describe("configured provider OAuth", () => {
 			/OAuth token refresh failed/,
 		);
 	});
+
+	it("prefers ID token JWT exp over access-token expires_in", async () => {
+		const shortLivedIdToken = idToken(120);
+		const fetchMock = vi.fn(async () =>
+			Response.json({
+				access_token: "access-new",
+				id_token: shortLivedIdToken,
+				refresh_token: "refresh-new",
+				expires_in: 7200,
+				token_type: "Bearer",
+			}),
+		);
+		const provider = createConfiguredOAuthProvider("custom", config(fetchMock));
+		const credentials = await provider.refreshToken({ access: "id-old", refresh: "refresh-old", expires: 1 });
+		const expected = Math.floor(Date.now() / 1000) + 120;
+		// Within a few seconds of the JWT exp claim (ms).
+		expect(credentials.expires).toBeGreaterThan(Date.now());
+		expect(credentials.expires).toBeLessThan(Date.now() + 180_000);
+		expect(Math.abs(credentials.expires - expected * 1000)).toBeLessThan(5_000);
+	});
+
+	it("aborts an in-flight refresh when the caller signal aborts", async () => {
+		const controller = new AbortController();
+		const fetchMock = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+			const signal = init?.signal;
+			await new Promise<void>((_resolve, reject) => {
+				if (signal?.aborted) {
+					reject(new DOMException("Aborted", "AbortError"));
+					return;
+				}
+				signal?.addEventListener("abort", () => reject(new DOMException("Aborted", "AbortError")), {
+					once: true,
+				});
+			});
+			return Response.json({ access_token: "late", token_type: "Bearer" });
+		});
+		const provider = createConfiguredOAuthProvider("custom", { ...config(fetchMock), useIdToken: false });
+		const refresh = provider.refreshToken({ access: "old", refresh: "refresh-old", expires: 1 }, controller.signal);
+		controller.abort();
+		await expect(refresh).rejects.toThrow(/aborted|OAuth token refresh failed/i);
+	});
 });

@@ -285,6 +285,7 @@ export const getModelsConfigSchemaBundle = once(() => {
 		authorizationUrl: "string",
 		tokenUrl: "string",
 		scopes: "string[]",
+		"issuer?": "string",
 		"redirectUri?": "string",
 		"callbackPort?": "number",
 		"callbackPath?": "string",
@@ -308,6 +309,14 @@ export const getModelsConfigSchemaBundle = once(() => {
 			return ctx.mustBe("tokenUrl a valid URL");
 		}
 		if (value.scopes.length === 0) return ctx.mustBe("scopes a non-empty array");
+		if (value.issuer !== undefined) {
+			try {
+				const issuer = new URL(value.issuer);
+				if (issuer.protocol !== "https:") return ctx.mustBe("issuer an HTTPS URL");
+			} catch {
+				return ctx.mustBe("issuer a valid URL");
+			}
+		}
 		if (
 			value.callbackPort !== undefined &&
 			(!Number.isInteger(value.callbackPort) || value.callbackPort < 0 || value.callbackPort > 65_535)

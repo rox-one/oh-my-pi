@@ -30,8 +30,23 @@ const customOAuthProviders = new Map<string, OAuthProviderInterface>();
 
 /**
  * Register a custom OAuth provider.
+ *
+ * Rejects IDs that collide with a built-in provider definition, or with a
+ * custom provider owned by a different `sourceId`. Same-source re-registration
+ * replaces the previous definition (models.yml reloads).
  */
 export function registerOAuthProvider(provider: OAuthProviderInterface): void {
+	if (getProviderDefinition(provider.id)) {
+		throw new AIError.ConfigurationError(
+			`OAuth provider "${provider.id}" collides with a built-in provider and cannot be registered.`,
+		);
+	}
+	const existing = customOAuthProviders.get(provider.id);
+	if (existing && existing.sourceId !== provider.sourceId) {
+		throw new AIError.ConfigurationError(
+			`OAuth provider "${provider.id}" is already registered by source "${existing.sourceId ?? "unknown"}".`,
+		);
+	}
 	customOAuthProviders.set(provider.id, provider);
 }
 
@@ -47,6 +62,13 @@ export function unregisterOAuthProvider(id: string): void {
  */
 export function getOAuthProvider(id: OAuthProviderId): OAuthProviderInterface | undefined {
 	return customOAuthProviders.get(id);
+}
+
+/**
+ * Remove a single custom OAuth provider by ID.
+ */
+export function unregisterOAuthProvider(id: OAuthProviderId): void {
+	customOAuthProviders.delete(id);
 }
 
 /**
@@ -73,6 +95,16 @@ export async function refreshOAuthToken(
 			kind: "validation",
 			provider,
 		});
+	}
+	const custom = getOAuthProvider(provider);
+	if (custom) {
+		if (!custom.refreshToken) {
+			throw new AIError.OAuthError(`OAuth provider "${provider}" does not support token refresh`, {
+				kind: "configuration",
+				provider,
+			});
+		}
+		return custom.refreshToken(credentials, signal);
 	}
 	const def = getProviderDefinition(provider);
 	if (!def?.login) {
