@@ -1501,6 +1501,7 @@
 - Fixed automatic `agent.continue()` paths failing to run context-fit maintenance when reverting to a smaller-context model after a cooldown expiry.
 - Fixed `/handoff` reporting "Handoff cancelled" for actual generation or stream timeout errors, ensuring the real error is surfaced.
 - Added the `advisor.lateConcern` setting (`preserve` | `steer`, default `preserve`): when set to `steer`, an advisor `concern` raised after the agent's final answer wakes the agent to act on it (like a `blocker`) instead of being preserved as a passive card. Aimed at slow advisors whose review reliably lands after the turn completes, so their concerns would otherwise never trigger a turn.
+- Added opt-in `settings.autoRestartOnUpdate` (default `false`). A persisted interactive session detects a stable replacement of its running executable, waits for the active turn to settle, then resumes through the normal session path with unsaved editor text retained.
 
 ## [17.2.10] - 2026-08-06
 

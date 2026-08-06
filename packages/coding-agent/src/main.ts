@@ -96,8 +96,9 @@ import type { AgentSession } from "./session/agent-session";
 import { describeAuthBrokerStartupError } from "./session/auth-broker-config";
 import type { AuthStorage } from "./session/auth-storage";
 import {
-	AUTO_RESTART_SESSION_FILE_ENV,
+	autoRestartHandoffEnv,
 	buildAutoRestartCommand,
+	consumeAutoRestartHandoff,
 	defaultAutoRestartWatchPaths,
 	ExecutableUpdateMonitor,
 	handoffAutoRestart,
@@ -1434,9 +1435,8 @@ export async function runRootCommand(
 	await logger.time("initTheme:initial", initTheme);
 
 	const parsedArgs = parsed;
-	const autoRestartSessionFile = process.env[AUTO_RESTART_SESSION_FILE_ENV];
+	const autoRestartSessionFile = consumeAutoRestartHandoff(process.env, process.ppid);
 	if (autoRestartSessionFile) {
-		delete process.env[AUTO_RESTART_SESSION_FILE_ENV];
 		prepareAutoRestartArgs(parsedArgs, autoRestartSessionFile);
 	}
 	await logger.time("applyStartupCwd", applyStartupCwd, parsedArgs);
@@ -1991,7 +1991,8 @@ export async function runRootCommand(
 				initialImages,
 				parsedArgs.join,
 			);
-			if (autoRestartOutcome.autoRestartSessionFile) {
+			const handoffSessionFile = autoRestartOutcome.autoRestartSessionFile;
+			if (handoffSessionFile) {
 				try {
 					const cmd = buildAutoRestartCommand({
 						argv: process.argv,
@@ -2006,7 +2007,7 @@ export async function runRootCommand(
 								cwd: process.cwd(),
 								env: {
 									...process.env,
-									[AUTO_RESTART_SESSION_FILE_ENV]: autoRestartOutcome.autoRestartSessionFile,
+									...autoRestartHandoffEnv(handoffSessionFile, process.pid),
 								},
 								stdin: "inherit",
 								stdout: "inherit",
@@ -2017,7 +2018,7 @@ export async function runRootCommand(
 				} catch (error) {
 					process.stderr.write(
 						`\nAuto-restart failed: ${error instanceof Error ? error.message : String(error)}\n` +
-							`Resume this session with ${APP_NAME} --resume ${autoRestartOutcome.autoRestartSessionFile}\n`,
+							`Resume this session with ${APP_NAME} --resume ${handoffSessionFile}\n`,
 					);
 					await postmortem.quit(1);
 				}
