@@ -980,6 +980,7 @@
 - Fixed the status-line `session_name` segment to honor the `statusLine.sessionAccent` setting, falling back to the theme's accent color when disabled.
 - Fixed automatic `agent.continue()` paths failing to run context-fit maintenance when reverting to a smaller-context model after a cooldown expiry.
 - Fixed `/handoff` reporting "Handoff cancelled" for actual generation or stream timeout errors, ensuring the real error is surfaced.
+- Added the `advisor.lateConcern` setting (`preserve` | `steer`, default `preserve`): when set to `steer`, an advisor `concern` raised after the agent's final answer wakes the agent to act on it (like a `blocker`) instead of being preserved as a passive card. Aimed at slow advisors whose review reliably lands after the turn completes, so their concerns would otherwise never trigger a turn.
 
 ## [17.2.10] - 2026-08-06
 
