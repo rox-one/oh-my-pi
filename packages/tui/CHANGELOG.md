@@ -188,6 +188,9 @@
 - Fixed prompt autocomplete to support Windows drive-absolute paths (e.g., C:/ or C:\).
 - Fixed desktop notifications in systemd, tmux, or SSH-attached Linux sessions when DBUS_SESSION_BUS_ADDRESS is unset.
 - Fixed an issue where Shift+letter and shifted symbol inputs (such as capital letters, ?, and !) were silently dropped on Windows and WSL terminals using ConPTY (e.g., WezTerm).
+### Fixed
+
+- Fixed an explicit appearance refresh (`app.display.reset`) inside tmux leaking DA1 capability bytes into the editor and keeping a stale light/dark theme. The refresh routed both the OSC 11 query and its DA1 sentinel through tmux's passthrough envelope; the outer terminal's DA1 reply then had to round-trip through tmux's input parser, where a fragmented client→tmux response under a low `escape-time` was misdecoded as a key press and the remaining capability bytes surfaced as pane input. The refresh is now two-staged: tmux's OSC 11 cache is refreshed with a passthrough query alone (no DA1), then read back via a direct pane-local probe after a bounded settle delay ([#7800](https://github.com/can1357/oh-my-pi/issues/7800)).
 
 ## [17.2.9] - 2026-08-05
 

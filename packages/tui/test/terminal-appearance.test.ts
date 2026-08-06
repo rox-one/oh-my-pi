@@ -361,73 +361,84 @@ describe("ProcessTerminal OSC 11 appearance detection", () => {
 		expect(afterStoppedRefresh).toBe(afterStop);
 	});
 
-	it("passes an explicit appearance refresh through tmux without changing the startup probe", () => {
+	it("refreshes tmux's OSC 11 cache with a passthrough query but never a passthrough DA1 (#7800)", () => {
 		Bun.env.TMUX = "/tmp/tmux-1000/default,1234,0";
 		const { terminal, writes } = setupTerminal();
 
+		// Startup probes stay direct.
 		expect(writes).toContain("\x1b]11;?\x07");
 		expect(writes).toContain("\x1b[c");
 
 		process.stdin.emit("data", "\x1b]11;rgb:ffff/ffff/ffff\x07");
 		for (let i = 0; i < 7; i++) process.stdin.emit("data", "\x1b[?1;2c");
+		const before = writes.length;
 		terminal.refreshAppearance?.();
 
-		expect(writes).toContain("\x1bPtmux;\x1b\x1b]11;?\x07\x1b\\");
+		// Stage one passes the OSC 11 query — and only the query — through tmux so
+		// tmux refreshes its background cache. Routing the DA1 sentinel through
+		// tmux is what leaked capability bytes into the editor (#7800), so it must
+		// not appear in the passthrough envelope.
+		const stage1 = writes.slice(before);
+		expect(stage1).toContain("\x1bPtmux;\x1b\x1b]11;?\x07\x1b\\");
+		expect(stage1).not.toContain("\x1bPtmux;\x1b\x1b]11;?\x07\x1b\x1b[c\x1b\\");
+		expect(stage1.some(w => w.includes("\x1b[c"))).toBe(false);
 
 		terminal.stop();
 	});
 
-	it("reads tmux's refreshed cache without passing a DA1 reply through tmux", () => {
+	it("reads tmux's refreshed cache with a direct pane-local DA1 probe after a settle delay (#7800)", () => {
 		vi.useFakeTimers();
 		Bun.env.TMUX = "/tmp/tmux-1000/default,1234,0";
-		const { terminal, received, queryCount } = setupTerminal();
+		const { terminal, writes, received } = setupTerminal();
 
+		// Seed appearance and drain the startup probe cycle.
 		process.stdin.emit("data", "\x1b]11;rgb:0000/0000/0000\x07");
 		for (let i = 0; i < 7; i++) process.stdin.emit("data", "\x1b[?1;2c");
+		expect(terminal.appearance).toBe("dark");
+
 		const reports: Array<{ appearance: string; token: number | undefined }> = [];
 		terminal.onAppearanceReport?.((appearance, token) => reports.push({ appearance, token }));
-		const beforeRefresh = queryCount();
 
-		const token = 42;
-		terminal.refreshAppearance?.(token);
-		expect(queryCount()).toBe(beforeRefresh);
+		const before = writes.length;
+		expect(terminal.refreshAppearance?.(42)).toBe(42);
 
-		// A fragmented outer DA1 reply can be decoded by tmux as an Alt+[ key
-		// followed by printable capability bytes. Wait for the OSC 11 response to
-		// reach tmux's cache, then query that cache directly with a local sentinel.
-		vi.advanceTimersByTime(99);
-		expect(queryCount()).toBe(beforeRefresh);
-		vi.advanceTimersByTime(1);
-		expect(queryCount()).toBe(beforeRefresh + 1);
+		// Stage two is armed on a bounded timer, not emitted synchronously, so no
+		// DA1 sentinel is written until the settle delay elapses.
+		expect(writes.slice(before)).not.toContain("\x1b[c");
+		vi.advanceTimersByTime(100);
 
+		// A direct pane-local probe (OSC 11 + DA1) that tmux answers itself.
+		const stage2 = writes.slice(before);
+		expect(stage2).toContain("\x1b]11;?\x07");
+		expect(stage2).toContain("\x1b[c");
+
+		// tmux answers from its refreshed cache: the report is token-correlated,
+		// the appearance re-evaluates, and no bytes leak to the input handler.
 		process.stdin.emit("data", "\x1b]11;rgb:ffff/ffff/ffff\x07");
 		process.stdin.emit("data", "\x1b[?1;2c");
-		const detected = terminal.appearance;
-		terminal.stop();
 
-		expect(detected).toBe("light");
-		expect(reports).toEqual([{ appearance: "light", token }]);
+		expect(reports).toContainEqual({ appearance: "light", token: 42 });
+		expect(terminal.appearance).toBe("light");
 		expect(received).toEqual([]);
+
+		terminal.stop();
 	});
 
-	it("cancels a pending tmux appearance cache read during teardown", () => {
+	it("cancels the pending tmux appearance refresh timer on teardown (#7800)", () => {
 		vi.useFakeTimers();
 		Bun.env.TMUX = "/tmp/tmux-1000/default,1234,0";
-		const { terminal, queryCount, sentinelCount } = setupTerminal();
+		const { terminal, writes } = setupTerminal();
 
 		process.stdin.emit("data", "\x1b]11;rgb:0000/0000/0000\x07");
 		for (let i = 0; i < 7; i++) process.stdin.emit("data", "\x1b[?1;2c");
-		const directQueriesBeforeRefresh = queryCount();
-		const directSentinelsBeforeRefresh = sentinelCount();
 
-		terminal.refreshAppearance?.();
-		expect(vi.getTimerCount()).toBe(1);
+		terminal.refreshAppearance?.(7);
 		terminal.stop();
-		expect(vi.getTimerCount()).toBe(0);
-		vi.advanceTimersByTime(100);
 
-		expect(queryCount()).toBe(directQueriesBeforeRefresh);
-		expect(sentinelCount()).toBe(directSentinelsBeforeRefresh);
+		// The stage-two probe must not fire after teardown.
+		const afterStop = writes.length;
+		vi.advanceTimersByTime(1000);
+		expect(writes.length).toBe(afterStop);
 	});
 
 	it("refreshAppearance() re-evaluates a changed background through the callback pipeline", () => {
