@@ -1073,6 +1073,7 @@
 - Fixed parsing of POSIX `$EDITOR` commands that contain quoted arguments or executable paths with spaces.
 - Fixed persisted Agent Hub rows losing the explicit caller model role when a subagent used a model override, preserving role provenance across restarts.
 - Fixed unobserved promise rejections in browser helpers (such as `tab.waitForResponse()`) causing tab workers to hang or crash.
+- Fixed `/tree` rendering blank rows for session bookkeeping and lifecycle entries, while keeping noisy bookkeeping hidden from the default filter ([#7778](https://github.com/can1357/oh-my-pi/issues/7778)).
 
 ## [17.2.9] - 2026-08-05
 
