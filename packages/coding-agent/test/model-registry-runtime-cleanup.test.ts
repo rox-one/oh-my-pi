@@ -54,7 +54,7 @@ describe("ModelRegistry runtime source cleanup", () => {
 	});
 
 	test("unregisterProvider removes only the named provider and its login entry", () => {
-		const registry = new ModelRegistry(authStorage, undefined, { ignoreLocalModelConfig: true });
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
 		registry.registerProvider(
 			"runtime-provider",
 			{
