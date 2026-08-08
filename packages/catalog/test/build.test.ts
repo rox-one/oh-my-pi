@@ -673,6 +673,15 @@ describe("OpenAI explicit prompt-cache breakpoint compat", () => {
 		expect(responses.supportsPromptCacheBreakpoints).toBe(true);
 		expect(responses.promptCacheBreakpointTtl).toBe("30m");
 
+		const azure = buildOpenAIResponsesCompat({
+			id: "gpt-5.6-luna",
+			provider: "azure",
+			name: "GPT 5.6 Luna",
+			baseUrl: "",
+		});
+		expect(azure.supportsPromptCacheBreakpoints).toBe(true);
+		expect(azure.promptCacheBreakpointTtl).toBe("30m");
+
 		expect(
 			buildOpenAICompat(
 				completionsSpec({ id: "gpt-5.6-preview", provider: "openai", baseUrl: "https://api.openai.com/v1" }),

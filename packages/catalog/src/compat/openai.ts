@@ -136,12 +136,13 @@ function isOfficialOpenAIEndpoint(provider: string, baseUrl: string): boolean {
 }
 
 /**
- * Explicit prompt-cache breakpoints are a GPT-5.6+ first-party contract. Keep
- * this intentionally narrow: compatible gateways and older OpenAI models
- * reject the new request fields unless their catalog compat opts in.
+ * Explicit prompt-cache breakpoints are a GPT-5.6+ first-party OpenAI/Azure contract. Keep
+ * this intentionally narrow: compatible gateways and older models reject the new request
+ * fields unless their catalog compat opts in.
  */
 function supportsOfficialOpenAIPromptCacheBreakpoints(provider: string, modelId: string, baseUrl: string): boolean {
-	if (!isOfficialOpenAIEndpoint(provider, baseUrl)) return false;
+	const isAzure = provider === "azure" || provider === "azure-openai";
+	if (!isAzure && !isOfficialOpenAIEndpoint(provider, baseUrl)) return false;
 	const model = parseOpenAIModel(bareModelId(modelId));
 	return model !== null && semverGte(model.version, "5.6");
 }

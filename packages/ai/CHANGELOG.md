@@ -1,6 +1,7 @@
 # Changelog
 
 ## [Unreleased]
+- Added opt-in implicit and explicit 30-minute prompt caching for Azure OpenAI GPT-5.6+ Responses requests, including stable-history breakpoint markers, while preserving the existing prompt-cache key.
 
 ### Fixed
 

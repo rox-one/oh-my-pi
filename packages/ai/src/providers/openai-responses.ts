@@ -91,6 +91,7 @@ import {
 	isOpenAIResponsesProgressEvent,
 	isOpenRouterAnthropicModel,
 	isStrictToolsDisabledForScope,
+	markLatestStableResponsesCacheBreakpoint as markLatestStableResponsesCacheBreakpointShared,
 	type OpenAIPromptCacheOptions,
 	type OpenAIStrictToolsScope,
 	type OpenAIStrictToolsState,
@@ -1066,46 +1067,10 @@ function markLatestStableResponsesCacheBreakpoint(
 	if (statefulBaseline) {
 		if (restoreResponsesCacheBreakpointsFromBaseline(input, statefulBaseline)) return true;
 		// A prior marker whose content no longer matches means chaining will
-		// reset to a full replay. Recompute a fresh boundary for that replay.
-		// Markerless baselines stay markerless so appends do not mutate them.
+		// reset to a full replay. Markerless baselines stay markerless.
 		if (!hasResponsesCacheBreakpoint(statefulBaseline)) return false;
 	}
-
-	let latestInputMessage = -1;
-	for (let i = input.length - 1; i >= 0; i--) {
-		const message = input[i];
-		if (!("role" in message)) continue;
-		if (message.role === "user" || message.role === "developer") {
-			latestInputMessage = i;
-			break;
-		}
-	}
-	if (latestInputMessage <= 0) return false;
-
-	for (let i = latestInputMessage - 1; i >= 0; i--) {
-		const message = input[i];
-		if (isStableStringResponsesInstruction(message)) {
-			const text = message.content;
-			Object.assign(message, {
-				content: [
-					{
-						type: "input_text",
-						text,
-						prompt_cache_breakpoint: { mode: "explicit" },
-					},
-				],
-			});
-			return true;
-		}
-		if (!isResponsesPromptCacheableMessage(message)) continue;
-		for (let j = message.content.length - 1; j >= 0; j--) {
-			const block = message.content[j];
-			if (!isResponsesPromptCacheableContentBlock(block)) continue;
-			Object.assign(block, { prompt_cache_breakpoint: { mode: "explicit" } });
-			return true;
-		}
-	}
-	return false;
+	return markLatestStableResponsesCacheBreakpointShared(input);
 }
 
 function applyOpenAIResponsesPromptCachePolicy(

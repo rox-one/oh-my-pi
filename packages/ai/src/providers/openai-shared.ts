@@ -117,6 +117,46 @@ import type {
 import { transformMessages } from "./transform-messages";
 import { joinTextWithImagePlaceholder, NON_VISION_IMAGE_PLACEHOLDER, partitionVisionContent } from "./vision-guard";
 
+/** Mark the latest stable Responses input prefix for explicit prompt caching. */
+export function markLatestStableResponsesCacheBreakpoint(input: ResponseInput | undefined): boolean {
+	if (!input) return false;
+	let latestInputMessage = -1;
+	for (let i = input.length - 1; i >= 0; i--) {
+		const message = input[i];
+		if (!message || !("role" in message)) continue;
+		if (message.role === "user" || message.role === "developer") {
+			latestInputMessage = i;
+			break;
+		}
+	}
+	if (latestInputMessage <= 0) return false;
+
+	for (let i = latestInputMessage - 1; i >= 0; i--) {
+		const message = input[i];
+		if (
+			message &&
+			"role" in message &&
+			"content" in message &&
+			(message.role === "developer" || message.role === "system") &&
+			typeof message.content === "string" &&
+			message.content.length > 0
+		) {
+			Object.assign(message, {
+				content: [{ type: "input_text", text: message.content, prompt_cache_breakpoint: { mode: "explicit" } }],
+			});
+			return true;
+		}
+		if (!message || !("content" in message) || !Array.isArray(message.content)) continue;
+		for (let j = message.content.length - 1; j >= 0; j--) {
+			const block = message.content[j];
+			if (!block || typeof block !== "object" || !("type" in block)) continue;
+			if (block.type !== "input_text" && block.type !== "input_image" && block.type !== "input_file") continue;
+			Object.assign(block, { prompt_cache_breakpoint: { mode: "explicit" } });
+			return true;
+		}
+	}
+	return false;
+}
 /**
  * Keyless-provider sentinel. Custom providers configured with `auth: none`
  * (models.yml) have no credential, so the coding-agent resolves their API key
