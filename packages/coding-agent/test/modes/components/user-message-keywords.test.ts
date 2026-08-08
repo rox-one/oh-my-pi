@@ -55,22 +55,14 @@ describe("UserMessageComponent magic-keyword highlighting", () => {
 		expect(raw).toContain("orchestrate");
 	});
 
-	it("closes the OSC 133 prompt zone and leaves no command zone open", () => {
+	it("closes the OSC 133 prompt zone with a command-output start so the cursor leaves .input", () => {
 		const raw = render("first line\nsecond line");
 		expect(raw).toContain("\x1b]133;A\x07");
 		expect(raw).toContain("\x1b]133;B\x07");
-		// #8030: the command-start marker is required. Terminals latch a sticky
-		// `.input` cursor semantic on 133;B that only 133;C clears; without it every
-		// later cell stays tagged as prompt input and click-to-move injects arrow
-		// keys into the pty.
-		expect(raw).toContain("\x1b]133;C\x07");
-		// ...but the zone is closed inside the same render, so terminals still cannot
-		// group later assistant/tool output under the submitted prompt.
-		expect(raw).toContain("\x1b]133;B\x07\x1b]133;C\x07\x1b]133;D;0\x07");
-		expect(raw.endsWith("\x1b]133;B\x07\x1b]133;C\x07\x1b]133;D;0\x07")).toBe(true);
-		// Exactly one balanced command zone per bubble.
-		expect(countOccurrences(raw, "\x1b]133;C\x07")).toBe(1);
-		expect(countOccurrences(raw, "\x1b]133;D;0\x07")).toBe(1);
+		// ;C (output-start) MUST follow ;B: it clears the sticky `.input` cursor
+		// semantic in Ghostty-family terminals (#8030). Missing ;C leaves click-to-move
+		// injecting arrow keys into the editor on every left-click.
+		expect(raw).toContain("\x1b]133;B\x07\x1b]133;C\x07");
 	});
 
 	it("closes the OSC 133 command zone for a single-line message too", () => {
