@@ -15,6 +15,9 @@ const adviseSchema = type({
 		"One concrete piece of advice for the agent you are watching. Terse, specific, actionable.",
 	),
 	"severity?": type("'nit' | 'concern' | 'blocker'").describe("How strongly to weigh this. Omit for a plain nit."),
+	"attribution?": type("string").describe(
+		"Opaque source attribution supplied in the current review context. Set only when that source directly caused this advice. Never include it in note.",
+	),
 });
 
 export type AdviseParams = typeof adviseSchema.infer;
@@ -24,6 +27,7 @@ export type AdvisorSeverity = "nit" | "concern" | "blocker";
 export interface AdviseDetails {
 	note: string;
 	severity?: AdvisorSeverity;
+	attribution?: string;
 	/** Which configured advisor produced this note (omitted for the default advisor). */
 	advisor?: string;
 }
@@ -32,6 +36,7 @@ export interface AdviseDetails {
 export interface AdvisorNote {
 	note: string;
 	severity?: AdvisorSeverity;
+	attribution?: string;
 	/** Which configured advisor produced this note (omitted for the default advisor). */
 	advisor?: string;
 }
@@ -249,20 +254,26 @@ export class AdviseTool implements AgentTool<typeof adviseSchema, AdviseDetails>
 				pending.severity = args.severity;
 			}
 			return {
-				content: [
-					{
-						type: "text",
-						text: "Deferred — primary is mid-turn; this note will be delivered automatically when the turn completes. Do not re-raise the same point.",
-					},
-				],
-				details: { note: args.note, severity: args.severity },
+				content: [{ type: "text", text: "Recorded." }],
+				details: { note: args.note, severity: args.severity, attribution: args.attribution },
 				useless: true,
 			};
 		}
-		const delivered = this.#deliver(args.note, args.severity);
+		const key = advisorNoteDedupeKey(args.note);
+		const rank = advisorSeverityRank(args.severity);
+		const previousRank = this.#deliveredNoteSeverities.get(key) ?? 0;
+		if (rank <= previousRank) {
+			return {
+				content: [{ type: "text", text: "Duplicate advice ignored." }],
+				details: { note: args.note, severity: args.severity, attribution: args.attribution },
+				useless: true,
+			};
+		}
+		this.#deliveredNoteSeverities.set(key, rank);
+		this.onAdvice(args.note, args.severity);
 		return {
-			content: [{ type: "text", text: delivered ? "Recorded." : "Duplicate advice ignored." }],
-			details: { note: args.note, severity: args.severity },
+			content: [{ type: "text", text: "Recorded." }],
+			details: { note: args.note, severity: args.severity, attribution: args.attribution },
 			useless: true,
 		};
 	}

@@ -894,6 +894,19 @@ export interface UserPythonEvent {
 }
 
 // ============================================================================
+// Advisor Context Events
+// ============================================================================
+
+/** Fired before native Advisor review so extensions can contribute bounded context. */
+export interface AdvisorContextEvent {
+	type: "advisor_context";
+	/** Stable session scope; opaque to extensions. */
+	scopeKey: string;
+	/** The bounded newest primary transcript updates about to be reviewed. */
+	updates: readonly unknown[];
+}
+
+// ============================================================================
 // Input Events
 // ============================================================================
 
@@ -1096,6 +1109,7 @@ export type ExtensionEvent =
 	| McpNotificationEvent
 	| UserBashEvent
 	| UserPythonEvent
+	| AdvisorContextEvent
 	| InputEvent
 	| ToolCallEvent
 	| ToolResultEvent
@@ -1134,6 +1148,11 @@ export interface UserBashEventResult {
 export interface UserPythonEventResult {
 	/** Full replacement: extension handled execution, use this result */
 	result?: PythonResult;
+}
+
+export interface AdvisorContextEventResult {
+	/** Bounded context appended to the native Advisor review update. */
+	context?: string;
 }
 
 export type { ToolResultEventResult } from "../shared-events";
@@ -1229,6 +1248,9 @@ export interface ExtensionAPI {
 	/** Injected pi-coding-agent exports for accessing SDK utilities */
 	pi: typeof PiCodingAgent;
 
+	/** Stable runtime host identifier for cross-host extensions. */
+	readonly host: "omp";
+
 	// =========================================================================
 	// Event Subscription
 	// =========================================================================
@@ -1289,6 +1311,7 @@ export interface ExtensionAPI {
 	on(event: "tool_result", handler: ExtensionHandler<ToolResultEvent, ToolResultEventResult>): void;
 	on(event: "user_bash", handler: ExtensionHandler<UserBashEvent, UserBashEventResult>): void;
 	on(event: "user_python", handler: ExtensionHandler<UserPythonEvent, UserPythonEventResult>): void;
+	on(event: "advisor_context", handler: ExtensionHandler<AdvisorContextEvent, AdvisorContextEventResult>): void;
 	on(event: "mcp_notification", handler: ExtensionHandler<McpNotificationEvent>): void;
 
 	// =========================================================================

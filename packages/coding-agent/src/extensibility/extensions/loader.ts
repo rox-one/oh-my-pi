@@ -151,6 +151,7 @@ export class ExtensionRuntime implements IExtensionRuntime {
  * Action methods delegate to the shared runtime.
  */
 class ConcreteExtensionAPI implements ExtensionAPI, IExtensionRuntime {
+	readonly host = "omp" as const;
 	readonly logger = logger;
 	readonly typebox = TypeBox;
 	readonly arktype = type;

@@ -24,6 +24,8 @@ import type { BranchHandler, NavigateTreeHandler, NewSessionHandler } from "../s
 import { ManagedTimers } from "./managed-timers";
 import { createExtensionModelQuery } from "./model-api";
 import type {
+	AdvisorContextEvent,
+	AdvisorContextEventResult,
 	AfterProviderResponseEvent,
 	AssistantThinkingRenderer,
 	BeforeAgentStartEvent,
@@ -325,6 +327,8 @@ const MAX_PENDING_CREDENTIAL_DISABLED = 32;
  * spills, but it does so consistently at both ends. Drop-oldest under pressure.
  */
 const MAX_PENDING_MCP_NOTIFICATIONS = 100;
+const MAX_ADVISOR_CONTEXT_CONTRIBUTIONS = 8;
+const MAX_ADVISOR_CONTEXT_CHARS = 8_000;
 
 /**
  * Events handled by the generic emit() method.
@@ -335,6 +339,7 @@ type RunnerEmitEvent = Exclude<
 	| ToolCallEvent
 	| ToolResultEvent
 	| UserBashEvent
+	| AdvisorContextEvent
 	| ContextEvent
 	| BeforeProviderRequestEvent
 	| AfterProviderResponseEvent
@@ -1493,6 +1498,26 @@ export class ExtensionRunner {
 			return { block: true, reason: `Tool execution was cancelled while an extension handler was pending` };
 		}
 		return result;
+	}
+
+	async emitAdvisorContext(event: AdvisorContextEvent): Promise<string[]> {
+		const contributions: string[] = [];
+		let ctx: ExtensionContext | undefined;
+		for (const ext of this.extensions) {
+			const handlers = ext.handlers.get("advisor_context");
+			if (!handlers?.length) continue;
+			ctx ??= this.createContext();
+			for (const handler of handlers) {
+				const result = (await this.#runHandlerWithTimeout(handler, event, ctx, ext, extensionHandlerTimeoutMs)) as
+					| AdvisorContextEventResult
+					| undefined;
+				const context = result?.context;
+				if (typeof context !== "string" || !context.trim()) continue;
+				contributions.push(context.slice(0, MAX_ADVISOR_CONTEXT_CHARS));
+				if (contributions.length >= MAX_ADVISOR_CONTEXT_CONTRIBUTIONS) return contributions;
+			}
+		}
+		return contributions;
 	}
 
 	async emitUserBash(event: UserBashEvent): Promise<UserBashEventResult | undefined> {

@@ -924,6 +924,25 @@ describe("advisor", () => {
 			};
 		}
 
+		it("includes extension context only in the matching Advisor update", async () => {
+			const promptInputs: string[] = [];
+			const messages: AgentMessage[] = [{ role: "user", content: "first", timestamp: 1 } as AgentMessage];
+			const runtime = new AdvisorRuntime(makeAgent(promptInputs), {
+				snapshotMessages: () => messages,
+				enqueueAdvice: () => {},
+			});
+
+			runtime.onTurnEnd(messages, { extensionContext: "approved experience guidance" });
+			await runtime.waitForCatchup(1000, 1);
+			expect(promptInputs[0]).toContain("approved experience guidance");
+
+			messages.push({ role: "user", content: "second", timestamp: 2 } as AgentMessage);
+			runtime.onTurnEnd(messages);
+			await runtime.waitForCatchup(1000, 1);
+			expect(promptInputs[1]).toContain("second");
+			expect(promptInputs[1]).not.toContain("approved experience guidance");
+		});
+
 		it("coalesces multiple onTurnEnd calls while a prompt is in-flight", async () => {
 			const promptInputs: Array<string | AgentMessage[]> = [];
 			const { promise: firstPromptPromise, resolve: finishFirstPrompt } = Promise.withResolvers<void>();

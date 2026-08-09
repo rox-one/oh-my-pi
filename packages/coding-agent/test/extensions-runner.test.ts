@@ -92,6 +92,63 @@ describe("ExtensionRunner", () => {
 		};
 	};
 
+	it("exposes the stable OMP host identifier to extensions", async () => {
+		fs.writeFileSync(
+			path.join(extensionsDir, "host.ts"),
+			`export default function (pi) {
+				if (pi.host !== "omp") throw new Error("unexpected extension host");
+			}`,
+		);
+		const result = await loadTestExtensions();
+		expect(result.errors).toEqual([]);
+		expect(result.extensions).toHaveLength(1);
+	});
+
+	it("aggregates bounded Advisor context contributions", async () => {
+		fs.writeFileSync(
+			path.join(extensionsDir, "advisor-context.ts"),
+			`export default function (pi) {
+				pi.on("advisor_context", event => ({
+					context: event.scopeKey === "scope" && event.updates.length === 1 ? "x".repeat(9000) : "",
+				}));
+				pi.on("advisor_context", () => ({ context: "   " }));
+			}`,
+		);
+		const result = await loadTestExtensions();
+		const runner = new ExtensionRunner(
+			result.extensions,
+			result.runtime,
+			tempDir.path(),
+			sessionManager,
+			modelRegistry,
+		);
+		const contributions = await runner.emitAdvisorContext({
+			type: "advisor_context",
+			scopeKey: "scope",
+			updates: [{ role: "user", content: "current" }],
+		});
+		expect(contributions).toEqual(["x".repeat(8000)]);
+	});
+
+	it("exposes caller localProtocolOptions through extension context", async () => {
+		const localProtocolOptions = {
+			getArtifactsDir: () => tempDir.join("artifacts"),
+			getSessionId: () => "runner-session",
+		};
+		const result = await loadTestExtensions();
+		const runner = new ExtensionRunner(
+			result.extensions,
+			result.runtime,
+			tempDir.path(),
+			sessionManager,
+			modelRegistry,
+			undefined,
+			undefined,
+			localProtocolOptions,
+		);
+
+		expect(runner.createContext().localProtocolOptions).toBe(localProtocolOptions);
+	});
 	it("reflects SessionManager.moveTo() changes instead of the constructor-time snapshot (/move)", async () => {
 		const dirA = tempDir.join("dirA");
 		const dirB = tempDir.join("dirB");

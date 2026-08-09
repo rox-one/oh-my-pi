@@ -100,6 +100,7 @@ import { buildSessionMetadata } from "./session-metadata";
 import type { YieldQueue } from "./yield-queue";
 
 const ADVISOR_CODEX_SSE_MAX_ATTEMPTS = 1;
+const MAX_ADVISOR_CONTEXT_UPDATE_MESSAGES = 16;
 /** Advisor statistics for the advisor status command. */
 export interface AdvisorStats {
 	configured: boolean;
@@ -248,6 +249,7 @@ export interface SessionAdvisorsHost {
 	planModeState(): PlanModeState | undefined;
 	clientBridge(): ClientBridge | undefined;
 	emitSessionEvent(event: AgentSessionEvent): Promise<void>;
+	advisorContextContributions?(updates: readonly unknown[]): Promise<string[]>;
 	emitNotice(level: "info" | "warning" | "error", message: string, source?: string): void;
 	sendCustomMessage(message: CustomMessagePayload, options?: AdvisorMessageDeliveryOptions): Promise<boolean>;
 	extractQueuedAdvisorCards(): CustomMessage[];
@@ -340,10 +342,23 @@ export class SessionAdvisors {
 		signal?: AbortSignal,
 	): Promise<void> {
 		this.#advisorPrimaryTurnsCompleted++;
+		let extensionContext: string | undefined;
+		if (this.#advisors.length > 0 && this.#host.advisorContextContributions) {
+			try {
+				const contributions = await this.#host.advisorContextContributions(
+					messages.slice(-MAX_ADVISOR_CONTEXT_UPDATE_MESSAGES),
+				);
+				if (contributions.length > 0) {
+					extensionContext = ["### Extension-provided Advisor context", ...contributions].join("\n\n");
+				}
+			} catch (error) {
+				logger.warn("advisor extension context unavailable; review continues without it", { err: String(error) });
+			}
+		}
 		for (const advisor of this.#advisors) {
 			if (advisor.runtime.disposed) continue;
 			try {
-				advisor.runtime.onTurnEnd(messages, { willContinue });
+				advisor.runtime.onTurnEnd(messages, { willContinue, extensionContext });
 			} catch (error) {
 				logger.warn("advisor onTurnEnd threw; delta dropped", { advisor: advisor.name, err: String(error) });
 			}
