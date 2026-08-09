@@ -12,7 +12,7 @@ import type {
 	UsageStatus,
 	UsageWindow,
 } from "../usage";
-import { DAY_MS, parseIsoTimestamp, WEEK_MS } from "./shared";
+import { DAY_MS, HOUR_MS, parseIsoTimestamp, WEEK_MS } from "./shared";
 
 // (Refresh is the sole responsibility of AuthStorage; no provider-direct refresh here.)
 
@@ -72,7 +72,7 @@ interface AntigravityQuotaSummaryResponse {
 const DEFAULT_ENDPOINT = "https://daily-cloudcode-pa.googleapis.com";
 const FETCH_AVAILABLE_MODELS_PATH = "/v1internal:fetchAvailableModels";
 const RETRIEVE_USER_QUOTA_SUMMARY_PATH = "/v1internal:retrieveUserQuotaSummary";
-const FIVE_HOURS_MS = 5 * 60 * 60 * 1000;
+const FIVE_HOURS_MS = 5 * HOUR_MS;
 
 interface AntigravityWindowDescriptor {
 	id: string;
@@ -410,7 +410,7 @@ async function fetchAntigravityUsage(params: UsageFetchParams, ctx: UsageFetchCo
 				if (response.ok) return { response, endpoint };
 				if (!AIError.isTransientStatus(response.status)) break;
 			} catch (error) {
-				if (endpoint === endpoints[endpoints.length - 1]) throw error;
+				if (params.signal?.aborted || endpoint === endpoints[endpoints.length - 1]) throw error;
 			}
 		}
 		return response ? { response, endpoint: attemptedEndpoint } : undefined;
@@ -420,26 +420,33 @@ async function fetchAntigravityUsage(params: UsageFetchParams, ctx: UsageFetchCo
 	// account-wide pools: Gemini and third-party models, each with 5h and weekly
 	// buckets. The legacy per-model response below does not identify those pools
 	// reliably, so use it only when the summary endpoint is unavailable.
-	const summaryResult = await requestEndpoint(RETRIEVE_USER_QUOTA_SUMMARY_PATH);
-	if (summaryResult?.response.ok) {
-		const summaryData = (await summaryResult.response.json()) as AntigravityQuotaSummaryResponse;
-		const summaryLimits = buildQuotaSummaryLimits(summaryData, params);
-		if (summaryLimits.length > 0) {
-			const metadata: UsageReport["metadata"] = {
-				endpoint: summaryResult.endpoint,
-				usageSource: "retrieveUserQuotaSummary",
-				projectId: credential.projectId,
-			};
-			if (credential.email) metadata.email = credential.email;
-			if (credential.accountId) metadata.accountId = credential.accountId;
-			return {
-				provider: params.provider,
-				fetchedAt: nowMs,
-				limits: summaryLimits,
-				metadata,
-				raw: summaryData,
-			};
+	try {
+		const summaryResult = await requestEndpoint(RETRIEVE_USER_QUOTA_SUMMARY_PATH);
+		if (summaryResult?.response.ok) {
+			const summaryData = (await summaryResult.response.json()) as AntigravityQuotaSummaryResponse;
+			const summaryLimits = buildQuotaSummaryLimits(summaryData, params);
+			if (summaryLimits.length > 0) {
+				const metadata: UsageReport["metadata"] = {
+					endpoint: summaryResult.endpoint,
+					usageSource: "retrieveUserQuotaSummary",
+					projectId: credential.projectId,
+				};
+				if (credential.email) metadata.email = credential.email;
+				if (credential.accountId) metadata.accountId = credential.accountId;
+				return {
+					provider: params.provider,
+					fetchedAt: nowMs,
+					limits: summaryLimits,
+					metadata,
+					raw: summaryData,
+				};
+			}
 		}
+	} catch (error) {
+		if (params.signal?.aborted) throw error;
+		ctx.logger?.debug("Antigravity quota summary unavailable; falling back to model quotas", {
+			error: String(error),
+		});
 	}
 
 	const modelsResult = await requestEndpoint(FETCH_AVAILABLE_MODELS_PATH);
@@ -577,13 +584,28 @@ export const antigravityUsageProvider: UsageProvider = {
 	supports: params => params.provider === "google-antigravity",
 };
 
-function getAntigravityCounterKeysForModel(context: CredentialRankingContext | undefined): string[] {
+type AntigravityModelFamily = "anthropic" | "google" | "openai";
+
+function getAntigravityModelFamily(context: CredentialRankingContext | undefined): AntigravityModelFamily | undefined {
 	const modelId = context?.modelId?.toLowerCase();
-	if (!modelId) return [];
-	if (modelId.startsWith("claude-")) return ["third-party", "anthropic"];
-	if (modelId.startsWith("gemini-") || modelId.startsWith("gemma-")) return ["google"];
-	if (modelId.startsWith("gpt-") || modelId.startsWith("openai/")) return ["third-party", "openai"];
-	return [];
+	if (!modelId) return undefined;
+	if (modelId.startsWith("claude-")) return "anthropic";
+	if (modelId.startsWith("gemini-") || modelId.startsWith("gemma-")) return "google";
+	if (modelId.startsWith("gpt-") || modelId.startsWith("openai/")) return "openai";
+	return undefined;
+}
+
+function getAntigravityCounterKeysForModel(context: CredentialRankingContext | undefined): string[] {
+	switch (getAntigravityModelFamily(context)) {
+		case "anthropic":
+			return ["third-party", "anthropic"];
+		case "google":
+			return ["google"];
+		case "openai":
+			return ["third-party", "openai"];
+		default:
+			return [];
+	}
 }
 
 function getAntigravityCounterLimits(report: UsageReport, counterKey: string): UsageLimit[] {
@@ -629,11 +651,12 @@ export const antigravityRankingStrategy: CredentialRankingStrategy = {
 		return { primary: rankAntigravityLimits(report, context)[0] };
 	},
 	scopeLimits: scopeAntigravityLimitsForModel,
-	// Always return a scope for Antigravity so missing/unknown model context
-	// cannot fall through to AuthStorage's provider-wide block bucket.
+	// Reactive backoff remains family-specific because the legacy report has
+	// separate Anthropic and OpenAI counters, while blockScope has no report
+	// source. Summary exhaustion still reaches both through model-scoped usage.
+	// Unknown context gets a local scope rather than a provider-wide block.
 	blockScope(context) {
-		const counterKey = getAntigravityCounterKeysForModel(context)[0];
-		return `counter:${counterKey ?? "unknown"}`;
+		return `counter:${getAntigravityModelFamily(context) ?? "unknown"}`;
 	},
 	// Summary windows carry `durationMs`; fall back to daily only for legacy
 	// unlabelled quotaInfo entries from `fetchAvailableModels`.

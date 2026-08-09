@@ -186,6 +186,9 @@
 - Fixed Alibaba DashScope/Bailian transient per-minute rate limits being misclassified as full quota exhaustion, causing unnecessary long backoffs instead of quick retries.
 - Fixed Anthropic-compatible streams dropping thinking content, which broke replay of prior reasoning.
 - Updated the Alibaba Coding Plan China login flow to point to the current Bailian API-key management console.
+### Added
+
+- Added Antigravity's authoritative Gemini and shared Claude/GPT five-hour and weekly quota windows to `omp usage`, with compatibility fallback to legacy model quotas ([#8061](https://github.com/can1357/oh-my-pi/pull/8061) by [@paolomazzitti](https://github.com/paolomazzitti)).
 
 ## [17.3.4] - 2026-08-14
 
