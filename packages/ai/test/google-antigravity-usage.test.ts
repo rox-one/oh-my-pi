@@ -70,6 +70,74 @@ function makeApiModel(
 // ── tests ────────────────────────────────────────────────────────────
 
 describe("antigravity usage provider", () => {
+	it("uses the authoritative 5-hour and weekly quota summary", async () => {
+		const now = Date.now();
+		const urls: string[] = [];
+		const payload = {
+			groups: [
+				{
+					displayName: "Gemini Models",
+					buckets: [
+						{
+							bucketId: "gemini-weekly",
+							displayName: "Weekly Limit Remaining",
+							window: "weekly",
+							remaining: { case: "remainingFraction", value: 0.85 },
+							resetTime: new Date(now + 5 * 24 * 3600_000).toISOString(),
+						},
+						{
+							bucketId: "gemini-5h",
+							displayName: "Five Hour Limit Remaining",
+							window: "5h",
+							remainingFraction: 0.9,
+							resetTime: new Date(now + 4 * 3600_000).toISOString(),
+						},
+						{
+							bucketId: "gemini-image-5h",
+							displayName: "Future image quota",
+							remainingFraction: 0.01,
+						},
+					],
+				},
+				{
+					displayName: "Claude and GPT Models",
+					buckets: [
+						{ bucketId: "3p-weekly", window: "weekly", remainingFraction: 1 },
+						{ bucketId: "3p-5h", window: "5h", remainingFraction: 1 },
+					],
+				},
+			],
+		};
+		const fetchImpl: FetchImpl = async input => {
+			urls.push(String(input));
+			return new Response(JSON.stringify(payload), {
+				status: 200,
+				headers: { "content-type": "application/json" },
+			});
+		};
+
+		const report = await antigravityUsageProvider.fetchUsage!(
+			{ provider: "google-antigravity", credential: makeCredential(), signal: undefined },
+			makeCtx(fetchImpl),
+		);
+
+		expect(urls).toHaveLength(1);
+		expect(urls[0]).toEndWith("/v1internal:retrieveUserQuotaSummary");
+		expect(report?.metadata?.usageSource).toBe("retrieveUserQuotaSummary");
+		expect(report?.limits).toHaveLength(4);
+		const geminiWeekly = report?.limits.find(limit => limit.id === "google-antigravity:google:default:weekly");
+		const geminiFiveHour = report?.limits.find(limit => limit.id === "google-antigravity:google:default:5h");
+		const thirdPartyWeekly = report?.limits.find(
+			limit => limit.id === "google-antigravity:third-party:default:weekly",
+		);
+		expect(geminiWeekly?.label).toBe("Gemini Models");
+		expect(geminiWeekly?.window?.durationMs).toBe(7 * 24 * 60 * 60 * 1000);
+		expect(geminiWeekly?.amount.remainingFraction).toBe(0.85);
+		expect(geminiFiveHour?.window?.durationMs).toBe(5 * 60 * 60 * 1000);
+		expect(geminiFiveHour?.amount.remainingFraction).toBe(0.9);
+		expect(thirdPartyWeekly?.label).toBe("Claude and GPT Models");
+	});
+
 	it("merges two models with same tier into one limit", async () => {
 		const payload = {
 			models: {
@@ -373,6 +441,23 @@ describe("antigravity ranking strategy", () => {
 		const { primary, secondary } = antigravityRankingStrategy.findWindowLimits(report);
 		expect(primary).toBe(weekly);
 		expect(secondary).toBeUndefined();
+	});
+
+	it("scopes Claude and GPT models to the shared third-party pool", () => {
+		const thirdParty = makeLimit(0.2, "Claude and GPT Models");
+		thirdParty.id = "google-antigravity:third-party:default:weekly";
+		const google = makeLimit(0.05, "Gemini Models");
+		google.id = "google-antigravity:google:default:weekly";
+		const report = {
+			provider: "google-antigravity" as const,
+			fetchedAt: Date.now(),
+			limits: [google, thirdParty],
+		};
+
+		expect(antigravityRankingStrategy.findWindowLimits(report, { modelId: "claude-sonnet-4-6" }).primary).toBe(
+			thirdParty,
+		);
+		expect(antigravityRankingStrategy.findWindowLimits(report, { modelId: "gpt-oss-120b" }).primary).toBe(thirdParty);
 	});
 
 	it("returns undefined windows when the credential has no usage limits", () => {

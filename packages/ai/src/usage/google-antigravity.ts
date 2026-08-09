@@ -45,8 +45,34 @@ interface AntigravityUsageResponse {
 	models: Record<string, AntigravityModelInfo>;
 }
 
+interface AntigravityQuotaSummaryBucket {
+	bucketId?: string;
+	displayName?: string;
+	window?: string;
+	remainingFraction?: number;
+	remaining?: {
+		remainingFraction?: number;
+		case?: string;
+		value?: number;
+	};
+	resetTime?: string;
+	disabled?: boolean;
+}
+
+interface AntigravityQuotaSummaryGroup {
+	displayName?: string;
+	buckets?: AntigravityQuotaSummaryBucket[];
+}
+
+interface AntigravityQuotaSummaryResponse {
+	groups?: AntigravityQuotaSummaryGroup[];
+	response?: { groups?: AntigravityQuotaSummaryGroup[] };
+}
+
 const DEFAULT_ENDPOINT = "https://daily-cloudcode-pa.googleapis.com";
 const FETCH_AVAILABLE_MODELS_PATH = "/v1internal:fetchAvailableModels";
+const RETRIEVE_USER_QUOTA_SUMMARY_PATH = "/v1internal:retrieveUserQuotaSummary";
+const FIVE_HOURS_MS = 5 * 60 * 60 * 1000;
 
 interface AntigravityWindowDescriptor {
 	id: string;
@@ -58,6 +84,9 @@ function classifyWindow(id: string | undefined, label: string | undefined): Anti
 	const source = `${id ?? ""} ${label ?? ""}`.toLowerCase();
 	if (source.includes("week") || source.includes("7d") || /7[\s_-]*day/.test(source)) {
 		return { id: "weekly", label: "Weekly", durationMs: WEEK_MS };
+	}
+	if (source.includes("5h") || source.includes("five hour") || /5[\s_-]*hour/.test(source)) {
+		return { id: "5h", label: "Five Hour", durationMs: FIVE_HOURS_MS };
 	}
 	if (source.includes("day") || source.includes("daily") || source.includes("24h")) {
 		return { id: "daily", label: "Daily", durationMs: DAY_MS };
@@ -234,6 +263,106 @@ function normalizeQuotaInfos(info: AntigravityModelInfo): AntigravityQuotaInfo[]
 	return results;
 }
 
+function quotaSummaryGroups(data: AntigravityQuotaSummaryResponse): AntigravityQuotaSummaryGroup[] {
+	return data.response?.groups ?? data.groups ?? [];
+}
+
+function quotaSummaryRemainingFraction(bucket: AntigravityQuotaSummaryBucket): number | undefined {
+	if (bucket.remainingFraction !== undefined) return bucket.remainingFraction;
+	if (bucket.remaining?.remainingFraction !== undefined) return bucket.remaining.remainingFraction;
+	if (bucket.remaining?.case === "remainingFraction") return bucket.remaining.value;
+	return undefined;
+}
+
+function quotaSummaryCounter(
+	group: AntigravityQuotaSummaryGroup,
+	bucket: AntigravityQuotaSummaryBucket,
+): { key: string; label: string } | undefined {
+	const bucketId = bucket.bucketId?.toLowerCase();
+	const groupName = group.displayName?.toLowerCase() ?? "";
+	if (bucketId === "gemini-5h" || bucketId === "gemini-weekly") {
+		return { key: "google", label: group.displayName ?? "Gemini Models" };
+	}
+	if (bucketId === "3p-5h" || bucketId === "3p-weekly") {
+		return { key: "third-party", label: group.displayName ?? "Claude and GPT Models" };
+	}
+	if (bucketId) return undefined;
+	if (groupName.includes("gemini")) return { key: "google", label: group.displayName ?? "Gemini Models" };
+	if (groupName.includes("claude") || groupName.includes("gpt") || groupName.includes("third party")) {
+		return { key: "third-party", label: group.displayName ?? "Claude and GPT Models" };
+	}
+	return undefined;
+}
+
+function quotaSummaryWindow(bucket: AntigravityQuotaSummaryBucket): AntigravityWindowDescriptor | undefined {
+	switch (bucket.bucketId?.toLowerCase()) {
+		case "gemini-5h":
+		case "3p-5h":
+			return classifyWindow("5h", bucket.displayName);
+		case "gemini-weekly":
+		case "3p-weekly":
+			return classifyWindow("weekly", bucket.displayName);
+		default:
+			return bucket.bucketId ? undefined : classifyWindow(bucket.window, bucket.displayName);
+	}
+}
+
+function buildQuotaSummaryLimits(data: AntigravityQuotaSummaryResponse, params: UsageFetchParams): UsageLimit[] {
+	const credential = params.credential;
+	const deduped = new Map<string, UsageLimit>();
+
+	for (const group of quotaSummaryGroups(data)) {
+		for (const bucket of group.buckets ?? []) {
+			if (bucket.disabled) continue;
+			const counter = quotaSummaryCounter(group, bucket);
+			const descriptor = quotaSummaryWindow(bucket);
+			if (!counter || !descriptor) continue;
+
+			const quotaInfo: AntigravityQuotaInfo = {
+				remainingFraction: quotaSummaryRemainingFraction(bucket),
+				resetTime: bucket.resetTime,
+				windowId: descriptor.id,
+				windowLabel: descriptor.label,
+			};
+			if (quotaInfo.remainingFraction === undefined && quotaInfo.resetTime === undefined) continue;
+
+			const amount = buildAmount(quotaInfo);
+			const window = parseWindow(quotaInfo, descriptor);
+			const key = `${counter.key}|${descriptor.id}`;
+			const limit: UsageLimit = {
+				id: `${params.provider}:${counter.key}:default:${descriptor.id}`,
+				label: counter.label,
+				scope: {
+					provider: params.provider,
+					accountId: credential.accountId,
+					projectId: credential.projectId,
+					windowId: descriptor.id,
+				},
+				window,
+				amount,
+				status: getUsageStatus(amount.remainingFraction),
+			};
+
+			const existing = deduped.get(key);
+			const existingFraction = existing?.amount.remainingFraction;
+			const nextFraction = amount.remainingFraction;
+			if (
+				!existing ||
+				(existingFraction === undefined && nextFraction !== undefined) ||
+				(existingFraction !== undefined && nextFraction !== undefined && nextFraction < existingFraction)
+			) {
+				deduped.set(key, limit);
+			}
+		}
+	}
+
+	return [...deduped.values()].sort((a, b) => {
+		const aFraction = a.amount.remainingFraction ?? 1;
+		const bFraction = b.amount.remainingFraction ?? 1;
+		return aFraction - bFraction;
+	});
+}
+
 /**
  * Return the OAuth access token to use against `/v1internal:*`. AuthStorage is
  * the sole refresh authority (broker-aware, single-flighted, rotation-safe);
@@ -261,46 +390,68 @@ async function fetchAntigravityUsage(params: UsageFetchParams, ctx: UsageFetchCo
 	const baseUrl = params.baseUrl?.replace(/\/+$/, "");
 	const endpoints = baseUrl ? [baseUrl] : [DEFAULT_ENDPOINT, "https://daily-cloudcode-pa.sandbox.googleapis.com"];
 
-	let response: Response | undefined;
-	let successfulEndpoint = DEFAULT_ENDPOINT;
-	for (const endpoint of endpoints) {
-		try {
-			const url = `${endpoint}${FETCH_AVAILABLE_MODELS_PATH}`;
-			response = await ctx.fetch(url, {
-				method: "POST",
-				headers: {
-					Authorization: `Bearer ${accessToken}`,
-					"Content-Type": "application/json",
-					"User-Agent": getAntigravityUserAgent(),
-				},
-				body: JSON.stringify({ project: credential.projectId }),
-				signal: params.signal,
-			});
+	const requestEndpoint = async (path: string): Promise<{ response: Response; endpoint: string } | undefined> => {
+		let response: Response | undefined;
+		let attemptedEndpoint = DEFAULT_ENDPOINT;
+		for (const endpoint of endpoints) {
+			attemptedEndpoint = endpoint;
+			try {
+				response = await ctx.fetch(`${endpoint}${path}`, {
+					method: "POST",
+					headers: {
+						Authorization: `Bearer ${accessToken}`,
+						"Content-Type": "application/json",
+						"User-Agent": getAntigravityUserAgent(),
+					},
+					body: JSON.stringify({ project: credential.projectId }),
+					signal: params.signal,
+				});
 
-			if (response.ok) {
-				successfulEndpoint = endpoint;
-				break;
+				if (response.ok) return { response, endpoint };
+				if (!AIError.isTransientStatus(response.status)) break;
+			} catch (error) {
+				if (endpoint === endpoints[endpoints.length - 1]) throw error;
 			}
+		}
+		return response ? { response, endpoint: attemptedEndpoint } : undefined;
+	};
 
-			if (AIError.isTransientStatus(response.status)) {
-				continue;
-			}
-			break;
-		} catch (error) {
-			if (endpoint === endpoints[endpoints.length - 1]) {
-				throw error;
-			}
+	// This endpoint backs the Antigravity usage screen and exposes the real
+	// account-wide pools: Gemini and third-party models, each with 5h and weekly
+	// buckets. The legacy per-model response below does not identify those pools
+	// reliably, so use it only when the summary endpoint is unavailable.
+	const summaryResult = await requestEndpoint(RETRIEVE_USER_QUOTA_SUMMARY_PATH);
+	if (summaryResult?.response.ok) {
+		const summaryData = (await summaryResult.response.json()) as AntigravityQuotaSummaryResponse;
+		const summaryLimits = buildQuotaSummaryLimits(summaryData, params);
+		if (summaryLimits.length > 0) {
+			const metadata: UsageReport["metadata"] = {
+				endpoint: summaryResult.endpoint,
+				usageSource: "retrieveUserQuotaSummary",
+				projectId: credential.projectId,
+			};
+			if (credential.email) metadata.email = credential.email;
+			if (credential.accountId) metadata.accountId = credential.accountId;
+			return {
+				provider: params.provider,
+				fetchedAt: nowMs,
+				limits: summaryLimits,
+				metadata,
+				raw: summaryData,
+			};
 		}
 	}
 
-	if (!response?.ok) {
+	const modelsResult = await requestEndpoint(FETCH_AVAILABLE_MODELS_PATH);
+	if (!modelsResult?.response.ok) {
 		ctx.logger?.warn("Antigravity usage fetch failed", {
-			status: response?.status ?? 0,
-			statusText: response?.statusText ?? "unknown",
+			status: modelsResult?.response.status ?? 0,
+			statusText: modelsResult?.response.statusText ?? "unknown",
 		});
 		return null;
 	}
-	const data = (await response.json()) as AntigravityUsageResponse;
+	const successfulEndpoint = modelsResult.endpoint;
+	const data = (await modelsResult.response.json()) as AntigravityUsageResponse;
 
 	// The API returns per-model quota entries, but quota is shared across
 	// models within the same backend counter, tier, and reset window. Keep
@@ -426,13 +577,13 @@ export const antigravityUsageProvider: UsageProvider = {
 	supports: params => params.provider === "google-antigravity",
 };
 
-function getAntigravityCounterKeyForModel(context: CredentialRankingContext | undefined): string | undefined {
+function getAntigravityCounterKeysForModel(context: CredentialRankingContext | undefined): string[] {
 	const modelId = context?.modelId?.toLowerCase();
-	if (!modelId) return undefined;
-	if (modelId.startsWith("claude-")) return "anthropic";
-	if (modelId.startsWith("gemini-") || modelId.startsWith("gemma-")) return "google";
-	if (modelId.startsWith("gpt-") || modelId.startsWith("openai/")) return "openai";
-	return undefined;
+	if (!modelId) return [];
+	if (modelId.startsWith("claude-")) return ["third-party", "anthropic"];
+	if (modelId.startsWith("gemini-") || modelId.startsWith("gemma-")) return ["google"];
+	if (modelId.startsWith("gpt-") || modelId.startsWith("openai/")) return ["third-party", "openai"];
+	return [];
 }
 
 function getAntigravityCounterLimits(report: UsageReport, counterKey: string): UsageLimit[] {
@@ -447,22 +598,23 @@ function scopeAntigravityLimitsForModel(
 	report: UsageReport,
 	context: CredentialRankingContext | undefined,
 ): UsageLimit[] {
-	const counterKey = getAntigravityCounterKeyForModel(context);
-	if (!counterKey) return [];
-	const backendLimits = getAntigravityCounterLimits(report, counterKey);
-	if (backendLimits.length > 0) return backendLimits;
-	return getAntigravityCounterLimits(report, "default");
+	const counterKeys = getAntigravityCounterKeysForModel(context);
+	for (const counterKey of counterKeys) {
+		const backendLimits = getAntigravityCounterLimits(report, counterKey);
+		if (backendLimits.length > 0) return backendLimits;
+	}
+	return counterKeys.length > 0 ? getAntigravityCounterLimits(report, "default") : [];
 }
 
 function rankAntigravityLimits(report: UsageReport, context: CredentialRankingContext | undefined): UsageLimit[] {
-	const counterKey = getAntigravityCounterKeyForModel(context);
-	if (!counterKey) return report.limits;
+	if (getAntigravityCounterKeysForModel(context).length === 0) return report.limits;
 	return scopeAntigravityLimitsForModel(report, context);
 }
 
 /**
- * Antigravity quotas are returned per backend counter (Anthropic / Google /
- * OpenAI) and can include both daily and weekly windows. `fetchAntigravityUsage`
+ * Antigravity quota summaries return a Google pool plus a shared third-party
+ * pool for Claude and GPT, each with 5-hour and weekly windows. Legacy fallback
+ * reports can still expose separate Anthropic/OpenAI counters. `fetchAntigravityUsage`
  * sorts `limits` ascending by `remainingFraction`; after model-family scoping,
  * the most-pressured relevant counter/window is index 0.
  *
@@ -480,11 +632,10 @@ export const antigravityRankingStrategy: CredentialRankingStrategy = {
 	// Always return a scope for Antigravity so missing/unknown model context
 	// cannot fall through to AuthStorage's provider-wide block bucket.
 	blockScope(context) {
-		const counterKey = getAntigravityCounterKeyForModel(context);
+		const counterKey = getAntigravityCounterKeysForModel(context)[0];
 		return `counter:${counterKey ?? "unknown"}`;
 	},
-	// Antigravity windows carry `durationMs` when the response identifies them
-	// as daily/weekly. Fall back to daily for legacy unlabelled quotaInfo
-	// entries from `daily-cloudcode-pa.googleapis.com`.
+	// Summary windows carry `durationMs`; fall back to daily only for legacy
+	// unlabelled quotaInfo entries from `fetchAvailableModels`.
 	windowDefaults: { primaryMs: DAY_MS, secondaryMs: DAY_MS },
 };
