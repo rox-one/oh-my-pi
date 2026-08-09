@@ -138,6 +138,83 @@ describe("antigravity usage provider", () => {
 		expect(thirdPartyWeekly?.label).toBe("Claude and GPT Models");
 	});
 
+	it("falls back to model quotas when the summary response is malformed", async () => {
+		let requestCount = 0;
+		const payload = { models: { gemini: makeApiModel("Gemini", { remainingFraction: 0.6 }) } };
+		const fetchImpl: FetchImpl = async input => {
+			requestCount += 1;
+			if (String(input).endsWith("/v1internal:retrieveUserQuotaSummary")) {
+				return new Response("{", { status: 200, headers: { "content-type": "application/json" } });
+			}
+			return new Response(JSON.stringify(payload), {
+				status: 200,
+				headers: { "content-type": "application/json" },
+			});
+		};
+
+		const report = await antigravityUsageProvider.fetchUsage!(
+			{ provider: "google-antigravity", credential: makeCredential(), signal: undefined },
+			makeCtx(fetchImpl),
+		);
+
+		expect(requestCount).toBe(2);
+		expect(report?.metadata?.usageSource).toBeUndefined();
+		expect(report?.limits).toHaveLength(1);
+		expect(report?.limits[0]?.amount.remainingFraction).toBe(0.6);
+	});
+
+	it("falls back to model quotas when the summary request fails", async () => {
+		let requestCount = 0;
+		const payload = { models: { gemini: makeApiModel("Gemini", { remainingFraction: 0.7 }) } };
+		const fetchImpl: FetchImpl = async input => {
+			requestCount += 1;
+			if (String(input).endsWith("/v1internal:retrieveUserQuotaSummary")) {
+				throw new Error("summary unavailable");
+			}
+			return new Response(JSON.stringify(payload), {
+				status: 200,
+				headers: { "content-type": "application/json" },
+			});
+		};
+
+		const report = await antigravityUsageProvider.fetchUsage!(
+			{
+				provider: "google-antigravity",
+				credential: makeCredential(),
+				baseUrl: "https://antigravity.test",
+				signal: undefined,
+			},
+			makeCtx(fetchImpl),
+		);
+
+		expect(requestCount).toBe(2);
+		expect(report?.metadata?.usageSource).toBeUndefined();
+		expect(report?.limits[0]?.amount.remainingFraction).toBe(0.7);
+	});
+
+	it("does not turn cancellation into a legacy fallback request", async () => {
+		const controller = new AbortController();
+		const abortReason = new Error("cancelled");
+		controller.abort(abortReason);
+		let requestCount = 0;
+		const fetchImpl: FetchImpl = async () => {
+			requestCount += 1;
+			throw abortReason;
+		};
+
+		const result = antigravityUsageProvider.fetchUsage!(
+			{
+				provider: "google-antigravity",
+				credential: makeCredential(),
+				signal: controller.signal,
+			},
+			makeCtx(fetchImpl),
+		);
+
+		await expect(result).rejects.toBe(abortReason);
+		expect(requestCount).toBe(1);
+	});
+
 	it("merges two models with same tier into one limit", async () => {
 		const payload = {
 			models: {
@@ -458,6 +535,13 @@ describe("antigravity ranking strategy", () => {
 			thirdParty,
 		);
 		expect(antigravityRankingStrategy.findWindowLimits(report, { modelId: "gpt-oss-120b" }).primary).toBe(thirdParty);
+	});
+
+	it("keeps reactive Claude and GPT blocks family-specific for legacy quotas", () => {
+		expect(antigravityRankingStrategy.blockScope?.({ modelId: "claude-sonnet-4-6" })).toBe("counter:anthropic");
+		expect(antigravityRankingStrategy.blockScope?.({ modelId: "gpt-oss-120b" })).toBe("counter:openai");
+		expect(antigravityRankingStrategy.blockScope?.({ modelId: "gemini-3.5-flash" })).toBe("counter:google");
+		expect(antigravityRankingStrategy.blockScope?.({})).toBe("counter:unknown");
 	});
 
 	it("returns undefined windows when the credential has no usage limits", () => {
