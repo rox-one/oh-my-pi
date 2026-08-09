@@ -36,7 +36,6 @@ export interface AdviseDetails {
 export interface AdvisorNote {
 	note: string;
 	severity?: AdvisorSeverity;
-	attribution?: string;
 	/** Which configured advisor produced this note (omitted for the default advisor). */
 	advisor?: string;
 }

@@ -1501,6 +1501,15 @@ export class ExtensionRunner {
 	}
 
 	async emitAdvisorContext(event: AdvisorContextEvent): Promise<string[]> {
+		let isolatedEvent: AdvisorContextEvent;
+		try {
+			isolatedEvent = structuredClone(event);
+		} catch (error) {
+			logger.warn("Advisor context updates could not be detached; extension context omitted", {
+				error: error instanceof Error ? error.message : String(error),
+			});
+			return [];
+		}
 		const contributions: string[] = [];
 		let ctx: ExtensionContext | undefined;
 		for (const ext of this.extensions) {
@@ -1508,9 +1517,13 @@ export class ExtensionRunner {
 			if (!handlers?.length) continue;
 			ctx ??= this.createContext();
 			for (const handler of handlers) {
-				const result = (await this.#runHandlerWithTimeout(handler, event, ctx, ext, extensionHandlerTimeoutMs)) as
-					| AdvisorContextEventResult
-					| undefined;
+				const result = (await this.#runHandlerWithTimeout(
+					handler,
+					isolatedEvent,
+					ctx,
+					ext,
+					extensionHandlerTimeoutMs,
+				)) as AdvisorContextEventResult | undefined;
 				const context = result?.context;
 				if (typeof context !== "string" || !context.trim()) continue;
 				contributions.push(context.slice(0, MAX_ADVISOR_CONTEXT_CHARS));

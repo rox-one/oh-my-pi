@@ -108,9 +108,11 @@ describe("ExtensionRunner", () => {
 		fs.writeFileSync(
 			path.join(extensionsDir, "advisor-context.ts"),
 			`export default function (pi) {
-				pi.on("advisor_context", event => ({
-					context: event.scopeKey === "scope" && event.updates.length === 1 ? "x".repeat(9000) : "",
-				}));
+				pi.on("advisor_context", event => {
+					const matches = event.scopeKey === "scope" && event.updates.length === 1;
+					event.updates[0].content = "mutated";
+					return { context: matches ? "x".repeat(9000) : "" };
+				});
 				pi.on("advisor_context", () => ({ context: "   " }));
 			}`,
 		);
@@ -122,12 +124,14 @@ describe("ExtensionRunner", () => {
 			sessionManager,
 			modelRegistry,
 		);
+		const updates = [{ role: "user", content: "current" }];
 		const contributions = await runner.emitAdvisorContext({
 			type: "advisor_context",
 			scopeKey: "scope",
-			updates: [{ role: "user", content: "current" }],
+			updates,
 		});
 		expect(contributions).toEqual(["x".repeat(8000)]);
+		expect(updates).toEqual([{ role: "user", content: "current" }]);
 	});
 
 	it("exposes caller localProtocolOptions through extension context", async () => {
