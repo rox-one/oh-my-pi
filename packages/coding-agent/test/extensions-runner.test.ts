@@ -134,6 +134,33 @@ describe("ExtensionRunner", () => {
 		expect(updates).toEqual([{ role: "user", content: "current" }]);
 	});
 
+	it("aborts in-flight Advisor context collection", async () => {
+		fs.writeFileSync(
+			path.join(extensionsDir, "advisor-context-abort.ts"),
+			`export default function (pi) {
+				pi.on("advisor_context", async (_event, ctx) => {
+					await new Promise(resolve => ctx.signal.addEventListener("abort", resolve, { once: true }));
+					return { context: "late" };
+				});
+			}`,
+		);
+		const result = await loadTestExtensions();
+		const runner = new ExtensionRunner(
+			result.extensions,
+			result.runtime,
+			tempDir.path(),
+			sessionManager,
+			modelRegistry,
+		);
+		const controller = new AbortController();
+		const pending = runner.emitAdvisorContext(
+			{ type: "advisor_context", scopeKey: "scope", updates: [{ role: "user", content: "current" }] },
+			controller.signal,
+		);
+		controller.abort();
+		expect(await pending).toEqual([]);
+	});
+
 	it("exposes caller localProtocolOptions through extension context", async () => {
 		const localProtocolOptions = {
 			getArtifactsDir: () => tempDir.join("artifacts"),

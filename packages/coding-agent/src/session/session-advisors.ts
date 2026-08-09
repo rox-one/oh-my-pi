@@ -249,7 +249,7 @@ export interface SessionAdvisorsHost {
 	planModeState(): PlanModeState | undefined;
 	clientBridge(): ClientBridge | undefined;
 	emitSessionEvent(event: AgentSessionEvent): Promise<void>;
-	advisorContextContributions?(updates: readonly unknown[]): Promise<string[]>;
+	advisorContextContributions?(updates: readonly unknown[], signal?: AbortSignal): Promise<string[]>;
 	emitNotice(level: "info" | "warning" | "error", message: string, source?: string): void;
 	sendCustomMessage(message: CustomMessagePayload, options?: AdvisorMessageDeliveryOptions): Promise<boolean>;
 	extractQueuedAdvisorCards(): CustomMessage[];
@@ -347,6 +347,7 @@ export class SessionAdvisors {
 			try {
 				const contributions = await this.#host.advisorContextContributions(
 					messages.slice(-MAX_ADVISOR_CONTEXT_UPDATE_MESSAGES),
+					signal,
 				);
 				if (contributions.length > 0) {
 					extensionContext = ["### Extension-provided Advisor context", ...contributions].join("\n\n");

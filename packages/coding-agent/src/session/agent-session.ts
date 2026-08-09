@@ -2076,12 +2076,15 @@ export class AgentSession {
 			planModeState: () => this.#planModeState,
 			clientBridge: () => this.#clientBridge,
 			emitSessionEvent: event => this.#emitSessionEvent(event),
-			advisorContextContributions: updates =>
-				this.#extensionRunner?.emitAdvisorContext({
-					type: "advisor_context",
-					scopeKey: this.sessionManager.getSessionId(),
-					updates,
-				}) ?? Promise.resolve([]),
+			advisorContextContributions: (updates, signal) =>
+				this.#extensionRunner?.emitAdvisorContext(
+					{
+						type: "advisor_context",
+						scopeKey: this.sessionManager.getSessionId(),
+						updates,
+					},
+					signal,
+				) ?? Promise.resolve([]),
 			emitNotice: (level, message, source) => this.emitNotice(level, message, source),
 			sendCustomMessage: (message, options) => this.sendCustomMessage(message, options),
 			extractQueuedAdvisorCards: () => this.#extractQueuedAdvisorCards(),

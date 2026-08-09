@@ -897,7 +897,10 @@ export interface UserPythonEvent {
 // Advisor Context Events
 // ============================================================================
 
-/** Fired before native Advisor review so extensions can contribute bounded context. */
+/**
+ * Fired before native Advisor review so extensions can contribute bounded context.
+ * Handlers share a two-second aggregate budget and should stop work when `ctx.signal` aborts.
+ */
 export interface AdvisorContextEvent {
 	type: "advisor_context";
 	/** Stable session scope; opaque to extensions. */

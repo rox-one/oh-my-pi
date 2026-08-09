@@ -329,6 +329,7 @@ const MAX_PENDING_CREDENTIAL_DISABLED = 32;
 const MAX_PENDING_MCP_NOTIFICATIONS = 100;
 const MAX_ADVISOR_CONTEXT_CONTRIBUTIONS = 8;
 const MAX_ADVISOR_CONTEXT_CHARS = 8_000;
+const MAX_ADVISOR_CONTEXT_COLLECTION_MS = 2_000;
 
 /**
  * Events handled by the generic emit() method.
@@ -1500,7 +1501,7 @@ export class ExtensionRunner {
 		return result;
 	}
 
-	async emitAdvisorContext(event: AdvisorContextEvent): Promise<string[]> {
+	async emitAdvisorContext(event: AdvisorContextEvent, signal?: AbortSignal): Promise<string[]> {
 		let isolatedEvent: AdvisorContextEvent;
 		try {
 			isolatedEvent = structuredClone(event);
@@ -1510,6 +1511,7 @@ export class ExtensionRunner {
 			});
 			return [];
 		}
+		const deadline = Date.now() + MAX_ADVISOR_CONTEXT_COLLECTION_MS;
 		const contributions: string[] = [];
 		let ctx: ExtensionContext | undefined;
 		for (const ext of this.extensions) {
@@ -1517,13 +1519,20 @@ export class ExtensionRunner {
 			if (!handlers?.length) continue;
 			ctx ??= this.createContext();
 			for (const handler of handlers) {
+				if (signal?.aborted) return [];
+				const remainingMs = deadline - Date.now();
+				if (remainingMs <= 0) return contributions;
 				const result = (await this.#runHandlerWithTimeout(
 					handler,
 					isolatedEvent,
 					ctx,
 					ext,
-					extensionHandlerTimeoutMs,
-				)) as AdvisorContextEventResult | undefined;
+					remainingMs,
+					undefined,
+					signal,
+				)) as
+					| AdvisorContextEventResult
+					| undefined;
 				const context = result?.context;
 				if (typeof context !== "string" || !context.trim()) continue;
 				contributions.push(context.slice(0, MAX_ADVISOR_CONTEXT_CHARS));
