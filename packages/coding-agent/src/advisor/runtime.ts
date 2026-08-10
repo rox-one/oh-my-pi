@@ -802,7 +802,22 @@ export class AdvisorRuntime {
 		let context = extensionContext?.trim();
 		if (!context) return text;
 		const obfuscator = this.host.obfuscator;
-		if (obfuscator?.hasSecrets()) context = obfuscator.obfuscate(context, this.#advisorRegexSecretValues);
+		if (obfuscator?.hasSecrets()) {
+			let discoveredNewRegexSecretValue = false;
+			for (const secretValue of obfuscator.collectRegexSecretValuesForObfuscation(context)) {
+				if (this.#advisorRegexSecretValues.has(secretValue)) continue;
+				this.#advisorRegexSecretValues.add(secretValue);
+				discoveredNewRegexSecretValue = true;
+			}
+			scrubAdvisorHistory(obfuscator, this.agent.state.messages, this.#advisorRegexSecretValues);
+			if (discoveredNewRegexSecretValue) {
+				const stripUnsafePrefix = (value: string): string =>
+					obfuscator.stripUnsafeFriendlyPlaceholderPrefixes(value, this.#advisorRegexSecretValues);
+				text = stripUnsafePrefix(text);
+				this.#pending = this.#pending.map(delta => ({ ...delta, text: stripUnsafePrefix(delta.text) }));
+			}
+			context = obfuscator.obfuscate(context, this.#advisorRegexSecretValues);
+		}
 		return `${text}\n\n${context}`;
 	}
 

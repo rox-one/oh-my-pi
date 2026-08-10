@@ -134,6 +134,28 @@ describe("ExtensionRunner", () => {
 		expect(updates).toEqual([{ role: "user", content: "current" }]);
 	});
 
+	it("skips Advisor context cloning when no extension registered a handler", async () => {
+		const result = await loadTestExtensions();
+		const runner = new ExtensionRunner(
+			result.extensions,
+			result.runtime,
+			tempDir.path(),
+			sessionManager,
+			modelRegistry,
+		);
+		const updates = [{ role: "user", content: () => "not cloneable" }];
+		const warn = vi.spyOn(logger, "warn").mockImplementation(() => {});
+
+		expect(
+			await runner.emitAdvisorContext({
+				type: "advisor_context",
+				scopeKey: "scope",
+				updates,
+			}),
+		).toEqual([]);
+		expect(warn).not.toHaveBeenCalled();
+	});
+
 	it("aborts in-flight Advisor context collection", async () => {
 		fs.writeFileSync(
 			path.join(extensionsDir, "advisor-context-abort.ts"),
