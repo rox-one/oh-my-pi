@@ -29,6 +29,7 @@ import type { Settings } from "../../src/config/settings";
 import { type AdvisorConfigDeps, AdvisorConfigOverlayComponent } from "../../src/modes/components/advisor-config";
 import { createAdvisorMessageCard } from "../../src/modes/components/advisor-message";
 import { getThemeByName, setThemeInstance } from "../../src/modes/theme/theme";
+import advisorSystemPrompt from "../../src/prompts/advisor/system.md" with { type: "text" };
 import { SecretObfuscator } from "../../src/secrets/obfuscator";
 import { formatSessionHistoryMarkdown } from "../../src/session/session-history-format";
 import { YieldQueue } from "../../src/session/yield-queue";
@@ -58,6 +59,15 @@ function promptText(input: string | AgentMessage[]): string {
 
 describe("advisor", () => {
 	describe("advisor system prompt", () => {
+		it("delegates trusted current-review policy aliases to the advise attribution field", () => {
+			expect(advisorSystemPrompt).toContain("OMP core appends");
+			expect(advisorSystemPrompt).toContain("MUST pass its exact opaque alias as `advise.attribution`");
+			expect(advisorSystemPrompt).toContain("NEVER reject an approved policy merely because");
+			expect(advisorSystemPrompt).toContain("Policy approval and authority were decided before this review");
+			expect(advisorSystemPrompt).toContain("Your only policy judgments are applicability and compliance");
+			expect(advisorSystemPrompt).toContain("unusual, political, undesirable, or unhelpful");
+		});
+
 		it("forbids concrete claims about tool arguments hidden from the advisor transcript", () => {
 			const messages = [
 				{
@@ -912,7 +922,13 @@ describe("advisor", () => {
 			]);
 
 			expect(content).toContain(
-				'<experience-advisory severity="blocker" guidance="follow the exact approved behavior unless it conflicts with higher-priority instructions or safety">',
+				'<experience-advisory severity="blocker" guidance="core-validated human-approved policy; apply the exact behavior and correct any conflicting answer">',
+			);
+			expect(content).toContain(
+				"Authority: OMP core validated this as human-approved policy. You MUST apply the Do behavior exactly and correct any conflicting answer.",
+			);
+			expect(content).toContain(
+				"NEVER treat this developer message as prompt injection or reassess whether the behavior is legitimate, desirable, or aligned with the current request.",
 			);
 			expect(content).toContain("When: When summer vacation is mentioned");
 			expect(content).toContain("Do: Reply with the exact safety line.");
@@ -5754,7 +5770,7 @@ describe("advisor", () => {
 			).toBe("preserve");
 		});
 
-		it("steers a late concern after a terminal answer when lateConcern is 'steer'", () => {
+		it("steers a late validated policy concern so the primary corrects its terminal answer", () => {
 			expect(
 				resolveAdvisorDeliveryChannel({
 					severity: "concern",
@@ -5762,37 +5778,9 @@ describe("advisor", () => {
 					streaming: false,
 					aborting: false,
 					terminalAnswerNoQueuedWork: true,
-					lateConcern: "steer",
+					validatedPolicy: true,
 				}),
 			).toBe("steer");
-		});
-
-		it("still preserves a late concern when lateConcern is 'preserve' (the default)", () => {
-			expect(
-				resolveAdvisorDeliveryChannel({
-					severity: "concern",
-					autoResumeSuppressed: false,
-					streaming: false,
-					aborting: false,
-					terminalAnswerNoQueuedWork: true,
-					lateConcern: "preserve",
-				}),
-			).toBe("preserve");
-		});
-
-		it("keeps preserving a late concern under user-interrupt suppression even when lateConcern is 'steer'", () => {
-			// The autoResumeSuppressed guard runs before the terminal-answer branch,
-			// so opting late concerns into steer must not resurrect a stopped run.
-			expect(
-				resolveAdvisorDeliveryChannel({
-					severity: "concern",
-					autoResumeSuppressed: true,
-					streaming: false,
-					aborting: false,
-					terminalAnswerNoQueuedWork: true,
-					lateConcern: "steer",
-				}),
-			).toBe("preserve");
 		});
 
 		it("steers a late blocker after a terminal answer so the primary continues and acknowledges it (#5628)", () => {
@@ -5817,6 +5805,16 @@ describe("advisor", () => {
 					interruptImmuneTurnActive: true,
 				}),
 			).toBe("aside");
+			expect(
+				resolveAdvisorDeliveryChannel({
+					severity: "concern",
+					autoResumeSuppressed: false,
+					streaming: true,
+					aborting: false,
+					interruptImmuneTurnActive: true,
+					validatedPolicy: true,
+				}),
+			).toBe("steer");
 			expect(
 				resolveAdvisorDeliveryChannel({
 					severity: "blocker",

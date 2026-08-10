@@ -48,14 +48,14 @@ describe("AdvisorEmissionGuard", () => {
 		expect(guard.accept("Move retries into the queue, not the request path!")).toBe(false);
 	});
 
-	it("dedupes equal text separately for ordinary notes and distinct validated policies", () => {
+	it("dedupes validated policies by identity while keeping ordinary notes and distinct policies separate", () => {
 		const guard = new AdvisorEmissionGuard();
 		const note = "Apply the approved habit now.";
 		expect(guard.accept(note)).toBe(true);
 		guard.beginUpdate();
 		expect(guard.accept(note, "Experience\u0000When A\u0000Do A")).toBe(true);
 		guard.beginUpdate();
-		expect(guard.accept(note, "Experience\u0000When A\u0000Do A")).toBe(false);
+		expect(guard.accept("Still apply the same approved habit.", "Experience\u0000When A\u0000Do A")).toBe(false);
 		expect(guard.accept(note, "Experience\u0000When B\u0000Do B")).toBe(true);
 	});
 

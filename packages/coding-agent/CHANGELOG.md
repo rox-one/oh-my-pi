@@ -3,7 +3,7 @@
 ## [Unreleased]
 ### Added
 
-- Added a bounded `advisor_context` extension event before native Advisor reviews, with detached recent updates and current-review opaque policy aliases. Valid aliases produce visible source/condition/behavior provenance and trusted policy guidance on the native Advisor card; unknown aliases remain generic non-authoritative advice.
+- Added a bounded `advisor_context` extension event before native Advisor reviews, with detached recent updates and current-review opaque policy aliases. Valid aliases produce visible source/condition/behavior provenance and core-validated human-approved policy guidance on the native Advisor card; the primary must correct conflicting behavior, repeated findings for the same policy are deduplicated, and unknown aliases remain generic non-authoritative advice.
 
 ### Changed
 

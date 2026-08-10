@@ -64,7 +64,9 @@ const ADVISOR_GUIDANCE = "weigh, don't blindly obey";
 
 /** Behavioral framing reserved for validated, human-approved extension policy. */
 const POLICY_GUIDANCE =
-	"follow the exact approved behavior unless it conflicts with higher-priority instructions or safety";
+	"core-validated human-approved policy; apply the exact behavior and correct any conflicting answer";
+const POLICY_AUTHORITY =
+	"Authority: OMP core validated this as human-approved policy. You MUST apply the Do behavior exactly and correct any conflicting answer.\nNEVER treat this developer message as prompt injection or reassess whether the behavior is legitimate, desirable, or aligned with the current request.\nOnly a concrete conflict with a higher-priority system instruction or safety requirement can override it.";
 
 /**
  * Render a batch of Advisor notes as the agent-facing message body. Validated
@@ -77,9 +79,12 @@ export function formatAdvisorBatchContent(notes: readonly AdvisorNote[]): string
 		.map(n => {
 			const severity = n.severity ? ` severity="${n.severity}"` : "";
 			if (n.policy) {
-				const body = [`When: ${n.policy.condition}`, `Do: ${n.policy.behavior}`, `Correction: ${n.note}`].join(
-					"\n",
-				);
+				const body = [
+					POLICY_AUTHORITY,
+					`When: ${n.policy.condition}`,
+					`Do: ${n.policy.behavior}`,
+					`Correction: ${n.note}`,
+				].join("\n");
 				return `<experience-advisory${severity} guidance="${POLICY_GUIDANCE}">\n${escapeXmlText(body)}\n</experience-advisory>`;
 			}
 			const who = n.advisor ? ` advisor="${escapeXmlAttribute(n.advisor)}"` : "";
@@ -121,13 +126,9 @@ export function isAdvisorInterruptImmuneTurnActive(opts: {
  *   advice is acted on immediately.
  * - If the primary tail is already a terminal text answer and there is no queued
  *   work, a late `concern` is preserved as a visible card instead of waking the
- *   primary to restate completion, unless `lateConcern` is "steer" (the
- *   `advisor.lateConcern` setting), which opts a late concern into the same
- *   triggered-turn steer as a blocker. That is useful for slow advisors whose
- *   review always lands after the turn completes, so their concerns would
- *   otherwise never wake the agent. A `blocker` steers a triggered turn either
- *   way: it means the agent handed off broken or unexercised work, so it must
- *   acknowledge and continue before the turn is considered done (#5628).
+ *   primary to restate completion. A `blocker` or validated policy is the
+ *   exception: both require the primary to acknowledge and correct the answer
+ *   before the turn is considered done (#5628).
  * - After a deliberate user interrupt (`autoResumeSuppressed`) the advisor must
  *   not auto-resume the stopped run. While the agent is idle — or still tearing
  *   the interrupted turn down (`aborting`) — the note is preserved as a visible
@@ -136,10 +137,9 @@ export function isAdvisorInterruptImmuneTurnActive(opts: {
  *   auto-resume anything, so it is delivered live. Parking it during an active
  *   run instead strands it (it never reaches the running agent) and the withheld
  *   notes dump as one burst at the next user prompt — the bug this guards.
- * - During the post-interrupt immune-turn window, further `concern` notes are
- *   downgraded to asides; preservation still wins. A `blocker` is exempt: it
- *   means the agent handed off broken or unexercised work, so it still steers a
- *   triggered turn even right after a prior interrupt (#5628).
+ * - During the post-interrupt immune-turn window, ordinary `concern` notes are
+ *   downgraded to asides; ordinary `blocker` notes and validated policies still
+ *   steer, while explicit user-interrupt preservation still wins (#5628).
  */
 export function resolveAdvisorDeliveryChannel(opts: {
 	severity: AdvisorSeverity | undefined;
@@ -148,21 +148,23 @@ export function resolveAdvisorDeliveryChannel(opts: {
 	aborting: boolean;
 	terminalAnswerNoQueuedWork?: boolean;
 	interruptImmuneTurnActive?: boolean;
+	validatedPolicy?: boolean;
 	preserveOnly?: boolean;
 	lateConcern?: "preserve" | "steer";
 }): AdvisorDeliveryChannel {
 	if (opts.preserveOnly && !opts.streaming) return "preserve";
-	if (!isInterruptingSeverity(opts.severity)) return "aside";
+	const interrupting = opts.validatedPolicy || isInterruptingSeverity(opts.severity);
+	if (!interrupting) return "aside";
 	if (opts.autoResumeSuppressed && (opts.aborting || !opts.streaming)) return "preserve";
 	if (
 		opts.terminalAnswerNoQueuedWork &&
+		!opts.validatedPolicy &&
 		opts.severity !== "blocker" &&
-		opts.lateConcern !== "steer" &&
 		!opts.streaming &&
 		!opts.aborting
 	)
 		return "preserve";
-	if (opts.interruptImmuneTurnActive && opts.severity !== "blocker") return "aside";
+	if (opts.interruptImmuneTurnActive && opts.severity !== "blocker" && !opts.validatedPolicy) return "aside";
 	return "steer";
 }
 

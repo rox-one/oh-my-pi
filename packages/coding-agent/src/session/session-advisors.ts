@@ -1089,9 +1089,10 @@ export class SessionAdvisors {
 		// agent-facing `<advisory>` bytes stay identical to the pre-multi-advisor path.
 		const source = advisor.slug ? advisor.name : undefined;
 		const accepted: AdvisorNote = { note, severity, advisor: source, policy };
-		const interrupting = isInterruptingSeverity(severity);
+		const interrupting = policy !== undefined || isInterruptingSeverity(severity);
 		const channel = resolveAdvisorDeliveryChannel({
 			severity,
+			validatedPolicy: policy !== undefined,
 			autoResumeSuppressed: this.#advisorAutoResumeSuppressed,
 			preserveOnly: this.#preserveAdvisorAdvice,
 			// Key on the live agent-core loop, not session `isStreaming` (which also
