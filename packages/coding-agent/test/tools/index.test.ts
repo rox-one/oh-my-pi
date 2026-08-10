@@ -68,6 +68,23 @@ describe("createTools", () => {
 		expect(names).not.toContain("vim");
 	});
 
+	it("excludes task when recursion depth is exhausted", async () => {
+		const session = createTestSession({
+			settings: createSettingsWithOverrides({ "task.maxRecursionDepth": 1 }),
+			taskDepth: 1,
+		});
+		const tools = await createTools(session, ["read", "task"]);
+
+		expect(tools.map(tool => tool.name)).toEqual(["read"]);
+	});
+
+	it("excludes task and hub when the session spawn policy disables spawning", async () => {
+		const session = createTestSession({ getSessionSpawns: () => "" });
+		const tools = await createTools(session, ["read", "task", "hub"]);
+
+		expect(tools.map(tool => tool.name)).toEqual(["read"]);
+	});
+
 	it("normalizes legacy explicit tool names", async () => {
 		const session = createTestSession({
 			settings: createSettingsWithOverrides({ "astGrep.enabled": false }),

@@ -18,7 +18,7 @@ import type { EvalCellResult, EvalDisplayOutput, EvalLanguage, EvalStatusEvent, 
 import evalDescription from "../prompts/tools/eval.md" with { type: "text" };
 import evalCodeModeDescription from "../prompts/tools/eval-code-mode.md" with { type: "text" };
 import { DEFAULT_MAX_BYTES, OutputSink, type OutputSummary, TailBuffer } from "../session/streaming-output";
-import { resolveSpawnPolicy } from "../task/spawn-policy";
+import { canSpawnSubagents, resolveSpawnPolicy } from "../task/spawn-policy";
 import { webpExclusionForModel } from "../utils/image-loading";
 import { formatDimensionNote, resizeImage } from "../utils/image-resize";
 import type { ToolSession } from ".";
@@ -330,12 +330,19 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 		} else {
 			const backends = resolveEvalBackends(this.session);
 			const sessionSpawns = this.session.getSessionSpawns?.() ?? "*";
+			const spawns = canSpawnSubagents(
+				sessionSpawns,
+				this.session.settings.get("task.maxRecursionDepth") ?? 2,
+				this.session.taskDepth ?? 0,
+			)
+				? sessionSpawns
+				: false;
 			base = getEvalToolDescription({
 				py: backends.python,
 				js: backends.js,
 				rb: backends.ruby,
 				jl: backends.julia,
-				spawns: sessionSpawns,
+				spawns,
 				autoBackgroundEnabled: this.session.settings.get("eval.autoBackground.enabled"),
 			});
 		}
