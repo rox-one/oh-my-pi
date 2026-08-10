@@ -1,6 +1,6 @@
 # Vibe mode
 
-Vibe mode turns the top-level interactive session into a **director** for persistent background worker sessions instead of letting it edit or execute commands itself. The director's active tools are reduced to `read`, optional parent-owned `todo`, and five worker-control tools. Workers do the searching, editing, running, and building; the director verifies their claims by reading touched files. When available, `todo` belongs only to the parent director.
+Vibe mode turns the top-level interactive session into a **director** for persistent background worker sessions instead of letting it edit or execute commands itself. The director's active tools are reduced to `read`, optional parent-owned `todo`, and five worker-control tools (plus any tools granted via `vibe.directorTools`, see below). Workers do the searching, editing, running, and building; the director verifies their claims by reading touched files. When available, `todo` belongs only to the parent director.
 
 ## Enabling and disabling
 
@@ -12,7 +12,7 @@ Toggle it with the `/vibe` slash command:
 /vibe                 # run again to exit
 ```
 
-- Entering activates a parent-session worker scope, installs the vibe tools, reduces the active toolset to `read`, optional parent-owned `todo`, and the vibe tools, and injects the director instructions.
+- Entering activates a parent-session worker scope, installs the vibe tools, reduces the active toolset to `read`, optional parent-owned `todo`, and the vibe tools (plus any `vibe.directorTools` grants), and injects the director instructions.
 - An inline prompt (`/vibe <prompt>`) enters the mode and submits that prompt as the first directive.
 - Exiting restores the prior toolset, cancels in-flight worker turns, kills every worker session in the scope, and persists terminal lifecycle records. A worker never outlives an intentional mode exit.
 - Vibe mode is mutually exclusive with both active **and paused** plan/goal modes; exit those modes first.
@@ -20,6 +20,20 @@ Toggle it with the `/vibe` slash command:
 - The status line shows a `Vibe` indicator while the mode is on.
 
 `/vibe` is an interactive-TUI command. The mode and worker lifecycle events are persisted with the parent session. Resuming a session whose current mode is `vibe` rehydrates completed workers as idle/parked sessions with their child transcripts; a turn interrupted by process restart is not resumed automatically. Explicitly killed or mode-exit workers stay terminal.
+
+## Director tool grants
+
+By default the director's toolset is `read`, optional parent-owned `todo`, and the vibe tools — hands off the keyboard. When workers are unavailable (e.g. provider quota exhaustion) or an action is too small to delegate, `vibe.directorTools` (default `[]`) grants the director direct access to additional tools:
+
+```sh
+omp config set vibe.directorTools '["bash","write"]'
+```
+
+- Granted names must exist in the session registry; unknown names are ignored (validation happens at entry, not at set time).
+- The prompt context lists only grants that are actually active, and the status line reports them on entry.
+- The setting is session-snapshotted: it takes effect on the next `/vibe` entry of a fresh session (restart or resume).
+- Exiting vibe mode restores the pre-vibe toolset exactly, grants included.
+- Delegation remains the default; grants are an escape hatch, not a replacement for workers.
 
 ## The two worker tiers
 

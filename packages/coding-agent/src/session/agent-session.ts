@@ -6540,6 +6540,9 @@ export class AgentSession {
 			customType: "vibe-mode-context",
 			content: prompt.render(vibeModeActivePrompt, {
 				todoAvailable: this.getActiveToolNames().includes("todo"),
+				directorTools: this.settings
+					.get("vibe.directorTools")
+					.filter(name => this.getActiveToolNames().includes(name)),
 			}),
 			display: false,
 			attribution: "agent",

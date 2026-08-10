@@ -3,7 +3,8 @@
  *
  * 1. Vibe tools do not exist in the session registry before the mode is entered.
  * 2. Entering registers and activates exactly `read`, parent-owned `todo`, plus
- *    the vibe tools.
+ *    the vibe tools — plus any configured `vibe.directorTools` grants that exist
+ *    in the registry (unknown names are ignored).
  * 3. Exiting unregisters the vibe tools and restores the pre-vibe active toolset
  *    exactly, including the legitimate empty set.
  */
@@ -19,6 +20,7 @@ import { initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import type { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { normalizeCustomMessagePayload } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { FileSessionStorage, type WriteTextAtomicOptions } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import { VIBE_TOOL_NAMES } from "@oh-my-pi/pi-coding-agent/tools/vibe";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
@@ -309,6 +311,61 @@ describe("InteractiveMode vibe mode toggle", () => {
 				message => message.role === "custom" && message.customType === "irc:incoming",
 			),
 		).toHaveLength(2);
+	});
+	it("grants configured vibe.directorTools to the director and strips them on exit", async () => {
+		const model = session.model;
+		if (!model) throw new Error("Expected active model");
+		const grantedSession = new AgentSession({
+			agent: new Agent({
+				initialState: {
+					model,
+					systemPrompt: ["Test"],
+					tools: [],
+					messages: [],
+				},
+			}),
+			sessionManager: SessionManager.create(tempDir.path(), tempDir.path()),
+			settings: Settings.isolated({ "vibe.directorTools": ["bash", "write", "no-such-tool"] }),
+			modelRegistry,
+			toolRegistry: new Map(["read", "todo", "bash", "write"].map(name => [name, stubTool(name)])),
+			builtInToolNames: ["read", "todo", "bash", "write"],
+			createVibeTools: () => VIBE_TOOL_NAMES.map(stubTool),
+		});
+		const grantedMode = new InteractiveMode(
+			grantedSession,
+			"test",
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			new EventBus(),
+		);
+
+		try {
+			await grantedMode.handleVibeModeCommand();
+			expect(grantedMode.vibeModeEnabled).toBe(true);
+			// Granted tools are active; the unknown name never lands in the set.
+			expect(grantedSession.getActiveToolNames().toSorted()).toEqual(
+				["read", "todo", "bash", "write", ...VIBE_TOOL_NAMES].toSorted(),
+			);
+
+			// The injected director prompt advertises only the granted tools.
+			const sendCustomMessage = vi.spyOn(grantedSession, "sendCustomMessage");
+			await grantedSession.sendVibeModeContext({ deliverAs: "steer" });
+			const message = normalizeCustomMessagePayload(sendCustomMessage.mock.calls[0]?.[0]);
+			const content = typeof message.content === "string" ? message.content : "";
+			expect(content).toContain("`bash`");
+			expect(content).toContain("`write`");
+			expect(content).not.toContain("no-such-tool");
+
+			await grantedMode.handleVibeModeCommand();
+			expect(grantedMode.vibeModeEnabled).toBe(false);
+			expect(grantedSession.getActiveToolNames()).toEqual([]);
+			expect(grantedSession.getAllToolNames().toSorted()).toEqual(["read", "todo", "bash", "write"].toSorted());
+		} finally {
+			grantedMode.stop();
+			await grantedSession.dispose();
+		}
 	});
 
 	it("keeps a same-named non-built-in Todo tool unavailable in Vibe mode", async () => {

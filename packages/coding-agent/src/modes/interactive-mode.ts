@@ -3902,6 +3902,17 @@ export class InteractiveMode implements InteractiveModeContext {
 		const previousTools = options?.previousTools ?? this.session.getEnabledToolNames();
 		const vibeBaseTools = ["read"];
 		if (this.session.hasBuiltInTool("todo")) vibeBaseTools.push("todo");
+		// vibe.directorTools grants extra tools to the director (e.g. bash,
+		// write) beyond the default read/todo/vibe set. Names the session does
+		// not have are ignored; applyActiveToolsByName would filter them anyway.
+		const allToolNames = new Set(this.session.getAllToolNames());
+		const grantedTools: string[] = [];
+		for (const name of this.settings.get("vibe.directorTools")) {
+			if (allToolNames.has(name) && !vibeBaseTools.includes(name)) {
+				vibeBaseTools.push(name);
+				grantedTools.push(name);
+			}
+		}
 		await this.session.activateVibeTools(vibeBaseTools);
 		this.#vibeModePreviousTools = previousTools;
 		this.#vibeModeOwnerScope = ownerScope;
@@ -3916,7 +3927,9 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#updateVibeModeStatus();
 		if (options?.persistModeChange !== false) this.sessionManager.appendModeChange("vibe", { previousTools });
 		this.showStatus(
-			"Vibe mode enabled. You direct fast/good worker sessions; toolset is read + optional parent Todo + vibe tools.",
+			grantedTools.length > 0
+				? `Vibe mode enabled. Director toolset: read + optional parent Todo + vibe tools + granted: ${grantedTools.join(", ")}.`
+				: "Vibe mode enabled. You direct fast/good worker sessions; toolset is read + optional parent Todo + vibe tools.",
 		);
 	}
 
