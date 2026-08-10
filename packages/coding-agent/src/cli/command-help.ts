@@ -6,6 +6,10 @@ export const acpHelp = {
 
 export const agentsHelp = { description: "Manage bundled task agents" } satisfies CommandMetadata;
 
+export const attachHelp = {
+	description: "Attach an interactive pane to a live vibe worker",
+} satisfies CommandMetadata;
+
 export const authBrokerHelp = {
 	description: "Manage the omp auth-broker (credential vault)",
 } satisfies CommandMetadata;

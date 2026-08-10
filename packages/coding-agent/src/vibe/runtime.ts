@@ -18,7 +18,10 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { logger, prompt, Snowflake } from "@oh-my-pi/pi-utils";
 import type { AsyncJob, AsyncJobManager } from "../async/job-manager";
-import { resolveAgentModelSelection } from "../config/model-resolver";
+import type { AttachWorkerKey } from "../attach/protocol";
+import type { AttachFollowUpResult } from "../attach/registry";
+import { AttachVibeBridge, attachFallbackBaseDir } from "../attach/vibe-bridge";
+import { resolveAgentModelPatterns } from "../config/model-resolver";
 import type { LocalProtocolOptions } from "../internal-urls";
 import { registerArtifactsDir } from "../internal-urls/registry-helpers";
 import { MCPManager } from "../mcp/manager";
@@ -314,6 +317,20 @@ function matchesScope(record: VibeRecord, scope: VibeOwnerScope): boolean {
 	);
 }
 
+/** Attach registry key for a vibe record within its owner scope. */
+function attachKeyOfRecord(record: VibeRecord): AttachWorkerKey {
+	return { workerId: record.id, ownerScope: record.parentSessionId };
+}
+
+/** Reconstruct the owner scope of a record (used for attach bridge keying). */
+function scopeFromRecord(record: VibeRecord): VibeOwnerScope {
+	return {
+		ownerId: record.ownerId,
+		parentSessionId: record.parentSessionId,
+		parentSessionFile: record.parentSessionFile,
+	};
+}
+
 function objectRecord(value: unknown): Record<string, unknown> | undefined {
 	if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
 	return value as Record<string, unknown>;
@@ -457,6 +474,8 @@ export class VibeSessionRegistry {
 	readonly #terminationTails = new Map<string, Promise<void>>();
 	readonly #terminatedScopes = new Set<string>();
 	#teardownGraceMs = VIBE_TEARDOWN_GRACE_MS;
+	/** Per-scope attach substrate (registry + 0600 socket server), keyed by scopeKey(scope, ""). */
+	readonly #attachBridges = new Map<string, { bridge: AttachVibeBridge; session: ToolSession | null }>();
 
 	/** Override the teardown grace period for deterministic lifecycle tests. */
 	setTeardownGraceForTesting(timeoutMs: number): void {
@@ -479,6 +498,127 @@ export class VibeSessionRegistry {
 	/** Re-open spawn admission after an explicit Vibe-mode entry. */
 	activateScope(scope: VibeOwnerScope): void {
 		this.#terminatedScopes.delete(scopeKey(scope, ""));
+	}
+
+	/**
+	 * Look up or lazily create the attach bridge (registry + socket server) for
+	 * one scope. A fresh bridge backfills every already-live record in the
+	 * scope (revived workers included) so the attach view is complete before
+	 * the first spawn.
+	 */
+	#attachBridge(
+		scope: VibeOwnerScope,
+		session: ToolSession,
+	): { bridge: AttachVibeBridge; session: ToolSession | null } {
+		const key = scopeKey(scope, "");
+		const existing = this.#attachBridges.get(key);
+		if (existing) {
+			existing.session = session;
+			return existing;
+		}
+		const baseDir = scope.parentSessionFile
+			? path.resolve(scope.parentSessionFile.slice(0, -6))
+			: attachFallbackBaseDir(scope.parentSessionId);
+		const bridge = new AttachVibeBridge({
+			ownerScope: scope.parentSessionId,
+			baseDir,
+			runTurn: (workerKey, prompt, options) => this.#runAttachTurn(scope, workerKey, prompt, options?.timeoutMs),
+			abortTurn: (workerKey, reason) => this.#abortAttachTurn(scope, workerKey, reason),
+			liveSessionOf: workerKey => this.#attachLiveSessionOf(scope, workerKey),
+			isParked: workerKey => this.#attachIsParked(scope, workerKey),
+		});
+		for (const record of this.#records.values()) {
+			if (!matchesScope(record, scope) || record.state === "dead") continue;
+			bridge.register(attachKeyOfRecord(record), record.lastActivity ?? null, true);
+		}
+		const entry = { bridge, session };
+		this.#attachBridges.set(key, entry);
+		return entry;
+	}
+
+	/** The attach bridge for a record's scope, when one exists. */
+	#attachForRecord(record: VibeRecord): AttachVibeBridge | undefined {
+		return this.#attachBridges.get(scopeKey(scopeFromRecord(record), ""))?.bridge;
+	}
+
+	/** Run one pane-origin follow-up through the same turn-job queue as vibe_send, awaiting the job. */
+	async #runAttachTurn(
+		scope: VibeOwnerScope,
+		workerKey: AttachWorkerKey,
+		prompt: string,
+		timeoutMs?: number,
+	): Promise<AttachFollowUpResult> {
+		const entry = this.#attachBridges.get(scopeKey(scope, ""));
+		const session = entry?.session;
+		if (!session) return { ok: false, error: "no director session available for the attach scope" };
+		let outcome: VibeSendOutcome;
+		try {
+			outcome = await this.send(session, { session: workerKey.workerId, message: prompt });
+		} catch (error) {
+			return { ok: false, error: error instanceof Error ? error.message : String(error) };
+		}
+		if (outcome.mode !== "turn" || !outcome.jobId) {
+			return { ok: true, payload: { mode: outcome.mode } };
+		}
+		const manager = this.#manager(session);
+		const job = manager.getJob(outcome.jobId);
+		if (!job) return { ok: true, payload: { mode: outcome.mode, jobId: outcome.jobId } };
+		let jobError: string | undefined;
+		let timedOut = false;
+		if (timeoutMs !== undefined && timeoutMs > 0) {
+			const { promise: timeoutPromise, resolve: timeoutResolve } = Promise.withResolvers<void>();
+			const timer = setTimeout(() => {
+				timedOut = true;
+				timeoutResolve();
+			}, timeoutMs);
+			try {
+				await Promise.race([
+					job.promise.then(
+						() => undefined,
+						error => {
+							jobError = error instanceof Error ? error.message : String(error);
+						},
+					),
+					timeoutPromise,
+				]);
+			} finally {
+				clearTimeout(timer);
+			}
+		} else {
+			try {
+				await job.promise;
+			} catch (error) {
+				jobError = error instanceof Error ? error.message : String(error);
+			}
+		}
+		if (timedOut) return { ok: false, error: `follow-up timed out after ${timeoutMs}ms` };
+		if (jobError) return { ok: false, error: jobError };
+		return { ok: true, payload: { mode: outcome.mode, jobId: outcome.jobId } };
+	}
+
+	/** Cancel the worker's in-flight turn job only; the adopted worker survives. */
+	async #abortAttachTurn(scope: VibeOwnerScope, workerKey: AttachWorkerKey, reason?: string): Promise<boolean> {
+		const entry = this.#attachBridges.get(scopeKey(scope, ""));
+		const record = this.#records.get(scopeKey(scope, workerKey.workerId));
+		if (!entry || !record?.turn) return false;
+		const session = entry.session;
+		if (!session) return false;
+		const cancelled = this.#manager(session).cancel(record.turn.jobId, { ownerId: record.ownerId });
+		if (cancelled) {
+			record.lastActivity = firstLine(`aborted: ${reason ?? "follow-up cancelled"}`);
+			record.lastActivityAt = Date.now();
+		}
+		return cancelled;
+	}
+
+	#attachLiveSessionOf(scope: VibeOwnerScope, workerKey: AttachWorkerKey): unknown {
+		const record = this.#records.get(scopeKey(scope, workerKey.workerId));
+		return record ? this.#registeredAgent(record)?.session : undefined;
+	}
+
+	#attachIsParked(scope: VibeOwnerScope, workerKey: AttachWorkerKey): boolean {
+		const record = this.#records.get(scopeKey(scope, workerKey.workerId));
+		return record ? this.#registeredAgent(record)?.status === "parked" : false;
 	}
 
 	async #withTerminationLock<T>(scope: VibeOwnerScope, operation: () => Promise<T>): Promise<T> {
@@ -995,7 +1135,17 @@ export class VibeSessionRegistry {
 			terminalPersisted: false,
 		};
 		const key = scopeKey(scope, id);
+		const attach = this.#attachBridge(scope, session);
 		this.#records.set(key, record);
+		attach.bridge.register(attachKeyOfRecord(record), firstLine(args.prompt));
+		try {
+			await attach.bridge.ensureStarted();
+		} catch (error) {
+			logger.warn("vibe: attach server failed to start", {
+				id,
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
 		let spawnPersisted = false;
 		try {
 			if (childSessionFile) {
@@ -1028,6 +1178,7 @@ export class VibeSessionRegistry {
 				}
 			}
 			this.#records.delete(key);
+			this.#attachBridges.get(scopeKey(scope, ""))?.bridge.unregister(attachKeyOfRecord(record), "spawn-failed");
 			throw error;
 		}
 	}
@@ -1177,6 +1328,7 @@ export class VibeSessionRegistry {
 			record.lastActivityAt = Date.now();
 			record.lastActivity = "suspended for parent-session switch";
 			this.#records.delete(scopeKey(scope, record.id));
+			this.#attachBridges.get(scopeKey(scope, ""))?.bridge.unregister(attachKeyOfRecord(record), "suspended");
 			if (record.turn && manager) manager.cancel(record.turn.jobId, { ownerId: record.ownerId });
 		}
 		const deadline = Date.now() + this.#teardownGraceMs;
@@ -1203,6 +1355,10 @@ export class VibeSessionRegistry {
 			if (lateRef && lateRef !== ref) {
 				await this.#releaseRefWithinDeadline(record.id, lateRef, deadline, "detach");
 			}
+		}
+		const attach = this.#attachBridges.get(scopeKey(scope, ""));
+		if (attach) {
+			await attach.bridge.stop();
 		}
 		return records.length;
 	}
@@ -1245,6 +1401,12 @@ export class VibeSessionRegistry {
 					this.#terminatedScopes.add(scopeKey(scope, ""));
 				}
 				throw error;
+			} finally {
+				const attach = this.#attachBridges.get(scopeKey(scope, ""));
+				if (attach) {
+					await attach.bridge.stop();
+					this.#attachBridges.delete(scopeKey(scope, ""));
+				}
 			}
 		});
 	}
@@ -1344,6 +1506,7 @@ export class VibeSessionRegistry {
 		}
 		const terminalRef = registered ?? this.#registeredAgent(record) ?? null;
 		await this.#markTerminalRecord(record, terminalRef, deadline);
+		this.#attachForRecord(record)?.unregister(attachKeyOfRecord(record), `vibe ${reason}`);
 		if (pendingJobs.length > 0) {
 			this.#continueKilledCleanup(
 				record,
@@ -1494,17 +1657,21 @@ export class VibeSessionRegistry {
 			mergeTrace(turn, progress);
 			record.resolvedModel = progress.resolvedModel ?? record.resolvedModel;
 			// recentOutput is newest-first; keep the latest lines oldest-first for display.
-			record.live = {
+			const live = {
 				currentTool: progress.currentTool,
 				currentToolArgs: progress.currentToolArgs,
 				lastIntent: progress.lastIntent,
 				outputTail: progress.recentOutput.slice(0, 3).reverse(),
 			};
+			record.live = live;
 			const gist =
 				progress.lastIntent ??
 				(progress.currentTool ? `${progress.currentTool} ${progress.currentToolArgs ?? ""}` : undefined);
 			if (gist) record.lastActivity = firstLine(gist);
 			record.lastActivityAt = Date.now();
+			// Live progress reaches the attach wire (coalesced per worker by the
+			// bridge); the final state is flushed before the turn settles below.
+			this.#attachForRecord(record)?.progress(attachKeyOfRecord(record), live);
 		};
 
 		const jobId = manager.register(
@@ -1512,6 +1679,7 @@ export class VibeSessionRegistry {
 			`vibe ${record.cli} ${record.id}: ${firstLine(message, 60)}`,
 			async ({ jobId: ownJobId, signal }) => {
 				record.state = "running";
+				this.#attachForRecord(record)?.updateState(attachKeyOfRecord(record), "running");
 				record.turnCount = turnIndex;
 				record.lastActivityAt = Date.now();
 				try {
@@ -1539,9 +1707,13 @@ export class VibeSessionRegistry {
 								eventBus: session.eventBus,
 								artifactsDir: session.getSessionFile()?.slice(0, -6),
 							});
+					// Final progress flush: the turn is about to settle, so any
+					// coalesced live state must reach the wire now.
+					this.#attachForRecord(record)?.flushProgress(attachKeyOfRecord(record));
 					return await this.#settleTurn(session, manager, record, turn, ownJobId, turnIndex, result);
 				} catch (error) {
 					if (error instanceof VibeTurnError) throw error;
+					this.#attachForRecord(record)?.flushProgress(attachKeyOfRecord(record));
 					await this.#finishTurn(session, manager, record, ownJobId);
 					const reason = error instanceof Error ? error.message : String(error);
 					record.lastActivity = firstLine(`turn failed: ${reason}`);
@@ -1577,8 +1749,10 @@ export class VibeSessionRegistry {
 		record.state = registered && (registered.status === "idle" || registered.status === "parked") ? "idle" : "dead";
 		if (record.state === "dead") {
 			record.terminalPersisted = await this.#appendTombstone(session, record, "unrecoverable");
+			this.#attachForRecord(record)?.unregister(attachKeyOfRecord(record), "unrecoverable turn failure");
 			return;
 		}
+		this.#attachForRecord(record)?.updateState(attachKeyOfRecord(record), "idle", record.lastActivity ?? null);
 		const settledPersisted = await this.#appendLifecycleEvent(
 			session,
 			{
