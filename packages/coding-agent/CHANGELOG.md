@@ -3,7 +3,7 @@
 ## [Unreleased]
 ### Added
 
-- Added a bounded `advisor_context` extension event before native Advisor reviews, with detached recent updates and opaque source attribution retained only in private Advisor tool records.
+- Added a bounded `advisor_context` extension event before native Advisor reviews, with detached recent updates and current-review opaque policy aliases. Valid aliases produce visible source/condition/behavior provenance and trusted policy guidance on the native Advisor card; unknown aliases remain generic non-authoritative advice.
 
 ### Changed
 

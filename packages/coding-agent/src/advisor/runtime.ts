@@ -13,6 +13,12 @@ import {
 	PRIMARY_CONTEXT_CUSTOM_TYPES,
 } from "../session/session-history-format";
 import { ADVISOR_RENDER_OPTIONS, renderAdvisorDeltaChunks } from "./delta-split";
+import type { AdvisorPolicyAttribution } from "./advise-tool";
+
+export interface AdvisorExtensionContext {
+	text: string;
+	policyAttributions: readonly AdvisorPolicyAttribution[];
+}
 
 /**
  * Minimal slice of `Agent` the runtime drives — satisfied by pi-agent-core
@@ -59,7 +65,7 @@ export interface AdvisorRuntimeHost {
 	 * The host owns these gates because it routes `advise()` results back to the
 	 * primary.
 	 */
-	beginAdvisorUpdate?(inProgress: boolean): void;
+	beginAdvisorUpdate?(inProgress: boolean, policyAttributions?: readonly AdvisorPolicyAttribution[]): void;
 	/**
 	 * Called with the error of every failed advisor turn, before the retry sleep
 	 * or the dropped-after-3 path. Lets the host apply credential-level remedies
@@ -242,7 +248,7 @@ interface PendingDelta {
 	turns: number;
 	/** Whether the primary was mid-turn (willContinue:true) when this delta was rendered. */
 	wip: boolean;
-	extensionContext?: string;
+	extensionContext?: AdvisorExtensionContext;
 	overflowRecovery?: boolean;
 }
 
@@ -403,7 +409,10 @@ export class AdvisorRuntime {
 	 *   advisor knows to withhold critique on partial work. The flag is carried on
 	 *   the delta and forwarded to the reprime path so it is never silently dropped.
 	 */
-	onTurnEnd(messages?: AgentMessage[], opts?: { willContinue?: boolean; extensionContext?: string }): void {
+	onTurnEnd(
+		messages?: AgentMessage[],
+		opts?: { willContinue?: boolean; extensionContext?: AdvisorExtensionContext },
+	): void {
 		if (this.disposed || this.#quotaExhausted || this.#halted) return;
 		const all = messages ?? this.host.snapshotMessages();
 		this.#latestMessages = all;
@@ -797,9 +806,9 @@ export class AdvisorRuntime {
 		return `${mdHead}\n\n---\n\n[in progress — more steps follow]`;
 	}
 
-	#appendExtensionContext(text: string | null, extensionContext?: string): string | null {
+	#appendExtensionContext(text: string | null, extensionContext?: AdvisorExtensionContext): string | null {
 		if (!text) return null;
-		let context = extensionContext?.trim();
+		let context = extensionContext?.text.trim();
 		if (!context) return text;
 		const obfuscator = this.host.obfuscator;
 		if (obfuscator?.hasSecrets()) {
@@ -824,7 +833,7 @@ export class AdvisorRuntime {
 	#renderDelta(
 		messages?: AgentMessage[],
 		wip = false,
-		extensionContext?: string,
+		extensionContext?: AdvisorExtensionContext,
 	): Omit<PendingDelta, "turns" | "overflowRecovery"> | null {
 		const all = messages ?? this.#latestMessages ?? this.host.snapshotMessages();
 		let prefixChanged = all.length < this.#lastCount;
@@ -980,7 +989,7 @@ export class AdvisorRuntime {
 		preparedMessages: AgentMessage[];
 		finalTurns: number;
 		wip: boolean;
-		extensionContext?: string;
+		extensionContext?: AdvisorExtensionContext;
 		resetContext: boolean;
 	} | null> {
 		let batchText = initial.map(b => b.text).join("\n\n");
@@ -990,12 +999,15 @@ export class AdvisorRuntime {
 		// so a willContinue:true turn keeps its [in progress] heading. Also
 		// returned to #drain so the retry-requeue path preserves it on failed turns.
 		let wip = initial.at(-1)?.wip ?? false;
-		const combinedExtensionContext = (): string | undefined => {
-			const context = initial
+		const combinedExtensionContext = (): AdvisorExtensionContext | undefined => {
+			const contexts = initial
 				.map(delta => delta.extensionContext)
-				.filter((value): value is string => !!value)
-				.join("\n\n");
-			return context || undefined;
+				.filter((value): value is AdvisorExtensionContext => !!value);
+			if (contexts.length === 0) return undefined;
+			return {
+				text: contexts.map(value => value.text).join("\n\n"),
+				policyAttributions: contexts.flatMap(value => value.policyAttributions),
+			};
 		};
 
 		for (let round = 0; round < MAX_COALESCE_ROUNDS; round++) {
@@ -1212,16 +1224,15 @@ export class AdvisorRuntime {
 				const messageSnapshot = this.agent.state.messages.length;
 				const contextWasFresh = resetContext || recoveringOverflow || messageSnapshot === 0;
 				try {
-					this.host.beginAdvisorUpdate?.(wip);
-					// Candidate 4 (multi-message split): deliver the Session update as
-					// multiple user messages so the provider prompt cache can
-					// incrementally hit each appended message (cache_read grows with
-					// the session instead of staying pinned at the instructions/tools
-					// boundary). Falls back to the single-block string when the chunk
-					// renderer cannot split (e.g. empty delta). The split is
-					// byte-equivalent to the old single-block render (equivalence
-					// tested), so the advisor sees identical context.
-					const splitMessages = this.#formatRawDeltaMessageChunks(preparedMessages, wip);
+					// Reset the host's per-update advisor state (one-advise-per-update
+					// gate) and pass through whether this batch reviews partial work.
+					this.host.beginAdvisorUpdate?.(wip, extensionContext?.policyAttributions);
+					// Deliver ordinary Session updates as multiple messages for prompt-cache
+					// growth. Extension context is already appended to `batch`, so preserve
+					// that single authoritative payload instead of dropping it from the split.
+					const splitMessages = extensionContext
+						? null
+						: this.#formatRawDeltaMessageChunks(preparedMessages, wip);
 					const promptInput: string | AgentMessage[] = splitMessages ?? batch;
 					const prompt = this.agent.prompt(promptInput);
 					this.#promptInFlight = prompt;

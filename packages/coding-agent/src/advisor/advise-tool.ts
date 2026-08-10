@@ -32,12 +32,26 @@ export interface AdviseDetails {
 	advisor?: string;
 }
 
+/** Exact approved policy provenance rendered with a validated Advisor note. */
+export interface AdvisorPolicyDetails {
+	source: string;
+	condition: string;
+	behavior: string;
+}
+
+/** Current-review-only opaque alias plus its visible policy provenance. */
+export interface AdvisorPolicyAttribution extends AdvisorPolicyDetails {
+	attribution: string;
+}
+
 /** One queued advice note. */
 export interface AdvisorNote {
 	note: string;
 	severity?: AdvisorSeverity;
 	/** Which configured advisor produced this note (omitted for the default advisor). */
 	advisor?: string;
+	/** Present only after OMP validates a current-review opaque attribution. */
+	policy?: AdvisorPolicyDetails;
 }
 
 /** Details payload on the batched `advisor` custom message rendered in the transcript. */
@@ -45,24 +59,29 @@ export interface AdvisorMessageDetails {
 	notes: AdvisorNote[];
 }
 
-/**
- * Behavioral framing for the watched agent — advice, not orders. Carried as a
- * tag attribute (rather than a prose header) so the rendered agent-facing output
- * stays a clean `<advisory>` block. The primary agent's system prompt never
- * mentions advisories, so this is its only cue for how to treat them.
- */
+/** Behavioral framing for ordinary Advisor notes. */
 const ADVISOR_GUIDANCE = "weigh, don't blindly obey";
 
+/** Behavioral framing reserved for validated, human-approved extension policy. */
+const POLICY_GUIDANCE =
+	"follow the exact approved behavior unless it conflicts with higher-priority instructions or safety";
+
 /**
- * Render a batch of advisor notes as the agent-facing message body: one
- * `<advisory>` element per note, severity as an attribute. Shared by the
- * non-interrupting YieldQueue dispatcher and the interrupting steer path so both
- * build byte-identical content.
+ * Render a batch of Advisor notes as the agent-facing message body. Validated
+ * extension policy carries its exact approved condition and behavior; ordinary
+ * notes remain non-authoritative advice. Shared by both delivery channels so
+ * they build byte-identical content.
  */
 export function formatAdvisorBatchContent(notes: readonly AdvisorNote[]): string {
 	return notes
 		.map(n => {
 			const severity = n.severity ? ` severity="${n.severity}"` : "";
+			if (n.policy) {
+				const body = [`When: ${n.policy.condition}`, `Do: ${n.policy.behavior}`, `Correction: ${n.note}`].join(
+					"\n",
+				);
+				return `<experience-advisory${severity} guidance="${POLICY_GUIDANCE}">\n${escapeXmlText(body)}\n</experience-advisory>`;
+			}
 			const who = n.advisor ? ` advisor="${escapeXmlAttribute(n.advisor)}"` : "";
 			return `<advisory${who}${severity} guidance="${ADVISOR_GUIDANCE}">\n${escapeXmlText(n.note)}\n</advisory>`;
 		})
@@ -173,8 +192,8 @@ export function deriveAdvisorTelemetry(
  */
 export const ADVISOR_DEFAULT_TOOL_NAMES: ReadonlySet<string> = new Set(["read", "grep", "glob"]);
 
-function advisorNoteDedupeKey(note: string): string {
-	return note.trim().replace(/\s+/g, " ");
+function advisorNoteDedupeKey(note: string, attribution?: string): string {
+	return `${attribution ?? ""}\u0000${note.trim().replace(/\s+/g, " ")}`;
 }
 
 /** Rank advisor severities so the dedupe state can detect a real escalation
@@ -204,7 +223,9 @@ export class AdviseTool implements AgentTool<typeof adviseSchema, AdviseDetails>
 	 *  Cleared on `resetDeliveredNotes` alongside the delivered-rank map. */
 	#deferredNotes: { key: string; note: string; severity?: AdviseDetails["severity"] }[] = [];
 
-	constructor(private readonly onAdvice: (note: string, severity?: AdviseDetails["severity"]) => void) {}
+	constructor(
+		private readonly onAdvice: (note: string, severity?: AdviseDetails["severity"], attribution?: string) => void,
+	) {}
 
 	/**
 	 * Mark whether the next advisor prompt reviews an in-progress primary turn.
@@ -258,7 +279,7 @@ export class AdviseTool implements AgentTool<typeof adviseSchema, AdviseDetails>
 				useless: true,
 			};
 		}
-		const key = advisorNoteDedupeKey(args.note);
+		const key = advisorNoteDedupeKey(args.note, args.attribution);
 		const rank = advisorSeverityRank(args.severity);
 		const previousRank = this.#deliveredNoteSeverities.get(key) ?? 0;
 		if (rank <= previousRank) {
@@ -269,7 +290,8 @@ export class AdviseTool implements AgentTool<typeof adviseSchema, AdviseDetails>
 			};
 		}
 		this.#deliveredNoteSeverities.set(key, rank);
-		this.onAdvice(args.note, args.severity);
+		if (args.attribution) this.onAdvice(args.note, args.severity, args.attribution);
+		else this.onAdvice(args.note, args.severity);
 		return {
 			content: [{ type: "text", text: "Recorded." }],
 			details: { note: args.note, severity: args.severity, attribution: args.attribution },

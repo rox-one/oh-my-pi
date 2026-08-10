@@ -103,9 +103,9 @@ const DEFAULT_HISTORY_CAPACITY = 4096;
 /**
  * Decides whether an advisor `advise()` call should reach the primary agent.
  *
- * Enforces — in this order — the noise filter, session-scoped exact-text
- * dedupe (FIFO-evicted at {@link DEFAULT_HISTORY_CAPACITY}), and a per-update
- * rate limit of one accepted note per advisor model prompt. Suppressed calls
+ * Enforces — in this order — the noise filter, session-scoped exact-text and
+ * validated-policy dedupe (FIFO-evicted at {@link DEFAULT_HISTORY_CAPACITY}),
+ * and a per-update rate limit of one accepted note per advisor model prompt. Suppressed calls
  * never consume the per-update budget — a noise call doesn't burn the slot
  * for a real concern that follows in the same update.
  *
@@ -154,10 +154,11 @@ export class AdvisorEmissionGuard {
 	 * Empty / whitespace-only notes are suppressed; the model's
 	 * tool-args contract still requires a non-empty string but defense-in-depth.
 	 */
-	accept(note: string): boolean {
-		const key = normalizeAdvisorNote(note);
-		if (!key) return false;
-		if (SUPPRESSED_NORMALIZED_PHRASES[key]) return false;
+	accept(note: string, policyKey?: string): boolean {
+		const normalizedNote = normalizeAdvisorNote(note);
+		if (!normalizedNote) return false;
+		if (SUPPRESSED_NORMALIZED_PHRASES[normalizedNote]) return false;
+		const key = policyKey === undefined ? normalizedNote : `${policyKey}\u0000${normalizedNote}`;
 		if (this.#seen.has(key)) return false;
 		if (this.#consumedThisUpdate) return false;
 		this.#consumedThisUpdate = true;

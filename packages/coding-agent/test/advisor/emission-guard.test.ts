@@ -48,6 +48,17 @@ describe("AdvisorEmissionGuard", () => {
 		expect(guard.accept("Move retries into the queue, not the request path!")).toBe(false);
 	});
 
+	it("dedupes equal text separately for ordinary notes and distinct validated policies", () => {
+		const guard = new AdvisorEmissionGuard();
+		const note = "Apply the approved habit now.";
+		expect(guard.accept(note)).toBe(true);
+		guard.beginUpdate();
+		expect(guard.accept(note, "Experience\u0000When A\u0000Do A")).toBe(true);
+		guard.beginUpdate();
+		expect(guard.accept(note, "Experience\u0000When A\u0000Do A")).toBe(false);
+		expect(guard.accept(note, "Experience\u0000When B\u0000Do B")).toBe(true);
+	});
+
 	it("rate-limits to one accepted advise per advisor update cycle", () => {
 		// The advisor system prompt says "at most one `advise` per update". Real
 		// models violate this; the guard enforces it at the boundary so the

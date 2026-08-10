@@ -292,6 +292,7 @@ Cancelable pre-events:
 - `before_provider_request` (may replace provider request payload — the replacement is applied by every provider that fires the hook, which is all of them except `devin-agent`, which does not fire it)
 - `after_provider_response`
 - `context`
+- `advisor_context` — contributes bounded private context before each native Advisor review. A handler may return `{ context, policies }`; each policy carries an opaque `attribution` plus exact visible `source`, `condition`, and `behavior`. If the Advisor cites a current-review alias in `advise.attribution`, OMP validates it, renders the approved policy provenance with the note, and tells the primary agent to follow the exact approved behavior unless higher-priority instructions or safety conflict. Unknown, stale, or duplicate aliases remain ordinary non-authoritative Advisor notes.
 - `agent_start` / `agent_end` — agent loop lifecycle notification; `agent_end` remains notification-only
 - `session_stop` — main-session stop hook, awaited before settle; may continue with `{ continue: true, additionalContext }` or `{ decision: "block", reason }`; capped at 8 consecutive continuations and never fires for task/subagent sessions
 - `turn_start` / `turn_end`

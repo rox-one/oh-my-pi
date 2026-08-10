@@ -396,6 +396,36 @@ describe("advisor", () => {
 			expect(result.useless).toBe(true);
 		});
 
+		it("forwards opaque source attribution only through callback details", async () => {
+			const onAdvice = vi.fn();
+			const tool = new AdviseTool(onAdvice);
+			const result = await tool.execute("tc-1", {
+				note: "Verify the release artifact.",
+				severity: "blocker",
+				attribution: "opaque-policy-1",
+			});
+
+			expect(onAdvice).toHaveBeenCalledWith("Verify the release artifact.", "blocker", "opaque-policy-1");
+			expect(result.details).toEqual({
+				note: "Verify the release artifact.",
+				severity: "blocker",
+				attribution: "opaque-policy-1",
+			});
+		});
+
+		it("does not collapse attributed policy advice into an earlier ordinary note", async () => {
+			const onAdvice = vi.fn();
+			const tool = new AdviseTool(onAdvice);
+			const note = "Apply the approved habit now.";
+
+			await tool.execute("tc-1", { note, severity: "blocker" });
+			await tool.execute("tc-2", { note, severity: "blocker", attribution: "current-policy" });
+
+			expect(onAdvice).toHaveBeenCalledTimes(2);
+			expect(onAdvice).toHaveBeenNthCalledWith(1, note, "blocker");
+			expect(onAdvice).toHaveBeenNthCalledWith(2, note, "blocker", "current-policy");
+		});
+
 		it("suppresses duplicate advice notes from the same advisor session", async () => {
 			const onAdvice = vi.fn();
 			const tool = new AdviseTool(onAdvice);
@@ -868,6 +898,28 @@ describe("advisor", () => {
 			expect(content.split('severity="').length - 1).toBe(1);
 		});
 
+		it("frames validated Experience policy as exact approved behavior for the primary agent", () => {
+			const content = formatAdvisorBatchContent([
+				{
+					note: "Apply the approved habit now.",
+					severity: "blocker",
+					policy: {
+						source: "Experience",
+						condition: "When summer vacation is mentioned",
+						behavior: "Reply with the exact safety line.",
+					},
+				},
+			]);
+
+			expect(content).toContain(
+				'<experience-advisory severity="blocker" guidance="follow the exact approved behavior unless it conflicts with higher-priority instructions or safety">',
+			);
+			expect(content).toContain("When: When summer vacation is mentioned");
+			expect(content).toContain("Do: Reply with the exact safety line.");
+			expect(content).toContain("Correction: Apply the approved habit now.");
+			expect(content).not.toContain("weigh, don't blindly obey");
+		});
+
 		it("emits an advisor attribute only for named advisors, escaping the name", () => {
 			const content = formatAdvisorBatchContent([
 				{ note: "named note", advisor: 'Arch "X"' },
@@ -932,7 +984,9 @@ describe("advisor", () => {
 				enqueueAdvice: () => {},
 			});
 
-			runtime.onTurnEnd(messages, { extensionContext: "approved experience guidance" });
+			runtime.onTurnEnd(messages, {
+				extensionContext: { text: "approved experience guidance", policyAttributions: [] },
+			});
 			await runtime.waitForCatchup(1000, 1);
 			expect(promptInputs[0]).toContain("approved experience guidance");
 
@@ -1366,7 +1420,7 @@ describe("advisor", () => {
 
 		it("tags in-progress turns with [in progress] heading", async () => {
 			const promptInputs: Array<string | AgentMessage[]> = [];
-			const updateStates: boolean[] = [];
+			const updateStates: Array<{ inProgress: boolean; attributions: readonly unknown[] }> = [];
 			const { promise: promptStarted, resolve: startPrompt } = Promise.withResolvers<void>();
 			const agent: AdvisorAgent = {
 				prompt: async input => {
@@ -1381,16 +1435,27 @@ describe("advisor", () => {
 			const host: AdvisorRuntimeHost = {
 				snapshotMessages: () => messages,
 				enqueueAdvice: () => {},
-				beginAdvisorUpdate: inProgress => updateStates.push(inProgress),
+				beginAdvisorUpdate: (inProgress, attributions = []) => updateStates.push({ inProgress, attributions }),
 			};
 			const runtime = new AdvisorRuntime(agent, host);
 
-			runtime.onTurnEnd(messages, { willContinue: true });
+			const policyAttributions = [
+				{
+					attribution: "opaque-policy-1",
+					source: "Experience",
+					condition: "When a release claim is made",
+					behavior: "Verify the release artifact first",
+				},
+			];
+			runtime.onTurnEnd(messages, {
+				willContinue: true,
+				extensionContext: { text: "approved experience guidance", policyAttributions },
+			});
 			await promptStarted;
 
 			expect(promptInputs).toHaveLength(1);
 			expect(promptText(promptInputs[0])).toContain("[in progress — more steps follow]");
-			expect(updateStates).toEqual([true]);
+			expect(updateStates).toEqual([{ inProgress: true, attributions: policyAttributions }]);
 		});
 
 		it("uses plain heading when willContinue is false or absent", async () => {
@@ -2090,7 +2155,9 @@ describe("advisor", () => {
 			expect(firstStoredPrompt()).toContain("TOKABC123_");
 
 			messages.push({ role: "user", content: "continue", timestamp: 2 } as AgentMessage);
-			runtime.onTurnEnd(messages, { extensionContext: "approved guidance for tok_abc123" });
+			runtime.onTurnEnd(messages, {
+				extensionContext: { text: "approved guidance for tok_abc123", policyAttributions: [] },
+			});
 			await runtime.waitForCatchup(1000, 1);
 
 			expect(promptInputs).toHaveLength(2);
@@ -5465,6 +5532,60 @@ describe("advisor", () => {
 			expect(text).toContain("module boundary leak");
 			// The implicit "default" advisor stays unlabeled.
 			expect(text).not.toContain("[default]");
+		});
+
+		it("renders a validated policy attribution as an Experience violation card", async () => {
+			const uiTheme = await getThemeByName("dark");
+			if (!uiTheme) throw new Error("theme unavailable");
+			const card = createAdvisorMessageCard(
+				{
+					notes: [
+						{
+							note: "Stop and verify the release artifact.",
+							severity: "blocker",
+							policy: {
+								source: "Experience",
+								condition: "When a release claim is made",
+								behavior: "Verify the release artifact first",
+							},
+						},
+					],
+				},
+				() => true,
+				uiTheme,
+			);
+			const text = strip(card.render(80));
+			expect(text).toContain("Experience");
+			expect(text).toContain("1 habit violation");
+			expect(text).toContain("When: When a release claim is made");
+			expect(text).toContain("Do: Verify the release artifact first");
+			expect(text).toContain("Correction: Stop and verify the release artifact.");
+			expect(text).not.toContain("opaque-policy");
+		});
+
+		it("preserves per-policy sources when one card contains multiple sources", async () => {
+			const uiTheme = await getThemeByName("dark");
+			if (!uiTheme) throw new Error("theme unavailable");
+			const card = createAdvisorMessageCard(
+				{
+					notes: [
+						{
+							note: "Apply the approved habit.",
+							policy: { source: "Experience", condition: "When A", behavior: "Do A" },
+						},
+						{
+							note: "Apply the second policy.",
+							policy: { source: "Compliance", condition: "When B", behavior: "Do B" },
+						},
+					],
+				},
+				() => true,
+				uiTheme,
+			);
+			const text = strip(card.render(80));
+			expect(text).toContain("Advisor");
+			expect(text).toContain("[Experience]");
+			expect(text).toContain("[Compliance]");
 		});
 
 		it("collapses to the first notes with an overflow hint", async () => {

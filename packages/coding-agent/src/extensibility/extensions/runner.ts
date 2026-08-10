@@ -24,8 +24,10 @@ import type { BranchHandler, NavigateTreeHandler, NewSessionHandler } from "../s
 import { ManagedTimers } from "./managed-timers";
 import { createExtensionModelQuery } from "./model-api";
 import type {
+	AdvisorContextContribution,
 	AdvisorContextEvent,
 	AdvisorContextEventResult,
+	AdvisorContextPolicyAttribution,
 	AfterProviderResponseEvent,
 	AssistantThinkingRenderer,
 	BeforeAgentStartEvent,
@@ -329,7 +331,36 @@ const MAX_PENDING_CREDENTIAL_DISABLED = 32;
 const MAX_PENDING_MCP_NOTIFICATIONS = 100;
 const MAX_ADVISOR_CONTEXT_CONTRIBUTIONS = 8;
 const MAX_ADVISOR_CONTEXT_CHARS = 8_000;
+const MAX_ADVISOR_CONTEXT_POLICIES = 16;
+const MAX_ADVISOR_ATTRIBUTION_CHARS = 256;
+const MAX_ADVISOR_SOURCE_CHARS = 80;
+const MAX_ADVISOR_POLICY_TEXT_CHARS = 2_000;
 const MAX_ADVISOR_CONTEXT_COLLECTION_MS = 2_000;
+
+function boundedAdvisorPolicyAttributions(value: unknown): AdvisorContextPolicyAttribution[] {
+	if (!Array.isArray(value)) return [];
+	const policies: AdvisorContextPolicyAttribution[] = [];
+	for (const item of value) {
+		if (!item || typeof item !== "object") continue;
+		const candidate = item as Record<string, unknown>;
+		const rawAttribution = typeof candidate.attribution === "string" ? candidate.attribution : "";
+		const attribution = rawAttribution.trim();
+		const source = typeof candidate.source === "string" ? candidate.source.trim() : "";
+		const condition = typeof candidate.condition === "string" ? candidate.condition.trim() : "";
+		const behavior = typeof candidate.behavior === "string" ? candidate.behavior.trim() : "";
+		if (!attribution || attribution !== rawAttribution || attribution.length > MAX_ADVISOR_ATTRIBUTION_CHARS)
+			continue;
+		if (/\s|[\p{Cc}\p{Cf}]/u.test(attribution) || !source || !condition || !behavior) continue;
+		policies.push({
+			attribution,
+			source: source.slice(0, MAX_ADVISOR_SOURCE_CHARS),
+			condition: condition.slice(0, MAX_ADVISOR_POLICY_TEXT_CHARS),
+			behavior: behavior.slice(0, MAX_ADVISOR_POLICY_TEXT_CHARS),
+		});
+		if (policies.length >= MAX_ADVISOR_CONTEXT_POLICIES) break;
+	}
+	return policies;
+}
 
 /**
  * Events handled by the generic emit() method.
@@ -1501,19 +1532,10 @@ export class ExtensionRunner {
 		return result;
 	}
 
-	async emitAdvisorContext(event: AdvisorContextEvent, signal?: AbortSignal): Promise<string[]> {
+	async emitAdvisorContext(event: AdvisorContextEvent, signal?: AbortSignal): Promise<AdvisorContextContribution[]> {
 		if (!this.hasHandlers("advisor_context")) return [];
-		let isolatedEvent: AdvisorContextEvent;
-		try {
-			isolatedEvent = structuredClone(event);
-		} catch (error) {
-			logger.warn("Advisor context updates could not be detached; extension context omitted", {
-				error: error instanceof Error ? error.message : String(error),
-			});
-			return [];
-		}
 		const deadline = Date.now() + MAX_ADVISOR_CONTEXT_COLLECTION_MS;
-		const contributions: string[] = [];
+		const contributions: AdvisorContextContribution[] = [];
 		let ctx: ExtensionContext | undefined;
 		for (const ext of this.extensions) {
 			const handlers = ext.handlers.get("advisor_context");
@@ -1523,6 +1545,15 @@ export class ExtensionRunner {
 				if (signal?.aborted) return [];
 				const remainingMs = deadline - Date.now();
 				if (remainingMs <= 0) return contributions;
+				let isolatedEvent: AdvisorContextEvent;
+				try {
+					isolatedEvent = structuredClone(event);
+				} catch (error) {
+					logger.warn("Advisor context updates could not be detached; extension context omitted", {
+						error: error instanceof Error ? error.message : String(error),
+					});
+					return [];
+				}
 				const result = (await this.#runHandlerWithTimeout(
 					handler,
 					isolatedEvent,
@@ -1536,7 +1567,10 @@ export class ExtensionRunner {
 					| undefined;
 				const context = result?.context;
 				if (typeof context !== "string" || !context.trim()) continue;
-				contributions.push(context.slice(0, MAX_ADVISOR_CONTEXT_CHARS));
+				contributions.push({
+					context: context.slice(0, MAX_ADVISOR_CONTEXT_CHARS),
+					policies: boundedAdvisorPolicyAttributions(result?.policies),
+				});
 				if (contributions.length >= MAX_ADVISOR_CONTEXT_CONTRIBUTIONS) return contributions;
 			}
 		}

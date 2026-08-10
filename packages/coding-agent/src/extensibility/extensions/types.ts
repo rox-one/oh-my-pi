@@ -1153,9 +1153,32 @@ export interface UserPythonEventResult {
 	result?: PythonResult;
 }
 
+/**
+ * Exact approved policy text that an extension permits the native Advisor to
+ * attribute visibly when it directly causes an `advise()` call.
+ */
+export interface AdvisorContextPolicyAttribution {
+	/** Opaque alias included in private Advisor context; never rendered. */
+	attribution: string;
+	/** User-facing source label, such as "Experience". */
+	source: string;
+	/** Exact approved applicability wording. */
+	condition: string;
+	/** Exact approved behavior wording. */
+	behavior: string;
+}
+
 export interface AdvisorContextEventResult {
 	/** Bounded context appended to the native Advisor review update. */
 	context?: string;
+	/** Bounded policy aliases the Advisor may cite for visible provenance. */
+	policies?: AdvisorContextPolicyAttribution[];
+}
+
+/** Sanitized contribution accepted by the extension runner. */
+export interface AdvisorContextContribution {
+	context: string;
+	policies: AdvisorContextPolicyAttribution[];
 }
 
 export type { ToolResultEventResult } from "../shared-events";

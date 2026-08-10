@@ -111,7 +111,20 @@ describe("ExtensionRunner", () => {
 				pi.on("advisor_context", event => {
 					const matches = event.scopeKey === "scope" && event.updates.length === 1;
 					event.updates[0].content = "mutated";
-					return { context: matches ? "x".repeat(9000) : "" };
+					return {
+						context: matches ? "x".repeat(9000) : "",
+						policies: [{
+							attribution: "opaque-policy-1",
+							source: "Experience",
+							condition: "When a release claim is made",
+							behavior: "Verify the release artifact first",
+						}, {
+							attribution: " opaque-policy-2 ",
+							source: "Experience",
+							condition: "When malformed",
+							behavior: "Never becomes authoritative",
+						}],
+					};
 				});
 				pi.on("advisor_context", () => ({ context: "   " }));
 			}`,
@@ -130,8 +143,47 @@ describe("ExtensionRunner", () => {
 			scopeKey: "scope",
 			updates,
 		});
-		expect(contributions).toEqual(["x".repeat(8000)]);
+		expect(contributions).toEqual([
+			{
+				context: "x".repeat(8000),
+				policies: [
+					{
+						attribution: "opaque-policy-1",
+						source: "Experience",
+						condition: "When a release claim is made",
+						behavior: "Verify the release artifact first",
+					},
+				],
+			},
+		]);
 		expect(updates).toEqual([{ role: "user", content: "current" }]);
+	});
+
+	it("isolates each Advisor context handler from prior handler mutations", async () => {
+		fs.writeFileSync(
+			path.join(extensionsDir, "advisor-context-isolation.ts"),
+			`export default function (pi) {
+				pi.on("advisor_context", event => {
+					event.updates[0].content = "mutated";
+					return { context: "first" };
+				});
+				pi.on("advisor_context", event => ({ context: event.updates[0].content }));
+			}`,
+		);
+		const result = await loadTestExtensions();
+		const runner = new ExtensionRunner(
+			result.extensions,
+			result.runtime,
+			tempDir.path(),
+			sessionManager,
+			modelRegistry,
+		);
+		const contributions = await runner.emitAdvisorContext({
+			type: "advisor_context",
+			scopeKey: "scope",
+			updates: [{ role: "user", content: "current" }],
+		});
+		expect(contributions.map(value => value.context)).toEqual(["first", "current"]);
 	});
 
 	it("skips Advisor context cloning when no extension registered a handler", async () => {

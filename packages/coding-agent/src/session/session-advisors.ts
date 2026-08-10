@@ -42,9 +42,11 @@ import {
 	type AdvisorAgent,
 	type AdvisorConfig,
 	AdvisorEmissionGuard,
+	type AdvisorExtensionContext,
 	type AdvisorMessageDetails,
 	type AdvisorNote,
 	AdvisorOutputQuarantinedError,
+	type AdvisorPolicyDetails,
 	AdvisorRuntime,
 	type AdvisorRuntimeStatus,
 	type AdvisorSeverity,
@@ -71,6 +73,7 @@ import { serviceTierForAllFamilies, serviceTierSettingToTier } from "../config/s
 import type { Settings } from "../config/settings";
 import { CursorExecHandlers, type CursorMcpResourceAdapter } from "../cursor";
 import { bridgeToolMap } from "../cursor-bridge-tools";
+import type { AdvisorContextContribution } from "../extensibility/extensions/types";
 import { estimateToolSchemaTokens } from "../modes/utils/context-usage";
 import type { PlanModeState } from "../plan-mode/state";
 import advisorSystemPrompt from "../prompts/advisor/system.md" with { type: "text" };
@@ -153,6 +156,7 @@ interface ActiveAdvisor {
 	runtime: AdvisorRuntime;
 	adviseTool: AdviseTool;
 	emissionGuard: AdvisorEmissionGuard;
+	policyAttributions: Map<string, AdvisorPolicyDetails>;
 	recorder: AdvisorTranscriptRecorder;
 	recorderClosed: Promise<void>;
 	agentUnsubscribe?: () => void;
@@ -249,7 +253,10 @@ export interface SessionAdvisorsHost {
 	planModeState(): PlanModeState | undefined;
 	clientBridge(): ClientBridge | undefined;
 	emitSessionEvent(event: AgentSessionEvent): Promise<void>;
-	advisorContextContributions?(updates: readonly unknown[], signal?: AbortSignal): Promise<string[]>;
+	advisorContextContributions?(
+		updates: readonly unknown[],
+		signal?: AbortSignal,
+	): Promise<AdvisorContextContribution[]>;
 	emitNotice(level: "info" | "warning" | "error", message: string, source?: string): void;
 	sendCustomMessage(message: CustomMessagePayload, options?: AdvisorMessageDeliveryOptions): Promise<boolean>;
 	extractQueuedAdvisorCards(): CustomMessage[];
@@ -342,7 +349,7 @@ export class SessionAdvisors {
 		signal?: AbortSignal,
 	): Promise<void> {
 		this.#advisorPrimaryTurnsCompleted++;
-		let extensionContext: string | undefined;
+		let extensionContext: AdvisorExtensionContext | undefined;
 		if (this.#advisors.length > 0 && this.#host.advisorContextContributions) {
 			try {
 				const contributions = await this.#host.advisorContextContributions(
@@ -350,7 +357,12 @@ export class SessionAdvisors {
 					signal,
 				);
 				if (contributions.length > 0) {
-					extensionContext = ["### Extension-provided Advisor context", ...contributions].join("\n\n");
+					extensionContext = {
+						text: ["### Extension-provided Advisor context", ...contributions.map(value => value.context)].join(
+							"\n\n",
+						),
+						policyAttributions: contributions.flatMap(value => value.policies),
+					};
 				}
 			} catch (error) {
 				logger.warn("advisor extension context unavailable; review continues without it", { err: String(error) });
@@ -744,7 +756,9 @@ export class SessionAdvisors {
 			} = descriptor;
 
 			const emissionGuard = new AdvisorEmissionGuard();
-			const adviseTool = new AdviseTool((note, severity) => this.#routeAdvice(advisorRef, note, severity));
+			const adviseTool = new AdviseTool((note, severity, attribution) =>
+				this.#routeAdvice(advisorRef, note, severity, attribution),
+			);
 
 			// `#advisorWatchdogPrompt` already carries WATCHDOG.md + YAML shared
 			// instructions; `config.instructions` adds this advisor's specialization.
@@ -949,9 +963,21 @@ export class SessionAdvisors {
 				maintainContext: (incoming, signal) => this.#maintainAdvisorContext(advisorRef, incoming, signal),
 				obfuscator: this.#host.obfuscator,
 				getModelIdentity: () => formatModelString(advisorRef.agent.state.model),
-				beginAdvisorUpdate: inProgress => {
+				beginAdvisorUpdate: (inProgress, policyAttributions = []) => {
 					advisorRef.adviseTool.beginUpdate(inProgress);
 					advisorRef.emissionGuard.beginUpdate();
+					advisorRef.policyAttributions.clear();
+					const duplicates = new Set<string>();
+					for (const policy of policyAttributions) {
+						if (duplicates.has(policy.attribution)) continue;
+						if (advisorRef.policyAttributions.has(policy.attribution)) {
+							advisorRef.policyAttributions.delete(policy.attribution);
+							duplicates.add(policy.attribution);
+							continue;
+						}
+						const { attribution: _attribution, ...visible } = policy;
+						advisorRef.policyAttributions.set(policy.attribution, visible);
+					}
 				},
 				onTurnError: (error, failedMessages, signal) =>
 					this.#recoverAdvisorTurn(advisorRef, error, failedMessages, signal),
@@ -998,6 +1024,7 @@ export class SessionAdvisors {
 				providerSessionId: advisorProviderSessionId,
 				retryFallbackPendingSuccess: false,
 				signature,
+				policyAttributions: new Map(),
 			};
 			this.#refreshAdvisorProviderIdentity(advisorRef);
 			this.#attachAdvisorRecorderFeed(advisorRef);
@@ -1051,14 +1078,17 @@ export class SessionAdvisors {
 		return isTerminalTextAssistantAnswer(messages[tail]);
 	}
 
-	#routeAdvice(advisor: ActiveAdvisor, note: string, severity?: AdvisorSeverity): void {
-		if (!advisor.emissionGuard.accept(note)) {
+	#routeAdvice(advisor: ActiveAdvisor, note: string, severity?: AdvisorSeverity, attribution?: string): void {
+		const policy = attribution ? advisor.policyAttributions.get(attribution) : undefined;
+		const policyKey = policy ? JSON.stringify([policy.source, policy.condition, policy.behavior]) : undefined;
+		if (!advisor.emissionGuard.accept(note, policyKey)) {
 			logger.debug("advisor advice suppressed by emission guard", { severity, advisor: advisor.name });
 			return;
 		}
 		// The implicit single ("default") advisor stamps no source name, so its
 		// agent-facing `<advisory>` bytes stay identical to the pre-multi-advisor path.
 		const source = advisor.slug ? advisor.name : undefined;
+		const accepted: AdvisorNote = { note, severity, advisor: source, policy };
 		const interrupting = isInterruptingSeverity(severity);
 		const channel = resolveAdvisorDeliveryChannel({
 			severity,
@@ -1074,10 +1104,10 @@ export class SessionAdvisors {
 			interruptImmuneTurnActive: interrupting && this.#isAdvisorInterruptImmuneTurnActive(),
 		});
 		if (channel === "aside") {
-			this.#host.yieldQueue.enqueue("advisor", { note, severity, advisor: source });
+			this.#host.yieldQueue.enqueue("advisor", accepted);
 			return;
 		}
-		const notes: AdvisorNote[] = [{ note, severity, advisor: source }];
+		const notes: AdvisorNote[] = [accepted];
 		const content = formatAdvisorBatchContent(notes);
 		const details = { notes } satisfies AdvisorMessageDetails;
 		if (channel === "preserve") {
