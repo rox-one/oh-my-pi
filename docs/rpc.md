@@ -228,6 +228,25 @@ availability without a second round trip.
 - `{ id?, type: "set_follow_up_mode", mode: "all" | "one-at-a-time" }`
 - `{ id?, type: "set_interrupt_mode", mode: "immediate" | "wait" }`
 
+### Session modes (plan / vibe / goal)
+
+- `{ id?, type: "set_mode", mode: "none" | "plan" | "vibe" | "goal", objective?: string }`
+
+Activates or deactivates a session special mode, with the same mutual-exclusion
+semantics as the TUI's `/plan`, `/vibe` and `/goal` commands: entering a mode
+while another is active fails with `"Exit <mode> mode first."` and the current
+mode stays. `goal` requires an `objective`; `none` exits whichever mode is
+active. The response reports the resulting live mode:
+
+```json
+{ "type": "response", "command": "set_mode", "success": true, "data": { "mode": "plan" } }
+```
+
+Mode state is persisted as `mode_change` session entries, so switching back to
+a session (via `switch_session`) restores its mode automatically. Model-role
+switching on plan entry is intentionally left to the client (use `set_model`),
+matching ACP's `session/set_mode`.
+
 ### Compaction
 
 - `{ id?, type: "compact", customInstructions?: string }`
@@ -385,6 +404,7 @@ is re-armed.
   "isStreaming": false,
   "activityPhase": "provider|maintenance|idle",
   "isCompacting": false,
+  "mode": "none|plan|plan_paused|vibe|goal|goal_paused",
   "steeringMode": "all|one-at-a-time",
   "followUpMode": "all|one-at-a-time",
   "interruptMode": "immediate|wait",

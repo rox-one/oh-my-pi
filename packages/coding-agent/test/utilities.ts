@@ -14,6 +14,7 @@ import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { createTools, type ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
+import { createVibeTools } from "@oh-my-pi/pi-coding-agent/tools/vibe";
 import { Snowflake } from "@oh-my-pi/pi-utils";
 import { e2eApiKey } from "../../ai/test/oauth";
 
@@ -31,6 +32,8 @@ export interface TestSessionOptions {
 	settingsOverrides?: Record<string, unknown>;
 	/** Extension runner to wire into the session (e.g. to stub `session_before_tree`/etc. hooks) */
 	extensionRunner?: ExtensionRunner;
+	/** Wire the ephemeral vibe tool factory (`vibe_spawn` etc.), needed to enter vibe mode. */
+	vibeTools?: boolean;
 	/** Secret obfuscator to wire into the session (e.g. to test deobfuscation of persisted tool arguments) */
 	obfuscator?: SecretObfuscator;
 }
@@ -116,6 +119,7 @@ export async function createTestSession(options: TestSessionOptions = {}): Promi
 		modelRegistry,
 		extensionRunner: options.extensionRunner,
 		obfuscator: options.obfuscator,
+		createVibeTools: options.vibeTools ? () => createVibeTools(toolSession) : undefined,
 	});
 
 	// Must subscribe to enable session persistence

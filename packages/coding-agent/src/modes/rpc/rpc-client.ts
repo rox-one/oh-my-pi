@@ -59,12 +59,9 @@ import type {
 	RpcPromptResultFrame,
 	RpcRenameSessionResult,
 	RpcResponse,
-	RpcResumeSessionResult,
-	RpcSessionInfoResult,
-	RpcSessionInfoUpdateFrame,
+	RpcSessionMode,
 	RpcSessionState,
-	RpcSettingsChange,
-	RpcSettingsUpdateFrame,
+	RpcSetModeTarget,
 	RpcSubagentEventFrame,
 	RpcSubagentLifecycleFrame,
 	RpcSubagentMessagesResult,
@@ -1134,6 +1131,19 @@ export class RpcClient {
 			fromByte: selector.fromByte,
 		});
 		return this.#getData<RpcSubagentMessagesResult>(response);
+	}
+
+	/**
+	 * Switch the session's special mode (plan / vibe / goal). `goal` requires
+	 * an `objective`. Returns the resulting live mode.
+	 */
+	async setMode(mode: RpcSetModeTarget, objective?: string): Promise<RpcSessionMode> {
+		const response = await this.#send({
+			type: "set_mode",
+			mode,
+			...(objective !== undefined ? { objective } : {}),
+		});
+		return this.#getData<{ mode: RpcSessionMode }>(response).mode;
 	}
 
 	/**
