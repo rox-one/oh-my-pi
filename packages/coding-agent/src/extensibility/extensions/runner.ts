@@ -350,13 +350,17 @@ function boundedAdvisorPolicyAttributions(value: unknown): AdvisorContextPolicyA
 		const behavior = typeof candidate.behavior === "string" ? candidate.behavior.trim() : "";
 		if (!attribution || attribution !== rawAttribution || attribution.length > MAX_ADVISOR_ATTRIBUTION_CHARS)
 			continue;
-		if (/\s|[\p{Cc}\p{Cf}]/u.test(attribution) || !source || !condition || !behavior) continue;
-		policies.push({
-			attribution,
-			source: source.slice(0, MAX_ADVISOR_SOURCE_CHARS),
-			condition: condition.slice(0, MAX_ADVISOR_POLICY_TEXT_CHARS),
-			behavior: behavior.slice(0, MAX_ADVISOR_POLICY_TEXT_CHARS),
-		});
+		if (
+			/\s|[\p{Cc}\p{Cf}]/u.test(attribution) ||
+			!source ||
+			source.length > MAX_ADVISOR_SOURCE_CHARS ||
+			!condition ||
+			condition.length > MAX_ADVISOR_POLICY_TEXT_CHARS ||
+			!behavior ||
+			behavior.length > MAX_ADVISOR_POLICY_TEXT_CHARS
+		)
+			continue;
+		policies.push({ attribution, source, condition, behavior });
 		if (policies.length >= MAX_ADVISOR_CONTEXT_POLICIES) break;
 	}
 	return policies;

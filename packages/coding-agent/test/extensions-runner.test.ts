@@ -123,6 +123,16 @@ describe("ExtensionRunner", () => {
 							source: "Experience",
 							condition: "When malformed",
 							behavior: "Never becomes authoritative",
+						}, {
+							attribution: "oversized-condition",
+							source: "Experience",
+							condition: "x".repeat(2001),
+							behavior: "Must be rejected rather than truncated",
+						}, {
+							attribution: "oversized-behavior",
+							source: "Experience",
+							condition: "When oversized",
+							behavior: "x".repeat(2001),
 						}],
 					};
 				});

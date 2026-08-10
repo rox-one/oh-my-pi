@@ -813,7 +813,11 @@ export class AdvisorRuntime {
 		const obfuscator = this.host.obfuscator;
 		if (obfuscator?.hasSecrets()) {
 			let discoveredNewRegexSecretValue = false;
-			for (const secretValue of obfuscator.collectRegexSecretValuesForObfuscation(context)) {
+			const policyText =
+				extensionContext?.policyAttributions
+					.flatMap(policy => [policy.source, policy.condition, policy.behavior])
+					.join("\n") ?? "";
+			for (const secretValue of obfuscator.collectRegexSecretValuesForObfuscation(`${context}\n${policyText}`)) {
 				if (this.#advisorRegexSecretValues.has(secretValue)) continue;
 				this.#advisorRegexSecretValues.add(secretValue);
 				discoveredNewRegexSecretValue = true;
@@ -828,6 +832,21 @@ export class AdvisorRuntime {
 			context = obfuscator.obfuscate(context, this.#advisorRegexSecretValues);
 		}
 		return `${text}\n\n${context}`;
+	}
+
+	#obfuscatePolicyAttributions(
+		extensionContext?: AdvisorExtensionContext,
+	): readonly AdvisorPolicyAttribution[] | undefined {
+		const policies = extensionContext?.policyAttributions;
+		if (!policies) return undefined;
+		const obfuscator = this.host.obfuscator;
+		if (!obfuscator?.hasSecrets()) return policies;
+		return policies.map(policy => ({
+			attribution: policy.attribution,
+			source: obfuscator.obfuscate(policy.source, this.#advisorRegexSecretValues),
+			condition: obfuscator.obfuscate(policy.condition, this.#advisorRegexSecretValues),
+			behavior: obfuscator.obfuscate(policy.behavior, this.#advisorRegexSecretValues),
+		}));
 	}
 
 	#renderDelta(
@@ -1226,7 +1245,7 @@ export class AdvisorRuntime {
 				try {
 					// Reset the host's per-update advisor state (one-advise-per-update
 					// gate) and pass through whether this batch reviews partial work.
-					this.host.beginAdvisorUpdate?.(wip, extensionContext?.policyAttributions);
+					this.host.beginAdvisorUpdate?.(wip, this.#obfuscatePolicyAttributions(extensionContext));
 					// Deliver ordinary Session updates as multiple messages for prompt-cache
 					// growth. Extension context is already appended to `batch`, so preserve
 					// that single authoritative payload instead of dropping it from the split.

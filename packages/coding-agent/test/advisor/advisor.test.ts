@@ -1458,6 +1458,43 @@ describe("advisor", () => {
 			expect(updateStates).toEqual([{ inProgress: true, attributions: policyAttributions }]);
 		});
 
+		it("obfuscates extension policy provenance before handing it to the primary session", async () => {
+			const plainSecret = "POLICY_SECRET_TOKEN_123";
+			const regexSecret = "tok_policy123";
+			const obfuscator = new SecretObfuscator([
+				{ type: "plain", content: plainSecret },
+				{ type: "regex", content: "tok_[a-z0-9]+", mode: "replace" },
+			]);
+			const promptInputs: string[] = [];
+			const deliveredAttributions: Array<readonly unknown[]> = [];
+			const messages: AgentMessage[] = [{ role: "user", content: "hello", timestamp: 1 } as AgentMessage];
+			const runtime = new AdvisorRuntime(makeAgent(promptInputs), {
+				snapshotMessages: () => messages,
+				enqueueAdvice: () => {},
+				obfuscator,
+				beginAdvisorUpdate: (_inProgress, attributions = []) => deliveredAttributions.push(attributions),
+			});
+			const policyAttributions = [
+				{
+					attribution: "opaque-policy-1",
+					source: `Experience ${plainSecret}`,
+					condition: `When ${plainSecret} is present`,
+					behavior: `Never expose ${regexSecret}`,
+				},
+			];
+
+			runtime.onTurnEnd(messages, {
+				extensionContext: { text: "approved experience guidance", policyAttributions },
+			});
+			await runtime.waitForCatchup(1000, 1);
+
+			const delivered = JSON.stringify(deliveredAttributions);
+			expect(delivered).not.toContain(plainSecret);
+			expect(delivered).not.toContain(regexSecret);
+			expect(delivered).toContain("$$");
+			expect(policyAttributions[0]?.condition).toContain(plainSecret);
+		});
+
 		it("uses plain heading when willContinue is false or absent", async () => {
 			const promptInputs: Array<string | AgentMessage[]> = [];
 			const updateStates: boolean[] = [];
