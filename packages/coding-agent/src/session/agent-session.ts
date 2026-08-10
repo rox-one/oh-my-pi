@@ -184,6 +184,7 @@ import {
 	obfuscateProviderContext,
 } from "../secrets/message-transform";
 import type { SecretObfuscator } from "../secrets/obfuscator";
+import { canSpawnAtDepth } from "../task/types";
 import {
 	AUTO_THINKING,
 	type ConfiguredThinkingLevel,
@@ -616,6 +617,7 @@ export class AgentSession {
 	#agentId: string | undefined;
 	#agentKind: "main" | "sub" = "main";
 	#scoutAllowedBySpawnPolicy = true;
+	#taskDepth = 0;
 	#providerSessionId: string | undefined;
 	#freshProviderSessionId: string | undefined;
 	#inheritedProviderPromptCacheKey: string | undefined;
@@ -1492,6 +1494,7 @@ export class AgentSession {
 		this.#agentId = config.agentId;
 		this.#agentKind = config.agentKind ?? "main";
 		this.#scoutAllowedBySpawnPolicy = config.scoutAllowedBySpawnPolicy ?? true;
+		this.#taskDepth = config.taskDepth ?? 0;
 		this.#providerSessionId = config.providerSessionId;
 		this.#inheritedProviderPromptCacheKey =
 			config.providerPromptCacheKeySource === "fork" ? this.agent.promptCacheKey : undefined;
@@ -5425,7 +5428,11 @@ export class AgentSession {
 
 	#isScoutAvailable(): boolean {
 		const disabledAgents = this.settings.get("task.disabledAgents") as string[] | undefined;
-		return this.#scoutAllowedBySpawnPolicy && !disabledAgents?.includes("scout");
+		return (
+			canSpawnAtDepth(this.settings.get("task.maxRecursionDepth") ?? 2, this.#taskDepth) &&
+			this.#scoutAllowedBySpawnPolicy &&
+			!disabledAgents?.includes("scout")
+		);
 	}
 
 	async #buildPlanModeMessage(): Promise<CustomMessage | null> {

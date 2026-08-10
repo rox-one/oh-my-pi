@@ -18,7 +18,7 @@ import { IrcBus, type IrcDeliveryReceipt, type IrcMessage } from "../../irc/bus"
 import type { Theme } from "../../modes/theme/theme";
 import { type AgentRegistry, MAIN_AGENT_ID } from "../../registry/agent-registry";
 import { registerPersistedSubagents } from "../../registry/persisted-agents";
-import { canSpawnAtDepth } from "../../task/types";
+import { canSpawnSubagents } from "../../task/spawn-policy";
 import { Ellipsis, renderStatusLine, renderTreeList, truncateToWidth } from "../../tui";
 import {
 	createCachedComponent,
@@ -39,12 +39,15 @@ export const DEFAULT_IRC_TIMEOUT_MS = 120_000;
  * session that can still spawn subagents through the task tool. Only a
  * top-level session with task spawning unavailable has no peers.
  */
-export function isIrcEnabled(settings: Settings, taskDepth: number): boolean {
+export function isIrcEnabled(
+	settings: Settings,
+	taskDepth: number,
+	spawns: string | boolean | null | undefined = "*",
+): boolean {
 	if (taskDepth > 0) return true;
 	// Top-level session: peers exist only if it can still spawn subagents — the
 	// same capacity gate the task tool uses, reused here to avoid drift.
-	const maxDepth = settings.get("task.maxRecursionDepth") ?? 2;
-	return canSpawnAtDepth(maxDepth, taskDepth);
+	return canSpawnSubagents(spawns, settings.get("task.maxRecursionDepth") ?? 2, taskDepth);
 }
 
 export function formatIncoming(msg: IrcMessage): string {

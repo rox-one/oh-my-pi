@@ -31,7 +31,8 @@ import type { SessionManager } from "../session/session-manager";
 import type { ToolChoiceQueue } from "../session/tool-choice-queue";
 import { TaskTool } from "../task";
 import type { AgentOutputManager } from "../task/output-manager";
-import { canSpawnAtDepth, type StructuredSubagentSchemaMode } from "../task/types";
+import { canSpawnSubagents } from "../task/spawn-policy";
+import type { StructuredSubagentSchemaMode } from "../task/types";
 import type { EventBus } from "../utils/event-bus";
 import { type InspectImageMode, isInspectImageToolActive } from "../utils/inspect-image-mode";
 import { WebSearchTool } from "../web/search";
@@ -638,7 +639,9 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 			);
 		if (name === "hub") {
 			return (
-				!restrictToolNames && session.enableIrc !== false && isIrcEnabled(session.settings, session.taskDepth ?? 0)
+				!restrictToolNames &&
+				session.enableIrc !== false &&
+				isIrcEnabled(session.settings, session.taskDepth ?? 0, session.getSessionSpawns())
 			);
 		}
 		if (name === "retain" || name === "recall" || name === "reflect") {
@@ -658,7 +661,11 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 			);
 		}
 		if (name === "task") {
-			return canSpawnAtDepth(session.settings.get("task.maxRecursionDepth") ?? 2, session.taskDepth ?? 0);
+			return canSpawnSubagents(
+				session.getSessionSpawns(),
+				session.settings.get("task.maxRecursionDepth") ?? 2,
+				session.taskDepth ?? 0,
+			);
 		}
 		return true;
 	};

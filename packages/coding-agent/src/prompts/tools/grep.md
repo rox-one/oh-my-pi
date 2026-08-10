@@ -8,6 +8,7 @@ Searches files/internal URLs: Rust regex, PCRE2 fallback.
 </instruction>
 
 <critical>
-- MUST use instead of shell `grep`/`rg`.
-- Open-ended multi-round search MUST use {{#if scoutAvailable}}Task + scout,{{else}}Task,{{/if}} not chained calls.
+- MUST use this instead of shell `grep`/`rg`.
+{{#if taskAvailable}}- Open-ended multi-round search MUST use {{#if scoutAvailable}}Task + scout,{{else}}Task,{{/if}} not chained calls.
+{{/if}}
 </critical>

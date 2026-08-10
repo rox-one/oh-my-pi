@@ -142,6 +142,8 @@ interface TaskDescriptionOptions {
 	asyncEnabled: boolean;
 	ircEnabled: boolean;
 	parentSpawns: string;
+	maxRecursionDepth: number;
+	taskDepth: number;
 }
 
 /** Render the tool description from a cached agent list and current settings. */
@@ -164,7 +166,12 @@ function renderDescription(options: TaskDescriptionOptions): string {
 		readOnly: isReadOnlyAgent(agent),
 		blocking: agent.blocking === true,
 	}));
-	const scoutAvailable = isScoutSpawnable(options.disabledAgents, options.parentSpawns);
+	const scoutAvailable = isScoutSpawnable(
+		options.disabledAgents,
+		options.parentSpawns,
+		options.maxRecursionDepth,
+		options.taskDepth,
+	);
 	return prompt.render(taskDescriptionTemplate, {
 		agents: renderedAgents,
 		scoutAvailable,
@@ -611,6 +618,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			asyncEnabled: this.session.settings.get("async.enabled"),
 			ircEnabled: isIrcEnabled(this.session.settings, this.session.taskDepth ?? 0),
 			parentSpawns: this.session.getSessionSpawns() ?? "*",
+			maxRecursionDepth: this.session.settings.get("task.maxRecursionDepth") ?? 2,
+			taskDepth: this.session.taskDepth ?? 0,
 		});
 	}
 	private constructor(
@@ -752,6 +761,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						scoutAvailable: isScoutSpawnable(
 							this.session.settings.get("task.disabledAgents") as string[] | undefined,
 							this.session.getSessionSpawns?.() ?? "*",
+							this.session.settings.get("task.maxRecursionDepth") ?? 2,
+							this.session.taskDepth ?? 0,
 						),
 					});
 			const result = await this.#executeSyncFanout(
@@ -789,6 +800,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					scoutAvailable: isScoutSpawnable(
 						this.session.settings.get("task.disabledAgents") as string[] | undefined,
 						this.session.getSessionSpawns?.() ?? "*",
+						this.session.settings.get("task.maxRecursionDepth") ?? 2,
+						this.session.taskDepth ?? 0,
 					),
 				});
 		// Returns a fresh result (copied content array, copied text part) rather

@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from "bun:test";
 import { Settings } from "../../src/config/settings";
 import * as taskDiscovery from "../../src/task/discovery";
 import { TaskTool } from "../../src/task/index";
-import { isScoutSpawnable } from "../../src/task/spawn-policy";
+import { canSpawnSubagents, isScoutSpawnable } from "../../src/task/spawn-policy";
 import type { AgentDefinition } from "../../src/task/types";
 import { getTaskSchema } from "../../src/task/types";
 import type { ToolSession } from "../../src/tools";
@@ -64,27 +64,42 @@ describe("task spawn policy surfaces", () => {
 
 describe("isScoutSpawnable", () => {
 	it("is true with no disabled agents and unrestricted spawns", () => {
-		expect(isScoutSpawnable(undefined, "*")).toBe(true);
-		expect(isScoutSpawnable([], "*")).toBe(true);
+		expect(isScoutSpawnable(undefined, "*", 1, 0)).toBe(true);
+		expect(isScoutSpawnable([], "*", 1, 0)).toBe(true);
 	});
 
 	it("is false when scout is disabled via task.disabledAgents", () => {
-		expect(isScoutSpawnable(["scout"], "*")).toBe(false);
-		expect(isScoutSpawnable(["scout", "reviewer"], "*")).toBe(false);
+		expect(isScoutSpawnable(["scout"], "*", 1, 0)).toBe(false);
+		expect(isScoutSpawnable(["scout", "reviewer"], "*", 1, 0)).toBe(false);
 	});
 
 	it("is false when spawning is disabled", () => {
-		expect(isScoutSpawnable(undefined, false)).toBe(false);
-		expect(isScoutSpawnable(undefined, "")).toBe(false);
+		expect(isScoutSpawnable(undefined, false, 1, 0)).toBe(false);
+		expect(isScoutSpawnable(undefined, "", 1, 0)).toBe(false);
 	});
 
 	it("is false when scout is not in the allowed spawn list", () => {
-		expect(isScoutSpawnable(undefined, "reviewer")).toBe(false);
+		expect(isScoutSpawnable(undefined, "reviewer", 1, 0)).toBe(false);
 	});
 
 	it("is true when scout is in the allowed spawn list", () => {
-		expect(isScoutSpawnable(undefined, "scout,reviewer")).toBe(true);
-		expect(isScoutSpawnable(["reviewer"], "scout")).toBe(true);
+		expect(isScoutSpawnable(undefined, "scout,reviewer", 1, 0)).toBe(true);
+		expect(isScoutSpawnable(["reviewer"], "scout", 1, 0)).toBe(true);
+	});
+
+	it("is false when recursion depth is exhausted", () => {
+		expect(isScoutSpawnable(undefined, "*", 0, 0)).toBe(false);
+		expect(isScoutSpawnable(undefined, "*", 1, 1)).toBe(false);
+	});
+});
+
+describe("canSpawnSubagents", () => {
+	it("requires both spawn-policy permission and recursion capacity", () => {
+		expect(canSpawnSubagents("*", 1, 0)).toBe(true);
+		expect(canSpawnSubagents("", 1, 0)).toBe(false);
+		expect(canSpawnSubagents("*", 0, 0)).toBe(false);
+		expect(canSpawnSubagents("*", 1, 1)).toBe(false);
+		expect(canSpawnSubagents("*", -1, 50)).toBe(true);
 	});
 });
 

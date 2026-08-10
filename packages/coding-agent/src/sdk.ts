@@ -182,7 +182,7 @@ import {
 } from "./system-prompt";
 import { AgentOutputManager } from "./task/output-manager";
 import { wrapStreamFnWithProviderConcurrency } from "./task/provider-concurrency";
-import { isScoutSpawnable } from "./task/spawn-policy";
+import { isAgentAllowedBySpawnPolicy, isScoutSpawnable } from "./task/spawn-policy";
 import type { StructuredSubagentSchemaMode } from "./task/types";
 import {
 	AUTO_THINKING,
@@ -3057,8 +3057,10 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				scoutAvailable: isScoutSpawnable(
 					settings.get("task.disabledAgents") as string[] | undefined,
 					options.spawns ?? "*",
+					settings.get("task.maxRecursionDepth") ?? 2,
+					options.taskDepth ?? 0,
 				),
-				taskIrcEnabled: !restrictToolNames && isIrcEnabled(settings, options.taskDepth ?? 0),
+				taskIrcEnabled: !restrictToolNames && isIrcEnabled(settings, options.taskDepth ?? 0, options.spawns ?? "*"),
 				autoQaEnabled: !restrictToolNames && isAutoQaEnabled(settings),
 				secretsEnabled,
 				workspaceTree: workspaceTreePromise,
@@ -3555,7 +3557,8 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			initialAdvisorCosts,
 			settings,
 			autoApprove: options.autoApprove,
-			scoutAllowedBySpawnPolicy: isScoutSpawnable(undefined, options.spawns ?? "*"),
+			scoutAllowedBySpawnPolicy: isAgentAllowedBySpawnPolicy("scout", undefined, options.spawns ?? "*"),
+			taskDepth: options.taskDepth,
 			evalKernelOwnerId,
 			// Defined only for top-level sessions (creation is gated above).
 			// AgentSession uses this to decide whether it may dispose the global

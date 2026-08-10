@@ -28,7 +28,7 @@ import type { InternalResource, ResolveContext } from "../internal-urls/types";
 import type { Theme } from "../modes/theme/theme";
 import grepDescription from "../prompts/tools/grep.md" with { type: "text" };
 import { DEFAULT_MAX_COLUMN, type TruncationResult, truncateHead, truncateLine } from "../session/streaming-output";
-import { isScoutSpawnable } from "../task/spawn-policy";
+import { canSpawnSubagents, isScoutSpawnable } from "../task/spawn-policy";
 import {
 	Ellipsis,
 	fileHyperlink,
@@ -955,12 +955,18 @@ export class GrepTool implements AgentTool<typeof searchSchema, GrepToolDetails>
 	readonly summary = "Grep file contents using ripgrep (fast regex search)";
 	get description(): string {
 		const displayMode = resolveFileDisplayMode(this.session);
+		const spawns = this.session.getSessionSpawns?.() ?? "*";
+		const maxRecursionDepth = this.session.settings.get("task.maxRecursionDepth") ?? 2;
+		const taskDepth = this.session.taskDepth ?? 0;
 		return prompt.render(grepDescription, {
 			IS_HL_MODE: displayMode.hashLines,
 			IS_LINE_NUMBER_MODE: !displayMode.hashLines && displayMode.lineNumbers,
+			taskAvailable: canSpawnSubagents(spawns, maxRecursionDepth, taskDepth),
 			scoutAvailable: isScoutSpawnable(
 				this.session.settings.get("task.disabledAgents") as string[] | undefined,
-				this.session.getSessionSpawns?.() ?? "*",
+				spawns,
+				maxRecursionDepth,
+				taskDepth,
 			),
 		});
 	}
