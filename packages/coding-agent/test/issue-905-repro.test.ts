@@ -198,7 +198,6 @@ test("omp models does not execute ambient hooks while retaining explicit provide
 		authStorage.close();
 	}
 });
-
 test("omp models emits extension shutdown after listing (issue #6297)", async () => {
 	const authStorage = await AuthStorage.create(":memory:");
 	try {
