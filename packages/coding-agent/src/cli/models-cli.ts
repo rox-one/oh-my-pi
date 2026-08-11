@@ -16,6 +16,7 @@ import { getSupportedEfforts } from "@oh-my-pi/pi-catalog/model-thinking";
 import { formatNumber, getProjectDir } from "@oh-my-pi/pi-utils";
 import chalk from "@oh-my-pi/pi-utils/chalk";
 import { ModelRegistry } from "../config/model-registry";
+import { filterAvailableModelsByEnabledPatterns } from "../config/model-resolver";
 import { Settings } from "../config/settings";
 import { discoverAndLoadExtensions, ExtensionRunner, emitSessionShutdownEvent } from "../extensibility/extensions";
 import { discoverAuthStorage } from "../sdk";
@@ -171,8 +172,14 @@ function renderProviderModels(
 	action: ModelsAction,
 	pattern: string | undefined,
 	json: boolean,
+	settings?: Settings,
 ): void {
-	const available = modelRegistry.getAvailable();
+	const allAvailable = modelRegistry.getAvailable();
+	const enabledModels = settings?.get("enabledModels");
+	const available =
+		enabledModels && enabledModels.length > 0
+			? filterAvailableModelsByEnabledPatterns(allAvailable, enabledModels, settings)
+			: allAvailable;
 	const needle = pattern?.toLowerCase();
 	let filtered = available;
 
@@ -280,6 +287,8 @@ export interface RunModelsListingOptions {
 	disabledExtensionIds?: string[];
 	/** When true, exclude ambient factories and resolve only `additionalExtensionPaths`. */
 	disableExtensionDiscovery?: boolean;
+	/** Effective settings used to apply the `enabledModels` allow-list. */
+	settings?: Settings;
 }
 
 export async function runModelsListing(options: RunModelsListingOptions): Promise<void> {
@@ -293,6 +302,7 @@ export async function runModelsListing(options: RunModelsListingOptions): Promis
 		settingsExtensions = [],
 		disabledExtensionIds = [],
 		disableExtensionDiscovery = false,
+		settings,
 	} = options;
 
 	const eventBus = new EventBus();
@@ -335,7 +345,7 @@ export async function runModelsListing(options: RunModelsListingOptions): Promis
 		// Discover runtime (extension) provider catalogs now that they are registered.
 		await modelRegistry.refreshRuntimeProviders(action === "refresh" ? "online" : "online-if-uncached");
 
-		renderProviderModels(modelRegistry, action, pattern, json);
+		renderProviderModels(modelRegistry, action, pattern, json, settings);
 	} finally {
 		await emitSessionShutdownEvent(extensionRunner);
 	}
@@ -377,6 +387,7 @@ export async function runModelsCommand(command: ModelsCommandArgs): Promise<void
 			additionalExtensionPaths: cliExtensionPaths,
 			settingsExtensions: settings.get("extensions") ?? [],
 			disabledExtensionIds: settings.get("disabledExtensions") ?? [],
+			settings,
 			disableExtensionDiscovery: Boolean(command.flags.noExtensions),
 		});
 	} finally {

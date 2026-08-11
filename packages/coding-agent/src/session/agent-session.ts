@@ -5137,7 +5137,7 @@ export class AgentSession {
 		return this.#models.scopedModels;
 	}
 
-	/** Replace the Ctrl+P/`/models` cycle scope (post-discovery rebuild; see {@link ModelControls.setScopedModels}). */
+	/** Replace the session's cycle scope after late model discovery. */
 	setScopedModels(scopedModels: Array<{ model: Model; thinkingLevel?: ThinkingLevel }>): void {
 		this.#models.setScopedModels(scopedModels);
 	}

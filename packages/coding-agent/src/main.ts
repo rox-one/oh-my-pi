@@ -757,9 +757,22 @@ async function rescopeStartupToManagerCwd(
 	return manager;
 }
 
-async function rescopeStartupToManagerCwdForSharedWorkspace(
-	manager: SessionManager,
-	workspaceIdentifierMode: WorkspaceIdentifierMode | undefined,
+/**
+ * Resolve the effective model allow-list from an explicit `--models` scope or,
+ * failing that, the active project's `enabledModels`. Re-run after a resume
+ * switches projects so the destination project's settings-derived scope wins
+ * over the launch directory's.
+ *
+ * Startup calls this before `createSession` kicks off the background discovery
+ * refresh, so patterns that only match discovery-backed providers (proxies,
+ * Ollama, ...) would resolve against an empty registry and silently collapse
+ * to "unscoped" — the /model hub, alt+p picker, and Ctrl+P cycle then fall
+ * back to the full catalog. Mirror the initial-model discovery fallback:
+ * refresh once (cache-guided), then retry the same patterns.
+ */
+export async function resolveScopedModels(
+	parsed: Args,
+	modelRegistry: Pick<ModelRegistry, "getAvailable" | "getDiscoverableProviders" | "refresh">,
 	activeSettings: Settings,
 	beforeProjectDirChange: () => Promise<void> = async () => {},
 ): Promise<SessionManager> {
@@ -767,13 +780,22 @@ async function rescopeStartupToManagerCwdForSharedWorkspace(
 	if (workspaceIdentifierMode === "path" || workspaceIdentifierMode === undefined || !targetCwd) {
 		return manager;
 	}
-	if (normalizePathForComparison(targetCwd) === normalizePathForComparison(getProjectDir())) {
-		return manager;
+	const scopedModels = await resolveModelScope(
+		modelPatterns,
+		modelRegistry,
+		getModelMatchPreferences(activeSettings),
+		activeSettings,
+	);
+	if (scopedModels.length > 0 || modelRegistry.getDiscoverableProviders().length === 0) {
+		return scopedModels;
 	}
-	if (!(await directoryExists(targetCwd))) {
-		return manager;
-	}
-	return await rescopeStartupToManagerCwd(manager, activeSettings, beforeProjectDirChange);
+	await logger.time("resolveModelScopeDiscoveryFallback", () => modelRegistry.refresh("online-if-uncached"));
+	return await resolveModelScope(
+		modelPatterns,
+		modelRegistry,
+		getModelMatchPreferences(activeSettings),
+		activeSettings,
+	);
 }
 async function getChangelogForDisplay(parsed: Args): Promise<string | undefined> {
 	if (parsed.continue || parsed.resume) {

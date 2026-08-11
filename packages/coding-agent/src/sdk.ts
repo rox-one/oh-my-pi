@@ -69,6 +69,7 @@ import {
 	resolveCliModel,
 	resolveConfiguredModelPatterns,
 	resolveModelRoleValue,
+	resolveModelScope,
 } from "./config/model-resolver";
 import { loadPromptTemplates as loadPromptTemplatesInternal, type PromptTemplate } from "./config/prompt-templates";
 import { applyProviderGlobalsFromSettings } from "./config/provider-globals";
@@ -2592,7 +2593,8 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 					modelRegistry.getDiscoverableProviders().length > 0
 				) {
 					await logger.time("resolveModelDiscoveryFallback", () => modelRegistry.refresh("online-if-uncached"));
-					if (!(await tryResolveDefaultRole()) && !model) {
+					const defaultRoleResolved = await tryResolveDefaultRole();
+					if (!defaultRoleResolved && !model) {
 						const refreshedCandidates = await resolveAllowedModels(
 							modelRegistry,
 							settings,
@@ -4094,6 +4096,56 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				unsubscribeMcpNotifications?.(),
 			);
 		}
+		let lateModelRecoveryScheduled = false;
+		const configuredProviderIds = new Set<string>();
+		for (const selector of [settings.getModelRole("default"), ...(settings.get("enabledModels") ?? [])]) {
+			for (const pattern of resolveConfiguredModelPatterns(selector, settings)) {
+				const slashIndex = pattern.indexOf("/");
+				if (slashIndex > 0) configuredProviderIds.add(pattern.slice(0, slashIndex));
+			}
+		}
+		const lateModelRecoveryProviders = modelRegistry
+			.getDiscoverableProviders()
+			.filter(provider => configuredProviderIds.has(provider));
+		if (!session.model && !hasExplicitModel && lateModelRecoveryProviders.length > 0) {
+			lateModelRecoveryScheduled = true;
+			const configuredPatterns = settings.get("enabledModels");
+			const defaultRole = settings.getModelRole("default");
+			const defaultThinkingLevel = defaultRoleSpec.thinkingLevel;
+			void (async () => {
+				await Bun.sleep(0);
+				await modelRegistry.refresh("online");
+				if (session.model) return;
+				const matchPreferences = getModelMatchPreferences(settings);
+				let candidate = resolveModelRoleValue(defaultRole, modelRegistry.getAvailable(), {
+					settings,
+					matchPreferences,
+				}).model;
+				if (!candidate) {
+					const allowed = await resolveAllowedModels(modelRegistry, settings, matchPreferences);
+					candidate = pickDefaultAvailableModel(allowed.filter(hasModelAuth));
+				}
+				if (!candidate || session.model) return;
+				if (configuredPatterns && configuredPatterns.length > 0) {
+					const scoped = await resolveModelScope(configuredPatterns, modelRegistry, matchPreferences, settings);
+					session.setScopedModels(
+						scoped.map(entry => ({ model: entry.model, thinkingLevel: entry.thinkingLevel })),
+					);
+				}
+				await session.setModel(candidate, "default", {
+					thinkingLevel: defaultThinkingLevel === AUTO_THINKING ? undefined : defaultThinkingLevel,
+				});
+				session.emitNotice(
+					"info",
+					`Model discovery completed; selected ${candidate.provider}/${candidate.id}.`,
+					"models",
+				);
+			})().catch(error => {
+				logger.warn("late startup model discovery failed", {
+					error: error instanceof Error ? error.message : String(error),
+				});
+			});
+		}
 
 		startDeferredMCPDiscovery?.(session);
 
@@ -4115,7 +4167,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			extensionsResult,
 			setToolUIContext,
 			mcpManager,
-			modelFallbackMessage,
+			modelFallbackMessage: lateModelRecoveryScheduled ? undefined : modelFallbackMessage,
 			lspServers,
 			startBackgroundModelDiscovery: startRuntimeDiscovery,
 			eventBus,

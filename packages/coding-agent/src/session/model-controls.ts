@@ -138,12 +138,7 @@ export class ModelControls {
 		return this.#scopedModels;
 	}
 
-	/**
-	 * Replace the Ctrl+P cycle scope. Startup resolves the scope before background
-	 * provider discovery runs; the CLI re-pushes the fuller list here once discovery
-	 * completes so a newly-discovered `enabledModels` model joins the cycle and the
-	 * scoped `/models` picker (issue #9220).
-	 */
+	/** Replace the session's cycle scope after late model discovery. */
 	setScopedModels(scopedModels: Array<{ model: Model; thinkingLevel?: ThinkingLevel }>): void {
 		this.#scopedModels = scopedModels;
 	}

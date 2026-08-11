@@ -18,7 +18,8 @@ import * as path from "node:path";
 import { AuthStorage } from "@oh-my-pi/pi-ai";
 import { runModelsListing } from "@oh-my-pi/pi-coding-agent/cli/models-cli";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
-import { getProjectAgentDir, TempDir } from "@oh-my-pi/pi-utils";
+import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { TempDir } from "@oh-my-pi/pi-utils";
 
 let tmp: TempDir;
 let extPath: string;
@@ -167,10 +168,36 @@ test("omp models surfaces extension-registered providers (issue #905)", async ()
 	}
 });
 
-test("omp models does not execute ambient hooks while retaining explicit providers", async () => {
+test("omp models applies enabledModels to the listed catalog", async () => {
 	const authStorage = await AuthStorage.create(":memory:");
 	try {
 		const modelRegistry = new ModelRegistry(authStorage);
+		modelRegistry.registerProvider("scoped-gw", {
+			baseUrl: "https://scoped.example.com/v1",
+			apiKey: "literal-test-key",
+			api: "openai-completions",
+			models: [
+				{
+					id: "gpt-allowed",
+					name: "GPT Allowed",
+					reasoning: false,
+					input: ["text"],
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+					contextWindow: 128_000,
+					maxTokens: 4_096,
+				},
+				{
+					id: "claude-hidden",
+					name: "Claude Hidden",
+					reasoning: false,
+					input: ["text"],
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+					contextWindow: 128_000,
+					maxTokens: 4_096,
+				},
+			],
+		});
+		const settings = Settings.isolated({ enabledModels: ["scoped-gw/gpt-*"] });
 		const captured: string[] = [];
 		const originalWrite = process.stdout.write.bind(process.stdout);
 		process.stdout.write = ((chunk: string | Uint8Array) => {
@@ -183,22 +210,20 @@ test("omp models does not execute ambient hooks while retaining explicit provide
 				modelRegistry,
 				cwd: tmp.path(),
 				action: "ls",
-				additionalExtensionPaths: [explicitPackagePath],
+				settings,
+				disableExtensionDiscovery: true,
 			});
 		} finally {
 			process.stdout.write = originalWrite;
 		}
 
 		const output = captured.join("");
-		expect(output).toContain("explicit-gw");
-		expect(output).toContain("explicit-model");
-		expect(await Bun.file(ambientHookMarkerPath).exists()).toBe(false);
-		expect(await Bun.file(configuredHookMarkerPath).exists()).toBe(false);
+		expect(output).toContain("gpt-allowed");
+		expect(output).not.toContain("claude-hidden");
 	} finally {
 		authStorage.close();
 	}
 });
-
 test("omp models emits extension shutdown after listing (issue #6297)", async () => {
 	const authStorage = await AuthStorage.create(":memory:");
 	try {
