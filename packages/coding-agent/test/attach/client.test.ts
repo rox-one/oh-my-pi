@@ -526,7 +526,7 @@ describe("attach cli", () => {
 		const sessionFile = path.join(dir, "session.jsonl");
 		const missingToken = path.join(dir, "missing.token");
 		const stderr = new CollectingStream();
-		const previousExitCode = process.exitCode;
+		const previousExitCode = process.exitCode ?? 0;
 		try {
 			const command = new Attach(
 				["w1", "--session-file", sessionFile, "--token-file", missingToken],
