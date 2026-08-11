@@ -58,26 +58,30 @@ describe("SettingsSelectorComponent persistence scope", () => {
 		);
 	}
 
-	it("writes the global layer in global scope even when a project override shadows it", async () => {
+	it("writes the global layer while callbacks receive the shadowing effective value", async () => {
+		// Start both layers at true, then toggle only the global fallback to
+		// false. The persisted scope and active effective value must diverge.
+		settings.set("ask.enabled", true, "global");
 		const selector = createSelector();
 		expect(selector.render(120).join("\n")).toContain("Settings · project");
+		expect(settings.getGlobalValue("ask.enabled")).toBe(true);
 		expect(settings.get("ask.enabled")).toBe(true);
 
-		// Alt+S switches to global scope; the row now reflects the global layer
-		// (false), not the project-shadowed effective value.
+		// Alt+S switches to global scope; the row reflects the global layer
+		// (true), so Enter writes false even though project remains true.
 		selector.handleInput("\x1bs");
 		expect(selector.render(120).join("\n")).toContain("Settings · global");
 		for (const char of "ask tool interactive") selector.handleInput(char);
 		selector.handleInput("\n");
 
-		// The toggle set the global fallback to true; the project override still
-		// determines the effective value, so the session is untouched.
-		expect(settings.getGlobalValue("ask.enabled")).toBe(true);
+		expect(settings.getGlobalValue("ask.enabled")).toBe(false);
 		expect(settings.get("ask.enabled")).toBe(true);
+		// Side-effect handlers receive the merged effective value, not the
+		// global fallback displayed in the row.
 		expect(changes.at(-1)).toEqual({ path: "ask.enabled", value: true });
 
 		await settings.flush();
-		expect(YAML.parse(await Bun.file(path.join(agentDir, "config.yml")).text())).toEqual({ ask: { enabled: true } });
+		expect(YAML.parse(await Bun.file(path.join(agentDir, "config.yml")).text())).toEqual({ ask: { enabled: false } });
 		expect(YAML.parse(await Bun.file(projectConfigPath).text())).toEqual({
 			ask: { enabled: true },
 			custom: { keep: true },

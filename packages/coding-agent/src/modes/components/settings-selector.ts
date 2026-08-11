@@ -1172,7 +1172,7 @@ export class SettingsSelectorComponent implements Component {
 			value => {
 				const effective = this.#setSettingValue(def.path, value);
 				this.callbacks.onChange(def.path, effective);
-				done(this.#getSubmenuCurrentValue(def.path, effective));
+				done(this.#getSubmenuCurrentValue(def.path, this.#scopedValue(def.path)));
 			},
 			() => {
 				onPreviewCancel?.();
@@ -1207,7 +1207,7 @@ export class SettingsSelectorComponent implements Component {
 				// store "" which the browser.ts expandPath ignores (no-op fallback).
 				const effective = this.#setSettingValue(def.path, value);
 				this.callbacks.onChange(def.path, effective);
-				wrappedDone(this.#formatTextInputValue(def, effective));
+				wrappedDone(this.#formatTextInputValue(def, this.#scopedValue(def.path)));
 			},
 			() => wrappedDone(),
 		);
@@ -1220,7 +1220,7 @@ export class SettingsSelectorComponent implements Component {
 			value => {
 				const effective = this.#persistSetting("providers.maxInFlightRequests", value);
 				this.callbacks.onChange("providers.maxInFlightRequests", effective);
-				done(this.#formatProviderLimitsValue(effective));
+				done(this.#formatProviderLimitsValue(this.#scopedValue("providers.maxInFlightRequests")));
 			},
 			() => done(),
 			this.context.requestRender,
@@ -1284,13 +1284,13 @@ export class SettingsSelectorComponent implements Component {
 	}
 
 	/**
-	 * Persist a setting in the selected scope and return the value that scope
-	 * now resolves to, so callbacks and row summaries reflect the layer written
-	 * rather than a higher-precedence layer that may shadow it.
+	 * Persist a setting in the selected scope and return the recomputed merged
+	 * effective value. Row display reads {@link #scopedValue} separately, while
+	 * runtime callbacks must stay aligned with the active project configuration.
 	 */
 	#persistSetting(path: SettingPath, value: unknown): unknown {
 		settings.set(path, value as never, this.#scope);
-		return this.#scopedValue(path);
+		return settings.get(path);
 	}
 
 	/**
