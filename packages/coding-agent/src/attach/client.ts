@@ -2,10 +2,16 @@
  * attach/client.ts — interactive pane client for the local worker-attach substrate.
  *
  * Connects to the attach server over a Unix socket, authenticates with the
- * capability token, subscribes to a single worker, renders worker state and
- * live output as bounded sanitized lines, and forwards each stdin line as a
- * follow-up. Every I/O surface is injectable so the client is fully testable
- * without a TTY or a real server.
+ * capability token, subscribes to a single worker, and forwards each stdin
+ * line as a follow-up. All rendering is delegated to an {@link AttachView};
+ * the client owns every I/O surface (socket, keepalive, reconnect backoff,
+ * readline, signals, exit codes) so the transport is fully testable without a
+ * TTY or a real server and interchangeable views (line dump, fullscreen TUI)
+ * never touch the wire protocol.
+ *
+ * Follow-ups are serialized: while one is in flight, further input is queued
+ * client-side and flushed in order once the in-flight follow-up settles, so
+ * rapid follow-ups never hit the server's `busy` rejection.
  */
 
 import * as net from "node:net";
@@ -20,6 +26,7 @@ import {
 	type AttachSessionEntry,
 	type AttachSnapshot,
 	type AttachWorkerKey,
+	type AttachWorkerState,
 	decodeAttachLine,
 	encodeAttachMessage,
 } from "./protocol";
@@ -38,15 +45,25 @@ export interface AttachClientOptions {
 	readonly maxRenderedLines?: number;
 	/** Handle SIGINT (abort the in-flight follow-up, then bye). Defaults to true. */
 	readonly enableSignals?: boolean;
+	/**
+	 * Read follow-up input from a readline interface over `stdin`. Defaults to
+	 * true (line view). Fullscreen views that own the terminal (e.g. the TUI
+	 * pane) MUST set this to false and drive {@link AttachClient.sendFollowUp}
+	 * from their own input path — readline and the TUI cannot share stdin.
+	 */
+	readonly readline?: boolean;
 	/** Invoked with the exit code when the client terminates itself. */
 	readonly onExit?: (code: number) => void;
+	/** Rendering surface for worker state and output. Defaults to {@link AttachLineView}. */
+	readonly view?: AttachView;
 }
 
 const DEFAULT_BACKOFF_MS: readonly number[] = [200, 500, 1000, 2000, 5000];
 
 const MAX_RENDERED_LINE_LENGTH = 200;
 
-const TRIM_MARKER = "[trimmed: earlier output dropped]";
+/** Marker emitted when a bounded render window first drops earlier output. */
+export const TRIM_MARKER = "[trimmed: earlier output dropped]";
 
 /**
  * Sanitize one rendered line: strip ANSI escape sequences and control
@@ -63,27 +80,138 @@ export function sanitizeAttachLine(text: string, maxLength = MAX_RENDERED_LINE_L
 	return clean;
 }
 
+/** Connection phase reported to views: first attempt, authenticated, or reconnecting. */
+export type AttachViewConnection = "connecting" | "connected" | "reconnecting";
+
+/**
+ * Rendering surface driven by {@link AttachClient}. The transport calls these
+ * hooks for every protocol-visible transition; implementations decide how to
+ * present them (a line dump, a fullscreen TUI, a test spy). Every hook is
+ * optional so lightweight views implement only what they render.
+ */
+export interface AttachView {
+	/** The transport started a connection attempt or re-authenticated. */
+	onConnection?(connection: AttachViewConnection): void;
+	/** The worker's registry entry changed (initial snapshot / registered / updated). */
+	onEntry?(entry: AttachSessionEntry): void;
+	/** The worker's lifecycle state changed. */
+	onState?(state: AttachWorkerState): void;
+	/** Coalesced live progress: tool / intent / output tail. */
+	onProgress?(event: Extract<AttachEvent, { type: "progress" }>): void;
+	/** The server accepted the follow-up with the given ref. */
+	onFollowUpAccepted?(ref: string): void;
+	/** A follow-up settled with a result (or an error payload). */
+	onResult?(event: Extract<AttachEvent, { type: "follow_up_result" }>): void;
+	/** A protocol-level error arrived (e.g. `busy` from an external client). */
+	onError?(error: AttachError): void;
+	/** The worker was removed; the client exits 0 immediately after. */
+	onRemoved?(reason: string): void;
+	/** The server sent a polite `bye`; the client exits 0 immediately after. */
+	onBye?(): void;
+	/** The client terminated itself with the given code. */
+	onExit?(code: number): void;
+}
+
+/**
+ * Default line-oriented view: writes bounded sanitized lines to a writable
+ * stream, keeping a rolling window that emits `TRIM_MARKER` once when it
+ * first overflows. Byte-compatible with the pre-seam rendering so existing
+ * line-based consumers and tests keep their exact output contract.
+ */
+export class AttachLineView implements AttachView {
+	readonly #stdout: NodeJS.WritableStream;
+	readonly #maxRenderedLines: number;
+	#renderedLines: string[] = [];
+	#trimMarkerPrinted = false;
+
+	constructor(options: { readonly stdout?: NodeJS.WritableStream; readonly maxRenderedLines?: number } = {}) {
+		this.#stdout = options.stdout ?? process.stdout;
+		this.#maxRenderedLines = options.maxRenderedLines ?? 500;
+	}
+
+	onEntry(entry: AttachSessionEntry): void {
+		const summary = entry.summary !== null && entry.summary.length > 0 ? ` ${entry.summary}` : "";
+		this.#renderLine(`[${entry.state}]${summary}`);
+	}
+
+	onState(state: AttachWorkerState): void {
+		this.#renderLine(`[${state}]`);
+	}
+
+	onProgress(event: Extract<AttachEvent, { type: "progress" }>): void {
+		if (event.currentTool !== undefined && event.currentTool.trim().length > 0) {
+			const args =
+				event.currentToolArgs !== undefined && event.currentToolArgs.trim().length > 0
+					? ` ${event.currentToolArgs}`
+					: "";
+			this.#renderLine(`tool: ${event.currentTool}${args}`);
+		}
+		if (event.lastIntent !== undefined && event.lastIntent.trim().length > 0) {
+			this.#renderLine(`intent: ${event.lastIntent}`);
+		}
+		for (const line of event.outputTail) {
+			this.#renderLine(line);
+		}
+	}
+
+	onResult(event: Extract<AttachEvent, { type: "follow_up_result" }>): void {
+		if (!event.ok) this.#renderLine(`[result] error: ${event.error ?? "failed"}`);
+		else if (event.payload === undefined) this.#renderLine("[result] ok");
+		else
+			this.#renderLine(
+				`[result] ${typeof event.payload === "string" ? event.payload : JSON.stringify(event.payload)}`,
+			);
+	}
+
+	onError(error: AttachError): void {
+		this.#renderLine(`[error] ${error.code}: ${error.message}`);
+	}
+
+	onRemoved(reason: string): void {
+		this.#renderLine(`[removed] ${reason}`);
+	}
+
+	onBye(): void {
+		this.#renderLine("[bye]");
+	}
+
+	/** Write one sanitized line, keeping the rolling window bounded. */
+	#renderLine(text: string): void {
+		const line = sanitizeAttachLine(text);
+		if (line.length === 0) return;
+		this.#renderedLines.push(line);
+		if (this.#renderedLines.length > this.#maxRenderedLines) {
+			this.#renderedLines.shift();
+			if (!this.#trimMarkerPrinted) {
+				this.#trimMarkerPrinted = true;
+				this.#stdout.write(`${TRIM_MARKER}\n`);
+			}
+		}
+		this.#stdout.write(`${line}\n`);
+	}
+}
+
 /**
  * Interactive pane client for the attach substrate.
  *
  * Handshake: connect → `hello` (capability token) → `hello_ok` → `subscribe`
- * (worker id) → snapshot push. Afterwards the client renders worker
- * state/summary, progress output, and follow-up results as bounded sanitized
- * lines, forwards each stdin line as a `follow_up`, pings to keep the
- * connection alive, and reconnects with backoff after unexpected disconnects.
- * `removed`, a server `bye`, and `auth_failed` are terminal (exit 0/0/1) and
- * never reconnect.
+ * (worker id) → snapshot push. Afterwards the client forwards worker
+ * state/summary, progress output, and follow-up results to the configured
+ * {@link AttachView}, forwards each stdin line as a `follow_up` (queued while
+ * one is in flight), pings to keep the connection alive, and reconnects with
+ * backoff after unexpected disconnects. `removed`, a server `bye`, and
+ * `auth_failed` are terminal (exit 0/0/1) and never reconnect.
  */
 export class AttachClient {
 	readonly #socketPath: string;
 	readonly #token: string;
 	readonly #workerId: string;
-	readonly #stdout: NodeJS.WritableStream;
+	readonly #view: AttachView;
 	readonly #stdin: NodeJS.ReadableStream;
 	readonly #pingIntervalMs: number;
 	readonly #backoffMs: readonly number[];
-	readonly #maxRenderedLines: number;
 	readonly #enableSignals: boolean;
+	readonly #useReadline: boolean;
 	readonly #onExit: ((code: number) => void) | undefined;
 
 	#socket: net.Socket | null = null;
@@ -100,8 +228,6 @@ export class AttachClient {
 	#sigintHandler: (() => void) | null = null;
 	#started = false;
 	#exiting = false;
-	#renderedLines: string[] = [];
-	#trimMarkerPrinted = false;
 	#handshakeResolve: (() => void) | null = null;
 	#handshakePromise: Promise<void> | null = null;
 	#snapshotResolve: (() => void) | null = null;
@@ -111,12 +237,13 @@ export class AttachClient {
 		this.#socketPath = socketPath;
 		this.#token = token;
 		this.#workerId = workerId;
-		this.#stdout = options.stdout ?? process.stdout;
+		this.#view =
+			options.view ?? new AttachLineView({ stdout: options.stdout, maxRenderedLines: options.maxRenderedLines });
 		this.#stdin = options.stdin ?? process.stdin;
 		this.#pingIntervalMs = options.pingIntervalMs ?? 30_000;
 		this.#backoffMs = options.backoffMs ?? DEFAULT_BACKOFF_MS;
-		this.#maxRenderedLines = options.maxRenderedLines ?? 500;
 		this.#enableSignals = options.enableSignals ?? true;
+		this.#useReadline = options.readline ?? true;
 		this.#onExit = options.onExit;
 	}
 
@@ -135,7 +262,7 @@ export class AttachClient {
 			this.#snapshotResolve = resolve;
 		});
 		this.#connect();
-		this.#setupReadline();
+		if (this.#useReadline) this.#setupReadline();
 		if (this.#enableSignals) {
 			this.#sigintHandler = () => this.#handleSigint();
 			process.on("SIGINT", this.#sigintHandler);
@@ -168,6 +295,7 @@ export class AttachClient {
 	#connect(): void {
 		this.#accumulator = new AttachFrameAccumulator();
 		this.#authenticated = false;
+		this.#view.onConnection?.(this.#reconnectAttempt > 0 ? "reconnecting" : "connecting");
 		const socket = net.createConnection(this.#socketPath);
 		this.#socket = socket;
 		socket.on("connect", () => this.#onConnect());
@@ -241,7 +369,7 @@ export class AttachClient {
 			case "pong":
 				return;
 			case "bye":
-				this.#renderLine("[bye]");
+				this.#view.onBye?.();
 				this.#exit(0);
 				return;
 			case "error":
@@ -253,9 +381,10 @@ export class AttachClient {
 	#onHelloOk(message: Extract<AttachMessage, { kind: "hello_ok" }>): void {
 		this.#reconnectAttempt = 0;
 		this.#authenticated = true;
+		this.#view.onConnection?.("connected");
 		this.#captureOwnerScope(message.snapshot);
 		const entry = this.#findEntry(message.snapshot);
-		if (entry) this.#renderEntry(entry);
+		if (entry) this.#view.onEntry?.(entry);
 		this.#finishHandshake();
 		if (this.#pingTimer === null) {
 			this.#pingTimer = setInterval(() => this.#send({ kind: "ping" }), this.#pingIntervalMs);
@@ -267,7 +396,7 @@ export class AttachClient {
 	#onSnapshot(snapshot: AttachSnapshot): void {
 		this.#captureOwnerScope(snapshot);
 		const entry = this.#findEntry(snapshot);
-		if (entry) this.#renderEntry(entry);
+		if (entry) this.#view.onEntry?.(entry);
 		this.#finishSnapshot();
 	}
 
@@ -279,60 +408,38 @@ export class AttachClient {
 					this.#ownerScope = event.key.ownerScope;
 					this.#flushPendingFollowUps();
 				}
-				this.#renderEntry(event.entry);
+				this.#view.onEntry?.(event.entry);
 				return;
 			case "updated":
 				if (event.key.workerId !== this.#workerId) return;
-				this.#renderEntry(event.entry);
+				this.#view.onEntry?.(event.entry);
 				return;
 			case "state":
 				if (event.key.workerId !== this.#workerId) return;
-				this.#renderLine(`[${event.state}]`);
+				this.#view.onState?.(event.state);
 				return;
 			case "removed":
 				if (event.key.workerId !== this.#workerId) return;
-				this.#renderLine(`[removed] ${event.reason}`);
+				this.#view.onRemoved?.(event.reason);
 				this.#exit(0);
 				return;
 			case "follow_up_accepted":
+				if (event.key.workerId !== this.#workerId) return;
+				this.#view.onFollowUpAccepted?.(event.ref);
 				return;
 			case "follow_up_result":
 				if (event.key.workerId !== this.#workerId) return;
 				this.#inFlightRef = null;
-				this.#renderLine(this.#formatResult(event));
+				this.#view.onResult?.(event);
 				this.#flushPendingFollowUps();
 				return;
 			case "abort_accepted":
 				return;
 			case "progress":
 				if (event.key.workerId !== this.#workerId) return;
-				this.#renderProgress(event);
+				this.#view.onProgress?.(event);
 				return;
 		}
-	}
-
-	#formatResult(event: Extract<AttachEvent, { type: "follow_up_result" }>): string {
-		if (!event.ok) return `[result] error: ${event.error ?? "failed"}`;
-		if (event.payload === undefined) return "[result] ok";
-		const payload = typeof event.payload === "string" ? event.payload : JSON.stringify(event.payload);
-		return `[result] ${payload}`;
-	}
-
-	#renderProgress(event: Extract<AttachEvent, { type: "progress" }>): void {
-		if (event.currentTool !== undefined) {
-			this.#renderLine(`tool: ${event.currentTool}${event.currentToolArgs ? ` ${event.currentToolArgs}` : ""}`);
-		}
-		if (event.lastIntent !== undefined) {
-			this.#renderLine(`intent: ${event.lastIntent}`);
-		}
-		for (const line of event.outputTail) {
-			this.#renderLine(line);
-		}
-	}
-
-	#renderEntry(entry: AttachSessionEntry): void {
-		const summary = entry.summary !== null && entry.summary.length > 0 ? ` ${entry.summary}` : "";
-		this.#renderLine(`[${entry.state}]${summary}`);
 	}
 
 	#onError(error: AttachError): void {
@@ -341,25 +448,13 @@ export class AttachClient {
 			this.#exit(1);
 			return;
 		}
-		this.#renderLine(`[error] ${error.code}: ${error.message}`);
+		this.#view.onError?.(error);
 		if (error.ref !== undefined && error.ref === this.#inFlightRef) {
 			this.#inFlightRef = null;
+			// An error settled the in-flight follow-up (e.g. `unknown_worker`):
+			// the slot is free again, so drain the client-side queue.
+			this.#flushPendingFollowUps();
 		}
-	}
-
-	/** Write one sanitized line, keeping the rolling window bounded. */
-	#renderLine(text: string): void {
-		const line = sanitizeAttachLine(text);
-		if (line.length === 0) return;
-		this.#renderedLines.push(line);
-		if (this.#renderedLines.length > this.#maxRenderedLines) {
-			this.#renderedLines.shift();
-			if (!this.#trimMarkerPrinted) {
-				this.#trimMarkerPrinted = true;
-				this.#stdout.write(`${TRIM_MARKER}\n`);
-			}
-		}
-		this.#stdout.write(`${line}\n`);
 	}
 
 	#captureOwnerScope(snapshot: AttachSnapshot): void {
@@ -388,14 +483,22 @@ export class AttachClient {
 	}
 
 	#onInputLine(line: string): void {
-		if (line.trim().length === 0) return;
-		if (this.#ownerScope === null || !this.#authenticated) {
-			// The worker may not be registered yet (or we are reconnecting):
-			// hold the line and send it once we know where it belongs.
-			this.#pendingFollowUps.push(line);
+		this.sendFollowUp(line);
+	}
+
+	/**
+	 * Queue or send one follow-up prompt. While the worker is unknown, the
+	 * connection is reconnecting, or another follow-up is in flight, the
+	 * prompt is held and flushed in order once the slot is free. Used by both
+	 * the readline line view and the fullscreen pane's composer.
+	 */
+	sendFollowUp(payload: string): void {
+		if (payload.trim().length === 0) return;
+		if (this.#ownerScope === null || !this.#authenticated || this.#inFlightRef !== null) {
+			this.#pendingFollowUps.push(payload);
 			return;
 		}
-		this.#sendFollowUp(line);
+		this.#sendFollowUp(payload);
 	}
 
 	#sendFollowUp(payload: string): void {
@@ -415,6 +518,15 @@ export class AttachClient {
 
 	#followUpKey(): AttachWorkerKey {
 		return { workerId: this.#workerId, ownerScope: this.#ownerScope ?? "" };
+	}
+
+	/**
+	 * Cancel the in-flight follow-up (if any), send a polite `bye`, and exit
+	 * 0. Used by the SIGINT handler and by the fullscreen pane's Ctrl-C on an
+	 * empty draft.
+	 */
+	interrupt(): void {
+		this.#handleSigint();
 	}
 
 	#handleSigint(): void {
@@ -437,6 +549,7 @@ export class AttachClient {
 		this.#cleanup();
 		this.#finishHandshake();
 		this.#finishSnapshot();
+		this.#view.onExit?.(code);
 		this.#onExit?.(code);
 	}
 

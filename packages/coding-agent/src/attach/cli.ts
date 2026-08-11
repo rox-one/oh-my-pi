@@ -7,7 +7,8 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { Args, type CliConfig, Command } from "@oh-my-pi/pi-utils/cli";
 import { attachHelp as commandHelp } from "../cli/command-help";
-import { AttachClient } from "./client";
+import { initTheme } from "../modes/theme/theme";
+import { AttachPane } from "./pane";
 import { ATTACH_SOCKET_FILE, ATTACH_TOKEN_FILE } from "./server";
 import { ATTACH_RUNTIME_DIR_NAME } from "./vibe-bridge";
 
@@ -87,11 +88,12 @@ export default class Attach extends Command {
 			process.exitCode = 1;
 			return;
 		}
-		const client = new AttachClient(paths.socketFile, token, args.workerId ?? "", {
+		await initTheme();
+		const pane = new AttachPane(paths.socketFile, token, args.workerId ?? "", {
 			onExit: code => {
 				process.exitCode = code;
 			},
 		});
-		await client.start();
+		await pane.start();
 	}
 }

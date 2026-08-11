@@ -3,6 +3,9 @@ import { Buffer } from "node:buffer";
 import {
 	ATTACH_CAPABILITY_HEX_LENGTH,
 	ATTACH_MAX_FRAME_BYTES,
+	ATTACH_PROGRESS_MAX_LINE_LENGTH,
+	ATTACH_PROGRESS_MAX_OUTPUT_LINES,
+	ATTACH_PROGRESS_MAX_TOOL_LENGTH,
 	AttachBoundedQueue,
 	AttachFrameAccumulator,
 	AttachProtocolError,
@@ -13,6 +16,7 @@ import {
 	generateAttachCapability,
 	isAttachCapability,
 	isHelloMessage,
+	sanitizeAttachProgress,
 	shrinkAttachSnapshot,
 } from "../../src/attach/protocol";
 import { attachKeyString, parseAttachKeyString } from "../../src/attach/registry";
@@ -202,6 +206,49 @@ describe("attach snapshot shrinking", () => {
 	it("leaves snapshots within bounds untouched", () => {
 		const snapshot: AttachSnapshot = { version: 1, generatedAt: 1, sessions: [entry("w", 1, "fine")] };
 		expect(shrinkAttachSnapshot(snapshot)).toEqual(snapshot);
+	});
+});
+
+describe("attach progress sanitization", () => {
+	it("omits empty and whitespace-only optional fields", () => {
+		expect(sanitizeAttachProgress({ outputTail: [] })).toEqual({ outputTail: [] });
+		expect(
+			sanitizeAttachProgress({ currentTool: "", currentToolArgs: "  ", lastIntent: "", outputTail: [] }),
+		).toEqual({
+			outputTail: [],
+		});
+		expect("currentTool" in sanitizeAttachProgress({ outputTail: [] })).toBe(false);
+		expect("lastIntent" in sanitizeAttachProgress({ outputTail: [] })).toBe(false);
+	});
+
+	it("keeps non-empty optional fields and bounds content", () => {
+		const result = sanitizeAttachProgress({
+			currentTool: "bash",
+			currentToolArgs: "ls -la",
+			lastIntent: "check the files",
+			outputTail: ["a", "b"],
+		});
+		expect(result.currentTool).toBe("bash");
+		expect(result.currentToolArgs).toBe("ls -la");
+		expect(result.lastIntent).toBe("check the files");
+		expect(result.outputTail).toEqual(["a", "b"]);
+	});
+
+	it("collapses multi-line values to their first line and caps length", () => {
+		const long = "x".repeat(ATTACH_PROGRESS_MAX_TOOL_LENGTH + 50);
+		const result = sanitizeAttachProgress({
+			currentTool: `${long}\nsecond line`,
+			outputTail: ["line1\nline2", "y".repeat(ATTACH_PROGRESS_MAX_LINE_LENGTH + 50)],
+		});
+		expect(result.currentTool).toBe("x".repeat(ATTACH_PROGRESS_MAX_TOOL_LENGTH));
+		expect(result.outputTail).toEqual(["line1", "y".repeat(ATTACH_PROGRESS_MAX_LINE_LENGTH)]);
+	});
+
+	it("keeps only the last ATTACH_PROGRESS_MAX_OUTPUT_LINES tail lines", () => {
+		const result = sanitizeAttachProgress({
+			outputTail: Array.from({ length: ATTACH_PROGRESS_MAX_OUTPUT_LINES + 2 }, (_, i) => `out-${i}`),
+		});
+		expect(result.outputTail).toEqual(["out-2", "out-3", "out-4"]);
 	});
 });
 

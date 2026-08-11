@@ -911,20 +911,28 @@ export interface AttachProgressInput {
  * `ATTACH_PROGRESS_MAX_OUTPUT_LINES` capped lines (oldest first). Applied
  * before encoding so a progress event can never exceed its frame budget or
  * carry multi-line noise.
+ *
+ * `currentTool` / `currentToolArgs` / `lastIntent` are OMITTED when their
+ * bounded value is empty or whitespace-only, so clients never receive a
+ * `tool: ` / `intent: ` row with no content (the fields are optional on the
+ * wire and the decoder already handles absent fields).
  */
-export function sanitizeAttachProgress(input: AttachProgressInput): Required<AttachProgressInput> {
+export function sanitizeAttachProgress(input: AttachProgressInput): AttachProgressInput {
+	const optional = (value: string | undefined, max: number): string | undefined => {
+		if (value === undefined) return undefined;
+		const bounded = boundedLine(value, max);
+		return bounded.trim().length > 0 ? bounded : undefined;
+	};
+	const currentTool = optional(input.currentTool, ATTACH_PROGRESS_MAX_TOOL_LENGTH);
+	const currentToolArgs = optional(input.currentToolArgs, ATTACH_PROGRESS_MAX_TOOL_ARGS_LENGTH);
+	const lastIntent = optional(input.lastIntent, ATTACH_PROGRESS_MAX_INTENT_LENGTH);
 	return {
-		currentTool:
-			input.currentTool === undefined ? "" : boundedLine(input.currentTool, ATTACH_PROGRESS_MAX_TOOL_LENGTH),
-		currentToolArgs:
-			input.currentToolArgs === undefined
-				? ""
-				: boundedLine(input.currentToolArgs, ATTACH_PROGRESS_MAX_TOOL_ARGS_LENGTH),
-		lastIntent:
-			input.lastIntent === undefined ? "" : boundedLine(input.lastIntent, ATTACH_PROGRESS_MAX_INTENT_LENGTH),
 		outputTail: input.outputTail
 			.slice(-ATTACH_PROGRESS_MAX_OUTPUT_LINES)
 			.map(line => boundedLine(line, ATTACH_PROGRESS_MAX_LINE_LENGTH)),
+		...(currentTool !== undefined && { currentTool }),
+		...(currentToolArgs !== undefined && { currentToolArgs }),
+		...(lastIntent !== undefined && { lastIntent }),
 	};
 }
 

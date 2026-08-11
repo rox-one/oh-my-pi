@@ -369,7 +369,7 @@ describe("attach client", () => {
 		expect(result).toContain("turn-done");
 	});
 
-	it("prints a busy error without exiting and keeps the client alive", async () => {
+	it("queues follow-ups while one is in flight and flushes them in order", async () => {
 		const server = await FakeServer.listen(path.join(dir, "attach.sock"), {
 			token: TOKEN,
 			snapshot: snapshot([entry()]),
@@ -384,13 +384,14 @@ describe("attach client", () => {
 						kind: "event",
 						event: { type: "follow_up_accepted", key: KEY, ref: "f1" },
 					});
-					// Leave f1 in flight; resolve it later.
+					// Leave f1 in flight long enough for the hold assertion to
+					// observe that nothing else leaves the wire; resolve later.
 					setTimeout(() => {
 						connection.send({
 							kind: "event",
 							event: { type: "follow_up_result", key: KEY, ref: "f1", ok: true, payload: "first-done" },
 						});
-					}, 50);
+					}, 400);
 					return;
 				}
 				connection.send({
@@ -409,12 +410,27 @@ describe("attach client", () => {
 		stdin.write("first\n");
 		await poll(() => server.received.find(message => message.kind === "follow_up" && message.ref === "f1"));
 		stdin.write("second\n");
-		await poll(() => server.received.find(message => message.kind === "follow_up" && message.ref === "f2"));
+		stdin.write("third\n");
 
-		await poll(() => lineWith(stdout, "busy"));
-		expect(exits).toEqual([]);
+		// While f1 is in flight the follow-ups are held client-side: nothing
+		// else leaves the wire until the in-flight follow-up settles.
+		await new Promise(resolve => setTimeout(resolve, 120));
+		expect(server.received.filter(message => message.kind === "follow_up")).toHaveLength(1);
 
+		// f1 settles → the queue flushes in order (f2, then f3 after the busy
+		// error frees the slot). The busy display remains for external
+		// concurrency; the client stays alive throughout.
 		await poll(() => lineWith(stdout, "first-done"));
+		const f2 = await poll(() =>
+			server.received.find(message => message.kind === "follow_up" && message.ref === "f2"),
+		);
+		expect(f2).toMatchObject({ kind: "follow_up", ref: "f2", key: KEY, payload: "second" });
+		await poll(() => lineWith(stdout, "busy"));
+		const f3 = await poll(() =>
+			server.received.find(message => message.kind === "follow_up" && message.ref === "f3"),
+		);
+		expect(f3).toMatchObject({ kind: "follow_up", ref: "f3", key: KEY, payload: "third" });
+		await poll(() => (stdout.lines().filter(line => line.includes("busy")).length >= 2 ? true : undefined));
 		expect(exits).toEqual([]);
 	});
 

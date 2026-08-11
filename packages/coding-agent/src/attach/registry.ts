@@ -225,7 +225,7 @@ export class AttachRegistry {
 	 * be sanitized to wire bounds (the bridge sanitizes before calling); the
 	 * event is ignored when the worker is not registered.
 	 */
-	emitProgress(key: AttachWorkerKey, fields: Required<AttachProgressInput>, at: number): void {
+	emitProgress(key: AttachWorkerKey, fields: AttachProgressInput, at: number): void {
 		if (!this.#entries.has(attachKeyString(key))) return;
 		this.#emit({ type: "progress", key, at, ...fields });
 	}
