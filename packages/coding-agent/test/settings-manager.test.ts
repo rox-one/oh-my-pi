@@ -152,6 +152,24 @@ describe("Settings", () => {
 				custom: { keep: true },
 			});
 		});
+		it("resolves the global layer independently of a shadowing project override", async () => {
+			await writeSettings({ ask: { enabled: false } });
+			const projectConfigPath = path.join(projectDir, ".omp", "config.yml");
+			await Bun.write(projectConfigPath, YAML.stringify({ ask: { enabled: true } }, null, 2));
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+
+			// Effective view is the project override; the global getter ignores it.
+			expect(settings.get("ask.enabled")).toBe(true);
+			expect(settings.getGlobalValue("ask.enabled")).toBe(false);
+
+			settings.set("ask.enabled", true, "global");
+			expect(settings.getGlobalValue("ask.enabled")).toBe(true);
+			expect(settings.get("ask.enabled")).toBe(true);
+			await settings.flush();
+
+			expect(await readSettings()).toEqual({ ask: { enabled: true } });
+			expect(YAML.parse(await Bun.file(projectConfigPath).text())).toEqual({ ask: { enabled: true } });
+		});
 
 		it("removes a project override and immediately restores the global fallback", async () => {
 			await writeSettings({ ask: { enabled: false } });

@@ -543,6 +543,19 @@ export class Settings {
 	}
 
 	/**
+	 * Resolve a setting from only the global layer plus schema defaults,
+	 * ignoring the project/overlay/runtime layers. The settings UI uses this to
+	 * show and edit the global fallback while in global scope, so a project
+	 * override never masks the value being written.
+	 */
+	getGlobalValue<P extends SettingPath>(path: P): SettingValue<P> {
+		const value = getByPath(this.#global, SETTING_PATH_SEGMENTS[path]);
+		const resolved =
+			value !== undefined ? (resolvePathScopedStringArray(path, value, this.#cwd) ?? value) : getDefault(path);
+		return resolved as SettingValue<P>;
+	}
+
+	/**
 	 * Whether `path` has an explicitly configured value (global config, project
 	 * config, or runtime override) rather than falling back to the schema default.
 	 */

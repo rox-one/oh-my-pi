@@ -15,10 +15,23 @@ beforeAll(async () => {
 describe("SettingsSelectorComponent persistence scope", () => {
 	let settingsState: SettingsTestState | undefined;
 	let tempDir: TempDir;
+	let projectDir: string;
+	let agentDir: string;
+	let projectConfigPath: string;
+	let changes: Array<{ path: string; value: unknown }>;
 
-	beforeEach(() => {
+	beforeEach(async () => {
 		settingsState = beginSettingsTest();
 		tempDir = TempDir.createSync("@pi-settings-scope-test-");
+		projectDir = tempDir.join("project");
+		agentDir = tempDir.join("agent");
+		projectConfigPath = path.join(projectDir, ".omp", "config.yml");
+		// Global fallback disagrees with the project override so a shadowed
+		// global edit is observable: effective (project) stays true.
+		await Bun.write(path.join(agentDir, "config.yml"), YAML.stringify({ ask: { enabled: false } }, null, 2));
+		await Bun.write(projectConfigPath, YAML.stringify({ ask: { enabled: true }, custom: { keep: true } }, null, 2));
+		await Settings.init({ cwd: projectDir, agentDir });
+		changes = [];
 	});
 
 	afterEach(async () => {
@@ -29,14 +42,8 @@ describe("SettingsSelectorComponent persistence scope", () => {
 		await tempDir.remove();
 	});
 
-	it("defaults to project scope, exposes scope switching, and inherits the effective fallback", async () => {
-		const projectDir = tempDir.join("project");
-		const agentDir = tempDir.join("agent");
-		const projectConfigPath = path.join(projectDir, ".omp", "config.yml");
-		await Bun.write(projectConfigPath, YAML.stringify({ ask: { enabled: true }, custom: { keep: true } }, null, 2));
-		await Settings.init({ cwd: projectDir, agentDir });
-		const changes: Array<{ path: string; value: unknown }> = [];
-		const selector = new SettingsSelectorComponent(
+	function createSelector(): SettingsSelectorComponent {
+		return new SettingsSelectorComponent(
 			{
 				availableThinkingLevels: [],
 				thinkingLevel: undefined,
@@ -49,28 +56,47 @@ describe("SettingsSelectorComponent persistence scope", () => {
 				onCancel: () => {},
 			},
 		);
+	}
 
+	it("writes the global layer in global scope even when a project override shadows it", async () => {
+		const selector = createSelector();
 		expect(selector.render(120).join("\n")).toContain("Settings · project");
-		for (const char of "ask tool interactive") selector.handleInput(char);
-		selector.handleInput("\n");
-		expect(settings.get("ask.enabled")).toBe(false);
-		expect(changes.at(-1)).toEqual({ path: "ask.enabled", value: false });
+		expect(settings.get("ask.enabled")).toBe(true);
 
+		// Alt+S switches to global scope; the row now reflects the global layer
+		// (false), not the project-shadowed effective value.
 		selector.handleInput("\x1bs");
 		expect(selector.render(120).join("\n")).toContain("Settings · global");
+		for (const char of "ask tool interactive") selector.handleInput(char);
 		selector.handleInput("\n");
-		expect(settings.get("ask.enabled")).toBe(false);
-		expect(changes.at(-1)).toEqual({ path: "ask.enabled", value: false });
-		await settings.flush();
-		expect(YAML.parse(await Bun.file(path.join(agentDir, "config.yml")).text())).toEqual({ ask: { enabled: true } });
 
-		selector.handleInput("\x1b");
-		selector.handleInput("\x1bs");
-		expect(selector.render(120).join("\n")).toContain("Settings · project");
-		selector.handleInput("\x1b[3~");
+		// The toggle set the global fallback to true; the project override still
+		// determines the effective value, so the session is untouched.
+		expect(settings.getGlobalValue("ask.enabled")).toBe(true);
 		expect(settings.get("ask.enabled")).toBe(true);
 		expect(changes.at(-1)).toEqual({ path: "ask.enabled", value: true });
+
+		await settings.flush();
+		expect(YAML.parse(await Bun.file(path.join(agentDir, "config.yml")).text())).toEqual({ ask: { enabled: true } });
+		expect(YAML.parse(await Bun.file(projectConfigPath).text())).toEqual({
+			ask: { enabled: true },
+			custom: { keep: true },
+		});
+	});
+
+	it("inherits the global fallback when removing a project override", async () => {
+		const selector = createSelector();
+		// Locate the Ask row via search, then Esc lands on its tab with the row
+		// selected so Delete can remove the project override in list mode.
+		for (const char of "ask tool interactive") selector.handleInput(char);
+		selector.handleInput("\x1b");
+		selector.handleInput("\x1b[3~");
+
+		expect(settings.get("ask.enabled")).toBe(false);
+		expect(changes.at(-1)).toEqual({ path: "ask.enabled", value: false });
+
 		await settings.flush();
 		expect(YAML.parse(await Bun.file(projectConfigPath).text())).toEqual({ custom: { keep: true } });
+		expect(YAML.parse(await Bun.file(path.join(agentDir, "config.yml")).text())).toEqual({ ask: { enabled: false } });
 	});
 });
