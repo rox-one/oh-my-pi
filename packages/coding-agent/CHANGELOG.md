@@ -318,6 +318,7 @@
 ### Added
 
 - RPC mode: new `set_mode` command to activate/deactivate the plan, vibe and goal session modes headlessly (mirroring the TUI's `/plan` / `/vibe` / `/goal` mutual-exclusion semantics), a `mode` field in `get_state`, and automatic mode restoration across `switch_session`. `RpcClient.setMode()` is available for TypeScript hosts. ([#8171](https://github.com/can1357/oh-my-pi/issues/8171))
+- Fixed `/settings` silently writing project-shadowed edits to the global profile by adding explicit project/global scopes and project override inheritance. ([#8208](https://github.com/can1357/oh-my-pi/issues/8208))
 
 ## [17.2.12] - 2026-08-08
 
