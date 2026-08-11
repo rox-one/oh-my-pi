@@ -2,12 +2,24 @@ import { describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { AttachWorkerKey, AttachWorkerState } from "../../src/attach/protocol";
-import { AttachVibeBridge } from "../../src/attach/vibe-bridge";
+import type { AttachLiveSessionSource } from "../../src/attach/live-session";
+import type { AttachEvent, AttachWorkerKey, AttachWorkerState } from "../../src/attach/protocol";
+import { ATTACH_RUNTIME_DIR_NAME, AttachVibeBridge } from "../../src/attach/vibe-bridge";
 
 const KEY: AttachWorkerKey = { workerId: "w1", ownerScope: "scope-a" };
 
-function makeBridge(overrides: { parked?: boolean } = {}) {
+/** Fake presentation source matching the typed AttachLiveSessionSource surface. */
+function fakeSource(workerId: string): AttachLiveSessionSource {
+	return {
+		branchId: "b1",
+		sessionFile: null,
+		getCwd: () => "cwd",
+		getBranchEntries: () => [],
+		subscribe: () => () => {},
+	};
+}
+
+function makeBridge(overrides: { parked?: boolean; progressCoalesceMs?: number } = {}) {
 	const baseDir = path.join(os.tmpdir(), `omp-attach-bridge-${Math.random().toString(36).slice(2)}`);
 	const calls: string[] = [];
 	const bridge = new AttachVibeBridge({
@@ -21,18 +33,23 @@ function makeBridge(overrides: { parked?: boolean } = {}) {
 			calls.push("abortTurn");
 			return true;
 		},
-		liveSessionOf: key => ({ live: key.workerId }),
+		liveSessionOf: key => fakeSource(key.workerId),
 		isParked: () => overrides.parked === true,
+		progressCoalesceMs: overrides.progressCoalesceMs,
 	});
 	return { bridge, baseDir, calls };
 }
 
 describe("attach vibe bridge", () => {
-	it("registers workers with the live harness session and revives as revived state", () => {
+	it("registers workers with the live session source and revives as revived state", () => {
 		const { bridge } = makeBridge();
 		bridge.register(KEY, "spawned");
 		expect(bridge.registry.size).toBe(1);
-		expect(bridge.registry.liveSession(KEY)).toEqual({ live: "w1" });
+		const source = bridge.registry.liveSession(KEY);
+		expect(source?.branchId).toBe("b1");
+		expect(source?.sessionFile).toBeNull();
+		expect(source?.getCwd()).toBe("cwd");
+		expect(source?.getBranchEntries()).toEqual([]);
 		expect(bridge.registry.snapshot().sessions[0].state).toBe("starting");
 		bridge.register(KEY, "spawned"); // idempotent: already present
 		expect(bridge.registry.size).toBe(1);
@@ -64,18 +81,90 @@ describe("attach vibe bridge", () => {
 		expect(result.pendingFollowUps).toBe(0);
 	});
 
-	it("surfaces non-string follow-up payloads as failed results (not rejections)", async () => {
-		const { bridge } = makeBridge();
+	it("routes pane prompts through runTurn and surfaces failures as failed results", async () => {
+		const { bridge, calls } = makeBridge();
 		bridge.register(KEY);
-		const results: Array<{ ok: boolean; error?: string }> = [];
-		const unsubscribe = bridge.registry.subscribe(event => {
-			if (event.type === "follow_up_result") results.push({ ok: event.ok, error: event.error });
+		const outcome = await bridge.registry.runPrompt(KEY, "continue");
+		expect(calls).toContain("runTurn");
+		expect(outcome).toEqual({ ok: true, payload: "out" });
+
+		const failing = new AttachVibeBridge({
+			ownerScope: "scope-a",
+			baseDir: path.join(os.tmpdir(), `omp-attach-bridge-${Math.random().toString(36).slice(2)}`),
+			runTurn: async () => {
+				throw new Error("worker died");
+			},
+			abortTurn: async () => true,
+			liveSessionOf: () => fakeSource("w1"),
+			isParked: () => false,
 		});
+		failing.register(KEY);
+		await expect(failing.registry.runPrompt(KEY, "x")).resolves.toEqual({ ok: false, error: "worker died" });
+	});
+
+	it("stringifies non-string follow-up payloads before routing through runTurn", async () => {
+		const seen: string[] = [];
+		const baseDir = path.join(os.tmpdir(), `omp-attach-bridge-${Math.random().toString(36).slice(2)}`);
+		const bridge = new AttachVibeBridge({
+			ownerScope: "scope-a",
+			baseDir,
+			runTurn: async (_key, prompt) => {
+				seen.push(prompt);
+				return { ok: true };
+			},
+			abortTurn: async () => true,
+			liveSessionOf: () => fakeSource("w1"),
+			isParked: () => false,
+		});
+		bridge.register(KEY);
 		await bridge.registry.followUp(KEY, "r", 42);
+		await bridge.registry.followUp(KEY, "r2", { a: 1 });
+		expect(seen).toEqual(["42", '{"a":1}']);
+	});
+
+	it("coalesces progress per worker and flushes the freshest state", async () => {
+		const { bridge } = makeBridge({ progressCoalesceMs: 10_000 });
+		bridge.register(KEY);
+		const events: AttachEvent[] = [];
+		const unsubscribe = bridge.registry.subscribe(event => events.push(event));
+
+		bridge.progress(KEY, { currentTool: "bash", outputTail: [] });
+		bridge.progress(KEY, { currentTool: "bash", currentToolArgs: "ls -la", outputTail: ["out"] });
+		// The window has not elapsed: nothing emitted yet.
+		expect(events.filter(event => event.type === "progress")).toHaveLength(0);
+
+		bridge.flushProgress(KEY);
 		unsubscribe();
-		expect(results).toHaveLength(1);
-		expect(results[0].ok).toBe(false);
-		expect(results[0].error).toMatch(/non-empty string prompt/);
+		const progress = events.filter(event => event.type === "progress") as Extract<
+			AttachEvent,
+			{ type: "progress" }
+		>[];
+		expect(progress).toHaveLength(1);
+		expect(progress[0]!.currentTool).toBe("bash");
+		expect(progress[0]!.currentToolArgs).toBe("ls -la");
+		expect(progress[0]!.outputTail).toEqual(["out"]);
+	});
+
+	it("emits progress once the coalescing window elapses", async () => {
+		const { bridge } = makeBridge({ progressCoalesceMs: 30 });
+		bridge.register(KEY);
+		const events: AttachEvent[] = [];
+		const unsubscribe = bridge.registry.subscribe(event => events.push(event));
+		bridge.progress(KEY, { currentTool: "bash", outputTail: [] });
+		await new Promise(resolve => setTimeout(resolve, 80));
+		unsubscribe();
+		expect(events.filter(event => event.type === "progress")).toHaveLength(1);
+	});
+
+	it("drops pending progress on unregister", async () => {
+		const { bridge } = makeBridge({ progressCoalesceMs: 10_000 });
+		bridge.register(KEY);
+		const events: AttachEvent[] = [];
+		const unsubscribe = bridge.registry.subscribe(event => events.push(event));
+		bridge.progress(KEY, { currentTool: "bash", outputTail: [] });
+		bridge.unregister(KEY, "killed");
+		unsubscribe();
+		expect(events.some(event => event.type === "progress")).toBe(false);
 	});
 
 	it("binds a 0600 socket lazily on ensureStarted and restarts after stop", async () => {
@@ -91,6 +180,23 @@ describe("attach vibe bridge", () => {
 		await bridge.ensureStarted(); // restarts after stop (parent rehydrate)
 		expect(bridge.started).toBe(true);
 		await bridge.stop();
+		await fs.rm(baseDir, { recursive: true, force: true });
+	});
+
+	it("exposes the endpoint paths only after the server started", async () => {
+		const { bridge, baseDir } = makeBridge();
+		expect(bridge.endpoint()).toBeNull(); // paths only, never capability contents
+
+		await bridge.ensureStarted();
+		const endpoint = bridge.endpoint();
+		expect(endpoint).toEqual({
+			socketFile: bridge.server.socketFile,
+			tokenFile: bridge.server.tokenFile,
+		});
+		expect(endpoint!.socketFile).toContain(ATTACH_RUNTIME_DIR_NAME);
+
+		await bridge.stop();
+		expect(bridge.endpoint()).toBeNull();
 		await fs.rm(baseDir, { recursive: true, force: true });
 	});
 

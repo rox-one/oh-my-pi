@@ -18,6 +18,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { logger, prompt, Snowflake } from "@oh-my-pi/pi-utils";
 import type { AsyncJob, AsyncJobManager } from "../async/job-manager";
+import { type AttachLiveSessionSource, createAttachLiveSessionSource } from "../attach/live-session";
 import type { AttachWorkerKey } from "../attach/protocol";
 import type { AttachFollowUpResult } from "../attach/registry";
 import { AttachVibeBridge, attachFallbackBaseDir } from "../attach/vibe-bridge";
@@ -113,6 +114,13 @@ interface VibeSpawnLifecycleEvent extends VibeLifecycleBase {
 	agent: string;
 	childSessionFile: string;
 	createdAt: number;
+	/**
+	 * Attach endpoint paths (socket + token file — paths only, never token
+	 * contents) so pane launchers do not derive them from the parent session
+	 * file. Present when the attach server started for this worker.
+	 */
+	attachSocket?: string;
+	attachTokenFile?: string;
 }
 
 interface VibeTurnLifecycleEvent extends VibeLifecycleBase {
@@ -611,9 +619,12 @@ export class VibeSessionRegistry {
 		return cancelled;
 	}
 
-	#attachLiveSessionOf(scope: VibeOwnerScope, workerKey: AttachWorkerKey): unknown {
+	#attachLiveSessionOf(scope: VibeOwnerScope, workerKey: AttachWorkerKey): AttachLiveSessionSource | null {
 		const record = this.#records.get(scopeKey(scope, workerKey.workerId));
-		return record ? this.#registeredAgent(record)?.session : undefined;
+		const session = record ? this.#registeredAgent(record)?.session : undefined;
+		if (!session) return null;
+		const childSessionFile = record?.childSessionFile ?? null;
+		return createAttachLiveSessionSource(session, childSessionFile);
 	}
 
 	#attachIsParked(scope: VibeOwnerScope, workerKey: AttachWorkerKey): boolean {
@@ -1146,6 +1157,7 @@ export class VibeSessionRegistry {
 				error: error instanceof Error ? error.message : String(error),
 			});
 		}
+		const endpoint = attach.bridge.endpoint();
 		let spawnPersisted = false;
 		try {
 			if (childSessionFile) {
@@ -1158,6 +1170,10 @@ export class VibeSessionRegistry {
 						agent: agent.name,
 						childSessionFile: childSessionName,
 						createdAt,
+						...(endpoint !== null && {
+							attachSocket: endpoint.socketFile,
+							attachTokenFile: endpoint.tokenFile,
+						}),
 					},
 					record.parentSessionFile,
 				);
@@ -1592,6 +1608,7 @@ export class VibeSessionRegistry {
 			getArtifactsDir: session.getArtifactsDir ?? (() => null),
 			getSessionId: session.getSessionId ?? (() => null),
 		};
+		const endpoint = this.#attachForRecord(record)?.endpoint();
 		return {
 			cwd: session.cwd,
 			agent: record.agent,
@@ -1602,6 +1619,11 @@ export class VibeSessionRegistry {
 			id: record.id,
 			taskDepth: session.taskDepth ?? 0,
 			detached: true,
+			...(endpoint !== undefined &&
+				endpoint !== null && {
+					attachSocket: endpoint.socketFile,
+					attachTokenFile: endpoint.tokenFile,
+				}),
 			modelOverride: record.modelOverride,
 			modelRole: record.modelRole,
 			parentActiveModelPattern: session.getActiveModelString?.(),

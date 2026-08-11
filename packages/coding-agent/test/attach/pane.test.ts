@@ -1,14 +1,16 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+import { randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
-import { ProcessTerminal, ScrollView, TUI } from "@oh-my-pi/pi-tui";
-import { AttachPane, AttachPaneModel, AttachPaneView } from "../../src/attach/pane";
+import { ProcessTerminal, TUI } from "@oh-my-pi/pi-tui";
+import { AttachPane } from "../../src/attach/pane";
 import {
 	type AttachClientMessage,
 	type AttachEvent,
 	AttachFrameAccumulator,
+	type AttachLease,
 	type AttachMessage,
 	type AttachSessionEntry,
 	type AttachWorkerKey,
@@ -16,6 +18,7 @@ import {
 	encodeAttachMessage,
 } from "../../src/attach/protocol";
 import { initTheme } from "../../src/modes/theme/theme";
+import type { SessionMessageEntry } from "../../src/session/session-entries";
 
 const KEY: AttachWorkerKey = { workerId: "w1", ownerScope: "scope-a" };
 
@@ -33,16 +36,20 @@ function entry(overrides: Partial<AttachSessionEntry> = {}): AttachSessionEntry 
 	};
 }
 
+function messageEntry(id: string, text: string): SessionMessageEntry {
+	return {
+		type: "message",
+		id,
+		parentId: null,
+		timestamp: "2026-08-11T00:00:00.000Z",
+		message: { role: "user", content: text, timestamp: 1 },
+	};
+}
+
 function progress(
 	overrides: Partial<Extract<AttachEvent, { type: "progress" }>> = {},
 ): Extract<AttachEvent, { type: "progress" }> {
 	return { type: "progress", key: KEY, at: 1, outputTail: [], ...overrides };
-}
-
-function result(
-	overrides: Partial<Extract<AttachEvent, { type: "follow_up_result" }>> = {},
-): Extract<AttachEvent, { type: "follow_up_result" }> {
-	return { type: "follow_up_result", key: KEY, ref: "f1", ok: true, payload: "turn-done", ...overrides };
 }
 
 /** Poll `produce` until it yields a non-undefined value.
@@ -64,29 +71,33 @@ async function poll<T>(produce: () => T | undefined, timeoutMs = 2000): Promise<
 
 const TOKEN = "a".repeat(64);
 
+/** Test seam: scripted handling for the client's `view_open` frame. */
+type ViewOpenHandler = (socket: net.Socket, message: Extract<AttachClientMessage, { kind: "view_open" }>) => void;
+
 /**
- * Minimal attach server: auth, snapshot, and scripted follow-up replies.
- * Replies are fully event-driven: the server only ever auto-replies with
- * `hello_ok`/`snapshot`/`pong`/`bye` and `follow_up_accepted`; result and
- * error frames are injected by the test through {@link FakeServer.send} so
- * the state machine is driven deterministically with no timer races.
+ * Minimal attach server: auth, view_open grants (with an optional transcript
+ * epoch), prompt accepted, detach bye. Result and error frames are injected by
+ * the test through {@link FakeServer.send} so the state machine is driven
+ * deterministically with no timer races.
  */
 class FakeServer {
 	readonly socketFile: string;
 	readonly received: AttachClientMessage[] = [];
-	#socket: net.Socket | null = null;
+	lastGrantedLease: AttachLease | null = null;
+	readonly #socket: net.Socket | null = null;
 	readonly #server: net.Server;
 	readonly #accumulator = new AttachFrameAccumulator();
-	readonly #onFollowUp: (socket: net.Socket, message: Extract<AttachClientMessage, { kind: "follow_up" }>) => void;
+	#sockets = new Set<net.Socket>();
+	#epoch = 0;
+	readonly #autoTranscript: boolean;
+	readonly #onViewOpen: ViewOpenHandler | undefined;
 
-	private constructor(
-		socketFile: string,
-		onFollowUp: (socket: net.Socket, message: Extract<AttachClientMessage, { kind: "follow_up" }>) => void,
-	) {
+	private constructor(socketFile: string, options: { autoTranscript?: boolean; onViewOpen?: ViewOpenHandler } = {}) {
 		this.socketFile = socketFile;
-		this.#onFollowUp = onFollowUp;
+		this.#autoTranscript = options.autoTranscript ?? true;
+		this.#onViewOpen = options.onViewOpen;
 		this.#server = net.createServer(socket => {
-			this.#socket = socket;
+			this.#sockets.add(socket);
 			socket.on("data", chunk => {
 				for (const frame of this.#accumulator.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk))) {
 					const message = decodeAttachLine(frame) as AttachClientMessage;
@@ -95,14 +106,15 @@ class FakeServer {
 				}
 			});
 			socket.on("error", () => {});
+			socket.on("close", () => this.#sockets.delete(socket));
 		});
 	}
 
 	static async listen(
 		socketFile: string,
-		onFollowUp: (socket: net.Socket, message: Extract<AttachClientMessage, { kind: "follow_up" }>) => void,
+		options: { autoTranscript?: boolean; onViewOpen?: ViewOpenHandler } = {},
 	): Promise<FakeServer> {
-		const server = new FakeServer(socketFile, onFollowUp);
+		const server = new FakeServer(socketFile, options);
 		const { promise, resolve, reject } = Promise.withResolvers<void>();
 		server.#server.once("error", reject);
 		server.#server.listen(socketFile, () => {
@@ -114,14 +126,15 @@ class FakeServer {
 	}
 
 	async stop(): Promise<void> {
+		for (const socket of this.#sockets) socket.destroy();
 		const { promise, resolve } = Promise.withResolvers<void>();
 		this.#server.close(() => resolve());
 		await promise;
 	}
 
-	/** Inject a server→client frame (results and errors). */
+	/** Inject a server→client frame (results, errors, events, transcript). */
 	send(message: AttachMessage): void {
-		this.#socket?.write(encodeAttachMessage(message));
+		for (const socket of this.#sockets) socket.write(encodeAttachMessage(message));
 	}
 
 	#handle(socket: net.Socket, message: AttachClientMessage): void {
@@ -132,274 +145,96 @@ class FakeServer {
 			case "hello":
 				send({
 					kind: "hello_ok",
-					version: 1,
+					version: 2,
 					server: { pid: process.pid, startedAt: Date.now() },
-					snapshot: { version: 1, generatedAt: Date.now(), sessions: [entry({ state: "idle" })] },
+					snapshot: { version: 2, generatedAt: Date.now(), sessions: [entry({ state: "idle" })] },
 				});
 				return;
-			case "subscribe":
-				send({
-					kind: "snapshot",
-					snapshot: { version: 1, generatedAt: Date.now(), sessions: [entry({ state: "idle" })] },
-				});
+			case "view_open":
+				if (this.#onViewOpen) {
+					this.#onViewOpen(socket, message);
+					return;
+				}
+				this.#grantView(socket, message.key, 1);
 				return;
-			case "follow_up":
-				send({ kind: "event", event: { type: "follow_up_accepted", key: KEY, ref: message.ref } });
-				this.#onFollowUp(socket, message);
+			case "prompt":
+				send({ kind: "prompt_accepted", key: KEY, ref: message.ref, cmdId: message.cmdId });
+				return;
+			case "abort_turn":
+				return;
+			case "detach":
+				send({ kind: "bye", reason: message.reason ?? "detached" });
+				socket.destroy();
 				return;
 			case "ping":
 				send({ kind: "pong", nonce: message.nonce });
 				return;
 			case "bye":
 				send({ kind: "bye" });
-				socket.end();
+				socket.destroy();
 				return;
-			case "abort":
-				return;
+		}
+	}
+
+	#grantView(socket: net.Socket, key: AttachWorkerKey, generation: number): void {
+		const lease: AttachLease = {
+			leaseId: randomUUID(),
+			proof: "f".repeat(64),
+			generation,
+			graceMs: 30_000,
+		};
+		this.lastGrantedLease = lease;
+		this.#epoch += 1;
+		const epoch = this.#epoch;
+		const send = (reply: AttachMessage): void => {
+			socket.write(encodeAttachMessage(reply));
+		};
+		send({
+			kind: "view_open_ok",
+			key,
+			lease,
+			epoch,
+			entry: entry({ state: "idle" }),
+			cwd: "/cwd",
+		});
+		if (this.#autoTranscript) {
+			send({ kind: "transcript_begin", key: KEY, epoch, seq: 1 });
+			send({ kind: "transcript_items", key: KEY, epoch, seq: 2, items: [] });
+			send({ kind: "transcript_end", key: KEY, epoch, seq: 3, watermark: 0 });
 		}
 	}
 }
 
-describe("attach pane model", () => {
-	let model: AttachPaneModel;
+/** Fake TUI surface the pane needs (components never render through it in
+ *  these tests; the presenter only reads terminal columns + imageBudget). */
+function fakeTui(listeners: Array<(data: string) => { consume?: boolean } | undefined>) {
+	return {
+		addInputListener: vi.fn((listener: (data: string) => { consume?: boolean } | undefined) => {
+			listeners.push(listener);
+			return () => {};
+		}),
+		requestRender: vi.fn(),
+		requestComponentRender: vi.fn(),
+		resetDisplay: vi.fn(),
+		showOverlay: vi.fn(),
+		setFocus: vi.fn(),
+		start: vi.fn(),
+		stop: vi.fn(),
+		terminal: { rows: 24, columns: 120 },
+		imageBudget: undefined,
+	} as unknown as TUI;
+}
 
-	beforeEach(() => {
-		model = new AttachPaneModel();
-	});
-
-	it("appends tool/intent/output rows from progress and suppresses empty fields", () => {
-		model.appendProgress(
-			progress({
-				currentTool: "bash",
-				currentToolArgs: "ls -la",
-				lastIntent: "check the files",
-				outputTail: ["out-1"],
-			}),
-		);
-		expect(model.rows.map(row => row.text)).toEqual(["tool: bash ls -la", "intent: check the files", "out-1"]);
-
-		// Empty and whitespace-only fields produce no rows (the rejected
-		// `tool: ` / `intent: ` blank lines) and clear the header tool.
-		model.appendProgress(progress({ currentTool: "", currentToolArgs: "  ", lastIntent: "   ", outputTail: [] }));
-		expect(model.rows).toHaveLength(3);
-		expect(model.rows.some(row => /^\s*(tool|intent):\s*$/.test(row.text))).toBe(false);
-		expect(model.status.currentTool).toBeNull();
-
-		// Omitted fields behave the same as empty ones.
-		model.appendProgress(progress({ outputTail: [] }));
-		expect(model.rows).toHaveLength(3);
-	});
-
-	it("merges overlapping output tails without duplicating rows", () => {
-		model.appendProgress(progress({ outputTail: ["a", "b", "c"] }));
-		model.appendProgress(progress({ outputTail: ["b", "c", "d"] }));
-		model.appendProgress(progress({ outputTail: ["c", "d", "e"] }));
-		const outputRows = model.rows.filter(row => row.kind === "output").map(row => row.text);
-		expect(outputRows).toEqual(["a", "b", "c", "d", "e"]);
-	});
-
-	it("dedupes consecutive identical tool rows across coalesced ticks", () => {
-		model.appendProgress(progress({ currentTool: "bash", currentToolArgs: "ls", outputTail: [] }));
-		model.appendProgress(progress({ currentTool: "bash", currentToolArgs: "ls", outputTail: [] }));
-		expect(model.rows.filter(row => row.kind === "tool")).toHaveLength(1);
-	});
-
-	it("keeps state and entry updates out of the transcript", () => {
-		model.appendFollowUp("continue");
-		expect(model.rows).toHaveLength(1);
-
-		model.applyEntry(entry({ state: "running", summary: "turn 1" }));
-		model.setState("idle");
-		model.appendProgress(progress({ outputTail: [] }));
-
-		expect(model.rows).toHaveLength(1);
-		expect(model.status.state).toBe("idle");
-		expect(model.status.summary).toBe("turn 1");
-	});
-
-	it("bounds the transcript and emits the trim marker exactly once", () => {
-		const bounded = new AttachPaneModel({ maxRows: 3 });
-		for (let i = 0; i < 6; i += 1) bounded.appendFollowUp(`prompt-${i}`);
-		// The marker is pinned at the front; content rows stay at maxRows.
-		expect(bounded.rows).toHaveLength(4);
-		expect(bounded.rows[0]).toEqual({ kind: "output", text: "[trimmed: earlier output dropped]" });
-		expect(bounded.rows.slice(1).map(row => row.text)).toEqual(["prompt-3", "prompt-4", "prompt-5"]);
-		// Still flowing, marker not repeated.
-		bounded.appendFollowUp("prompt-6");
-		expect(bounded.rows.filter(row => row.text.includes("[trimmed"))).toHaveLength(1);
-		expect(bounded.rows.slice(1).map(row => row.text)).toEqual(["prompt-4", "prompt-5", "prompt-6"]);
-	});
-
-	it("tracks follow-up echo, queue, in-flight, and last result in the status", () => {
-		model.appendFollowUp("continue");
-		expect(model.rows[0]).toEqual({ kind: "followup", text: "continue" });
-		model.setQueued(1);
-		model.setInFlight(true);
-		expect(model.status.queued).toBe(1);
-		expect(model.status.inFlight).toBe(true);
-
-		model.appendResult(result());
-		expect(model.status.lastResult).toBe("[result] turn-done");
-		expect(model.status.currentTool).toBeNull();
-		expect(model.rows.at(-1)).toEqual({ kind: "result", text: "[result] turn-done" });
-	});
-
-	it("settleOne decrements outstanding and keeps in-flight while prompts remain", () => {
-		model.setQueued(2);
-		model.setInFlight(true);
-		model.settleOne();
-		expect(model.status.queued).toBe(1);
-		expect(model.status.inFlight).toBe(true);
-		model.settleOne();
-		expect(model.status.queued).toBe(0);
-		expect(model.status.inFlight).toBe(false);
-		// Settling below zero is clamped and never re-arms in-flight.
-		model.settleOne();
-		expect(model.status.queued).toBe(0);
-		expect(model.status.inFlight).toBe(false);
-	});
-
-	it("renders failed results as error rows and sanitizes payloads", () => {
-		model.appendResult(result({ ok: false, error: "worker crashed" }));
-		expect(model.rows.at(-1)).toEqual({ kind: "error", text: "[result] error: worker crashed" });
-
-		model.appendProgress(progress({ currentTool: "bash", currentToolArgs: "ls", outputTail: [] }));
-		model.appendResult(result({ ok: true, payload: "clean\x1b[31mred\x1b[0m" }));
-		expect(model.rows.at(-1)!.text).toBe("[result] cleanred");
-	});
-
-	it("appends removed and bye rows", () => {
-		model.appendRemoved("killed by user");
-		model.appendBye();
-		expect(model.rows.at(-2)).toEqual({ kind: "removed", text: "[removed] killed by user" });
-		expect(model.rows.at(-1)).toEqual({ kind: "bye", text: "[bye]" });
-	});
-});
-
-describe("attach pane view", () => {
-	let model: AttachPaneModel;
-	let ui: { requestRender: ReturnType<typeof vi.fn> };
-
-	beforeEach(async () => {
-		await initTheme();
-		model = new AttachPaneModel();
-		ui = { requestRender: vi.fn() };
-	});
-
-	function makeView(): AttachPaneView {
-		const scroll = new ScrollView([], { height: 10, scrollbar: "auto" });
-		return new AttachPaneView({ ui: ui as unknown as TUI, model, scroll });
-	}
-
-	it("routes empty progress fields to zero rows and requests renders", () => {
-		const view = makeView();
-		view.onProgress(progress({ currentTool: "", lastIntent: "  ", outputTail: [] }));
-		view.onEntry(entry({ state: "running" }));
-		view.onState("idle");
-		expect(model.rows).toHaveLength(0);
-		expect(model.status.state).toBe("idle");
-		expect(ui.requestRender).toHaveBeenCalled();
-	});
-
-	it("renders the submit echo immediately even while a follow-up is in flight", () => {
-		// A prompt queued client-side (another follow-up in flight) produces
-		// no server event until it flushes; the echo must still be painted.
-		const scroll = new ScrollView([], { height: 10, scrollbar: "never" });
-		const view = new AttachPaneView({ ui: ui as unknown as TUI, model, scroll });
-		model.setQueued(1);
-		model.setInFlight(true);
-		view.refresh();
-		model.appendFollowUp("continue");
-		model.setQueued(2);
-		view.refresh();
-		const lines = scroll.render(80);
-		expect(lines.some(line => line.includes("> continue"))).toBe(true);
-	});
-
-	it("keeps in-flight true while prompts remain after a result settles", () => {
-		const view = makeView();
-		model.setQueued(2);
-		model.setInFlight(true);
-		view.onFollowUpAccepted("f1");
-		expect(model.status.inFlight).toBe(true);
-
-		// The transport flushes the second prompt synchronously after the
-		// first result, so the slot stays busy until the count hits zero.
-		view.onResult(result({ ref: "f1" }));
-		expect(model.status.queued).toBe(1);
-		expect(model.status.inFlight).toBe(true);
-		expect(model.status.lastResult).toBe("[result] turn-done");
-
-		view.onFollowUpAccepted("f2");
-		view.onResult(result({ ref: "f2" }));
-		expect(model.status.queued).toBe(0);
-		expect(model.status.inFlight).toBe(false);
-	});
-
-	it("settles one outstanding on a ref-carrying error and keeps the next in flight", () => {
-		const view = makeView();
-		model.setQueued(2);
-		model.setInFlight(true);
-		view.onFollowUpAccepted("f1");
-
-		view.onError({ kind: "error", code: "busy", message: "follow-up already in flight", ref: "f1" });
-		expect(model.status.queued).toBe(1);
-		expect(model.status.inFlight).toBe(true);
-
-		view.onFollowUpAccepted("f2");
-		view.onResult(result({ ref: "f2" }));
-		expect(model.status.queued).toBe(0);
-		expect(model.status.inFlight).toBe(false);
-	});
-
-	it("ignores ref-less errors for settlement but still renders them", () => {
-		const view = makeView();
-		model.setQueued(1);
-		model.setInFlight(true);
-		view.onError({ kind: "error", code: "shutdown", message: "server stopping" });
-		expect(model.status.queued).toBe(1);
-		expect(model.status.inFlight).toBe(true);
-		expect(model.rows.at(-1)).toEqual({ kind: "error", text: "[error] shutdown: server stopping" });
-	});
-
-	it("appends removed rows before the terminal exit", () => {
-		const view = makeView();
-		view.onRemoved("killed by user");
-		expect(model.rows.at(-1)).toEqual({ kind: "removed", text: "[removed] killed by user" });
-		view.onBye();
-		expect(model.rows.at(-1)).toEqual({ kind: "bye", text: "[bye]" });
-	});
-});
-
-describe("attach pane keys", () => {
-	let ui: {
-		addInputListener: ReturnType<typeof vi.fn>;
-		requestRender: ReturnType<typeof vi.fn>;
-		setFocus: ReturnType<typeof vi.fn>;
-		showOverlay: ReturnType<typeof vi.fn>;
-		start: ReturnType<typeof vi.fn>;
-		stop: ReturnType<typeof vi.fn>;
-		terminal: { rows: number };
-	};
+describe("attach pane constructor and keys (thin host)", () => {
 	let listeners: Array<(data: string) => { consume?: boolean } | undefined>;
 	let exits: number[];
+	let ui: ReturnType<typeof fakeTui>;
 
 	beforeEach(async () => {
 		await initTheme();
 		listeners = [];
 		exits = [];
-		ui = {
-			addInputListener: vi.fn(listener => {
-				listeners.push(listener);
-				return () => {};
-			}),
-			requestRender: vi.fn(),
-			setFocus: vi.fn(),
-			showOverlay: vi.fn(),
-			start: vi.fn(),
-			stop: vi.fn(),
-			terminal: { rows: 24 },
-		};
+		ui = fakeTui(listeners);
 	});
 
 	afterEach(() => {
@@ -407,8 +242,8 @@ describe("attach pane keys", () => {
 	});
 
 	function makePane(): AttachPane {
-		const pane = new AttachPane("/tmp/attach.sock", "a".repeat(64), "w1", {
-			ui: ui as unknown as TUI,
+		const pane = new AttachPane("/tmp/attach.sock", TOKEN, "w1", {
+			ui,
 			onExit: code => {
 				exits.push(code);
 			},
@@ -417,14 +252,18 @@ describe("attach pane keys", () => {
 		return pane;
 	}
 
-	it("Ctrl-C clears a non-empty draft without exiting", () => {
+	it("wires the input listener and exposes the composer and initial status", () => {
 		const pane = makePane();
-		pane.getEditor().setText("half-typed");
-		const result = listeners[0]!("\x03");
-		expect(result).toEqual({ consume: true });
-		expect(pane.getEditor().textEquals("")).toBe(true);
-		expect(exits).toEqual([]);
-		expect(ui.requestRender).toHaveBeenCalled();
+		expect(pane.getEditor()).toBeDefined();
+		const status = pane.getStatus();
+		expect(status.connection).toBe("connecting");
+		expect(status.state).toBeNull();
+		expect(status.model).toBeUndefined();
+		expect(status.summary).toBeNull();
+		expect(status.currentTool).toBeNull();
+		expect(status.queued).toBe(0);
+		expect(status.inFlight).toBe(false);
+		expect(status.lastResult).toBeNull();
 	});
 
 	it("Escape clears the draft without exiting", () => {
@@ -436,18 +275,21 @@ describe("attach pane keys", () => {
 		expect(exits).toEqual([]);
 	});
 
-	it("Ctrl-C on an empty draft aborts, sends bye, and exits 0", () => {
-		makePane();
-		const result = listeners[0]!("\x03");
-		expect(result).toEqual({ consume: true });
-		expect(exits).toEqual([0]);
-	});
-
 	it("Escape on an empty draft is a no-op", () => {
 		makePane();
 		const result = listeners[0]!("\x1b");
 		expect(result).toEqual({ consume: true });
 		expect(exits).toEqual([]);
+	});
+
+	it("Ctrl-C clears a non-empty draft without exiting", () => {
+		const pane = makePane();
+		pane.getEditor().setText("half-typed");
+		const result = listeners[0]!("\x03");
+		expect(result).toEqual({ consume: true });
+		expect(pane.getEditor().textEquals("")).toBe(true);
+		expect(exits).toEqual([]);
+		expect(ui.requestRender).toHaveBeenCalled();
 	});
 
 	it("ignores unrelated keys so the editor receives them", () => {
@@ -458,16 +300,20 @@ describe("attach pane keys", () => {
 	});
 });
 
-describe("attach pane follow-up status (end-to-end)", () => {
+describe("attach pane fullscreen host", () => {
 	let dir: string;
+	let listeners: Array<(data: string) => { consume?: boolean } | undefined>;
+	let exits: number[];
+	let ui: ReturnType<typeof fakeTui>;
 	let server: FakeServer;
 	let pane: AttachPane;
-	let ui: { requestRender: ReturnType<typeof vi.fn> };
 
 	beforeEach(async () => {
 		await initTheme();
 		dir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-attach-pane-e2e-"));
-		ui = { requestRender: vi.fn() };
+		listeners = [];
+		exits = [];
+		ui = fakeTui(listeners);
 	});
 
 	afterEach(async () => {
@@ -477,24 +323,16 @@ describe("attach pane follow-up status (end-to-end)", () => {
 		vi.restoreAllMocks();
 	});
 
-	async function startPane(): Promise<AttachPane> {
-		server = await FakeServer.listen(path.join(dir, "attach.sock"), () => {
-			// Accepted replies are auto-sent; results/errors are injected by
-			// the test through FakeServer.send so every transition is driven
-			// deterministically.
-		});
+	async function startPane(
+		options: { autoTranscript?: boolean; onViewOpen?: ViewOpenHandler } = {},
+	): Promise<AttachPane> {
+		server = await FakeServer.listen(path.join(dir, "attach.sock"), options);
 		const created = new AttachPane(server.socketFile, TOKEN, "w1", {
-			ui: {
-				...ui,
-				addInputListener: vi.fn(() => () => {}),
-				setFocus: vi.fn(),
-				showOverlay: vi.fn(),
-				start: vi.fn(),
-				stop: vi.fn(),
-				terminal: { rows: 24 },
-			} as unknown as TUI,
+			ui,
 			pingIntervalMs: 60_000,
-			onExit: () => {},
+			onExit: code => {
+				exits.push(code);
+			},
 		});
 		pane = created;
 		await pane.start();
@@ -506,44 +344,196 @@ describe("attach pane follow-up status (end-to-end)", () => {
 		pane.getEditor().submit();
 	}
 
-	it("two rapid submits settle 2/in-flight → 1/in-flight → 0/idle", async () => {
+	it("shows the fullscreen overlay, focuses the composer, and connects", async () => {
+		await startPane();
+		expect(ui.showOverlay).toHaveBeenCalledTimes(1);
+		const [root, overlayOptions] = (ui.showOverlay as ReturnType<typeof vi.fn>).mock.calls[0]!;
+		expect(root).toBeDefined();
+		expect(overlayOptions).toMatchObject({ fullscreen: true, width: "100%", maxHeight: "100%" });
+		expect(ui.setFocus).toHaveBeenCalledWith(pane.getEditor());
+		expect(ui.start).toHaveBeenCalled();
+		expect(pane.getStatus().connection).toBe("connected");
+	});
+
+	it("submits the composer text as a leased prompt with cmdSeq and ref", async () => {
+		await startPane();
+		submit("continue the task");
+
+		const prompt = await poll(() => server.received.find(message => message.kind === "prompt"));
+		expect(prompt).toMatchObject({
+			kind: "prompt",
+			text: "continue the task",
+			leaseId: server.lastGrantedLease!.leaseId,
+			proof: server.lastGrantedLease!.proof,
+			generation: server.lastGrantedLease!.generation,
+			cmdSeq: 1,
+			ref: "p1",
+		});
+		const status = pane.getStatus();
+		expect(status.queued).toBe(1);
+		expect(status.inFlight).toBe(true);
+	});
+
+	it("rejects owner-only slash commands without sending a prompt", async () => {
+		await startPane();
+		submit("/new");
+
+		// The draft is cleared and no control leaves the wire.
+		expect(pane.getEditor().textEquals("")).toBe(true);
+		await new Promise(resolve => setTimeout(resolve, 100));
+		expect(server.received.some(message => message.kind === "prompt")).toBe(false);
+		expect(ui.requestRender).toHaveBeenCalled();
+	});
+
+	it("tracks queued/in-flight through prompt_accepted and results", async () => {
 		await startPane();
 
 		submit("first");
 		submit("second");
+		await poll(() => (pane.getStatus().queued === 2 ? pane.getStatus() : undefined));
+		expect(pane.getStatus().inFlight).toBe(true);
 
-		const both = await poll(() => (pane.getStatus().queued === 2 ? pane.getStatus() : undefined));
-		expect(both.inFlight).toBe(true);
+		server.send({ kind: "prompt_accepted", key: KEY, ref: "p1", cmdId: "c1" });
+		expect(pane.getStatus().inFlight).toBe(true);
 
-		// First result settles one outstanding; the transport flushes the
+		// The first result settles one outstanding; the transport flushes the
 		// second prompt synchronously, so the slot must stay busy.
-		server.send({ kind: "event", event: result({ ref: "f1" }) });
+		server.send({ kind: "prompt_result", key: KEY, ref: "p1", cmdId: "c1", ok: true, payload: "first-done" });
 		const middle = await poll(() => (pane.getStatus().queued === 1 ? pane.getStatus() : undefined));
 		expect(middle.inFlight).toBe(true);
 
 		// The second prompt reached the wire; settling it drains the queue.
-		await poll(() => server.received.find(message => message.kind === "follow_up" && message.ref === "f2"));
-		server.send({ kind: "event", event: result({ ref: "f2" }) });
+		await poll(() => server.received.find(message => message.kind === "prompt" && message.ref === "p2"));
+		server.send({ kind: "prompt_result", key: KEY, ref: "p2", cmdId: "c2", ok: true, payload: "second-done" });
 		const done = await poll(() => (pane.getStatus().queued === 0 ? pane.getStatus() : undefined));
 		expect(done.inFlight).toBe(false);
+		expect(done.lastResult).toBe("second-done");
 	});
 
-	it("a ref-carrying error settles one outstanding and keeps the next in flight", async () => {
+	it("a ref-carrying rejection settles one outstanding and keeps the next in flight", async () => {
 		await startPane();
 
 		submit("first");
 		submit("second");
 		await poll(() => (pane.getStatus().queued === 2 ? pane.getStatus() : undefined));
 
-		server.send({ kind: "error", code: "busy", message: "external client busy", ref: "f1" });
+		server.send({
+			kind: "control_rejected",
+			key: KEY,
+			cmdId: "c1",
+			ref: "p1",
+			code: "busy",
+			message: "external client busy",
+		});
 		const middle = await poll(() => (pane.getStatus().queued === 1 ? pane.getStatus() : undefined));
 		expect(middle.inFlight).toBe(true);
 
-		await poll(() => server.received.find(message => message.kind === "follow_up" && message.ref === "f2"));
-		server.send({ kind: "event", event: result({ ref: "f2" }) });
+		await poll(() => server.received.find(message => message.kind === "prompt" && message.ref === "p2"));
+		server.send({ kind: "prompt_result", key: KEY, ref: "p2", cmdId: "c2", ok: true, payload: "done" });
 		const done = await poll(() => (pane.getStatus().queued === 0 ? pane.getStatus() : undefined));
 		expect(done.inFlight).toBe(false);
-		expect(pane.getRows().some(row => row.kind === "error")).toBe(true);
+	});
+
+	it("Ctrl-C on an empty draft aborts the turn without exiting", async () => {
+		await startPane();
+		const result = listeners[0]!("\x03");
+		expect(result).toEqual({ consume: true });
+		const frame = await poll(() => server.received.find(message => message.kind === "abort_turn"));
+		expect(frame).toMatchObject({
+			kind: "abort_turn",
+			leaseId: server.lastGrantedLease!.leaseId,
+			proof: server.lastGrantedLease!.proof,
+			generation: server.lastGrantedLease!.generation,
+			cmdSeq: 1,
+		});
+		expect(exits).toEqual([]); // abort never exits
+	});
+
+	it("Ctrl-D detaches: sends detach, exits 0, and restores the terminal", async () => {
+		await startPane();
+		const result = listeners[0]!("\x04");
+		expect(result).toEqual({ consume: true });
+
+		await poll(() => (exits.length > 0 ? exits[0] : undefined));
+		expect(exits[0]).toBe(0);
+		const frame = await poll(() => server.received.find(message => message.kind === "detach"));
+		expect(frame).toMatchObject({
+			kind: "detach",
+			leaseId: server.lastGrantedLease!.leaseId,
+			reason: "user",
+		});
+		await poll(() => ((ui.stop as ReturnType<typeof vi.fn>).mock.calls.length > 0 ? true : undefined));
+	});
+
+	it("renders a live line from progress events", async () => {
+		await startPane();
+		server.send({ kind: "event", event: progress({ currentTool: "bash", currentToolArgs: "ls -la" }) });
+		const text = await poll(() => {
+			const rendered = pane.getTranscriptText();
+			return rendered.includes("bash") ? rendered : undefined;
+		});
+		expect(text).toContain("⚙ bash ls -la");
+	});
+
+	it("renders transcript snapshot frames through the shared presenter", async () => {
+		await startPane({ autoTranscript: false });
+		const epoch = 1;
+		server.send({ kind: "transcript_begin", key: KEY, epoch, seq: 1 });
+		server.send({
+			kind: "transcript_items",
+			key: KEY,
+			epoch,
+			seq: 2,
+			items: [messageEntry("m1", "hello worker pane")],
+		});
+		server.send({ kind: "transcript_end", key: KEY, epoch, seq: 3, watermark: 1, model: "deepseek/ds" });
+
+		const text = await poll(() => {
+			const rendered = pane.getTranscriptText();
+			return rendered.includes("hello worker pane") ? rendered : undefined;
+		});
+		expect(text).toContain("hello worker pane");
+	});
+
+	it("keeps status.model unset after transcript_end (the presenter owns the model label)", async () => {
+		await startPane({ autoTranscript: false });
+		server.send({ kind: "transcript_begin", key: KEY, epoch: 1, seq: 1 });
+		server.send({ kind: "transcript_items", key: KEY, epoch: 1, seq: 2, items: [] });
+		server.send({ kind: "transcript_end", key: KEY, epoch: 1, seq: 3, watermark: 0, model: "deepseek/ds" });
+		await poll(() => {
+			const status = pane.getStatus();
+			return status.connection === "connected" && status.queued === 0 ? status : undefined;
+		});
+		// The pane's status descriptor is fed by entry/state/prompt events only;
+		// transcript_end model metadata goes to the shared presenter.
+		expect(pane.getStatus().model).toBeUndefined();
+	});
+
+	it("exits 0 and restores the terminal when the worker is removed", async () => {
+		await startPane();
+		server.send({ kind: "event", event: { type: "removed", key: KEY, reason: "killed by user" } });
+		await poll(() => (exits.length > 0 ? exits[0] : undefined));
+		expect(exits[0]).toBe(0);
+		await poll(() => ((ui.stop as ReturnType<typeof vi.fn>).mock.calls.length > 0 ? true : undefined));
+	});
+
+	it("exits 1 when view_open is rejected with lease_busy", async () => {
+		await startPane({
+			onViewOpen: (socket, message) => {
+				socket.write(
+					encodeAttachMessage({
+						kind: "view_open_rejected",
+						key: message.key,
+						code: "lease_busy",
+						message: "controlled by another pane client",
+						holder: { generation: 1, expiresInMs: 30_000 },
+					}),
+				);
+			},
+		});
+		await poll(() => (exits.length > 0 ? exits[0] : undefined));
+		expect(exits[0]).toBe(1);
+		await poll(() => ((ui.stop as ReturnType<typeof vi.fn>).mock.calls.length > 0 ? true : undefined));
 	});
 });
 
@@ -567,9 +557,7 @@ describe("attach pane focus (real TUI)", () => {
 	});
 
 	it("focuses the composer inside the fullscreen overlay and typing reaches the wire", async () => {
-		server = await FakeServer.listen(path.join(dir, "attach.sock"), () => {
-			// Accepted replies are auto-sent; results are injected by the test.
-		});
+		server = await FakeServer.listen(path.join(dir, "attach.sock"));
 		pane = new AttachPane(server.socketFile, TOKEN, "w1", {
 			ui,
 			pingIntervalMs: 60_000,
@@ -591,9 +579,9 @@ describe("attach pane focus (real TUI)", () => {
 		focused.handleInput!("y");
 		expect(pane.getEditor().getText()).toBe("xy");
 
-		// Submitting through the editor reaches the worker wire.
+		// Submitting through the editor reaches the worker wire as a prompt.
 		focused.handleInput!("\r");
-		const followUp = await poll(() => server.received.find(message => message.kind === "follow_up"));
-		expect(followUp).toMatchObject({ kind: "follow_up", payload: "xy" });
+		const prompt = await poll(() => server.received.find(message => message.kind === "prompt"));
+		expect(prompt).toMatchObject({ kind: "prompt", text: "xy" });
 	});
 });

@@ -1,261 +1,91 @@
 /**
- * attach/pane.ts — OMO Slim-style fullscreen attach pane.
+ * attach/pane.ts — OMO Slim-style fullscreen attach pane (thin shared-surface host).
  *
- * Three layers, deliberately split so the transcript logic is pure and the
- * TUI surface stays thin:
+ * The pane is a SEPARATE PROCESS from the worker's parent: it owns exactly one
+ * `TUI(new ProcessTerminal())` (alternate screen, raw mode, resize, signals,
+ * restoration) and renders the worker's live transcript through the SAME
+ * process-agnostic {@link SessionTranscriptPresenter} the interactive mode
+ * uses — message/thinking/tool blocks, model tracking, expansion. The server
+ * streams semantic transcript frames (snapshot epoch + live appends); the
+ * pane never merges raw output bytes.
  *
- * - {@link AttachPaneModel} — pure transcript/status model with no I/O. It
- *   owns row bounding, empty-field suppression, consecutive-duplicate
- *   suppression, and the longest-suffix-overlap merge for progress tails.
- * - {@link AttachPaneView} — {@link AttachView} adapter: mutates the model on
- *   every client callback, repaints the scroll view, and requests a render.
- * - {@link AttachPane} — owns the `TUI(new ProcessTerminal())` composition
- *   (header + scrollable transcript + focused editor composer), the key
- *   handling (Ctrl-C draft-clear / abort+bye, Escape draft-clear, Enter
- *   submit with the editor's built-in multiline behavior), and the teardown
- *   path. Presenting the pane as a fullscreen overlay borrows the alternate
- *   screen buffer on first paint, so the shell launch command disappears
- *   behind the pane and the terminal is restored cleanly on exit.
- *
- * The attach protocol, server, registry, and vibe bridge are untouched: this
- * file only consumes the existing {@link AttachClient} transport seam.
+ * Controls are leased intents: Enter submits a prompt (queued in order while
+ * one is in flight), Ctrl-C on an empty draft aborts the current turn (the
+ * pane stays attached), Ctrl-D detaches (releases the lease and restores the
+ * terminal without killing the worker), Escape clears the draft. Owner-only
+ * session commands (leading `/`) are rejected with a status notice — they
+ * belong to the parent session, not the worker pane.
  */
 
-import type { Component, OverlayFocusOwner } from "@oh-my-pi/pi-tui";
 import {
+	type Component,
 	Container,
 	Editor,
 	matchesKey,
+	type OverlayFocusOwner,
 	ProcessTerminal,
 	ScrollView,
 	Text,
 	TUI,
-	truncateToWidth,
 	visibleWidth,
 } from "@oh-my-pi/pi-tui";
-import { getEditorTheme, theme } from "../modes/theme/theme";
-import { AttachClient, type AttachView, type AttachViewConnection, sanitizeAttachLine, TRIM_MARKER } from "./client";
-import type { AttachError, AttachEvent, AttachSessionEntry, AttachWorkerState } from "./protocol";
+import {
+	SessionTranscriptPresenter as Presenter,
+	type SessionTranscriptPresenter,
+} from "../modes/presentation/shared-transcript";
+import { getEditorTheme, type ThemeColor, theme } from "../modes/theme/theme";
+import { truncateToWidth } from "../tools/render-utils";
+import { AttachClient, type AttachView, type AttachViewConnection, type AttachViewOpenOutcome } from "./client";
+import type {
+	AttachControlRejected,
+	AttachError,
+	AttachEvent,
+	AttachPromptResult,
+	AttachSessionEntry,
+	AttachTranscriptAppend,
+	AttachTranscriptBegin,
+	AttachTranscriptEnd,
+	AttachTranscriptItems,
+	AttachTranscriptReset,
+	AttachWorkerState,
+} from "./protocol";
 
 /** Rows the header and composer chrome reserve; the transcript gets the rest. */
-const HEADER_ROWS = 1;
+const HEADER_ROWS = 2;
 /** Composer max height (top status border + up to two content rows + bottom border). */
 const EDITOR_MAX_HEIGHT = 4;
-/** Default transcript row bound. */
-const DEFAULT_MAX_ROWS = 500;
-/** Default cap for a single rendered transcript row. */
-const DEFAULT_MAX_LINE_LENGTH = 200;
 
 export type { AttachViewConnection };
 
-export type AttachPaneRowKind = "followup" | "tool" | "intent" | "output" | "result" | "error" | "removed" | "bye";
-
-/** One bounded, sanitized transcript row. */
-export interface AttachPaneRow {
-	readonly kind: AttachPaneRowKind;
-	readonly text: string;
-}
-
 /** Compact status descriptor rendered in the composer's top border. */
 export interface AttachPaneStatus {
-	readonly connection: AttachViewConnection;
-	readonly state: AttachWorkerState | null;
-	readonly summary: string | null;
-	readonly currentTool: string | null;
-	readonly queued: number;
-	readonly inFlight: boolean;
-	readonly lastResult: string | null;
+	connection: AttachViewConnection;
+	state: AttachWorkerState | null;
+	model: string | undefined;
+	summary: string | null;
+	currentTool: string | null;
+	queued: number;
+	inFlight: boolean;
+	lastResult: string | null;
 }
 
-export interface AttachPaneModelOptions {
-	/** Maximum transcript rows kept; older rows are dropped with a trim marker. Defaults to 500. */
-	readonly maxRows?: number;
-	/** Maximum characters per rendered row. Defaults to 200. */
-	readonly maxLineLength?: number;
+const INITIAL_STATUS: AttachPaneStatus = {
+	connection: "connecting",
+	state: null,
+	model: undefined,
+	summary: null,
+	currentTool: null,
+	queued: 0,
+	inFlight: false,
+	lastResult: null,
+};
+
+function themeFg(color: ThemeColor, text: string): string {
+	return typeof theme === "undefined" ? text : theme.fg(color, text);
 }
 
-/**
- * Pure transcript + status model for the attach pane. No TUI imports, no I/O:
- * every observable behavior (empty suppression, tail-overlap dedupe, state
- * bursts producing no rows, row bounding) is unit-testable in isolation.
- */
-export class AttachPaneModel {
-	#rows: AttachPaneRow[] = [];
-	#trimMarkerPrinted = false;
-	/** Last progress `outputTail` seen, for longest-suffix-overlap merging. */
-	#lastOutputTail: readonly string[] = [];
-	#status: AttachPaneStatus = {
-		connection: "connecting",
-		state: null,
-		summary: null,
-		currentTool: null,
-		queued: 0,
-		inFlight: false,
-		lastResult: null,
-	};
-	readonly #maxRows: number;
-	readonly #maxLineLength: number;
-
-	constructor(options: AttachPaneModelOptions = {}) {
-		this.#maxRows = Math.max(1, options.maxRows ?? DEFAULT_MAX_ROWS);
-		this.#maxLineLength = Math.max(1, options.maxLineLength ?? DEFAULT_MAX_LINE_LENGTH);
-	}
-
-	get rows(): readonly AttachPaneRow[] {
-		return this.#rows;
-	}
-
-	get status(): AttachPaneStatus {
-		return this.#status;
-	}
-
-	setConnection(connection: AttachViewConnection): void {
-		this.#status = { ...this.#status, connection };
-	}
-
-	/** Registry entry changes (snapshot / registered / updated) affect the header only. */
-	applyEntry(entry: AttachSessionEntry): void {
-		this.#status = { ...this.#status, state: entry.state, summary: entry.summary };
-	}
-
-	/** Lifecycle state events affect the header only — never the transcript. */
-	setState(state: AttachWorkerState): void {
-		this.#status = { ...this.#status, state };
-	}
-
-	setQueued(queued: number): void {
-		this.#status = { ...this.#status, queued: Math.max(0, queued) };
-	}
-
-	setInFlight(inFlight: boolean): void {
-		this.#status = { ...this.#status, inFlight };
-	}
-
-	/**
-	 * One outstanding follow-up settled (a result, or a ref-carrying error).
-	 * Decrements the outstanding count and keeps `inFlight` true iff another
-	 * prompt is still outstanding — the transport synchronously flushes the
-	 * next queued prompt when a follow-up settles, so the slot is busy again
-	 * exactly when the count is still positive.
-	 */
-	settleOne(): void {
-		const queued = Math.max(0, this.#status.queued - 1);
-		this.#status = { ...this.#status, queued, inFlight: queued > 0 };
-	}
-
-	/** Immediate echo of a composer submit. */
-	appendFollowUp(payload: string): void {
-		const text = sanitizeAttachLine(payload, this.#maxLineLength);
-		if (text.length === 0) return;
-		this.#appendRow({ kind: "followup", text });
-	}
-
-	/**
-	 * Apply one coalesced progress event: a tool row only when the tool label
-	 * is non-empty, an intent row only when the intent is non-empty, and the
-	 * output tail merged against the previous tail by longest suffix/prefix
-	 * overlap so repeated tails never duplicate rows. `state`/`updated`
-	 * bursts never reach this method — they are header-only.
-	 */
-	appendProgress(event: Extract<AttachEvent, { type: "progress" }>): void {
-		if (event.currentTool !== undefined && event.currentTool.trim().length > 0) {
-			const args =
-				event.currentToolArgs !== undefined && event.currentToolArgs.trim().length > 0
-					? ` ${event.currentToolArgs}`
-					: "";
-			const text = sanitizeAttachLine(`tool: ${event.currentTool}${args}`, this.#maxLineLength);
-			if (text.length > 0) this.#appendRow({ kind: "tool", text });
-		}
-		if (event.lastIntent !== undefined && event.lastIntent.trim().length > 0) {
-			const text = sanitizeAttachLine(`intent: ${event.lastIntent}`, this.#maxLineLength);
-			if (text.length > 0) this.#appendRow({ kind: "intent", text });
-		}
-		this.#mergeOutputTail(event.outputTail);
-		this.#status = {
-			...this.#status,
-			currentTool:
-				event.currentTool !== undefined && event.currentTool.trim().length > 0
-					? sanitizeAttachLine(event.currentTool, this.#maxLineLength)
-					: null,
-		};
-	}
-
-	appendResult(event: Extract<AttachEvent, { type: "follow_up_result" }>): void {
-		const text = event.ok
-			? event.payload === undefined
-				? "[result] ok"
-				: `[result] ${typeof event.payload === "string" ? event.payload : JSON.stringify(event.payload)}`
-			: `[result] error: ${event.error ?? "failed"}`;
-		const sanitized = sanitizeAttachLine(text, this.#maxLineLength);
-		if (sanitized.length === 0) return;
-		this.#appendRow({ kind: event.ok ? "result" : "error", text: sanitized });
-		// The turn settled: no tool is running anymore, and the result is the
-		// latest outcome for the header.
-		this.#status = { ...this.#status, lastResult: sanitized, currentTool: null };
-	}
-
-	appendError(error: AttachError): void {
-		const text = sanitizeAttachLine(`[error] ${error.code}: ${error.message}`, this.#maxLineLength);
-		if (text.length === 0) return;
-		this.#appendRow({ kind: "error", text });
-	}
-
-	appendRemoved(reason: string): void {
-		const text = sanitizeAttachLine(`[removed] ${reason}`, this.#maxLineLength);
-		if (text.length === 0) return;
-		this.#appendRow({ kind: "removed", text });
-	}
-
-	appendBye(): void {
-		this.#appendRow({ kind: "bye", text: "[bye]" });
-	}
-
-	/** Append a row, dropping consecutive duplicates and bounding the window. */
-	#appendRow(row: AttachPaneRow): void {
-		const previous = this.#rows[this.#rows.length - 1];
-		if (previous !== undefined && previous.kind === row.kind && previous.text === row.text) return;
-		this.#rows.push(row);
-		// The trim marker, once emitted, is pinned at the front; only content
-		// rows count against the bound.
-		const markerOffset = this.#trimMarkerPrinted ? 1 : 0;
-		if (this.#rows.length - markerOffset > this.#maxRows) {
-			this.#rows.splice(markerOffset, this.#rows.length - markerOffset - this.#maxRows);
-			if (!this.#trimMarkerPrinted) {
-				this.#trimMarkerPrinted = true;
-				this.#rows.unshift({ kind: "output", text: TRIM_MARKER });
-			}
-		}
-	}
-
-	/**
-	 * Append only the part of `tail` not already covered by the previous tail:
-	 * `k` is the longest suffix of the previous tail that is also a prefix of
-	 * the new tail, and `tail.slice(k)` is appended.
-	 */
-	#mergeOutputTail(tail: readonly string[]): void {
-		const previous = this.#lastOutputTail;
-		let overlap = 0;
-		const max = Math.min(previous.length, tail.length);
-		for (let k = max; k > 0; k -= 1) {
-			let matches = true;
-			for (let i = 0; i < k; i += 1) {
-				if (previous[previous.length - k + i] !== tail[i]) {
-					matches = false;
-					break;
-				}
-			}
-			if (matches) {
-				overlap = k;
-				break;
-			}
-		}
-		for (let i = overlap; i < tail.length; i += 1) {
-			const text = sanitizeAttachLine(tail[i]!, this.#maxLineLength);
-			if (text.length === 0) continue;
-			this.#appendRow({ kind: "output", text });
-		}
-		this.#lastOutputTail = [...tail];
-	}
+function themeBold(text: string): string {
+	return typeof theme === "undefined" ? text : theme.bold(text);
 }
 
 /** ScrollView wrapper that refits its height to the terminal on every render. */
@@ -301,122 +131,6 @@ class AttachPaneRoot extends Container implements OverlayFocusOwner {
 	}
 }
 
-export interface AttachPaneViewOptions {
-	readonly ui: TUI;
-	readonly model: AttachPaneModel;
-	readonly scroll: ScrollView;
-}
-
-/**
- * {@link AttachView} adapter for the pane: mutates the pure model and repaints
- * the scroll view (sticking to the bottom unless the user scrolled up), then
- * requests a TUI render.
- */
-export class AttachPaneView implements AttachView {
-	readonly #ui: TUI;
-	readonly #model: AttachPaneModel;
-	readonly #scroll: ScrollView;
-	/** Ref of the follow-up the transport is currently working on, if known. */
-	#inFlightRef: string | null = null;
-
-	constructor(options: AttachPaneViewOptions) {
-		this.#ui = options.ui;
-		this.#model = options.model;
-		this.#scroll = options.scroll;
-	}
-
-	onConnection(connection: AttachViewConnection): void {
-		this.#model.setConnection(connection);
-		this.refresh();
-	}
-
-	onEntry(entry: AttachSessionEntry): void {
-		this.#model.applyEntry(entry);
-		this.refresh();
-	}
-
-	onState(state: AttachWorkerState): void {
-		this.#model.setState(state);
-		this.refresh();
-	}
-
-	onProgress(event: Extract<AttachEvent, { type: "progress" }>): void {
-		this.#model.appendProgress(event);
-		this.refresh();
-	}
-
-	onFollowUpAccepted(ref: string): void {
-		// The server confirmed it is working on this follow-up; with the
-		// client-side queue the transport only sends when the slot is free,
-		// so this asserts the in-flight flag rather than toggling it.
-		this.#inFlightRef = ref;
-		this.#model.setInFlight(true);
-		this.refresh();
-	}
-
-	onResult(event: Extract<AttachEvent, { type: "follow_up_result" }>): void {
-		this.#model.appendResult(event);
-		this.#inFlightRef = null;
-		// The transport flushes the next queued prompt synchronously after a
-		// result, so the slot is still busy when more prompts are outstanding.
-		this.#model.settleOne();
-		this.refresh();
-	}
-
-	onError(error: AttachError): void {
-		this.#model.appendError(error);
-		// Only follow-up errors carry a ref (server.ts echoes the offending
-		// follow_up ref); such an error settles that outstanding prompt and
-		// the transport immediately flushes the next queued one.
-		if (error.ref !== undefined && (this.#inFlightRef === null || error.ref === this.#inFlightRef)) {
-			this.#inFlightRef = null;
-			this.#model.settleOne();
-		}
-		this.refresh();
-	}
-
-	onRemoved(reason: string): void {
-		this.#model.appendRemoved(reason);
-		this.refresh();
-	}
-
-	onBye(): void {
-		this.#model.appendBye();
-		this.refresh();
-	}
-
-	/** Rebuild the scroll lines from the model and repaint. */
-	refresh(): void {
-		const wasAtBottom = this.#scroll.getScrollOffset() >= this.#scroll.getMaxScrollOffset();
-		this.#scroll.setLines(this.#model.rows.map(row => this.#styleRow(row)));
-		if (wasAtBottom) this.#scroll.scrollToBottom();
-		this.#ui.requestRender();
-	}
-
-	#styleRow(row: AttachPaneRow): string {
-		const activeTheme = typeof theme === "undefined" ? undefined : theme;
-		if (activeTheme === undefined) return row.text;
-		switch (row.kind) {
-			case "followup":
-				return activeTheme.fg("userMessageText", `> ${row.text}`);
-			case "tool":
-				return activeTheme.fg("accent", row.text);
-			case "intent":
-				return activeTheme.fg("dim", row.text);
-			case "result":
-				return activeTheme.fg("success", row.text);
-			case "error":
-				return activeTheme.fg("error", row.text);
-			case "removed":
-				return activeTheme.fg("warning", row.text);
-			case "bye":
-				return activeTheme.fg("dim", row.text);
-			case "output":
-				return row.text;
-		}
-	}
-}
-
 export interface AttachPaneOptions {
 	/** Invoked with the exit code when the pane terminates. */
 	readonly onExit?: (code: number) => void;
@@ -426,50 +140,66 @@ export interface AttachPaneOptions {
 	readonly pingIntervalMs?: number;
 	/** Reconnect delays in milliseconds (see {@link AttachClientOptions.backoffMs}). */
 	readonly backoffMs?: readonly number[];
-	/** Maximum transcript rows kept. Defaults to 500. */
-	readonly maxRows?: number;
-	/** Maximum characters per rendered row. Defaults to 200. */
-	readonly maxLineLength?: number;
 }
 
 /**
- * Fullscreen attach pane: alternate-screen TUI with a clean header, a bounded
- * scrollable transcript, and a focused editor composer. Enter submits, the
- * editor's built-in Shift/Ctrl+Enter inserts newlines, Escape clears the
- * draft, and Ctrl-C clears the draft or (on an empty draft) aborts the
- * in-flight follow-up, sends bye, and exits 0.
+ * Fullscreen attach pane: alternate-screen TUI with a rich transcript
+ * (message/thinking/tool blocks via the shared presenter), a live streaming
+ * line, a focused editor composer, and lease-validated controls.
  */
 export class AttachPane {
 	readonly #client: AttachClient;
 	readonly #ui: TUI;
-	readonly #model: AttachPaneModel;
-	readonly #view: AttachPaneView;
+	readonly #view: PaneViewAdapter;
 	readonly #editor: Editor;
 	readonly #root: Component;
 	readonly #onExit: ((code: number) => void) | undefined;
+	#presenter: SessionTranscriptPresenter | null = null;
+	#status: AttachPaneStatus = INITIAL_STATUS;
+	#notice: string | undefined;
 	#started = false;
 	#finished = false;
+	#finishResolve: (() => void) | undefined;
+	#finishPromise: Promise<void> = new Promise<void>(resolve => {
+		this.#finishResolve = resolve;
+	});
 
 	constructor(socketPath: string, token: string, workerId: string, options: AttachPaneOptions = {}) {
-		this.#model = new AttachPaneModel({ maxRows: options.maxRows, maxLineLength: options.maxLineLength });
 		this.#ui = options.ui ?? new TUI(new ProcessTerminal());
 		this.#onExit = options.onExit;
 
 		const header = new Text(`attach ${workerId}`, 1, 0);
-		header.setStyleFn(text => {
-			const activeTheme = typeof theme === "undefined" ? undefined : theme;
-			return activeTheme === undefined ? text : activeTheme.bold(text);
-		});
+		header.setStyleFn(text => themeBold(text));
 
 		const scroll = new ScrollView([], { height: 1, scrollbar: "auto" });
-		this.#view = new AttachPaneView({ ui: this.#ui, model: this.#model, scroll });
-
 		const editor = new Editor(getEditorTheme());
 		editor.setMaxHeight(EDITOR_MAX_HEIGHT);
 		editor.setTopBorderProvider(availableWidth => this.#statusBorder(availableWidth));
 		editor.onSubmit = text => this.#submit(text);
 		this.#editor = editor;
 
+		this.#view = new PaneViewAdapter({
+			ui: this.#ui,
+			scroll,
+			createPresenter: cwd =>
+				new Presenter({
+					ui: this.#ui,
+					cwd: cwd || "",
+					requestRender: () => this.#ui.requestRender(),
+				}),
+			getPresenter: () => this.#presenter,
+			setPresenter: presenter => {
+				this.#presenter = presenter;
+			},
+			onStatus: status => {
+				this.#status = status;
+			},
+			onNotice: notice => {
+				this.#notice = notice;
+				this.#ui.requestRender();
+			},
+			getStatus: () => this.#status,
+		});
 		this.#client = new AttachClient(socketPath, token, workerId, {
 			enableSignals: false,
 			readline: false,
@@ -487,7 +217,7 @@ export class AttachPane {
 			new HeightAdjustedScroll(
 				scroll,
 				() => this.#ui.terminal.rows,
-				() => HEADER_ROWS + EDITOR_MAX_HEIGHT,
+				() => HEADER_ROWS + EDITOR_MAX_HEIGHT + (this.#notice ? 1 : 0),
 			),
 		);
 		root.addChild(editor);
@@ -501,18 +231,25 @@ export class AttachPane {
 
 	/** Current status descriptor (test seam). */
 	getStatus(): AttachPaneStatus {
-		return this.#model.status;
+		return this.#status;
 	}
 
-	/** Current transcript rows (test seam). */
-	getRows(): readonly AttachPaneRow[] {
-		return this.#model.rows;
+	/** Current rendered transcript text (test seam; presenter rows + live line). */
+	getTranscriptText(): string {
+		const presenter = this.#presenter;
+		const lines: string[] = [];
+		if (presenter && !presenter.isEmpty) {
+			lines.push(...presenter.container.render(120));
+		}
+		if (this.#view.liveLine !== undefined) lines.push(this.#view.liveLine);
+		return lines.join("\n");
 	}
 
 	/**
 	 * Present the pane (alternate screen on first paint) and connect to the
-	 * attach server. Resolves once the handshake and subscribe snapshot have
-	 * completed (or the pane exits early).
+	 * attach server. Resolves once the view_open has settled (or the pane
+	 * exits early). Hosts that must stay alive for the pane's whole life
+	 * await {@link finished} afterwards.
 	 */
 	async start(): Promise<void> {
 		if (this.#started) return;
@@ -530,19 +267,25 @@ export class AttachPane {
 		await this.#client.start();
 	}
 
+	/** Resolves when the pane finishes (client exit / detach / removal). */
+	finished(): Promise<void> {
+		return this.#finishPromise;
+	}
+
 	/** Shut the transport down without invoking `onExit` (test/cleanup seam). */
 	stop(): void {
 		this.#client.stop();
 		this.#ui.stop();
+		this.#finishResolve?.();
 	}
 
 	/** Build the composer's top-border status line, truncated to fit. */
 	#statusBorder(availableWidth: number): { content: string; width: number } | undefined {
-		const activeTheme = typeof theme === "undefined" ? undefined : theme;
-		const status = this.#model.status;
+		const status = this.#status;
 		const parts: string[] = [];
 		const state = status.state ?? (status.connection === "connected" ? "working" : status.connection);
-		parts.push(activeTheme === undefined ? state : activeTheme.fg("accent", state));
+		parts.push(themeFg("accent", state));
+		if (status.model !== undefined) parts.push(` ${themeFg("muted", status.model)}`);
 		if (status.summary !== null && status.summary.length > 0) {
 			parts.push(` ${status.summary}`);
 		}
@@ -565,26 +308,41 @@ export class AttachPane {
 	#submit(text: string): void {
 		const trimmed = text.trim();
 		if (trimmed.length === 0) return;
-		this.#model.appendFollowUp(trimmed);
-		this.#model.setQueued(this.#model.status.queued + 1);
-		this.#model.setInFlight(true);
-		this.#client.sendFollowUp(trimmed);
-		// Rebuild the scroll lines NOW: when the prompt is queued client-side
-		// (another follow-up in flight) no server event arrives until it
-		// flushes, so the immediate user echo must be painted here, not in a
-		// view callback.
-		this.#view.refresh();
+		if (trimmed.startsWith("/")) {
+			// Owner-only session commands (/new, /resume, /model, …) belong to
+			// the parent session; the worker pane cannot apply them.
+			this.#notice = "owner-only session commands are not supported in a worker pane";
+			this.#editor.setText("");
+			this.#ui.requestRender();
+			return;
+		}
+		this.#notice = undefined;
+		this.#status = {
+			...this.#status,
+			queued: this.#status.queued + 1,
+			inFlight: true,
+		};
+		this.#client.sendPrompt(trimmed);
+		this.#ui.requestRender();
 	}
 
 	/** Composer keys the TUI input listener intercepts before the editor. */
 	#handleKey(data: string): { consume: boolean } | undefined {
 		if (matchesKey(data, "ctrl+c")) {
 			if (this.#editor.textEquals("")) {
-				this.#client.interrupt();
+				// Abort-current-turn: the pane stays attached.
+				this.#notice = "aborting current turn…";
+				this.#client.abortTurn();
 			} else {
 				this.#editor.setText("");
-				this.#ui.requestRender();
 			}
+			this.#ui.requestRender();
+			return { consume: true };
+		}
+		if (matchesKey(data, "ctrl+d")) {
+			// Detach: release the lease and restore the terminal. The worker
+			// keeps running.
+			this.#client.detach("user");
 			return { consume: true };
 		}
 		if (matchesKey(data, "escape")) {
@@ -602,7 +360,223 @@ export class AttachPane {
 		if (this.#finished) return;
 		this.#finished = true;
 		this.#ui.requestRender(true);
-		setImmediate(() => this.#ui.stop());
+		setImmediate(() => {
+			this.#ui.stop();
+			// Resolve only after the terminal is restored so a host that
+			// process.exits on `finished()` never skips the restore.
+			this.#finishResolve?.();
+		});
 		this.#onExit?.(code);
+	}
+}
+
+/** Renders a live streaming line below the committed transcript. */
+function liveLineFor(event: Extract<AttachEvent, { type: "progress" }>): string | undefined {
+	if (event.currentTool !== undefined && event.currentTool.trim().length > 0) {
+		const args =
+			event.currentToolArgs !== undefined && event.currentToolArgs.trim().length > 0
+				? ` ${event.currentToolArgs}`
+				: "";
+		return `⚙ ${event.currentTool}${args}`;
+	}
+	if (event.lastIntent !== undefined && event.lastIntent.trim().length > 0) {
+		return event.lastIntent;
+	}
+	const tail = event.outputTail;
+	for (let i = tail.length - 1; i >= 0; i -= 1) {
+		const line = tail[i]!.trim();
+		if (line.length > 0) return line;
+	}
+	return undefined;
+}
+
+interface PaneViewAdapterOptions {
+	ui: TUI;
+	scroll: ScrollView;
+	/** Create the shared transcript presenter for a view (cwd known). */
+	createPresenter: (cwd: string) => SessionTranscriptPresenter;
+	getPresenter: () => SessionTranscriptPresenter | null;
+	setPresenter: (presenter: SessionTranscriptPresenter | null) => void;
+	onStatus: (status: AttachPaneStatus) => void;
+	onNotice: (notice: string | undefined) => void;
+	getStatus: () => AttachPaneStatus;
+}
+
+/**
+ * {@link AttachView} adapter for the pane: applies transcript frames to the
+ * shared presenter and repaints the scroll view (sticking to the bottom
+ * unless the user scrolled up), then requests a TUI render.
+ */
+class PaneViewAdapter implements AttachView {
+	readonly #ui: TUI;
+	readonly #scroll: ScrollView;
+	readonly #createPresenter: (cwd: string) => SessionTranscriptPresenter;
+	readonly #getPresenter: () => SessionTranscriptPresenter | null;
+	readonly #setPresenter: (presenter: SessionTranscriptPresenter | null) => void;
+	readonly #onStatus: (status: AttachPaneStatus) => void;
+	readonly #onNotice: (notice: string | undefined) => void;
+	readonly #getStatus: () => AttachPaneStatus;
+	#liveLineInternal: string | undefined;
+
+	constructor(options: PaneViewAdapterOptions) {
+		this.#ui = options.ui;
+		this.#scroll = options.scroll;
+		this.#createPresenter = options.createPresenter;
+		this.#getPresenter = options.getPresenter;
+		this.#setPresenter = options.setPresenter;
+		this.#onStatus = options.onStatus;
+		this.#onNotice = options.onNotice;
+		this.#getStatus = options.getStatus;
+	}
+
+	get liveLine(): string | undefined {
+		return this.#liveLineInternal;
+	}
+
+	onConnection(connection: AttachViewConnection): void {
+		this.#patch({ connection });
+	}
+
+	onEntry(entry: AttachSessionEntry): void {
+		this.#patch({ state: entry.state, summary: entry.summary });
+	}
+
+	onState(state: AttachWorkerState): void {
+		this.#patch({ state });
+	}
+
+	onViewOpen(outcome: AttachViewOpenOutcome): void {
+		if (!outcome.ok) {
+			this.#onNotice(`view rejected: ${outcome.rejection.code}: ${outcome.rejection.message}`);
+			return;
+		}
+		// A fresh view epoch: (re)create the presenter for the worker's cwd
+		// and reset it — the incoming begin/items/end frames rebuild it.
+		const presenter = this.#createPresenter(outcome.cwd ?? "");
+		this.#setPresenter(presenter);
+		this.#liveLineInternal = undefined;
+		this.#patch({ model: undefined, state: outcome.entry.state, summary: outcome.entry.summary });
+		this.refresh();
+	}
+
+	onTranscriptBegin(_frame: AttachTranscriptBegin): void {
+		const presenter = this.#getPresenter();
+		if (presenter) {
+			presenter.setModel(undefined);
+			presenter.reset();
+		}
+		this.refresh();
+	}
+
+	onTranscriptItems(frame: AttachTranscriptItems): void {
+		const presenter = this.#getPresenter();
+		if (presenter) presenter.append(frame.items);
+		this.refresh();
+	}
+
+	onTranscriptEnd(frame: AttachTranscriptEnd): void {
+		const presenter = this.#getPresenter();
+		if (presenter) presenter.setModel(frame.model);
+		// A committed message replaced the streaming tail.
+		this.#liveLineInternal = undefined;
+		this.refresh();
+	}
+
+	onTranscriptAppend(frame: AttachTranscriptAppend): void {
+		const presenter = this.#getPresenter();
+		if (presenter) presenter.append(frame.items);
+		this.#liveLineInternal = undefined;
+		this.refresh();
+	}
+
+	onTranscriptReset(_frame: AttachTranscriptReset): void {
+		const presenter = this.#getPresenter();
+		if (presenter) {
+			presenter.setModel(undefined);
+			presenter.reset();
+		}
+		this.#liveLineInternal = undefined;
+		this.refresh();
+	}
+
+	onProgress(event: Extract<AttachEvent, { type: "progress" }>): void {
+		const line = liveLineFor(event);
+		if (line !== undefined) this.#liveLineInternal = line;
+		this.#patch({
+			currentTool: event.currentTool !== undefined && event.currentTool.trim().length > 0 ? event.currentTool : null,
+		});
+		this.refresh();
+	}
+
+	onPromptAccepted(_ref: string): void {
+		this.#patch({ inFlight: true });
+		this.refresh();
+	}
+
+	onPromptResult(event: AttachPromptResult): void {
+		const status = this.#getStatus();
+		const lastResult = event.ok
+			? event.payload === undefined
+				? "ok"
+				: typeof event.payload === "string"
+					? event.payload
+					: JSON.stringify(event.payload)
+			: `error: ${event.error ?? "failed"}`;
+		this.#patch({
+			queued: Math.max(0, status.queued - 1),
+			inFlight: status.queued > 1,
+			lastResult,
+			currentTool: null,
+		});
+		this.refresh();
+	}
+
+	onControlRejected(rejection: AttachControlRejected): void {
+		const status = this.#getStatus();
+		if (rejection.ref !== undefined && (status.inFlight || status.queued > 0)) {
+			this.#patch({
+				queued: Math.max(0, status.queued - 1),
+				inFlight: status.queued > 1,
+			});
+		}
+		this.#onNotice(`${rejection.code}: ${rejection.message}`);
+		this.refresh();
+	}
+
+	onError(error: AttachError): void {
+		this.#onNotice(`[error] ${error.code}: ${error.message}`);
+		this.refresh();
+	}
+
+	onRemoved(reason: string): void {
+		this.#onNotice(`worker removed: ${reason}`);
+		this.refresh();
+	}
+
+	onBye(reason?: string): void {
+		this.#onNotice(reason !== undefined && reason.length > 0 ? `bye: ${reason}` : "bye");
+		this.refresh();
+	}
+
+	#patch(patch: Partial<AttachPaneStatus>): void {
+		this.#onStatus({ ...this.#getStatus(), ...patch });
+	}
+
+	/** Rebuild the scroll lines from the presenter + live line and repaint. */
+	refresh(): void {
+		const presenter = this.#getPresenter();
+		const wasAtBottom = this.#scroll.getScrollOffset() >= this.#scroll.getMaxScrollOffset();
+		const lines: string[] = [];
+		if (presenter && !presenter.isEmpty) {
+			lines.push(...presenter.container.render(Math.max(40, this.#ui.terminal.columns - 1)));
+		} else {
+			lines.push("  no messages yet");
+		}
+		if (this.#liveLineInternal !== undefined) {
+			lines.push(this.#liveLineInternal);
+		}
+		this.#scroll.setLines(lines);
+		if (wasAtBottom) this.#scroll.scrollToBottom();
+		this.#ui.requestRender();
 	}
 }

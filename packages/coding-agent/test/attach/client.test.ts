@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as net from "node:net";
 import * as os from "node:os";
@@ -9,6 +10,7 @@ import { AttachClient } from "../../src/attach/client";
 import {
 	type AttachClientMessage,
 	AttachFrameAccumulator,
+	type AttachLease,
 	type AttachMessage,
 	type AttachSessionEntry,
 	type AttachSnapshot,
@@ -35,7 +37,7 @@ function entry(overrides: Partial<AttachSessionEntry> = {}): AttachSessionEntry 
 }
 
 function snapshot(sessions: AttachSessionEntry[] = []): AttachSnapshot {
-	return { version: 1, generatedAt: Date.now(), sessions };
+	return { version: 2, generatedAt: Date.now(), sessions };
 }
 
 /** Writable stream that captures everything written to it as text. */
@@ -104,9 +106,11 @@ class FakeConnection {
 	}
 
 	close(): void {
-		// Graceful FIN so pending writes (error frames, bye) are flushed to the
-		// client before the socket closes; destroy() would drop them.
-		this.#socket.end();
+		// destroy() matches the real AttachServer's connection close; end()
+		// leaves the server socket half-open after a peer destroy, which
+		// would hang server.close() in teardown. Writes issued just before
+		// close() still flush to the kernel before the handle closes.
+		this.#socket.destroy();
 	}
 }
 
@@ -115,17 +119,36 @@ interface FakeServerOptions {
 	readonly token: string;
 	/** Snapshot sent in `hello_ok` and pushed on `subscribe` by default. */
 	readonly snapshot: AttachSnapshot;
-	/** Called for every authenticated client message; defaults to a scripted echo. */
-	readonly onMessage?: (connection: FakeConnection, message: AttachClientMessage) => void;
+	/** Entry delivered in `view_open_ok`. */
+	readonly viewEntry?: AttachSessionEntry;
+	/**
+	 * Called for every authenticated client message. `next` runs the default
+	 * scripted flow; call it to keep default handling (e.g. view_open grants)
+	 * and layer extra behavior on top.
+	 */
+	readonly onMessage?: (
+		connection: FakeConnection,
+		message: AttachClientMessage,
+		next: (connection: FakeConnection, message: AttachClientMessage) => void,
+	) => void;
 }
 
-/** Minimal attach server for tests: hello/auth, snapshots, and scripted messages. */
+/**
+ * Minimal attach server for tests: hello/auth, view_open (grant/resume leases
+ * and stream a transcript snapshot epoch), prompt/abort_turn/detach handling,
+ * and scripted messages. Leases are remembered per worker so a reconnecting
+ * client can resume its own lease within the grace window.
+ */
 class FakeServer {
 	readonly socketFile: string;
 	readonly received: AttachClientMessage[] = [];
 	readonly connections: FakeConnection[] = [];
+	/** Last lease granted in a view_open_ok (test seam). */
+	lastGrantedLease: AttachLease | null = null;
 	readonly #server: net.Server;
 	readonly #options: FakeServerOptions;
+	readonly #leases = new Map<string, AttachLease>();
+	#epoch = 0;
 
 	private constructor(socketFile: string, options: FakeServerOptions) {
 		this.socketFile = socketFile;
@@ -158,6 +181,11 @@ class FakeServer {
 		});
 	}
 
+	/** Drop every live connection (simulates a socket-level disconnect). */
+	dropConnections(): void {
+		for (const connection of this.connections) connection.close();
+	}
+
 	#handleMessage(connection: FakeConnection, message: AttachClientMessage): void {
 		if (message.kind === "hello") {
 			if (message.capability !== this.#options.token) {
@@ -168,7 +196,7 @@ class FakeServer {
 			connection.markAuthenticated();
 			connection.send({
 				kind: "hello_ok",
-				version: 1,
+				version: 2,
 				server: { pid: process.pid, startedAt: Date.now() },
 				snapshot: this.#options.snapshot,
 			});
@@ -179,12 +207,29 @@ class FakeServer {
 			connection.close();
 			return;
 		}
-		const handler = this.#options.onMessage ?? ((conn, msg) => this.#defaultOnMessage(conn, msg));
-		handler(connection, message);
+		const handler = this.#options.onMessage ?? ((_conn, _msg, next) => next(_conn, _msg));
+		handler(connection, message, (conn, msg) => this.#defaultOnMessage(conn, msg));
 	}
 
 	#defaultOnMessage(connection: FakeConnection, message: AttachClientMessage): void {
 		switch (message.kind) {
+			case "view_open":
+				this.#handleViewOpen(connection, message);
+				return;
+			case "prompt":
+				connection.send({
+					kind: "prompt_accepted",
+					key: KEY,
+					ref: message.ref,
+					cmdId: message.cmdId,
+				});
+				return;
+			case "abort_turn":
+				return;
+			case "detach":
+				connection.send({ kind: "bye", reason: message.reason ?? "detached" });
+				connection.close();
+				return;
 			case "subscribe":
 				connection.send({ kind: "snapshot", snapshot: this.#options.snapshot });
 				return;
@@ -216,6 +261,69 @@ class FakeServer {
 			case "hello":
 				return;
 		}
+	}
+
+	/** Grant (or resume) a view: view_open_ok + a transcript snapshot epoch. */
+	#handleViewOpen(connection: FakeConnection, message: Extract<AttachClientMessage, { kind: "view_open" }>): void {
+		const workerId = message.key.workerId;
+		const held = this.#leases.get(workerId);
+		if (message.resume) {
+			if (
+				held &&
+				held.leaseId === message.resume.leaseId &&
+				held.proof === message.resume.proof &&
+				held.generation === message.resume.generation
+			) {
+				const resumed: AttachLease = { ...held, generation: held.generation + 1 };
+				this.#leases.set(workerId, resumed);
+				this.#grantView(connection, workerId, resumed);
+				return;
+			}
+			connection.send({
+				kind: "view_open_rejected",
+				key: message.key,
+				code: "stale_resume",
+				message: "no lease to resume (grace expired?)",
+			});
+			return;
+		}
+		if (held) {
+			connection.send({
+				kind: "view_open_rejected",
+				key: message.key,
+				code: "lease_busy",
+				message: "controlled by another pane client",
+				holder: { generation: held.generation, expiresInMs: 30_000 },
+			});
+			return;
+		}
+		const lease: AttachLease = {
+			leaseId: randomUUID(),
+			proof: "f".repeat(64),
+			generation: 1,
+			graceMs: 30_000,
+		};
+		this.#leases.set(workerId, lease);
+		this.#grantView(connection, workerId, lease);
+	}
+
+	#grantView(connection: FakeConnection, workerId: string, lease: AttachLease): void {
+		this.lastGrantedLease = lease;
+		this.#epoch += 1;
+		const epoch = this.#epoch;
+		connection.send({
+			kind: "view_open_ok",
+			key: { workerId, ownerScope: KEY.ownerScope },
+			lease,
+			epoch,
+			entry: this.#options.viewEntry ?? entry(),
+			cwd: "/cwd",
+		});
+		// Complete the snapshot epoch so the client clears its snapshot
+		// pending flag and flushes queued prompts.
+		connection.send({ kind: "transcript_begin", key: KEY, epoch, seq: 1 });
+		connection.send({ kind: "transcript_items", key: KEY, epoch, seq: 2, items: [] });
+		connection.send({ kind: "transcript_end", key: KEY, epoch, seq: 3, watermark: 0 });
 	}
 }
 
@@ -276,12 +384,20 @@ describe("attach client", () => {
 		return { client, stdout, stdin, exits };
 	}
 
-	it("exits 1 on auth_failed and does not reconnect", async () => {
+	async function listenServer(
+		options: Omit<FakeServerOptions, "token" | "snapshot"> & Partial<FakeServerOptions> = {},
+	) {
 		const server = await FakeServer.listen(path.join(dir, "attach.sock"), {
 			token: TOKEN,
-			snapshot: snapshot(),
+			snapshot: snapshot([entry()]),
+			...options,
 		});
 		servers.push(server);
+		return server;
+	}
+
+	it("exits 1 on auth_failed and does not reconnect", async () => {
+		const server = await listenServer();
 
 		const { client, exits } = startClient({ token: "b".repeat(64) });
 		await client.start();
@@ -295,12 +411,8 @@ describe("attach client", () => {
 		expect(server.connections.length).toBe(1);
 	});
 
-	it("renders the subscribed worker's status and subscribes with the worker id", async () => {
-		const server = await FakeServer.listen(path.join(dir, "attach.sock"), {
-			token: TOKEN,
-			snapshot: snapshot([entry({ state: "running", summary: "turn 1" })]),
-		});
-		servers.push(server);
+	it("opens a view after hello and renders the worker entry from view_open_ok", async () => {
+		const server = await listenServer({ viewEntry: entry({ state: "running", summary: "turn 1" }) });
 
 		const { client, stdout } = startClient();
 		await client.start();
@@ -308,19 +420,24 @@ describe("attach client", () => {
 		const status = await poll(() => lineWith(stdout, "[running]"));
 		expect(status).toContain("turn 1");
 
-		const subscribe = await poll(() => server.received.find(message => message.kind === "subscribe"));
-		expect(subscribe).toMatchObject({ kind: "subscribe", workerIds: ["w1"] });
+		const viewOpen = await poll(() => server.received.find(message => message.kind === "view_open"));
+		expect(viewOpen).toMatchObject({ kind: "view_open", key: { workerId: "w1", ownerScope: "" } });
+		// First connect has no lease: the decoded frame carries no resume.
+		expect((viewOpen as Extract<AttachClientMessage, { kind: "view_open" }>).resume).toBeUndefined();
 	});
 
 	it("renders progress output and prints a trim marker once past maxRenderedLines", async () => {
-		const server = await FakeServer.listen(path.join(dir, "attach.sock"), {
-			token: TOKEN,
-			snapshot: snapshot([entry({ state: "running", summary: "working" })]),
+		const server = await listenServer({
+			viewEntry: entry({ state: "running", summary: "working" }),
 			onMessage: (connection, message) => {
-				if (message.kind !== "subscribe") return;
+				if (message.kind !== "view_open") return;
 				connection.send({
-					kind: "snapshot",
-					snapshot: snapshot([entry({ state: "running", summary: "working" })]),
+					kind: "view_open_ok",
+					key: KEY,
+					lease: { leaseId: "lease-1", proof: "f".repeat(64), generation: 1, graceMs: 30_000 },
+					epoch: 1,
+					entry: entry({ state: "running", summary: "working" }),
+					cwd: "/cwd",
 				});
 				for (let i = 0; i < 8; i += 1) {
 					connection.send({
@@ -338,7 +455,6 @@ describe("attach client", () => {
 				}
 			},
 		});
-		servers.push(server);
 
 		const { client, stdout } = startClient({ maxRenderedLines: 5 });
 		await client.start();
@@ -351,100 +467,125 @@ describe("attach client", () => {
 		expect(stdout.lines().filter(line => line.includes("[trimmed")).length).toBe(1);
 	});
 
-	it("sends a follow-up per stdin line and renders the result", async () => {
-		const server = await FakeServer.listen(path.join(dir, "attach.sock"), {
-			token: TOKEN,
-			snapshot: snapshot([entry()]),
+	it("sends a prompt per stdin line and renders the result", async () => {
+		const server = await listenServer({
+			onMessage: (connection, message, next) => {
+				next(connection, message); // default view_open grant + transcript epoch
+				if (message.kind === "prompt") {
+					connection.send({ kind: "prompt_accepted", key: KEY, ref: message.ref, cmdId: message.cmdId });
+					connection.send({
+						kind: "prompt_result",
+						key: KEY,
+						ref: message.ref,
+						cmdId: message.cmdId,
+						ok: true,
+						payload: "turn-done",
+					});
+				}
+			},
 		});
-		servers.push(server);
 
 		const { client, stdout, stdin } = startClient();
 		await client.start();
 
 		stdin.write("continue please\n");
-		const followUp = await poll(() => server.received.find(message => message.kind === "follow_up"));
-		expect(followUp).toMatchObject({ kind: "follow_up", ref: "f1", key: KEY, payload: "continue please" });
-
+		const prompt = await poll(() => server.received.find(message => message.kind === "prompt"));
+		expect(prompt).toMatchObject({
+			kind: "prompt",
+			ref: "p1",
+			text: "continue please",
+			cmdSeq: 1,
+		});
 		const result = await poll(() => lineWith(stdout, "[result]"));
 		expect(result).toContain("turn-done");
 	});
 
-	it("queues follow-ups while one is in flight and flushes them in order", async () => {
-		const server = await FakeServer.listen(path.join(dir, "attach.sock"), {
-			token: TOKEN,
-			snapshot: snapshot([entry()]),
-			onMessage: (connection, message) => {
-				if (message.kind === "subscribe") {
-					connection.send({ kind: "snapshot", snapshot: snapshot([entry()]) });
-					return;
-				}
-				if (message.kind !== "follow_up") return;
-				if (message.ref === "f1") {
-					connection.send({
-						kind: "event",
-						event: { type: "follow_up_accepted", key: KEY, ref: "f1" },
-					});
-					// Leave f1 in flight long enough for the hold assertion to
-					// observe that nothing else leaves the wire; resolve later.
+	it("stores the granted lease and sends it on every prompt frame", async () => {
+		const server = await listenServer();
+		const { client } = startClient();
+		await client.start();
+
+		client.sendPrompt("hi there");
+		const prompt = await poll(() => server.received.find(message => message.kind === "prompt"));
+		expect(prompt).toMatchObject({
+			kind: "prompt",
+			leaseId: server.lastGrantedLease!.leaseId,
+			proof: server.lastGrantedLease!.proof,
+			generation: server.lastGrantedLease!.generation,
+			cmdSeq: 1,
+		});
+		expect((prompt as Extract<AttachClientMessage, { kind: "prompt" }>).cmdId.length).toBeGreaterThan(0);
+		expect((prompt as Extract<AttachClientMessage, { kind: "prompt" }>).ref).toBe("p1");
+	});
+
+	it("queues prompts while one is in flight and flushes them in order", async () => {
+		const server = await listenServer({
+			onMessage: (connection, message, next) => {
+				next(connection, message); // default view_open grant + transcript epoch
+				if (message.kind !== "prompt") return;
+				connection.send({ kind: "prompt_accepted", key: KEY, ref: message.ref, cmdId: message.cmdId });
+				if (message.ref === "p1") {
+					// Leave the first prompt in flight until the hold assertion
+					// has observed that nothing else leaves the wire.
 					setTimeout(() => {
 						connection.send({
-							kind: "event",
-							event: { type: "follow_up_result", key: KEY, ref: "f1", ok: true, payload: "first-done" },
+							kind: "prompt_result",
+							key: KEY,
+							ref: message.ref,
+							cmdId: message.cmdId,
+							ok: true,
+							payload: "first-done",
 						});
 					}, 400);
 					return;
 				}
 				connection.send({
-					kind: "error",
-					code: "busy",
-					message: "follow-up already in flight",
+					kind: "prompt_result",
+					key: KEY,
 					ref: message.ref,
+					cmdId: message.cmdId,
+					ok: true,
+					payload: "turn-done",
 				});
 			},
 		});
-		servers.push(server);
 
-		const { client, stdout, stdin, exits } = startClient();
+		const { client, stdout } = startClient();
 		await client.start();
 
-		stdin.write("first\n");
-		await poll(() => server.received.find(message => message.kind === "follow_up" && message.ref === "f1"));
-		stdin.write("second\n");
-		stdin.write("third\n");
+		client.sendPrompt("first");
+		await poll(() => server.received.find(message => message.kind === "prompt" && message.ref === "p1"));
+		client.sendPrompt("second");
+		client.sendPrompt("third");
 
-		// While f1 is in flight the follow-ups are held client-side: nothing
-		// else leaves the wire until the in-flight follow-up settles.
+		// While p1 is in flight the prompts are held client-side: nothing
+		// else leaves the wire until the in-flight prompt settles.
 		await new Promise(resolve => setTimeout(resolve, 120));
-		expect(server.received.filter(message => message.kind === "follow_up")).toHaveLength(1);
+		expect(server.received.filter(message => message.kind === "prompt")).toHaveLength(1);
 
-		// f1 settles → the queue flushes in order (f2, then f3 after the busy
-		// error frees the slot). The busy display remains for external
-		// concurrency; the client stays alive throughout.
+		// p1 settles → the queue flushes in order (p2, then p3).
 		await poll(() => lineWith(stdout, "first-done"));
-		const f2 = await poll(() =>
-			server.received.find(message => message.kind === "follow_up" && message.ref === "f2"),
-		);
-		expect(f2).toMatchObject({ kind: "follow_up", ref: "f2", key: KEY, payload: "second" });
-		await poll(() => lineWith(stdout, "busy"));
-		const f3 = await poll(() =>
-			server.received.find(message => message.kind === "follow_up" && message.ref === "f3"),
-		);
-		expect(f3).toMatchObject({ kind: "follow_up", ref: "f3", key: KEY, payload: "third" });
-		await poll(() => (stdout.lines().filter(line => line.includes("busy")).length >= 2 ? true : undefined));
-		expect(exits).toEqual([]);
+		const p2 = await poll(() => server.received.find(message => message.kind === "prompt" && message.ref === "p2"));
+		expect(p2).toMatchObject({ kind: "prompt", ref: "p2", text: "second", cmdSeq: 2 });
+		const p3 = await poll(() => server.received.find(message => message.kind === "prompt" && message.ref === "p3"));
+		expect(p3).toMatchObject({ kind: "prompt", ref: "p3", text: "third", cmdSeq: 3 });
 	});
 
 	it("prints the removal reason and exits 0 on removed", async () => {
-		const server = await FakeServer.listen(path.join(dir, "attach.sock"), {
-			token: TOKEN,
-			snapshot: snapshot([entry()]),
+		const server = await listenServer({
 			onMessage: (connection, message) => {
-				if (message.kind !== "subscribe") return;
-				connection.send({ kind: "snapshot", snapshot: snapshot([entry()]) });
+				if (message.kind !== "view_open") return;
+				connection.send({
+					kind: "view_open_ok",
+					key: KEY,
+					lease: { leaseId: "lease-1", proof: "f".repeat(64), generation: 1, graceMs: 30_000 },
+					epoch: 1,
+					entry: entry(),
+					cwd: "/cwd",
+				});
 				connection.send({ kind: "event", event: { type: "removed", key: KEY, reason: "killed by user" } });
 			},
 		});
-		servers.push(server);
 
 		const { client, stdout, exits } = startClient();
 		await client.start();
@@ -455,16 +596,20 @@ describe("attach client", () => {
 	});
 
 	it("exits 0 on a server bye", async () => {
-		const server = await FakeServer.listen(path.join(dir, "attach.sock"), {
-			token: TOKEN,
-			snapshot: snapshot([entry()]),
+		const server = await listenServer({
 			onMessage: (connection, message) => {
-				if (message.kind !== "subscribe") return;
-				connection.send({ kind: "snapshot", snapshot: snapshot([entry()]) });
+				if (message.kind !== "view_open") return;
+				connection.send({
+					kind: "view_open_ok",
+					key: KEY,
+					lease: { leaseId: "lease-1", proof: "f".repeat(64), generation: 1, graceMs: 30_000 },
+					epoch: 1,
+					entry: entry(),
+					cwd: "/cwd",
+				});
 				connection.send({ kind: "bye", reason: "shutting down" });
 			},
 		});
-		servers.push(server);
 
 		const { client, stdout, exits } = startClient();
 		await client.start();
@@ -476,13 +621,14 @@ describe("attach client", () => {
 		expect(lineWith(stdout, "[bye]")).toBe("[bye]");
 	});
 
-	it("reconnects with backoff after the server restarts", async () => {
+	it("reconnects with backoff after the server restarts and resumes the lease", async () => {
 		const socketFile = path.join(dir, "attach.sock");
 		const first = await FakeServer.listen(socketFile, { token: TOKEN, snapshot: snapshot([entry()]) });
 		servers.push(first);
 
 		const { client, exits } = startClient({ socketFile });
 		await client.start();
+		expect(first.lastGrantedLease).not.toBeNull();
 
 		// Simulate a server restart: drop the connection and the socket file.
 		await first.stop();
@@ -491,11 +637,169 @@ describe("attach client", () => {
 		const second = await FakeServer.listen(socketFile, { token: TOKEN, snapshot: snapshot([entry()]) });
 		servers.push(second);
 
-		// The client re-authenticates and resubscribes on the new server.
+		// The client re-authenticates and opens a view on the new server.
 		const hello = await poll(() => second.received.find(message => message.kind === "hello"));
 		expect(hello).toMatchObject({ kind: "hello", capability: TOKEN });
-		await poll(() => second.received.find(message => message.kind === "subscribe"));
+		const viewOpen = await poll(() => second.received.find(message => message.kind === "view_open"));
+		expect(viewOpen).toMatchObject({ kind: "view_open" });
 		expect(exits).toEqual([]);
+	});
+
+	it("reconnects and presents the held lease as resume on the same server", async () => {
+		const server = await listenServer();
+		const { client, exits } = startClient();
+		await client.start();
+		// Capture values, not the live lease object: the server mutates its
+		// generation in place when it re-grants on resume.
+		const grantedLeaseId = server.lastGrantedLease!.leaseId;
+		const grantedProof = server.lastGrantedLease!.proof;
+		const grantedGeneration = server.lastGrantedLease!.generation;
+
+		// Drop the socket; the client reconnects within its grace window.
+		server.dropConnections();
+		const resumed = await poll(() =>
+			server.received.find(message => message.kind === "view_open" && message.resume !== undefined),
+		);
+		expect(resumed).toMatchObject({
+			kind: "view_open",
+			resume: {
+				leaseId: grantedLeaseId,
+				proof: grantedProof,
+				generation: grantedGeneration,
+			},
+		});
+		expect(exits).toEqual([]);
+	});
+
+	it("retries without resume after a stale_resume rejection and keeps the new lease", async () => {
+		const server = await listenServer({
+			onMessage: (connection, message) => {
+				if (message.kind !== "view_open") return;
+				if (message.resume) {
+					connection.send({
+						kind: "view_open_rejected",
+						key: message.key,
+						code: "stale_resume",
+						message: "grace expired",
+					});
+					return;
+				}
+				connection.send({
+					kind: "view_open_ok",
+					key: message.key,
+					lease: { leaseId: "fresh-lease", proof: "e".repeat(64), generation: 1, graceMs: 30_000 },
+					epoch: 1,
+					entry: entry(),
+					cwd: "/cwd",
+				});
+				connection.send({ kind: "transcript_begin", key: KEY, epoch: 1, seq: 1 });
+				connection.send({ kind: "transcript_end", key: KEY, epoch: 1, seq: 2, watermark: 0 });
+			},
+		});
+
+		const { client } = startClient();
+		// First connection grants a lease via the default flow.
+		await client.start();
+
+		// Reconnect: the server now rejects the resume as stale.
+		server.dropConnections();
+		await poll(() => server.received.find(message => message.kind === "view_open" && message.resume !== undefined));
+
+		// The client re-views without resume and keeps the fresh lease.
+		const retry = await poll(
+			() =>
+				server.received.filter(message => message.kind === "view_open").at(-1) as
+					| Extract<AttachClientMessage, { kind: "view_open" }>
+					| undefined,
+		);
+		expect(retry.resume).toBeUndefined();
+	});
+
+	it("exits 1 when view_open is rejected with lease_busy", async () => {
+		const server = await listenServer({
+			onMessage: (connection, message) => {
+				if (message.kind !== "view_open") return;
+				connection.send({
+					kind: "view_open_rejected",
+					key: message.key,
+					code: "lease_busy",
+					message: "controlled by another pane client",
+					holder: { generation: 1, expiresInMs: 30_000 },
+				});
+			},
+		});
+
+		const { client, exits } = startClient();
+		await client.start();
+		await poll(() => (exits.length > 0 ? exits[0] : undefined));
+		expect(exits[0]).toBe(1);
+	});
+
+	it("abortTurn sends abort_turn with the current cmdSeq and lease", async () => {
+		const server = await listenServer();
+		const { client } = startClient();
+		await client.start();
+
+		client.abortTurn();
+		const frame = await poll(() => server.received.find(message => message.kind === "abort_turn"));
+		expect(frame).toMatchObject({
+			kind: "abort_turn",
+			leaseId: server.lastGrantedLease!.leaseId,
+			proof: server.lastGrantedLease!.proof,
+			generation: server.lastGrantedLease!.generation,
+			cmdSeq: 1,
+		});
+	});
+
+	it("detach sends detach with the lease and exits 0", async () => {
+		const server = await listenServer();
+		const { client, exits } = startClient();
+		await client.start();
+
+		client.detach("user");
+		await poll(() => (exits.length > 0 ? exits[0] : undefined));
+		expect(exits[0]).toBe(0);
+		const frame = await poll(() => server.received.find(message => message.kind === "detach"));
+		expect(frame).toMatchObject({
+			kind: "detach",
+			leaseId: server.lastGrantedLease!.leaseId,
+			proof: server.lastGrantedLease!.proof,
+			generation: server.lastGrantedLease!.generation,
+			reason: "user",
+		});
+	});
+
+	it("treats an out-of-order transcript frame as a protocol violation and reconnects", async () => {
+		const server = await listenServer({
+			onMessage: (connection, message) => {
+				if (message.kind !== "view_open") return;
+				connection.send({
+					kind: "view_open_ok",
+					key: message.key,
+					lease: { leaseId: "lease-1", proof: "f".repeat(64), generation: 1, graceMs: 30_000 },
+					epoch: 1,
+					entry: entry(),
+					cwd: "/cwd",
+				});
+				// Deliberately out of order: seq must start at 1.
+				connection.send({ kind: "transcript_begin", key: KEY, epoch: 1, seq: 99 });
+			},
+		});
+
+		const { client } = startClient();
+		await client.start();
+
+		// The violation schedules a reconnect; a fresh hello + view_open
+		// (with the held lease as resume) arrive after the backoff.
+		const hello = await poll(() =>
+			server.received.filter(message => message.kind === "hello").length >= 2 ? true : undefined,
+		);
+		expect(hello).toBe(true);
+		const resume = await poll(() =>
+			server.received.find(message => message.kind === "view_open" && message.resume !== undefined),
+		);
+		expect(resume).toMatchObject({ kind: "view_open", resume: { leaseId: "lease-1" } });
+		client.stop();
 	});
 });
 

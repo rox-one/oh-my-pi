@@ -203,6 +203,7 @@ describe("deriveAttachPaths", () => {
       runtimeDir: runtimeDir("9001"),
       socketPath: socketPath("9001"),
       tokenFile: tokenFile("9001"),
+      explicit: false,
     });
     expect(paths.socketPath).toEndWith(`/${ATTACH_SOCKET_FILE}`);
     expect(paths.tokenFile).toEndWith(`/${ATTACH_TOKEN_FILE}`);
@@ -316,6 +317,70 @@ describe("spawn", () => {
     expect(h.rpc.byMethod("pane.send_keys")[0].params.keys).toEqual(["ENTER"]);
   });
 
+  test("explicit endpoint metadata (attachSocket/attachTokenFile) spawns the pane without a session file", async () => {
+    const h = makeController();
+    // A no-session-parent worker (tmp fallback base dir): the started payload
+    // carries NO sessionFile, only the explicit attach endpoint paths. The
+    // runtime-dir existence check is bypassed (paths are authoritative).
+    h.controller.handleLifecycle({
+      id: "9007",
+      description: "vibe good session",
+      status: "started",
+      attachSocket: "/tmp/omp-attach-x/attach.sock",
+      attachTokenFile: "/tmp/omp-attach-x/attach.token",
+    });
+    await settle(h);
+    const splits = h.rpc.byMethod("pane.split");
+    expect(splits).toHaveLength(1);
+    expect(splits[0].params.env).toEqual({
+      [ATTACH_SOCKET_PATH_ENV]: "/tmp/omp-attach-x/attach.sock",
+      [ATTACH_TOKEN_FILE_PATH_ENV]: "/tmp/omp-attach-x/attach.token",
+    });
+    const texts = h.rpc.byMethod("pane.send_text");
+    expect(texts).toHaveLength(1);
+    expect(texts[0].params.text).toBe(
+      `omp attach 9007 --socket '/tmp/omp-attach-x/attach.sock' --token-file '/tmp/omp-attach-x/attach.token'`,
+    );
+    // The derived command must NOT reference a session file that does not exist.
+    expect(texts[0].params.text).not.toContain("--session-file");
+  });
+
+  test("explicit endpoint metadata wins over session-file derivation when both are present", async () => {
+    const h = makeController();
+    h.controller.handleLifecycle({
+      id: "9008",
+      description: "vibe fast session",
+      status: "started",
+      sessionFile: childFile("9008"),
+      attachSocket: "/tmp/omp-attach-y/attach.sock",
+      attachTokenFile: "/tmp/omp-attach-y/attach.token",
+    });
+    await settle(h);
+    const texts = h.rpc.byMethod("pane.send_text");
+    expect(texts).toHaveLength(1);
+    expect(texts[0].params.text).toBe(
+      `omp attach 9008 --socket '/tmp/omp-attach-y/attach.sock' --token-file '/tmp/omp-attach-y/attach.token'`,
+    );
+  });
+
+  test("invalid explicit endpoint metadata falls back to session-file derivation", async () => {
+    const h = makeController();
+    h.fs.dirs.add(runtimeDir("9009"));
+    // attachTokenFile missing: the explicit source is invalid, so the
+    // session-file derivation applies (runtime dir exists on disk).
+    h.controller.handleLifecycle({
+      id: "9009",
+      description: "vibe fast session",
+      status: "started",
+      sessionFile: childFile("9009"),
+      attachSocket: "/tmp/omp-attach-z/attach.sock",
+    });
+    await settle(h);
+    const texts = h.rpc.byMethod("pane.send_text");
+    expect(texts).toHaveLength(1);
+    expect(texts[0].params.text).toBe(`omp attach 9009 --session-file '${parentFile("9009")}'`);
+  });
+
   test("missing parent session file skips the worker with a warning and no pane", async () => {
     const warns = [];
     const h = makeController({ log: { error() {}, warn(...args) { warns.push(args.join(" ")); }, debug() {} } });
@@ -325,7 +390,7 @@ describe("spawn", () => {
     await settle(h);
     expect(h.rpc.byMethod("pane.split")).toHaveLength(0);
     expect(h.controller.tracked()).toEqual([]);
-    expect(warns.join("\n")).toContain("without a usable parent session file");
+    expect(warns.join("\n")).toContain("without attach endpoint metadata or a usable parent session file");
   });
 
   test("missing attach runtime dir (tmp fallback base dir) skips the worker with a warning", async () => {

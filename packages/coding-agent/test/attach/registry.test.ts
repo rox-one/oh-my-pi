@@ -1,5 +1,11 @@
-import { describe, expect, it } from "bun:test";
-import { type AttachEvent, AttachProtocolError, type AttachWorkerKey } from "../../src/attach/protocol";
+import { describe, expect, it, vi } from "bun:test";
+import { type AttachLiveSessionSource, createAttachLiveSessionSource } from "../../src/attach/live-session";
+import {
+	ATTACH_CMD_ACK_CACHE_SIZE,
+	type AttachEvent,
+	AttachProtocolError,
+	type AttachWorkerKey,
+} from "../../src/attach/protocol";
 import { AttachRegistry } from "../../src/attach/registry";
 
 const KEY: AttachWorkerKey = { workerId: "w1", ownerScope: "scope-a" };
@@ -13,9 +19,22 @@ function makeClock() {
 	};
 }
 
+/** Minimal fake presentation source for a live worker session. */
+function fakeSource(overrides: Partial<AttachLiveSessionSource> = {}): AttachLiveSessionSource {
+	return {
+		branchId: "b1",
+		sessionFile: null,
+		getCwd: () => "cwd",
+		getBranchEntries: () => [],
+		subscribe: () => () => {},
+		...overrides,
+	};
+}
+
 function makeRegistry() {
 	const clock = makeClock();
 	const registry = new AttachRegistry({
+		runPrompt: async () => ({ ok: true, payload: "done" }),
 		followUp: async () => ({ ok: true, payload: "done" }),
 		now: clock.now,
 	});
@@ -34,10 +53,11 @@ function collectEvents(registry: AttachRegistry, run: () => void): AttachEvent[]
 describe("attach registry registration lifecycle", () => {
 	it("registers a worker with starting state and emits registered", () => {
 		const { registry } = makeRegistry();
-		const events = collectEvents(registry, () => registry.register(KEY, { live: true }, "boot"));
+		const source = fakeSource();
+		const events = collectEvents(registry, () => registry.register(KEY, source, "boot"));
 		expect(registry.size).toBe(1);
 		expect(registry.has(KEY)).toBe(true);
-		expect(registry.liveSession(KEY)).toEqual({ live: true });
+		expect(registry.liveSession(KEY)).toBe(source);
 		const entry = registry.snapshot().sessions[0];
 		expect(entry.key).toEqual(KEY);
 		expect(entry.state).toBe("starting");
@@ -137,12 +157,270 @@ describe("attach registry subscriptions", () => {
 	});
 });
 
+describe("attach registry controller leases", () => {
+	function leaseOf(
+		result: ReturnType<AttachRegistry["acquireView"]>,
+	): NonNullable<Extract<ReturnType<AttachRegistry["acquireView"]>, { ok: true }>["lease"]> {
+		if (!result.ok) throw new Error(`expected lease, got ${result.code}`);
+		return result.lease;
+	}
+
+	it("acquires a lease and rejects a second acquisition with lease_busy + holder", () => {
+		const { registry } = makeRegistry();
+		registry.register(KEY, null);
+		const first = registry.acquireView(KEY, "client-1");
+		expect(first.ok).toBe(true);
+		const lease = leaseOf(first);
+		expect(lease.leaseId.length).toBeGreaterThan(0);
+		expect(lease.proof).toMatch(/^[0-9a-f]{64}$/);
+		expect(lease.generation).toBe(1);
+		expect(lease.graceMs).toBeGreaterThan(0);
+
+		// Reject-not-replace: a second pane client without resume is refused.
+		const second = registry.acquireView(KEY, "client-2");
+		expect(second.ok).toBe(false);
+		if (!second.ok) {
+			expect(second.code).toBe("lease_busy");
+			expect(second.holder).toEqual({ generation: 1, expiresInMs: expect.any(Number) });
+			expect(second.holder!.expiresInMs).toBeGreaterThan(0);
+		}
+		expect(registry.leaseInfo(KEY)).toEqual({ generation: 1, expiresInMs: expect.any(Number) });
+	});
+
+	it("resumes the same lease with correct id+proof+generation and bumps generation", () => {
+		const { registry } = makeRegistry();
+		registry.register(KEY, null);
+		const first = registry.acquireView(KEY, "client-1");
+		const lease = leaseOf(first);
+		const resumed = registry.acquireView(KEY, "client-1", {
+			leaseId: lease.leaseId,
+			proof: lease.proof,
+			generation: lease.generation,
+		});
+		expect(resumed.ok).toBe(true);
+		if (resumed.ok) {
+			expect(resumed.lease.leaseId).toBe(lease.leaseId);
+			expect(resumed.lease.proof).toBe(lease.proof);
+			expect(resumed.lease.generation).toBe(2);
+			expect(resumed.lease.graceMs).toBe(lease.graceMs);
+		}
+	});
+
+	it("rejects resume with a wrong proof and reports stale_resume when no lease exists", () => {
+		const { registry } = makeRegistry();
+		registry.register(KEY, null);
+		const lease = leaseOf(registry.acquireView(KEY, "client-1"));
+		const wrongProof = registry.acquireView(KEY, "client-1", {
+			leaseId: lease.leaseId,
+			proof: "c".repeat(64),
+			generation: lease.generation,
+		});
+		expect(wrongProof.ok).toBe(false);
+		if (!wrongProof.ok) expect(wrongProof.code).toBe("lease_busy");
+
+		// With the lease gone (grace expired / detached), resuming is stale.
+		expect(registry.releaseView(KEY, "client-1", lease.proof, "detach")).toBe(true);
+		const stale = registry.acquireView(KEY, "client-2", {
+			leaseId: "ghost",
+			proof: "d".repeat(64),
+			generation: 9,
+		});
+		expect(stale.ok).toBe(false);
+		if (!stale.ok) expect(stale.code).toBe("stale_resume");
+	});
+
+	it("releaseView requires the holder's proof and frees the lease for the next client", () => {
+		const { registry } = makeRegistry();
+		registry.register(KEY, null);
+		const lease = leaseOf(registry.acquireView(KEY, "client-1"));
+
+		expect(registry.releaseView(KEY, "client-1", "e".repeat(64), "wrong proof")).toBe(false);
+		expect(registry.leaseInfo(KEY)).toBeDefined(); // still held
+
+		expect(registry.releaseView(KEY, "client-1", lease.proof, "detach")).toBe(true);
+		expect(registry.leaseInfo(KEY)).toBeUndefined();
+		const next = registry.acquireView(KEY, "client-2");
+		expect(next.ok).toBe(true);
+	});
+
+	it("beginGrace keeps the lease until the grace window expires, then releases it", () => {
+		vi.useFakeTimers();
+		try {
+			const clock = makeClock();
+			const registry = new AttachRegistry({
+				runPrompt: async () => ({ ok: true }),
+				now: clock.now,
+				leaseGraceMs: 50,
+			});
+			registry.register(KEY, null);
+			const lease = leaseOf(registry.acquireView(KEY, "client-1"));
+
+			expect(registry.beginGrace(KEY, "client-1")).toBe(true);
+			// A foreign acquire is still rejected during the grace window.
+			const busy = registry.acquireView(KEY, "client-2");
+			expect(busy.ok).toBe(false);
+			if (!busy.ok) {
+				expect(busy.code).toBe("lease_busy");
+				expect(busy.holder).toEqual({ generation: 1, expiresInMs: 50 });
+			}
+
+			const events: AttachEvent[] = [];
+			const unsubscribe = registry.subscribe(event => events.push(event));
+			vi.advanceTimersByTime(50);
+			unsubscribe();
+
+			expect(registry.leaseInfo(KEY)).toBeUndefined();
+			expect(events.map(event => event.type)).toEqual(["lease_revoked"]);
+			const revoked = events[0] as Extract<AttachEvent, { type: "lease_revoked" }>;
+			expect(revoked.reason).toContain("grace expired");
+
+			// The freed lease is available to a fresh pane client.
+			const next = registry.acquireView(KEY, "client-2");
+			expect(next.ok).toBe(true);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("beginGrace ignores foreign client ids", () => {
+		const { registry } = makeRegistry();
+		registry.register(KEY, null);
+		registry.acquireView(KEY, "client-1");
+		expect(registry.beginGrace(KEY, "client-2")).toBe(false);
+	});
+
+	it("unregister releases the lease and emits lease_revoked + removed", () => {
+		const { registry } = makeRegistry();
+		registry.register(KEY, null);
+		registry.acquireView(KEY, "client-1");
+		const events = collectEvents(registry, () => {
+			expect(registry.unregister(KEY, "killed")).toBe(true);
+		});
+		expect(events.map(event => event.type)).toEqual(["lease_revoked", "removed"]);
+		expect(registry.leaseInfo(KEY)).toBeUndefined();
+		// The worker is gone entirely: acquiring now fails with unknown_worker.
+		const acquired = registry.acquireView(KEY, "client-2");
+		expect(acquired.ok).toBe(false);
+		if (!acquired.ok) expect(acquired.code).toBe("unknown_worker");
+	});
+});
+
+describe("attach registry command acknowledgement cache", () => {
+	it("caches command outcomes per worker and returns them", () => {
+		const { registry } = makeRegistry();
+		registry.register(KEY, null);
+		expect(registry.cachedCommand(KEY, "cmd-1")).toBeUndefined();
+		registry.rememberCommand(KEY, "cmd-1", { ok: true, payload: "ran" });
+		expect(registry.cachedCommand(KEY, "cmd-1")).toEqual({ ok: true, payload: "ran" });
+	});
+
+	it("keeps worker caches isolated", () => {
+		const { registry } = makeRegistry();
+		registry.register(KEY, null);
+		registry.register(OTHER_KEY, null);
+		registry.rememberCommand(KEY, "cmd-1", { ok: true });
+		expect(registry.cachedCommand(KEY, "cmd-1")).toBeDefined();
+		expect(registry.cachedCommand(OTHER_KEY, "cmd-1")).toBeUndefined();
+	});
+
+	it(`evicts the oldest entry beyond ${ATTACH_CMD_ACK_CACHE_SIZE} commands`, () => {
+		const { registry } = makeRegistry();
+		registry.register(KEY, null);
+		for (let i = 1; i <= ATTACH_CMD_ACK_CACHE_SIZE + 1; i += 1) {
+			registry.rememberCommand(KEY, `cmd-${i}`, { ok: true, payload: i });
+		}
+		expect(registry.cachedCommand(KEY, "cmd-1")).toBeUndefined(); // oldest evicted
+		expect(registry.cachedCommand(KEY, "cmd-2")).toEqual({ ok: true, payload: 2 });
+		expect(registry.cachedCommand(KEY, `cmd-${ATTACH_CMD_ACK_CACHE_SIZE + 1}`)).toEqual({
+			ok: true,
+			payload: ATTACH_CMD_ACK_CACHE_SIZE + 1,
+		});
+	});
+
+	it("drops the cache on unregister", () => {
+		const { registry } = makeRegistry();
+		registry.register(KEY, null);
+		registry.rememberCommand(KEY, "cmd-1", { ok: true });
+		registry.unregister(KEY, "gone");
+		expect(registry.cachedCommand(KEY, "cmd-1")).toBeUndefined();
+	});
+});
+
+describe("attach registry serialized prompts", () => {
+	it("runs a prompt through the callback and emits updated on start and settle", async () => {
+		const clock = makeClock();
+		const seen: unknown[] = [];
+		const registry = new AttachRegistry({
+			now: clock.now,
+			runPrompt: async (key, text, options) => {
+				seen.push({ key, text, options });
+				return { ok: true, payload: "out" };
+			},
+		});
+		registry.register(KEY, null);
+		const events: AttachEvent[] = [];
+		const unsubscribe = registry.subscribe(event => events.push(event));
+		const result = await registry.runPrompt(KEY, "hello", 5000);
+		unsubscribe();
+		expect(result).toEqual({ ok: true, payload: "out" });
+		expect(seen).toEqual([{ key: KEY, text: "hello", options: { timeoutMs: 5000 } }]);
+		// pendingFollowUps flips 0 → 1 → 0, emitting updated on both edges.
+		expect(events.map(event => event.type)).toEqual(["updated", "updated"]);
+		const entry = registry.snapshot().sessions[0];
+		expect(entry.pendingFollowUps).toBe(0);
+		expect(entry.lastActivityAt).not.toBeNull();
+	});
+
+	it("rejects a concurrent prompt for the same key with busy", async () => {
+		let release!: () => void;
+		const gate = new Promise<void>(resolve => {
+			release = resolve;
+		});
+		const registry = new AttachRegistry({
+			runPrompt: async () => {
+				await gate;
+				return { ok: true };
+			},
+		});
+		registry.register(KEY, null);
+		const first = registry.runPrompt(KEY, "p1");
+		await Promise.resolve(); // let the first prompt claim the slot
+		await expect(registry.runPrompt(KEY, "p2")).rejects.toMatchObject({ code: "busy" });
+		release();
+		await first;
+		// After settlement the slot is free again.
+		await expect(registry.runPrompt(KEY, "p3")).resolves.toEqual({ ok: true });
+	});
+
+	it("rejects a prompt for an unknown worker with unknown_worker", async () => {
+		const { registry } = makeRegistry();
+		try {
+			await registry.runPrompt(KEY, "p");
+			expect.unreachable();
+		} catch (error) {
+			expect(error).toBeInstanceOf(AttachProtocolError);
+			expect((error as AttachProtocolError).code).toBe("unknown_worker");
+		}
+	});
+
+	it("surfaces callback failures as failed results instead of throwing", async () => {
+		const registry = new AttachRegistry({
+			runPrompt: async () => {
+				throw new Error("boom");
+			},
+		});
+		registry.register(KEY, null);
+		await expect(registry.runPrompt(KEY, "p")).resolves.toEqual({ ok: false, error: "boom" });
+	});
+});
+
 describe("attach registry serialized follow-up", () => {
 	it("runs one follow-up and emits accepted then result with ref", async () => {
 		const clock = makeClock();
 		const seen: unknown[] = [];
 		const registry = new AttachRegistry({
 			now: clock.now,
+			runPrompt: async () => ({ ok: true, payload: "via-prompt" }),
 			followUp: async (key, payload) => {
 				seen.push({ key, payload });
 				return { ok: true, payload: "out" };
@@ -163,12 +441,26 @@ describe("attach registry serialized follow-up", () => {
 		expect(result.payload).toBe("out");
 	});
 
+	it("falls back to the prompt runner when no followUp callback is provided", async () => {
+		const seen: string[] = [];
+		const registry = new AttachRegistry({
+			runPrompt: async (_key, text) => {
+				seen.push(text);
+				return { ok: true, payload: text };
+			},
+		});
+		registry.register(KEY, null);
+		await registry.followUp(KEY, "ref-1", "continue");
+		expect(seen).toEqual(["continue"]);
+	});
+
 	it("rejects a concurrent follow-up for the same key with busy", async () => {
 		let release!: () => void;
 		const gate = new Promise<void>(resolve => {
 			release = resolve;
 		});
 		const registry = new AttachRegistry({
+			runPrompt: async () => ({ ok: true }),
 			followUp: async () => {
 				await gate;
 				return { ok: true };
@@ -191,6 +483,7 @@ describe("attach registry serialized follow-up", () => {
 
 	it("surfaces callback failures as failed results instead of throwing", async () => {
 		const registry = new AttachRegistry({
+			runPrompt: async () => ({ ok: true }),
 			followUp: async () => {
 				throw new Error("boom");
 			},
@@ -206,35 +499,24 @@ describe("attach registry serialized follow-up", () => {
 		expect(result?.ok).toBe(false);
 		expect(result?.error).toBe("boom");
 	});
-
-	it("throws AttachProtocolError with code for protocol-level rejections", async () => {
-		const { registry } = makeRegistry();
-		try {
-			await registry.followUp(KEY, "r", "p");
-			expect.unreachable();
-		} catch (error) {
-			expect(error).toBeInstanceOf(AttachProtocolError);
-			expect((error as AttachProtocolError).code).toBe("unknown_worker");
-		}
-	});
 });
 
 describe("attach registry abort (never kills)", () => {
-	it("returns false when no follow-up is in flight", async () => {
+	it("returns false when no prompt is in flight", async () => {
 		const { registry } = makeRegistry();
 		registry.register(KEY, null);
 		await expect(registry.abort(KEY, "user")).resolves.toBe(false);
 		expect(registry.has(KEY)).toBe(true); // abort never unregisters
 	});
 
-	it("cancels an in-flight follow-up via the abort callback and returns true", async () => {
+	it("cancels an in-flight prompt via the abort callback and returns true", async () => {
 		let release!: () => void;
 		const gate = new Promise<void>(resolve => {
 			release = resolve;
 		});
 		const aborted: { key: AttachWorkerKey; reason?: string }[] = [];
 		const registry = new AttachRegistry({
-			followUp: async () => {
+			runPrompt: async () => {
 				await gate;
 				return { ok: true };
 			},
@@ -244,13 +526,23 @@ describe("attach registry abort (never kills)", () => {
 			},
 		});
 		registry.register(KEY, null);
-		const first = registry.followUp(KEY, "r", "p");
+		const first = registry.runPrompt(KEY, "p");
 		await Promise.resolve();
 		await expect(registry.abort(KEY, "user-cancel")).resolves.toBe(true);
 		expect(aborted).toEqual([{ key: KEY, reason: "user-cancel" }]);
 		expect(registry.has(KEY)).toBe(true); // never killed
 		release();
 		await first;
+	});
+
+	it("emits abort_accepted even when no callback is wired", async () => {
+		const { registry } = makeRegistry();
+		registry.register(KEY, null);
+		const events = collectEvents(registry, () => {
+			void registry.abort(KEY, "user");
+		});
+		// The emit is synchronous when no abort callback awaits.
+		expect(events.map(event => event.type)).toEqual(["abort_accepted"]);
 	});
 });
 
@@ -280,5 +572,17 @@ describe("attach registry attached-client accounting", () => {
 		registry.attach(KEY, "c");
 		registry.unregister(KEY, "kill");
 		expect(registry.size).toBe(0);
+	});
+});
+
+describe("attach live session source adapter", () => {
+	it("createAttachLiveSessionSource is typed against the presentation surface", () => {
+		// The adapter factory exists and produces the minimum source shape;
+		// the live wiring is exercised by the vibe bridge tests. This guards
+		// the exported signature (branchId/sessionFile/getCwd/getBranchEntries/
+		// subscribe) so a src change surfaces here first.
+		expect(typeof createAttachLiveSessionSource).toBe("function");
+		expect(typeof fakeSource().subscribe).toBe("function");
+		expect(fakeSource().getCwd()).toBe("cwd");
 	});
 });

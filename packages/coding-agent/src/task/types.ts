@@ -92,6 +92,14 @@ export interface SubagentLifecyclePayload {
 	description?: string;
 	status: "started" | "completed" | "failed" | "aborted";
 	sessionFile?: string;
+	/**
+	 * Worker-attach endpoint paths (socket + token file — paths only, never
+	 * capability contents) when the spawning runtime exposes an attach
+	 * substrate. Lets pane launchers attach without deriving the runtime dir
+	 * from the session file (fallback parents have none).
+	 */
+	attachSocket?: string;
+	attachTokenFile?: string;
 	parentToolCallId?: string;
 	index: number;
 	/**

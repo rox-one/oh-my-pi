@@ -19,19 +19,22 @@
 //     progress status does NOT close the pane (the worker stays registered/
 //     continuable for follow-ups) — the pane closes only when the attach
 //     client exits or on session shutdown.
-//   - Session-file sourcing: the started lifecycle payload carries
-//     `sessionFile` — for a Vibe worker this is the CHILD session file
-//     `<parentSessionDir>/<workerId>.jsonl` (executor.ts builds it as
+//   - Endpoint sourcing: the started lifecycle payload may carry EXPLICIT
+//     attach endpoint metadata (`attachSocket` / `attachTokenFile` — paths
+//     only, never the token) emitted by the vibe runtime for every worker.
+//     When present they are authoritative (the worker may have no parent
+//     session file, e.g. the tmp fallback base dir). Otherwise the payload's
+//     `sessionFile` is used — for a Vibe worker this is the CHILD session
+//     file `<parentSessionDir>/<workerId>.jsonl` (executor.ts builds it as
 //     path.join(artifactsDir, `${id}.jsonl`) and the vibe runtime sets
 //     artifactsDir = parentSessionFile minus ".jsonl"). The parent session
 //     directory is therefore path.dirname(payload.sessionFile), verified by
 //     the basename match `${workerId}.jsonl`; the reconstructed parent
 //     session file is `<dir>.jsonl` and the attach runtime dir is
 //     `<dir>/attach` (vibe-bridge.ts ATTACH_RUNTIME_DIR_NAME), holding
-//     `attach.sock` and `attach.token` (attach/server.ts). When the payload
-//     carries no session file (parent has none), or the derived runtime dir
-//     does not exist on disk (tmp fallback base dir), the worker is skipped
-//     with a logged warning — no pane is created.
+//     `attach.sock` and `attach.token` (attach/server.ts). When neither
+//     source yields paths, or the derived runtime dir does not exist on
+//     disk, the worker is skipped with a logged warning — no pane is created.
 //   - Command/env: the split env carries ONLY the two PATH variables
 //     `ATTACH_SOCKET_PATH` and `ATTACH_TOKEN_FILE_PATH` (paths, never the
 //     token/capability — the client reads the 0600 token file itself); the
@@ -170,6 +173,15 @@ export function buildAttachCommand(bin, workerId, parentSessionFile) {
 }
 
 /**
+ * Attach command using the lifecycle payload's EXPLICIT endpoint paths
+ * (fallback-parent workers have no session file to derive from). The client
+ * reads the 0600 token file itself; only paths cross the command line.
+ */
+export function buildAttachCommandWithEndpoints(bin, workerId, socketPath, tokenFile) {
+  return `${bin || DEFAULT_ATTACH_BIN} attach ${workerId} --socket ${quoteShellArg(socketPath)} --token-file ${quoteShellArg(tokenFile)}`;
+}
+
+/**
  * Resolve the attach client command prefix. The explicit `attachBin` wins;
  * otherwise the running omp executable (`execPath` — under a fork parent this
  * IS the fork binary with the attach substrate); only when neither is
@@ -190,7 +202,7 @@ export function resolveAttachBin(attachBin, execPath = process.execPath) {
  * — and the parent session file is `<dir>.jsonl` (same reconstruction
  * session-manager.ts resolveBreadcrumbToInteractiveRoot uses). The attach
  * runtime dir is `<dir>/attach` (vibe-bridge.ts ATTACH_RUNTIME_DIR_NAME),
- * holding `attach.sock` / `attach.token` (attach/server.ts defaults).
+ * holding `attach.sock` and `attach.token` (attach/server.ts).
  *
  * Returns null (caller logs + skips the worker) when the session file is
  * missing, does not end in ".jsonl", or its basename does not match the
@@ -211,7 +223,39 @@ export function deriveAttachPaths(sessionFile, workerId) {
     runtimeDir,
     socketPath: path.join(runtimeDir, ATTACH_SOCKET_FILE),
     tokenFile: path.join(runtimeDir, ATTACH_TOKEN_FILE),
+    explicit: false,
   };
+}
+
+/**
+ * Build the attach paths from the lifecycle payload's EXPLICIT endpoint
+ * metadata (`attachSocket` / `attachTokenFile` — paths only, never the
+ * capability token). These are authoritative for workers whose parent
+ * session has no persisted JSONL (tmp fallback runtime dir), where the
+ * session-file derivation above cannot apply. The parent session file stays
+ * null when the payload carried none.
+ */
+export function deriveExplicitAttachPaths(attachSocket, attachTokenFile) {
+  if (typeof attachSocket !== "string" || attachSocket.length === 0) return null;
+  if (typeof attachTokenFile !== "string" || attachTokenFile.length === 0) return null;
+  if (!path.isAbsolute(attachSocket) || !path.isAbsolute(attachTokenFile)) return null;
+  return {
+    parentSessionFile: null,
+    parentSessionDir: null,
+    runtimeDir: null,
+    socketPath: attachSocket,
+    tokenFile: attachTokenFile,
+    explicit: true,
+  };
+}
+
+/** Prefer the explicit endpoint metadata; fall back to session-file derivation. */
+export function resolveAttachEndpoint(payload, workerId) {
+  if (payload && typeof payload === "object") {
+    const explicit = deriveExplicitAttachPaths(payload.attachSocket, payload.attachTokenFile);
+    if (explicit) return explicit;
+  }
+  return deriveAttachPaths(payload && typeof payload === "object" ? payload.sessionFile : undefined, workerId);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -396,7 +440,7 @@ export class AttachPaneController {
       if (status === "started") {
         // Started still requires the exact vibe session description.
         if (!isVibeDescription(description)) return;
-        this.#onStarted(id, payload.sessionFile);
+        this.#onStarted(id, payload);
       } else if (isTerminalStatus(status)) {
         // Terminal states are accepted for any valid tracked id, even when
         // the description is absent or has changed.
@@ -407,12 +451,13 @@ export class AttachPaneController {
     }
   }
 
-  #onStarted(id, sessionFile) {
-    const paths = deriveAttachPaths(sessionFile, id);
+  #onStarted(id, payload) {
+    const paths = resolveAttachEndpoint(payload, id);
     if (!paths) {
-      // Parent session file unavailable: the worker is skipped (no pane).
-      // The attach substrate cannot be located without it.
-      this.#log.warn?.("herdr-omp-attach-panes: skipping vibe worker without a usable parent session file", id);
+      // Neither explicit endpoint metadata nor a usable parent session file:
+      // the worker is skipped (no pane) — the attach substrate cannot be
+      // located without one of them.
+      this.#log.warn?.("herdr-omp-attach-panes: skipping vibe worker without attach endpoint metadata or a usable parent session file", id);
       return;
     }
     const existing = this.#attaches.get(id);
@@ -438,6 +483,7 @@ export class AttachPaneController {
       runtimeDir: paths.runtimeDir,
       socketPath: paths.socketPath,
       tokenFile: paths.tokenFile,
+      explicit: paths.explicit,
       status: "starting",
       closed: false,
       sawClient: false,
@@ -527,12 +573,17 @@ export class AttachPaneController {
       // time, so a missing dir means the payload's session file was NOT the
       // parent's child (e.g. the tmp fallback base dir of a no-session
       // parent) — skip rather than point a pane at a nonexistent socket.
-      try {
-        await this.#fs.stat(entry.runtimeDir);
-      } catch (err) {
-        this.#log.warn?.("herdr-omp-attach-panes: attach runtime dir missing; skipping worker", entry.vibeId, String(err));
-        if (this.#attaches.get(entry.vibeId) === entry) this.#attaches.delete(entry.vibeId);
-        return;
+      // Explicit endpoint metadata (payload attachSocket/attachTokenFile)
+      // bypasses this check: those paths are authoritative and the client
+      // reports a clear error if the socket is gone.
+      if (entry.runtimeDir !== null) {
+        try {
+          await this.#fs.stat(entry.runtimeDir);
+        } catch (err) {
+          this.#log.warn?.("herdr-omp-attach-panes: attach runtime dir missing; skipping worker", entry.vibeId, String(err));
+          if (this.#attaches.get(entry.vibeId) === entry) this.#attaches.delete(entry.vibeId);
+          return;
+        }
       }
       if (entry.closed) return;
       const target = await this.#pickSplitTarget(entry);
@@ -615,7 +666,9 @@ export class AttachPaneController {
 
   async #startClient(entry) {
     try {
-      const command = buildAttachCommand(this.#attachBin, entry.vibeId, entry.parentSessionFile);
+      const command = entry.explicit
+        ? buildAttachCommandWithEndpoints(this.#attachBin, entry.vibeId, entry.socketPath, entry.tokenFile)
+        : buildAttachCommand(this.#attachBin, entry.vibeId, entry.parentSessionFile);
       await this.#rpc.request("pane.send_text", { pane_id: entry.paneId, text: command });
       await this.#rpc.request("pane.send_keys", { pane_id: entry.paneId, keys: ["ENTER"] });
     } catch (err) {

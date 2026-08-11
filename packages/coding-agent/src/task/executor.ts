@@ -369,6 +369,14 @@ export interface ExecutorOptions {
 	 */
 	detached?: boolean;
 	modelOverride?: string | string[];
+	/**
+	 * Worker-attach endpoint paths (socket + token file — paths only) for the
+	 * started lifecycle payload. Forwarded verbatim into
+	 * {@link SubagentLifecyclePayload} so pane launchers can attach without
+	 * deriving the runtime dir from the session file.
+	 */
+	attachSocket?: string;
+	attachTokenFile?: string;
 	/** Explicit pre-expansion model role alias selected for this run. */
 	modelRole?: string;
 	/**
@@ -3231,6 +3239,8 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					description: options.description,
 					status: "started",
 					sessionFile: subtaskSessionFile,
+					attachSocket: options.attachSocket,
+					attachTokenFile: options.attachTokenFile,
 					index,
 				});
 			}

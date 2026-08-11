@@ -11,18 +11,22 @@
  *   suspend     → stop the bridge (workers detach to another process)
  *   rehydrate   → re-register (revived)
  *
- * Follow-ups are serialized per worker: the callback routes through
+ * Prompts are serialized per worker: the callback routes through
  * `VibeSessionRegistry.send` — the SAME turn-job queue as `vibe_send` — and
- * then awaits the registered turn job, so `follow_up_result` carries the real
- * turn outcome and a second concurrent follow-up for the same worker is
- * rejected with `busy`. Abort cancels the in-flight turn job (never kills the
- * worker: the adopted session survives to be parked or resumed).
+ * then awaits the registered turn job, so `prompt_result` carries the real
+ * turn outcome and a second concurrent prompt for the same worker is
+ * rejected with `busy`. Abort cancels the in-flight turn job (never kills
+ * the worker: the adopted session survives to be parked or resumed).
+ *
+ * The worker's live session reaches the registry ONLY as the typed
+ * {@link AttachLiveSessionSource} presentation surface (see live-session.ts);
+ * no attach path ever touches the raw AgentSession.
  */
 import * as os from "node:os";
 import * as path from "node:path";
+import type { AttachLiveSessionSource } from "./live-session";
 import {
 	type AttachProgressInput,
-	AttachProtocolError,
 	type AttachWorkerKey,
 	type AttachWorkerState,
 	sanitizeAttachProgress,
@@ -30,33 +34,34 @@ import {
 import { type AttachFollowUpResult, AttachRegistry, attachKeyString } from "./registry";
 import { AttachServer } from "./server";
 
-/** Wire payload for a follow-up: the prompt text sent to the worker. */
+/** Wire payload for a prompt: the prompt text sent to the worker. */
 export function attachPromptOf(payload: unknown): string {
-	if (typeof payload !== "string" || payload.trim().length === 0) {
-		throw new AttachProtocolError("malformed", "follow_up payload must be a non-empty string prompt");
+	if (typeof payload === "string") return payload;
+	try {
+		const text = JSON.stringify(payload);
+		return text === undefined ? "" : text;
+	} catch {
+		return String(payload);
 	}
-	return payload;
 }
 
 /**
  * Per-worker live-progress coalescing window. onProgress can fire several
- * times per second; the wire only needs the latest state, so emissions are
- * batched (default 120ms, within the 100-150ms spec) and the final state is
- * flushed before a turn settles.
+ * times per tool execution; the bridge keeps only the freshest state per
+ * worker and emits it at most once per window.
  */
 export const ATTACH_PROGRESS_COALESCE_MS = 120;
 
 export interface AttachVibeBridgeCallbacks {
-	/**
-	 * Runs one worker turn through the vibe turn-job queue (same path as
-	 * `vibe_send`). Returns the settled turn outcome; the bridge handles
-	 * awaiting the job and timeout racing.
-	 */
+	/** Serialized prompt runner (same turn-job queue as vibe_send). */
 	runTurn: (key: AttachWorkerKey, prompt: string, options?: { timeoutMs?: number }) => Promise<AttachFollowUpResult>;
-	/** Cancels the worker's in-flight turn job without killing the worker. */
+	/** Cancel the in-flight turn for a worker; never kills the worker. */
 	abortTurn: (key: AttachWorkerKey, reason?: string) => Promise<boolean>;
-	/** Resolves the live harness AgentSession for a worker, if any. */
-	liveSessionOf: (key: AttachWorkerKey) => unknown;
+	/**
+	 * The worker's live session as the typed presentation source (never the
+	 * raw AgentSession). Null when the worker's session has not materialized.
+	 */
+	liveSessionOf: (key: AttachWorkerKey) => AttachLiveSessionSource | null;
 	/** Whether the worker is currently parked by the AgentLifecycleManager. */
 	isParked: (key: AttachWorkerKey) => boolean;
 }
@@ -104,8 +109,11 @@ export class AttachVibeBridge {
 		this.#isParked = options.isParked;
 		this.#progressCoalesceMs = options.progressCoalesceMs ?? ATTACH_PROGRESS_COALESCE_MS;
 		this.registry = new AttachRegistry({
+			runPrompt: (key, text, promptOptions) => this.#runTurn(key, text, promptOptions),
 			followUp: (key, payload, followUpOptions) => this.#followUp(key, payload, followUpOptions?.timeoutMs),
 			abort: (key, reason) => this.#abortTurn(key, reason),
+			// Resolved lazily: the worker session materializes AFTER register.
+			liveSessionOf: key => this.#liveSessionOf(key),
 			now: options.now,
 		});
 		const runtimeDir = path.join(options.baseDir, ATTACH_RUNTIME_DIR_NAME);
@@ -118,6 +126,16 @@ export class AttachVibeBridge {
 
 	get started(): boolean {
 		return this.#started;
+	}
+
+	/**
+	 * The attach endpoint paths (socket + token file), or null before the
+	 * server started. Paths only — never capability contents. Lifecycle
+	 * payloads carry these so pane launchers never derive them from the
+	 * session file (fallback parents have none).
+	 */
+	endpoint(): { socketFile: string; tokenFile: string } | null {
+		return this.#started ? { socketFile: this.server.socketFile, tokenFile: this.server.tokenFile } : null;
 	}
 
 	/** Bind the 0600 socket + token file. Idempotent; restarts after stop(). */
@@ -226,7 +244,7 @@ export class AttachVibeBridge {
 	}
 
 	// -----------------------------------------------------------------------
-	// Serialized follow-up (same queue as vibe_send)
+	// Serialized prompt/follow-up (same queue as vibe_send)
 	// -----------------------------------------------------------------------
 
 	async #followUp(key: AttachWorkerKey, payload: unknown, timeoutMs?: number): Promise<AttachFollowUpResult> {

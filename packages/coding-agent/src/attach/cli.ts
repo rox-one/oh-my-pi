@@ -7,6 +7,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { Args, type CliConfig, Command } from "@oh-my-pi/pi-utils/cli";
 import { attachHelp as commandHelp } from "../cli/command-help";
+import { Settings } from "../config/settings";
 import { initTheme } from "../modes/theme/theme";
 import { AttachPane } from "./pane";
 import { ATTACH_SOCKET_FILE, ATTACH_TOKEN_FILE } from "./server";
@@ -60,8 +61,9 @@ export default class Attach extends Command {
 
 	static flags = {
 		"session-file": Args.string({
-			description: "Parent session JSONL file the worker belongs to",
-			required: true,
+			description:
+				"Parent session JSONL file the worker belongs to (optional when --socket and --token-file are given)",
+			required: false,
 		}),
 		socket: Args.string({ description: "Override the attach socket path" }),
 		"token-file": Args.string({ description: "Override the attach capability token file" }),
@@ -76,6 +78,11 @@ export default class Attach extends Command {
 
 	async run(): Promise<void> {
 		const { args, flags } = await this.parse(Attach);
+		if (!flags["session-file"] && (flags.socket === undefined || flags["token-file"] === undefined)) {
+			this.#stderr.write("attach: either --session-file or both --socket and --token-file are required\n");
+			process.exitCode = 1;
+			return;
+		}
 		const paths = resolveAttachPaths(flags["session-file"] ?? "", {
 			socket: flags.socket,
 			tokenFile: flags["token-file"],
@@ -89,11 +96,21 @@ export default class Attach extends Command {
 			return;
 		}
 		await initTheme();
+		// The shared transcript presenter's components read settings
+		// (tool-activity visibility, token-usage rows, etc.); the attach CLI
+		// does not run the full SDK startup, so initialize the singleton here.
+		await Settings.init();
 		const pane = new AttachPane(paths.socketFile, token, args.workerId ?? "", {
 			onExit: code => {
 				process.exitCode = code;
 			},
 		});
 		await pane.start();
+		// Stay alive for the pane's whole life. `finished()` resolves only
+		// after the TUI restored the terminal; then force the exit so no
+		// lingering handle (raw-mode stdin reader, framework watchers) can
+		// keep the process alive with a zombie pane.
+		await pane.finished();
+		process.exit(process.exitCode);
 	}
 }

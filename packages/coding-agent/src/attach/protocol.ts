@@ -18,46 +18,83 @@
  * - The capability is 256 bits of CSPRNG output, kept ONLY in the in-memory
  *   server and in a 0600 token file. It MUST never be placed in argv, env,
  *   logs, session transcripts, or any other observable surface.
+ * - Controller leases carry a second CSPRNG secret (the resume proof) that
+ *   only the granted client ever sees. Every control frame must present the
+ *   current lease id + proof + generation.
  *
  * Framing and backpressure
  * ------------------------
  * - Frames are bounded: `ATTACH_MAX_FRAME_BYTES` (1 MiB) per line. The decoder
  *   and `AttachFrameAccumulator` fail fast on oversized frames instead of
- *   buffering without bound.
+ *   buffering without bound. Transcript items are bounded per entry before
+ *   encoding (see `boundAttachTranscriptItems`) so a full snapshot always
+ *   fits within bounded frames.
  * - Writes go through a bounded queue (`AttachBoundedQueue`): when a slow
  *   client pushes the queue past its high-water mark the server drops the
  *   connection rather than buffering unboundedly. `detach`/disconnect never
  *   kills the worker — only the client subscription is torn down.
  *
- * Lifecycle
- * ---------
- *   client -> hello             server -> hello_ok { snapshot } | error
- *   client -> subscribe         server -> snapshot (matching scope) then `event`*
- *   client -> follow_up         server -> event follow_up_accepted / follow_up_result
- *   client -> abort             server -> event abort_accepted
- *   client -> ping              server -> pong
- *   client -> bye               server -> bye, then close
+ * Protocol version 2 — view epochs and controller leases
+ * -------------------------------------------------------
+ * v2 replaces the pane subscribe path with an explicit `view_open` handshake:
  *
- * Follow-ups are serialized per worker: only one in-flight follow-up per
- * `AttachWorkerKey`; a second one gets `error { code: "busy" }`. Abort is
- * always allowed and cancels the in-flight follow-up.
+ *   client -> hello { version: 2 }          server -> hello_ok | error
+ *   client -> view_open { key, resume? }    server -> view_open_ok { lease, epoch, entry }
+ *                                                        | view_open_rejected { code }
+ *   server -> transcript_begin { epoch, seq }
+ *          -> transcript_items { epoch, seq, items }*   (bounded chunks)
+ *          -> transcript_end { epoch, seq, watermark, model? }
+ *          -> event { type: "transcript_append" ... }*  (live additions)
+ *          -> event { type: "progress" | "updated" | "state" | ... }
+ *   client -> prompt { lease, cmdSeq, cmdId, ref, text }
+ *   server -> prompt_accepted { ref, cmdId } | control_rejected { ... }
+ *   server -> prompt_result { ref, cmdId, ok, payload?, error? }
+ *   client -> abort_turn { lease, cmdSeq, cmdId }
+ *   server -> abort_accepted { ref?, cmdId } | control_rejected { ... }
+ *   client -> detach { lease, reason? }      server -> bye { reason }, close
+ *   client -> ping                           server -> pong
  *
- * Progress events are ADDITIVE: `event { type: "progress" }` was introduced
- * without a protocol version bump and carries only live activity hints
- * (`currentTool` / `currentToolArgs` / `lastIntent` / `outputTail`) that a
- * client may ignore. Every progress field is bounded at the sender
- * (see `sanitizeAttachProgress`); older clients that do not recognize the
- * type simply skip it.
+ * - Every `view_open` acquires an atomic controller lease for the worker —
+ *   reject-not-replace: a second pane client is rejected with `lease_busy`
+ *   while the lease is held. `role: "observer"` clients (hello + subscribe)
+ *   never acquire a lease and are read-only.
+ * - The lease carries an opaque id, a secret resume proof, and a generation
+ *   that bumps on every successful (re)acquire. Disconnect holds the lease
+ *   for a short bounded grace so the SAME client instance can resume with
+ *   `resume: { leaseId, proof, generation }`; grace expiry, explicit detach,
+ *   worker removal, session switch, or shutdown releases it. Stale
+ *   generations and foreign leases are rejected.
+ * - Every control frame carries `leaseId + proof + generation` plus a
+ *   client-monotonic `cmdSeq` and a random `cmdId`. The server rejects
+ *   duplicate and out-of-order commands and caches bounded acknowledgements
+ *   so a reconnect can recover whether an accepted input ran — without ever
+ *   executing it twice.
+ * - Transcript delivery is epoch-scoped: the server stamps every transcript
+ *   frame with the view's epoch and a monotonic sequence. A reconnect
+ *   establishes a fresh snapshot epoch; stale epoch/sequence frames are
+ *   protocol errors that force a clean reconnect replay (no terminal-byte
+ *   recovery). `transcript_reset` signals a branch switch/rotation and is
+ *   followed by a fresh snapshot within the same epoch.
+ *
+ * Director/observer compatibility
+ * -------------------------------
+ * v1's `subscribe` + `snapshot` + `follow_up` + `abort` remain for
+ * `role: "director"` clients (the in-process director path) and for
+ * read-only `role: "observer"` clients; `follow_up`/`abort` are rejected
+ * with `forbidden` for observers. Pane clients MUST use `view_open`/`prompt`.
  */
 import { Buffer } from "node:buffer";
-import { randomBytes } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
+import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
+import { isRecord } from "@oh-my-pi/pi-utils";
+import type { SessionMessageEntry } from "../session/session-entries";
 
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
 
 /** Current wire protocol version. Bumped only on breaking wire changes. */
-export const ATTACH_PROTOCOL_VERSION = 1 as const;
+export const ATTACH_PROTOCOL_VERSION = 2 as const;
 
 /** Frame delimiter: one JSON object per line. */
 export const ATTACH_FRAME_DELIMITER = 0x0a; // '\n'
@@ -70,6 +107,12 @@ export const ATTACH_CAPABILITY_BYTES = 32;
 
 /** Capability serialized length in hex characters. */
 export const ATTACH_CAPABILITY_HEX_LENGTH = ATTACH_CAPABILITY_BYTES * 2;
+
+/** Lease proof entropy, in bytes (256 bits). */
+export const ATTACH_LEASE_PROOF_BYTES = 32;
+
+/** Lease proof serialized length in hex characters. */
+export const ATTACH_LEASE_PROOF_HEX_LENGTH = ATTACH_LEASE_PROOF_BYTES * 2;
 
 /** Mode applied to the token file that stores the capability. */
 export const ATTACH_TOKEN_FILE_MODE = 0o600;
@@ -102,6 +145,25 @@ export const ATTACH_PROGRESS_MAX_INTENT_LENGTH = 80;
 export const ATTACH_PROGRESS_MAX_OUTPUT_LINES = 3;
 /** Max characters per `outputTail` line in a progress event. */
 export const ATTACH_PROGRESS_MAX_LINE_LENGTH = 100;
+
+/** Transcript entries per `transcript_items` frame. */
+export const ATTACH_TRANSCRIPT_ITEMS_PER_FRAME = 25;
+
+/**
+ * Per-entry transcript serialization budget. Entries whose encoded size
+ * exceeds this are truncated (see {@link boundAttachTranscriptItems}) so a
+ * full snapshot always fits bounded frames.
+ */
+export const ATTACH_TRANSCRIPT_MAX_ENTRY_BYTES = 384 * 1024;
+
+/** Long strings inside a transcript entry are truncated to this many chars. */
+export const ATTACH_TRANSCRIPT_MAX_STRING_CHARS = 16 * 1024;
+
+/** Default disconnect grace for a controller lease, in ms. */
+export const ATTACH_LEASE_GRACE_MS = 30_000;
+
+/** Bounded command-acknowledgement cache size per worker. */
+export const ATTACH_CMD_ACK_CACHE_SIZE = 64;
 
 // ---------------------------------------------------------------------------
 // Core domain types
@@ -149,13 +211,29 @@ export interface AttachSnapshotShrinkOptions {
 	readonly maxSummaryLength?: number;
 }
 
+/**
+ * Controller lease for one worker view. The holder's control frames must
+ * present `leaseId + proof + generation`; `generation` bumps on every
+ * successful (re)acquire so a stale client can never control the worker.
+ */
+export interface AttachLease {
+	readonly leaseId: string;
+	readonly proof: string;
+	readonly generation: number;
+	/** Disconnect grace before the lease is released, in ms. */
+	readonly graceMs: number;
+}
+
 // ---------------------------------------------------------------------------
 // Wire messages (client -> server)
-// ---------------------------------------------------------------------------
 
 export interface AttachClientInfo {
-	/** `pane` = a pane-origin client; `director` = the session's director. */
-	readonly role: "pane" | "director";
+	/**
+	 * `pane` = a pane-origin client (must use view_open/prompt; acquires the
+	 * controller lease); `director` = the session's director (subscribe +
+	 * follow_up path); `observer` = read-only subscriber (no controls).
+	 */
+	readonly role: "pane" | "director" | "observer";
 	/** Free-form client label for logs (never trusted for auth). */
 	readonly name?: string;
 }
@@ -166,18 +244,79 @@ export interface AttachHello {
 	readonly version: number;
 	readonly capability: string;
 	readonly client: AttachClientInfo;
-	/** When true, the server replies with hello_ok + snapshot and starts streaming. */
-	readonly subscribe?: boolean;
 }
 
-/** Narrow the event stream. Empty arrays/omitted fields mean "everything". */
+/**
+ * Acquire (or resume) the controller lease for one worker and start its
+ * transcript view. `resume` is how a disconnected client reclaims its own
+ * lease within the grace window: the server re-grants ONLY when the presented
+ * lease id + proof + generation match the current holder. A fresh view_open
+ * with no `resume` is rejected with `lease_busy` while any lease is held.
+ */
+export interface AttachViewOpen {
+	readonly kind: "view_open";
+	readonly key: AttachWorkerKey;
+	readonly resume?: {
+		readonly leaseId: string;
+		readonly proof: string;
+		readonly generation: number;
+	};
+}
+
+/**
+ * Submit one prompt to the worker through the Vibe turn queue (same queue as
+ * `vibe_send`). Controller-only: requires the current lease. `cmdSeq` is
+ * client-monotonic per lease; `cmdId` is a client-generated idempotency key.
+ */
+export interface AttachPrompt {
+	readonly kind: "prompt";
+	readonly key: AttachWorkerKey;
+	readonly leaseId: string;
+	readonly proof: string;
+	readonly generation: number;
+	readonly cmdSeq: number;
+	readonly cmdId: string;
+	/** Client-generated correlation id, echoed on prompt_accepted/prompt_result. */
+	readonly ref: string;
+	readonly text: string;
+	readonly timeoutMs?: number;
+}
+
+/**
+ * Cancel the in-flight turn for a worker (never kills the worker).
+ * Controller-only; distinct from `detach` (which only releases the view).
+ */
+export interface AttachAbortTurn {
+	readonly kind: "abort_turn";
+	readonly key: AttachWorkerKey;
+	readonly leaseId: string;
+	readonly proof: string;
+	readonly generation: number;
+	readonly cmdSeq: number;
+	readonly cmdId: string;
+}
+
+/**
+ * Explicitly release the controller lease and close the view. The server
+ * replies `bye` and closes the connection. Does NOT abort the worker.
+ */
+export interface AttachDetach {
+	readonly kind: "detach";
+	readonly key: AttachWorkerKey;
+	readonly leaseId: string;
+	readonly proof: string;
+	readonly generation: number;
+	readonly reason?: string;
+}
+
+/** Narrow the event stream (director/observer subscribe path). */
 export interface AttachSubscribe {
 	readonly kind: "subscribe";
 	readonly workerIds?: readonly string[];
 	readonly ownerScopes?: readonly string[];
 }
 
-/** Serialized follow-up prompt for a worker (same queue as vibe_send). */
+/** Serialized follow-up prompt for a worker (director path; same queue as vibe_send). */
 export interface AttachFollowUp {
 	readonly kind: "follow_up";
 	/** Client-generated correlation id, echoed on follow_up_result. */
@@ -187,7 +326,7 @@ export interface AttachFollowUp {
 	readonly timeoutMs?: number;
 }
 
-/** Cancel the in-flight follow-up for a worker. Never kills the worker. */
+/** Cancel the in-flight follow-up for a worker (director path). Never kills the worker. */
 export interface AttachAbort {
 	readonly kind: "abort";
 	readonly key: AttachWorkerKey;
@@ -205,7 +344,17 @@ export interface AttachBye {
 	readonly kind: "bye";
 }
 
-export type AttachClientMessage = AttachHello | AttachSubscribe | AttachFollowUp | AttachAbort | AttachPing | AttachBye;
+export type AttachClientMessage =
+	| AttachHello
+	| AttachViewOpen
+	| AttachPrompt
+	| AttachAbortTurn
+	| AttachDetach
+	| AttachSubscribe
+	| AttachFollowUp
+	| AttachAbort
+	| AttachPing
+	| AttachBye;
 
 // ---------------------------------------------------------------------------
 // Wire messages (server -> client)
@@ -222,7 +371,126 @@ export interface AttachHelloOk {
 	readonly snapshot: AttachSnapshot;
 }
 
-/** Push of a fresh snapshot (after `subscribe`, and on demand). */
+/**
+ * Successful `view_open`: the caller holds the controller lease for `key`
+ * and may send `prompt`/`abort_turn`/`detach` frames. `epoch` scopes every
+ * subsequent transcript frame; `entry` is the worker's current state.
+ */
+export interface AttachViewOpenOk {
+	readonly kind: "view_open_ok";
+	readonly key: AttachWorkerKey;
+	readonly lease: AttachLease;
+	readonly epoch: number;
+	readonly entry: AttachSessionEntry;
+	/** Worker working directory (for path shortening in rendered components). */
+	readonly cwd?: string;
+}
+
+export type AttachViewOpenRejectCode = "lease_busy" | "unknown_worker" | "stale_resume" | "internal";
+
+/** Failed `view_open`. `holder` is present for `lease_busy` so the client can
+ *  show why and when the lease frees. */
+export interface AttachViewOpenRejected {
+	readonly kind: "view_open_rejected";
+	readonly key: AttachWorkerKey;
+	readonly code: AttachViewOpenRejectCode;
+	readonly message: string;
+	readonly holder?: {
+		readonly generation: number;
+		readonly expiresInMs: number;
+	};
+}
+
+/** Starts a snapshot epoch for a view: the following frames carry entries. */
+export interface AttachTranscriptBegin {
+	readonly kind: "transcript_begin";
+	readonly key: AttachWorkerKey;
+	readonly epoch: number;
+	readonly seq: number;
+}
+
+/** One bounded chunk of transcript entries within a snapshot epoch. */
+export interface AttachTranscriptItems {
+	readonly kind: "transcript_items";
+	readonly key: AttachWorkerKey;
+	readonly epoch: number;
+	readonly seq: number;
+	readonly items: readonly SessionMessageEntry[];
+}
+
+/** Completes the snapshot epoch; `watermark` is the total entry count sent. */
+export interface AttachTranscriptEnd {
+	readonly kind: "transcript_end";
+	readonly key: AttachWorkerKey;
+	readonly epoch: number;
+	readonly seq: number;
+	readonly watermark: number;
+	readonly model?: string;
+}
+
+/** One bounded chunk of NEWLY appended transcript entries (live, after the
+ *  snapshot epoch completed). The client appends these to its presenter. */
+export interface AttachTranscriptAppend {
+	readonly kind: "transcript_append";
+	readonly key: AttachWorkerKey;
+	readonly epoch: number;
+	readonly seq: number;
+	readonly items: readonly SessionMessageEntry[];
+	readonly watermark: number;
+	readonly model?: string;
+}
+
+/** The worker's transcript branch was switched/rotated; discard and re-snapshot. */
+export interface AttachTranscriptReset {
+	readonly kind: "transcript_reset";
+	readonly key: AttachWorkerKey;
+	readonly epoch: number;
+	readonly seq: number;
+	readonly reason: string;
+}
+
+/** The server accepted a controller prompt; `prompt_result` follows. */
+export interface AttachPromptAccepted {
+	readonly kind: "prompt_accepted";
+	readonly key: AttachWorkerKey;
+	readonly ref: string;
+	readonly cmdId: string;
+}
+
+/** A controller prompt settled with the real turn outcome. */
+export interface AttachPromptResult {
+	readonly kind: "prompt_result";
+	readonly key: AttachWorkerKey;
+	readonly ref: string;
+	readonly cmdId: string;
+	readonly ok: boolean;
+	readonly payload?: unknown;
+	readonly error?: string;
+}
+
+export type AttachControlRejectCode =
+	| "lease_required"
+	| "stale_lease"
+	| "stale_generation"
+	| "foreign_client"
+	| "duplicate"
+	| "out_of_order"
+	| "busy"
+	| "forbidden"
+	| "unknown_worker"
+	| "internal";
+
+/** A controller frame was rejected (lease/generation/sequence/idempotency). */
+export interface AttachControlRejected {
+	readonly kind: "control_rejected";
+	readonly key: AttachWorkerKey;
+	readonly cmdId?: string;
+	readonly ref?: string;
+	readonly code: AttachControlRejectCode;
+	readonly message: string;
+}
+
+/** Push of a fresh snapshot (director/observer subscribe path). */
 export interface AttachSnapshotPush {
 	readonly kind: "snapshot";
 	readonly snapshot: AttachSnapshot;
@@ -267,6 +535,16 @@ export interface AttachError {
 
 export type AttachServerMessage =
 	| AttachHelloOk
+	| AttachViewOpenOk
+	| AttachViewOpenRejected
+	| AttachTranscriptBegin
+	| AttachTranscriptItems
+	| AttachTranscriptEnd
+	| AttachTranscriptAppend
+	| AttachTranscriptReset
+	| AttachPromptAccepted
+	| AttachPromptResult
+	| AttachControlRejected
 	| AttachSnapshotPush
 	| AttachEventMessage
 	| AttachPong
@@ -320,6 +598,21 @@ export type AttachEvent =
 			readonly ref?: string;
 	  }
 	| {
+			readonly type: "lease_granted";
+			readonly key: AttachWorkerKey;
+			readonly generation: number;
+	  }
+	| {
+			readonly type: "lease_expired";
+			readonly key: AttachWorkerKey;
+			readonly reason: string;
+	  }
+	| {
+			readonly type: "lease_revoked";
+			readonly key: AttachWorkerKey;
+			readonly reason: string;
+	  }
+	| {
 			readonly type: "progress";
 			readonly key: AttachWorkerKey;
 			readonly at: number;
@@ -349,7 +642,7 @@ export class AttachProtocolError extends Error {
 }
 
 // ---------------------------------------------------------------------------
-// Capability
+// Capability + lease secrets
 // ---------------------------------------------------------------------------
 
 /** CSPRNG 256-bit capability serialized as 64 lowercase hex characters. */
@@ -364,6 +657,26 @@ export function isAttachCapability(capability: unknown): capability is string {
 		capability.length === ATTACH_CAPABILITY_HEX_LENGTH &&
 		/^[0-9a-f]+$/.test(capability)
 	);
+}
+
+/** CSPRNG 256-bit lease proof serialized as 64 lowercase hex characters. */
+export function generateAttachLeaseProof(): string {
+	return randomBytes(ATTACH_LEASE_PROOF_BYTES).toString("hex");
+}
+
+/** True iff `proof` has the exact expected shape. */
+export function isAttachLeaseProof(proof: unknown): proof is string {
+	return typeof proof === "string" && proof.length === ATTACH_LEASE_PROOF_HEX_LENGTH && /^[0-9a-f]+$/.test(proof);
+}
+
+/** Unique lease id (v4 UUID). */
+export function generateAttachLeaseId(): string {
+	return randomUUID();
+}
+
+/** Unique command id. */
+export function generateAttachCmdId(): string {
+	return randomUUID();
 }
 
 // ---------------------------------------------------------------------------
@@ -415,13 +728,21 @@ export function validateAttachMessage(value: unknown): AttachMessage {
 	if (typeof value !== "object" || value === null || Array.isArray(value)) {
 		throw new AttachProtocolError("malformed", "message must be a JSON object");
 	}
-	const kind = (value as { kind?: unknown }).kind;
+	const kind: unknown = "kind" in value ? value.kind : undefined;
 	if (typeof kind !== "string") {
 		throw new AttachProtocolError("malformed", 'message is missing string field "kind"');
 	}
 	switch (kind) {
 		case "hello":
 			return validateHello(value as Record<string, unknown>);
+		case "view_open":
+			return validateViewOpen(value as Record<string, unknown>);
+		case "prompt":
+			return validatePrompt(value as Record<string, unknown>);
+		case "abort_turn":
+			return validateAbortTurn(value as Record<string, unknown>);
+		case "detach":
+			return validateDetach(value as Record<string, unknown>);
 		case "subscribe":
 			return validateSubscribe(value as Record<string, unknown>);
 		case "follow_up":
@@ -433,6 +754,16 @@ export function validateAttachMessage(value: unknown): AttachMessage {
 		case "bye":
 			return validateBye(value as Record<string, unknown>);
 		case "hello_ok":
+		case "view_open_ok":
+		case "view_open_rejected":
+		case "transcript_begin":
+		case "transcript_items":
+		case "transcript_end":
+		case "transcript_append":
+		case "transcript_reset":
+		case "prompt_accepted":
+		case "prompt_result":
+		case "control_rejected":
 		case "snapshot":
 		case "event":
 		case "pong":
@@ -446,10 +777,6 @@ export function validateAttachMessage(value: unknown): AttachMessage {
 // ---------------------------------------------------------------------------
 // Per-kind validation
 // ---------------------------------------------------------------------------
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
-}
 
 function expectString(value: Record<string, unknown>, field: string): string {
 	const v = value[field];
@@ -490,12 +817,6 @@ function expectBoolean(value: Record<string, unknown>, field: string): boolean {
 	return v;
 }
 
-function expectOptionalBoolean(value: Record<string, unknown>, field: string): boolean | undefined {
-	const v = value[field];
-	if (v === undefined) return undefined;
-	return expectBoolean(value, field);
-}
-
 function expectWorkerKey(value: Record<string, unknown>, field: string): AttachWorkerKey {
 	const raw = value[field];
 	if (!isRecord(raw)) {
@@ -504,6 +825,48 @@ function expectWorkerKey(value: Record<string, unknown>, field: string): AttachW
 	return {
 		workerId: expectString(raw, "workerId"),
 		ownerScope: expectString(raw, "ownerScope"),
+	};
+}
+
+function expectLease(value: Record<string, unknown>, field: string): AttachLease {
+	const raw = value[field];
+	if (!isRecord(raw)) {
+		throw new AttachProtocolError("malformed", `field "${field}" must be an object`);
+	}
+	const leaseId = expectString(raw, "leaseId");
+	if (leaseId.length === 0) {
+		throw new AttachProtocolError("malformed", 'field "leaseId" must not be empty');
+	}
+	const proof = expectString(raw, "proof");
+	if (!isAttachLeaseProof(proof)) {
+		throw new AttachProtocolError("malformed", 'field "proof" has an invalid shape');
+	}
+	return {
+		leaseId,
+		proof,
+		generation: expectNumber(raw, "generation"),
+		graceMs: expectNumber(raw, "graceMs"),
+	};
+}
+
+function expectResume(value: Record<string, unknown>, field: string): AttachViewOpen["resume"] {
+	const raw = value[field];
+	if (raw === undefined) return undefined;
+	if (!isRecord(raw)) {
+		throw new AttachProtocolError("malformed", `field "${field}" must be an object`);
+	}
+	const leaseId = expectString(raw, "leaseId");
+	if (leaseId.length === 0) {
+		throw new AttachProtocolError("malformed", 'field "resume.leaseId" must not be empty');
+	}
+	const proof = expectString(raw, "proof");
+	if (!isAttachLeaseProof(proof)) {
+		throw new AttachProtocolError("malformed", 'field "resume.proof" has an invalid shape');
+	}
+	return {
+		leaseId,
+		proof,
+		generation: expectNumber(raw, "generation"),
 	};
 }
 
@@ -530,8 +893,8 @@ function validateHello(value: Record<string, unknown>): AttachHello {
 		throw new AttachProtocolError("malformed", 'field "client" must be an object');
 	}
 	const role = client.role;
-	if (role !== "pane" && role !== "director") {
-		throw new AttachProtocolError("malformed", 'field "client.role" must be "pane" or "director"');
+	if (role !== "pane" && role !== "director" && role !== "observer") {
+		throw new AttachProtocolError("malformed", 'field "client.role" must be "pane", "director", or "observer"');
 	}
 	return {
 		kind: "hello",
@@ -541,7 +904,102 @@ function validateHello(value: Record<string, unknown>): AttachHello {
 			role,
 			name: expectOptionalString(client, "name"),
 		},
-		subscribe: expectOptionalBoolean(value, "subscribe"),
+	};
+}
+
+function validateViewOpen(value: Record<string, unknown>): AttachViewOpen {
+	return {
+		kind: "view_open",
+		key: expectWorkerKey(value, "key"),
+		resume: expectResume(value, "resume"),
+	};
+}
+
+function validateLeaseFields(value: Record<string, unknown>): {
+	leaseId: string;
+	proof: string;
+	generation: number;
+} {
+	const leaseId = expectString(value, "leaseId");
+	if (leaseId.length === 0) {
+		throw new AttachProtocolError("malformed", 'field "leaseId" must not be empty');
+	}
+	const proof = expectString(value, "proof");
+	if (!isAttachLeaseProof(proof)) {
+		throw new AttachProtocolError("malformed", 'field "proof" has an invalid shape');
+	}
+	return {
+		leaseId,
+		proof,
+		generation: expectNumber(value, "generation"),
+	};
+}
+
+function validateControlHeader(value: Record<string, unknown>): {
+	key: AttachWorkerKey;
+	leaseId: string;
+	proof: string;
+	generation: number;
+	cmdSeq: number;
+	cmdId: string;
+} {
+	const key = expectWorkerKey(value, "key");
+	const lease = validateLeaseFields(value);
+	const cmdSeq = expectNumber(value, "cmdSeq");
+	if (!Number.isInteger(cmdSeq) || cmdSeq < 1) {
+		throw new AttachProtocolError("malformed", 'field "cmdSeq" must be a positive integer');
+	}
+	const cmdId = expectString(value, "cmdId");
+	if (cmdId.length === 0) {
+		throw new AttachProtocolError("malformed", 'field "cmdId" must not be empty');
+	}
+	return { key, leaseId: lease.leaseId, proof: lease.proof, generation: lease.generation, cmdSeq, cmdId };
+}
+
+function validatePrompt(value: Record<string, unknown>): AttachPrompt {
+	const header = validateControlHeader(value);
+	const ref = expectString(value, "ref");
+	if (ref.length === 0) {
+		throw new AttachProtocolError("malformed", 'field "ref" must not be empty');
+	}
+	const text = expectString(value, "text");
+	return {
+		kind: "prompt",
+		key: header.key,
+		leaseId: header.leaseId,
+		proof: header.proof,
+		generation: header.generation,
+		cmdSeq: header.cmdSeq,
+		cmdId: header.cmdId,
+		ref,
+		text,
+		timeoutMs: expectOptionalNumber(value, "timeoutMs"),
+	};
+}
+
+function validateAbortTurn(value: Record<string, unknown>): AttachAbortTurn {
+	const header = validateControlHeader(value);
+	return {
+		kind: "abort_turn",
+		key: header.key,
+		leaseId: header.leaseId,
+		proof: header.proof,
+		generation: header.generation,
+		cmdSeq: header.cmdSeq,
+		cmdId: header.cmdId,
+	};
+}
+
+function validateDetach(value: Record<string, unknown>): AttachDetach {
+	const key = expectWorkerKey(value, "key");
+	const lease = validateLeaseFields(value);
+	return {
+		kind: "detach",
+		key,
+		leaseId: lease.leaseId,
+		proof: lease.proof,
+		generation: expectNumber(value, "generation"),
+		reason: expectOptionalString(value, "reason"),
 	};
 }
 
@@ -590,6 +1048,21 @@ function validateBye(value: Record<string, unknown>): AttachBye {
 	return { kind: "bye" };
 }
 
+function expectTranscriptItems(value: unknown): readonly SessionMessageEntry[] {
+	if (!Array.isArray(value)) {
+		throw new AttachProtocolError("malformed", 'field "items" must be an array');
+	}
+	for (const item of value) {
+		if (!isRecord(item) || item.type !== "message" || !isRecord(item.message)) {
+			throw new AttachProtocolError("malformed", "transcript item must be a session message entry");
+		}
+		if (typeof item.id !== "string" || typeof item.timestamp !== "string") {
+			throw new AttachProtocolError("malformed", "transcript item is missing id or timestamp");
+		}
+	}
+	return value as unknown as readonly SessionMessageEntry[];
+}
+
 function validateServerMessage(kind: string, value: Record<string, unknown>): AttachServerMessage {
 	// Server-bound messages are produced by the server itself; we still verify
 	// the shape so the decode path rejects garbage (e.g. hostile peers echoing
@@ -608,6 +1081,130 @@ function validateServerMessage(kind: string, value: Record<string, unknown>): At
 					startedAt: expectNumber(server, "startedAt"),
 				},
 				snapshot: expectSnapshot(value.snapshot),
+			};
+		}
+		case "view_open_ok":
+			return {
+				kind: "view_open_ok",
+				key: expectWorkerKey(value, "key"),
+				lease: expectLease(value, "lease"),
+				epoch: expectNumber(value, "epoch"),
+				entry: expectSessionEntry(value.entry),
+				cwd: expectOptionalString(value, "cwd"),
+			};
+		case "view_open_rejected": {
+			const code = value.code;
+			const codes: readonly AttachViewOpenRejectCode[] = [
+				"lease_busy",
+				"unknown_worker",
+				"stale_resume",
+				"internal",
+			];
+			if (typeof code !== "string" || !codes.includes(code as AttachViewOpenRejectCode)) {
+				throw new AttachProtocolError("malformed", 'field "code" is not a valid rejection code');
+			}
+			const holder = value.holder;
+			return {
+				kind: "view_open_rejected",
+				key: expectWorkerKey(value, "key"),
+				code: code as AttachViewOpenRejectCode,
+				message: expectString(value, "message"),
+				holder:
+					holder === undefined || holder === null
+						? undefined
+						: isRecord(holder)
+							? {
+									generation: expectNumber(holder, "generation"),
+									expiresInMs: expectNumber(holder, "expiresInMs"),
+								}
+							: (() => {
+									throw new AttachProtocolError("malformed", 'field "holder" must be an object');
+								})(),
+			};
+		}
+		case "transcript_begin":
+			return {
+				kind: "transcript_begin",
+				key: expectWorkerKey(value, "key"),
+				epoch: expectNumber(value, "epoch"),
+				seq: expectNumber(value, "seq"),
+			};
+		case "transcript_items":
+			return {
+				kind: "transcript_items",
+				key: expectWorkerKey(value, "key"),
+				epoch: expectNumber(value, "epoch"),
+				seq: expectNumber(value, "seq"),
+				items: expectTranscriptItems(value.items),
+			};
+		case "transcript_end":
+			return {
+				kind: "transcript_end",
+				key: expectWorkerKey(value, "key"),
+				epoch: expectNumber(value, "epoch"),
+				seq: expectNumber(value, "seq"),
+				watermark: expectNumber(value, "watermark"),
+				model: expectOptionalString(value, "model"),
+			};
+		case "transcript_append":
+			return {
+				kind: "transcript_append",
+				key: expectWorkerKey(value, "key"),
+				epoch: expectNumber(value, "epoch"),
+				seq: expectNumber(value, "seq"),
+				items: expectTranscriptItems(value.items),
+				watermark: expectNumber(value, "watermark"),
+				model: expectOptionalString(value, "model"),
+			};
+		case "transcript_reset":
+			return {
+				kind: "transcript_reset",
+				key: expectWorkerKey(value, "key"),
+				epoch: expectNumber(value, "epoch"),
+				seq: expectNumber(value, "seq"),
+				reason: expectString(value, "reason"),
+			};
+		case "prompt_accepted":
+			return {
+				kind: "prompt_accepted",
+				key: expectWorkerKey(value, "key"),
+				ref: expectString(value, "ref"),
+				cmdId: expectString(value, "cmdId"),
+			};
+		case "prompt_result":
+			return {
+				kind: "prompt_result",
+				key: expectWorkerKey(value, "key"),
+				ref: expectString(value, "ref"),
+				cmdId: expectString(value, "cmdId"),
+				ok: expectBoolean(value, "ok"),
+				payload: "payload" in value ? value.payload : undefined,
+				error: expectOptionalString(value, "error"),
+			};
+		case "control_rejected": {
+			const code = value.code;
+			const codes: readonly AttachControlRejectCode[] = [
+				"lease_required",
+				"stale_lease",
+				"stale_generation",
+				"foreign_client",
+				"duplicate",
+				"out_of_order",
+				"busy",
+				"forbidden",
+				"unknown_worker",
+				"internal",
+			];
+			if (typeof code !== "string" || !codes.includes(code as AttachControlRejectCode)) {
+				throw new AttachProtocolError("malformed", 'field "code" is not a valid rejection code');
+			}
+			return {
+				kind: "control_rejected",
+				key: expectWorkerKey(value, "key"),
+				cmdId: expectOptionalString(value, "cmdId"),
+				ref: expectOptionalString(value, "ref"),
+				code: code as AttachControlRejectCode,
+				message: expectString(value, "message"),
 			};
 		}
 		case "snapshot":
@@ -736,6 +1333,11 @@ function expectEvent(value: unknown): AttachEvent {
 			};
 		case "abort_accepted":
 			return { type, key, ref: expectOptionalString(value, "ref") };
+		case "lease_granted":
+			return { type, key, generation: expectNumber(value, "generation") };
+		case "lease_expired":
+		case "lease_revoked":
+			return { type, key, reason: expectString(value, "reason") };
 		case "progress":
 			return {
 				type,
@@ -749,6 +1351,104 @@ function expectEvent(value: unknown): AttachEvent {
 		default:
 			throw new AttachProtocolError("unknown_kind", `unknown event type "${type}"`);
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Transcript entry bounding
+// ---------------------------------------------------------------------------
+
+/**
+ * Bound a transcript entry for the wire: long strings inside the message are
+ * truncated to `ATTACH_TRANSCRIPT_MAX_STRING_CHARS` and the encoded entry is
+ * kept under `ATTACH_TRANSCRIPT_MAX_ENTRY_BYTES`. Applied before encoding so
+ * snapshot chunks can never exceed their frame budget. Mutates nothing —
+ * returns a new entry when truncation was needed.
+ */
+export function boundAttachTranscriptEntry(entry: SessionMessageEntry): SessionMessageEntry {
+	const bounded = boundMessageForWire(entry.message);
+	if (bounded === entry.message) return entry;
+	return { ...entry, message: bounded };
+}
+
+/**
+ * Bound an array of transcript entries for the wire, splitting into bounded
+ * chunks of at most `ATTACH_TRANSCRIPT_ITEMS_PER_FRAME` entries.
+ */
+export function boundAttachTranscriptItems(
+	items: readonly SessionMessageEntry[],
+): readonly (readonly SessionMessageEntry[])[] {
+	const chunks: SessionMessageEntry[][] = [];
+	for (const item of items) {
+		const bounded = boundAttachTranscriptEntry(item);
+		if (chunks.length === 0 || chunks[chunks.length - 1]!.length >= ATTACH_TRANSCRIPT_ITEMS_PER_FRAME) {
+			chunks.push([bounded]);
+		} else {
+			chunks[chunks.length - 1]!.push(bounded);
+		}
+	}
+	return chunks;
+}
+
+/**
+ * Truncate long strings in a message to keep the encoded entry bounded.
+ * Non-content message kinds (bashExecution, pythonExecution, …) carry their
+ * payload in role-specific fields and are returned untouched — their strings
+ * are already bounded by the executor.
+ */
+function boundMessageForWire(message: AgentMessage): AgentMessage {
+	if (!("content" in message)) return message;
+	const max = ATTACH_TRANSCRIPT_MAX_STRING_CHARS;
+
+	const boundString = (value: string): string => {
+		return value.length <= max ? value : `${value.slice(0, max)}\n…[truncated]`;
+	};
+
+	const boundBlocks = (blocks: readonly unknown[]): readonly unknown[] | null => {
+		let mutated: unknown[] | null = null;
+		for (let i = 0; i < blocks.length; i++) {
+			const block = blocks[i];
+			if (typeof block !== "object" || block === null) continue;
+			const next: Record<string, unknown> = {};
+			let blockChanged = false;
+			for (const [key, value] of Object.entries(block)) {
+				if (typeof value === "string") {
+					const bounded = boundString(value);
+					if (bounded !== value) {
+						next[key] = bounded;
+						blockChanged = true;
+					} else {
+						next[key] = value;
+					}
+				} else if (Array.isArray(value)) {
+					const nested = boundBlocks(value);
+					if (nested !== null) {
+						next[key] = nested;
+						blockChanged = true;
+					} else {
+						next[key] = value;
+					}
+				} else {
+					next[key] = value;
+				}
+			}
+			if (blockChanged) {
+				if (mutated === null) mutated = blocks.slice();
+				mutated[i] = next;
+			}
+		}
+		return mutated;
+	};
+
+	const content = message.content;
+	if (typeof content === "string") {
+		const bounded = boundString(content);
+		return bounded === content ? message : ({ ...message, content: bounded } as AgentMessage);
+	}
+	if (Array.isArray(content)) {
+		const bounded = boundBlocks(content);
+		return bounded === null ? message : ({ ...message, content: bounded } as AgentMessage);
+	}
+	return message;
 }
 
 // ---------------------------------------------------------------------------
@@ -948,4 +1648,9 @@ export function formatAttachKey(key: AttachWorkerKey): string {
 /** True iff the message is a valid `hello` (used for strict hello-first auth). */
 export function isHelloMessage(message: AttachMessage): message is AttachHello {
 	return message.kind === "hello";
+}
+
+/** True iff the client role may submit controls (pane/director). */
+export function isControllerRole(role: AttachClientInfo["role"]): boolean {
+	return role === "pane" || role === "director";
 }

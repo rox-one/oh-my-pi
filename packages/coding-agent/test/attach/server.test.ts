@@ -3,11 +3,14 @@ import * as fs from "node:fs/promises";
 import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
-import { type AttachMessage, encodeAttachMessage } from "../../src/attach/protocol";
+import type { AttachLiveSessionSource } from "../../src/attach/live-session";
+import { ATTACH_MAX_FRAME_BYTES, type AttachMessage, encodeAttachMessage } from "../../src/attach/protocol";
 import { AttachRegistry } from "../../src/attach/registry";
 import { ATTACH_SOCKET_FILE, ATTACH_TOKEN_FILE, AttachServer } from "../../src/attach/server";
+import type { SessionMessageEntry } from "../../src/session/session-entries";
 
 const KEY = { workerId: "w1", ownerScope: "scope-a" };
+const PROOF = "b".repeat(64);
 
 /** Minimal client: connects, sends frames, buffers decoded server messages. */
 class TestClient {
@@ -52,6 +55,10 @@ class TestClient {
 		this.#socket.write(encodeAttachMessage(message));
 	}
 
+	sendRaw(data: Buffer): void {
+		this.#socket.write(data);
+	}
+
 	/** Resolve once a message matching `predicate` has arrived (polling, deterministic). */
 	async waitForMessage(predicate: (message: AttachMessage) => boolean, timeoutMs = 2000): Promise<AttachMessage> {
 		const deadline = Date.now() + timeoutMs;
@@ -75,6 +82,47 @@ class TestClient {
 	}
 }
 
+/** Fake live session presentation source with a mutable branch. */
+function fakeSource(initial: readonly SessionMessageEntry[] = []) {
+	let branchId = "b1";
+	let entries: readonly SessionMessageEntry[] = initial;
+	const listeners = new Set<() => void>();
+	const source: AttachLiveSessionSource = {
+		get branchId() {
+			return branchId;
+		},
+		sessionFile: null,
+		getCwd: () => "/cwd",
+		getBranchEntries: () => entries,
+		subscribe: listener => {
+			listeners.add(listener);
+			return () => listeners.delete(listener);
+		},
+	};
+	return {
+		source,
+		setBranch(next: readonly SessionMessageEntry[]): void {
+			entries = next;
+		},
+		setBranchId(id: string): void {
+			branchId = id;
+		},
+		notify(): void {
+			for (const listener of listeners) listener();
+		},
+	};
+}
+
+function messageEntry(id: string, text: string): SessionMessageEntry {
+	return {
+		type: "message",
+		id,
+		parentId: null,
+		timestamp: "2026-08-11T00:00:00.000Z",
+		message: { role: "user", content: text, timestamp: 1 },
+	};
+}
+
 describe("attach server", () => {
 	let runtimeDir: string;
 	let server: AttachServer;
@@ -83,7 +131,10 @@ describe("attach server", () => {
 
 	beforeEach(async () => {
 		runtimeDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-attach-test-"));
-		registry = new AttachRegistry({ followUp: async () => ({ ok: true, payload: "turn-done" }) });
+		registry = new AttachRegistry({
+			runPrompt: async () => ({ ok: true, payload: "turn-done" }),
+			followUp: async () => ({ ok: true, payload: "turn-done" }),
+		});
 		server = new AttachServer({
 			runtimeDir,
 			ownerScope: "scope-a",
@@ -101,14 +152,32 @@ describe("attach server", () => {
 		await fs.rm(runtimeDir, { recursive: true, force: true });
 	});
 
-	function hello(capability: string, extra: Partial<{ subscribe: boolean; role: "pane" | "director" }> = {}) {
+	function hello(capability: string, extra: { role?: "pane" | "director" | "observer" } = {}) {
 		return {
 			kind: "hello" as const,
-			version: 1,
+			version: 2,
 			capability,
 			client: { role: extra.role ?? "pane", name: "test-client" },
-			...(extra.subscribe === undefined ? {} : { subscribe: extra.subscribe }),
 		};
+	}
+
+	/** Connect, authenticate, and (for pane clients) open a view on KEY. */
+	async function openPaneView(capability = token): Promise<TestClient> {
+		const client = await TestClient.connect(server.socketFile);
+		client.send(hello(capability));
+		await client.waitForMessage(message => message.kind === "hello_ok");
+		client.send({ kind: "view_open", key: KEY });
+		await client.waitForMessage(message => message.kind === "view_open_ok");
+		return client;
+	}
+
+	/** The lease granted in the client's view_open_ok. */
+	async function grantedLease(client: TestClient) {
+		const ok = (await client.waitForMessage(message => message.kind === "view_open_ok")) as Extract<
+			AttachMessage,
+			{ kind: "view_open_ok" }
+		>;
+		return ok.lease;
 	}
 
 	describe("filesystem permissions", () => {
@@ -159,6 +228,14 @@ describe("attach server", () => {
 			expect(error).toMatchObject({ kind: "error", code: "hello_required" });
 			await client.waitForClose();
 		});
+
+		it("rejects an oversized frame with frame_too_large", async () => {
+			const client = await TestClient.connect(server.socketFile);
+			client.sendRaw(Buffer.concat([Buffer.alloc(ATTACH_MAX_FRAME_BYTES + 1), Buffer.from("\n", "utf8")]));
+			const error = await client.waitForMessage(message => message.kind === "error");
+			expect(error).toMatchObject({ kind: "error", code: "frame_too_large" });
+			await client.waitForClose();
+		});
 	});
 
 	describe("authentication and snapshots", () => {
@@ -166,7 +243,7 @@ describe("attach server", () => {
 			const client = await TestClient.connect(server.socketFile);
 			client.send(hello(token));
 			const ok = await client.waitForMessage(message => message.kind === "hello_ok");
-			expect(ok).toMatchObject({ kind: "hello_ok", version: 1 });
+			expect(ok).toMatchObject({ kind: "hello_ok", version: 2 });
 			const helloOk = ok as Extract<AttachMessage, { kind: "hello_ok" }>;
 			expect(helloOk.snapshot.sessions).toEqual([]);
 			expect(helloOk.server.pid).toBe(process.pid);
@@ -194,13 +271,15 @@ describe("attach server", () => {
 		});
 	});
 
-	describe("subscribe: snapshot + events + entries + state", () => {
+	describe("director/observer subscribe path (v1 compatibility)", () => {
 		it("streams registered/state/updated/removed events for subscribed workers", async () => {
 			const client = await TestClient.connect(server.socketFile);
-			client.send(hello(token, { subscribe: true }));
+			client.send(hello(token, { role: "director" }));
 			await client.waitForMessage(message => message.kind === "hello_ok");
+			client.send({ kind: "subscribe" as const });
+			await client.waitForMessage(message => message.kind === "snapshot");
 
-			registry.register(KEY, { live: true }, "spawned");
+			registry.register(KEY, null, "spawned");
 			const registered = await client.waitForMessage(message => message.kind === "event");
 			expect((registered as Extract<AttachMessage, { kind: "event" }>).event).toMatchObject({
 				type: "registered",
@@ -233,13 +312,19 @@ describe("attach server", () => {
 		it("sends a snapshot push on subscribe and includes existing entries", async () => {
 			registry.register(KEY, null, "existing");
 			const client = await TestClient.connect(server.socketFile);
-			client.send(hello(token, { subscribe: true }));
+			client.send(hello(token, { role: "director" }));
 			const helloOk = (await client.waitForMessage(message => message.kind === "hello_ok")) as Extract<
 				AttachMessage,
 				{ kind: "hello_ok" }
 			>;
 			expect(helloOk.snapshot.sessions).toHaveLength(1);
 			expect(helloOk.snapshot.sessions[0].key).toEqual(KEY);
+			client.send({ kind: "subscribe" as const });
+			const push = (await client.waitForMessage(message => message.kind === "snapshot")) as Extract<
+				AttachMessage,
+				{ kind: "snapshot" }
+			>;
+			expect(push.snapshot.sessions).toHaveLength(1);
 			client.close();
 		});
 
@@ -265,12 +350,30 @@ describe("attach server", () => {
 			expect(event.event.key).toEqual(KEY);
 			client.close();
 		});
+
+		it("rejects a follow_up from an observer role with control_rejected forbidden", async () => {
+			registry.register(KEY, null);
+			const client = await TestClient.connect(server.socketFile);
+			client.send(hello(token, { role: "observer" }));
+			await client.waitForMessage(message => message.kind === "hello_ok");
+			client.send({ kind: "subscribe" as const });
+			await client.waitForMessage(message => message.kind === "snapshot");
+			client.send({ kind: "follow_up" as const, ref: "r1", key: KEY, payload: "p" });
+			const rejected = (await client.waitForMessage(message => message.kind === "control_rejected")) as Extract<
+				AttachMessage,
+				{ kind: "control_rejected" }
+			>;
+			expect(rejected.code).toBe("forbidden");
+			expect(rejected.ref).toBe("r1");
+			client.close();
+		});
 	});
 
-	describe("serialized follow-up over the wire", () => {
+	describe("serialized follow-up over the wire (director path)", () => {
 		it("runs a follow-up and streams accepted + result with the client ref", async () => {
 			const seen: unknown[] = [];
 			const serverRegistry = new AttachRegistry({
+				runPrompt: async () => ({ ok: true }),
 				followUp: async (key, payload) => {
 					seen.push({ key, payload });
 					return { ok: true, payload: "turn-done" };
@@ -289,8 +392,10 @@ describe("attach server", () => {
 			registry.register(KEY, null);
 
 			const client = await TestClient.connect(server.socketFile);
-			client.send(hello(token, { subscribe: true }));
+			client.send(hello(token, { role: "director" }));
 			await client.waitForMessage(message => message.kind === "hello_ok");
+			client.send({ kind: "subscribe" as const });
+			await client.waitForMessage(message => message.kind === "snapshot");
 			client.send({ kind: "follow_up" as const, ref: "ref-7", key: KEY, payload: "continue" });
 
 			const result = (await client.waitForMessage(
@@ -325,6 +430,7 @@ describe("attach server", () => {
 				release = resolve;
 			});
 			const serverRegistry = new AttachRegistry({
+				runPrompt: async () => ({ ok: true }),
 				followUp: async () => {
 					await gate;
 					return { ok: true };
@@ -355,12 +461,574 @@ describe("attach server", () => {
 		});
 	});
 
-	describe("disconnect, detach, and teardown", () => {
-		it("detach on disconnect never unregisters the worker", async () => {
+	describe("view_open: lease + epoch + transcript snapshot", () => {
+		it("grants a lease and streams the transcript snapshot from the live source", async () => {
+			const { source } = fakeSource([messageEntry("e1", "first"), messageEntry("e2", "second")]);
+			registry.register(KEY, source, "spawned");
+
+			const client = await TestClient.connect(server.socketFile);
+			client.send(hello(token));
+			await client.waitForMessage(message => message.kind === "hello_ok");
+			client.send({ kind: "view_open", key: KEY });
+
+			const ok = (await client.waitForMessage(message => message.kind === "view_open_ok")) as Extract<
+				AttachMessage,
+				{ kind: "view_open_ok" }
+			>;
+			expect(ok.key).toEqual(KEY);
+			expect(ok.lease.generation).toBe(1);
+			expect(ok.lease.proof).toMatch(/^[0-9a-f]{64}$/);
+			expect(ok.lease.graceMs).toBeGreaterThan(0);
+			expect(ok.epoch).toBeGreaterThan(0);
+			expect(ok.entry.key).toEqual(KEY);
+			expect(ok.entry.state).toBe("starting");
+			expect(ok.cwd).toBe("/cwd");
+
+			const begin = (await client.waitForMessage(message => message.kind === "transcript_append")) as Extract<
+				AttachMessage,
+				{ kind: "transcript_append" }
+			>;
+			// The initial feed is delivered through the live append path (the
+			// first sync's branchId matches the freshly created feed state), so
+			// the snapshot arrives as transcript_append + transcript_end.
+			expect(begin).toMatchObject({ epoch: ok.epoch, seq: 1, watermark: 0 });
+			expect(begin.items.map(item => item.id)).toEqual(["e1", "e2"]);
+			const end = (await client.waitForMessage(message => message.kind === "transcript_end")) as Extract<
+				AttachMessage,
+				{ kind: "transcript_end" }
+			>;
+			expect(end).toMatchObject({ epoch: ok.epoch, seq: 2, watermark: 2 });
+			client.close();
+		});
+
+		it("streams new entries as transcript_append when the source grows", async () => {
+			const { source, setBranch, notify } = fakeSource([messageEntry("e1", "first")]);
+			registry.register(KEY, source);
+			const client = await openPaneView();
+			const ok = (await client.waitForMessage(message => message.kind === "view_open_ok")) as Extract<
+				AttachMessage,
+				{ kind: "view_open_ok" }
+			>;
+			await client.waitForMessage(message => message.kind === "transcript_end");
+
+			setBranch([messageEntry("e1", "first"), messageEntry("e2", "second"), messageEntry("e3", "third")]);
+			notify();
+			// The initial feed already delivered an append (watermark 0); wait
+			// for the growth append (watermark 1 = entries sent so far).
+			const append = (await client.waitForMessage(
+				message => message.kind === "transcript_append" && message.watermark === 1,
+			)) as Extract<AttachMessage, { kind: "transcript_append" }>;
+			expect(append.epoch).toBe(ok.epoch);
+			expect(append.items.map(item => item.id)).toEqual(["e2", "e3"]);
+			expect(append.watermark).toBe(1);
+			const end = (await client.waitForMessage(
+				message => message.kind === "transcript_end" && message.watermark === 3,
+			)) as Extract<AttachMessage, { kind: "transcript_end" }>;
+			expect(end.watermark).toBe(3);
+			client.close();
+		});
+
+		it("resets and re-snapshots when the source branch switches", async () => {
+			const { source, setBranch, setBranchId, notify } = fakeSource([messageEntry("e1", "old")]);
+			registry.register(KEY, source);
+			const client = await openPaneView();
+			await client.waitForMessage(message => message.kind === "transcript_end");
+
+			setBranchId("b2");
+			setBranch([messageEntry("e4", "new branch")]);
+			notify();
+
+			const reset = (await client.waitForMessage(message => message.kind === "transcript_reset")) as Extract<
+				AttachMessage,
+				{ kind: "transcript_reset" }
+			>;
+			expect(reset.reason).toContain("branch");
+			const begin = (await client.waitForMessage(message => message.kind === "transcript_begin")) as Extract<
+				AttachMessage,
+				{ kind: "transcript_begin" }
+			>;
+			expect(begin.seq).toBe(reset.seq + 1);
+			const items = (await client.waitForMessage(message => message.kind === "transcript_items")) as Extract<
+				AttachMessage,
+				{ kind: "transcript_items" }
+			>;
+			expect(items.items.map(item => item.id)).toEqual(["e4"]);
+			client.close();
+		});
+
+		it("rejects a second pane view with lease_busy and holder info", async () => {
+			registry.register(KEY, null);
+			const first = await openPaneView();
+
+			const second = await TestClient.connect(server.socketFile);
+			second.send(hello(token));
+			await second.waitForMessage(message => message.kind === "hello_ok");
+			second.send({ kind: "view_open", key: KEY });
+			const rejected = (await second.waitForMessage(message => message.kind === "view_open_rejected")) as Extract<
+				AttachMessage,
+				{ kind: "view_open_rejected" }
+			>;
+			expect(rejected.code).toBe("lease_busy");
+			expect(rejected.holder).toEqual({ generation: 1, expiresInMs: expect.any(Number) });
+			first.close();
+			second.close();
+		});
+
+		it("resumes the lease on reconnect and re-snapshots in a fresh epoch", async () => {
+			const { source } = fakeSource([messageEntry("e1", "first")]);
+			registry.register(KEY, source);
+			const first = await openPaneView();
+			const firstOk = (await first.waitForMessage(message => message.kind === "view_open_ok")) as Extract<
+				AttachMessage,
+				{ kind: "view_open_ok" }
+			>;
+			await first.waitForMessage(message => message.kind === "transcript_end");
+			first.close();
+			await first.waitForClose();
+
+			// Same client instance, new socket, within the disconnect grace.
+			const second = await TestClient.connect(server.socketFile);
+			second.send(hello(token));
+			await second.waitForMessage(message => message.kind === "hello_ok");
+			second.send({
+				kind: "view_open",
+				key: KEY,
+				resume: {
+					leaseId: firstOk.lease.leaseId,
+					proof: firstOk.lease.proof,
+					generation: firstOk.lease.generation,
+				},
+			});
+			const ok = (await second.waitForMessage(message => message.kind === "view_open_ok")) as Extract<
+				AttachMessage,
+				{ kind: "view_open_ok" }
+			>;
+			expect(ok.lease.leaseId).toBe(firstOk.lease.leaseId);
+			expect(ok.lease.proof).toBe(firstOk.lease.proof);
+			expect(ok.lease.generation).toBe(2);
+			expect(ok.epoch).toBeGreaterThan(firstOk.epoch);
+			// The transcript is re-delivered in the new epoch via the live
+			// append path (fresh feed state, matching branchId).
+			const append = (await second.waitForMessage(message => message.kind === "transcript_append")) as Extract<
+				AttachMessage,
+				{ kind: "transcript_append" }
+			>;
+			expect(append.epoch).toBe(ok.epoch);
+			expect(append.items.map(item => item.id)).toEqual(["e1"]);
+			second.close();
+		});
+
+		it("rejects a view_open for an unknown worker", async () => {
+			const client = await TestClient.connect(server.socketFile);
+			client.send(hello(token));
+			await client.waitForMessage(message => message.kind === "hello_ok");
+			client.send({ kind: "view_open", key: { workerId: "ghost", ownerScope: "scope-a" } });
+			const rejected = (await client.waitForMessage(message => message.kind === "view_open_rejected")) as Extract<
+				AttachMessage,
+				{ kind: "view_open_rejected" }
+			>;
+			expect(rejected.code).toBe("unknown_worker");
+			client.close();
+		});
+
+		it("normalizes an empty ownerScope to the server's scope", async () => {
+			const { source } = fakeSource([messageEntry("e1", "first")]);
+			registry.register(KEY, source);
+			const client = await TestClient.connect(server.socketFile);
+			client.send(hello(token));
+			await client.waitForMessage(message => message.kind === "hello_ok");
+			client.send({ kind: "view_open", key: { workerId: "w1", ownerScope: "" } });
+			const ok = (await client.waitForMessage(message => message.kind === "view_open_ok")) as Extract<
+				AttachMessage,
+				{ kind: "view_open_ok" }
+			>;
+			expect(ok.key).toEqual(KEY);
+			// The normalized key is echoed, and controls with an empty scope work.
+			const lease = ok.lease;
+			client.send({
+				kind: "prompt",
+				key: { workerId: "w1", ownerScope: "" },
+				leaseId: lease.leaseId,
+				proof: lease.proof,
+				generation: lease.generation,
+				cmdSeq: 1,
+				cmdId: "cmd-1",
+				ref: "p1",
+				text: "hello",
+			});
+			const accepted = (await client.waitForMessage(message => message.kind === "prompt_accepted")) as Extract<
+				AttachMessage,
+				{ kind: "prompt_accepted" }
+			>;
+			expect(accepted.ref).toBe("p1");
+			client.close();
+		});
+	});
+
+	describe("controller prompts", () => {
+		it("accepts a prompt, runs it through the registry, and delivers the result", async () => {
+			const seen: Array<{ key: unknown; text: string }> = [];
+			const serverRegistry = new AttachRegistry({
+				runPrompt: async (key, text) => {
+					seen.push({ key, text });
+					return { ok: true, payload: "turn-done" };
+				},
+			});
+			await server.stop();
+			server = new AttachServer({
+				runtimeDir,
+				ownerScope: "scope-a",
+				registry: serverRegistry,
+				helloTimeoutMs: 500,
+			});
+			await server.start();
+			registry = serverRegistry;
+			token = (await fs.readFile(server.tokenFile, "utf8")).trim();
+			registry.register(KEY, null);
+
+			const client = await openPaneView();
+			const lease = await grantedLease(client);
+			client.send({
+				kind: "prompt",
+				key: KEY,
+				leaseId: lease.leaseId,
+				proof: lease.proof,
+				generation: lease.generation,
+				cmdSeq: 1,
+				cmdId: "cmd-1",
+				ref: "p1",
+				text: "continue please",
+			});
+			const accepted = (await client.waitForMessage(message => message.kind === "prompt_accepted")) as Extract<
+				AttachMessage,
+				{ kind: "prompt_accepted" }
+			>;
+			expect(accepted).toMatchObject({ ref: "p1", cmdId: "cmd-1" });
+			const result = (await client.waitForMessage(message => message.kind === "prompt_result")) as Extract<
+				AttachMessage,
+				{ kind: "prompt_result" }
+			>;
+			expect(result).toMatchObject({ ref: "p1", cmdId: "cmd-1", ok: true, payload: "turn-done" });
+			expect(seen).toEqual([{ key: KEY, text: "continue please" }]);
+			client.close();
+		});
+
+		it("rejects a second prompt while the first is in flight with busy", async () => {
+			let release!: () => void;
+			const gate = new Promise<void>(resolve => {
+				release = resolve;
+			});
+			const serverRegistry = new AttachRegistry({
+				runPrompt: async () => {
+					await gate;
+					return { ok: true };
+				},
+			});
+			await server.stop();
+			server = new AttachServer({
+				runtimeDir,
+				ownerScope: "scope-a",
+				registry: serverRegistry,
+				helloTimeoutMs: 500,
+			});
+			await server.start();
+			registry = serverRegistry;
+			token = (await fs.readFile(server.tokenFile, "utf8")).trim();
+			registry.register(KEY, null);
+
+			const client = await openPaneView();
+			const lease = await grantedLease(client);
+			const promptFrame = (cmdId: string, cmdSeq: number, ref: string) => ({
+				kind: "prompt" as const,
+				key: KEY,
+				leaseId: lease.leaseId,
+				proof: lease.proof,
+				generation: lease.generation,
+				cmdSeq,
+				cmdId,
+				ref,
+				text: "go",
+			});
+			client.send(promptFrame("cmd-1", 1, "p1"));
+			await client.waitForMessage(message => message.kind === "prompt_accepted");
+			client.send(promptFrame("cmd-2", 2, "p2"));
+			const rejected = (await client.waitForMessage(message => message.kind === "control_rejected")) as Extract<
+				AttachMessage,
+				{ kind: "control_rejected" }
+			>;
+			expect(rejected).toMatchObject({ code: "busy", cmdId: "cmd-2", ref: "p2" });
+			release();
+			await client.waitForMessage(message => message.kind === "prompt_result");
+			client.close();
+		});
+
+		it("replays a cached result for a repeated cmdId without re-running", async () => {
+			const calls: string[] = [];
+			const serverRegistry = new AttachRegistry({
+				runPrompt: async (_key, text) => {
+					calls.push(text);
+					return { ok: true, payload: "first-run" };
+				},
+			});
+			await server.stop();
+			server = new AttachServer({
+				runtimeDir,
+				ownerScope: "scope-a",
+				registry: serverRegistry,
+				helloTimeoutMs: 500,
+			});
+			await server.start();
+			registry = serverRegistry;
+			token = (await fs.readFile(server.tokenFile, "utf8")).trim();
+			registry.register(KEY, null);
+
+			// First connection runs the command and caches the outcome.
+			const first = await openPaneView();
+			const lease = await grantedLease(first);
+			first.send({
+				kind: "prompt",
+				key: KEY,
+				leaseId: lease.leaseId,
+				proof: lease.proof,
+				generation: lease.generation,
+				cmdSeq: 1,
+				cmdId: "same-cmd",
+				ref: "p1",
+				text: "run me",
+			});
+			await first.waitForMessage(message => message.kind === "prompt_result");
+			expect(calls).toEqual(["run me"]);
+			first.close();
+			await first.waitForClose();
+
+			// The same client reconnects and replays the in-flight command id.
+			const second = await TestClient.connect(server.socketFile);
+			second.send(hello(token));
+			await second.waitForMessage(message => message.kind === "hello_ok");
+			second.send({
+				kind: "view_open",
+				key: KEY,
+				resume: { leaseId: lease.leaseId, proof: lease.proof, generation: lease.generation },
+			});
+			const ok = (await second.waitForMessage(message => message.kind === "view_open_ok")) as Extract<
+				AttachMessage,
+				{ kind: "view_open_ok" }
+			>;
+			second.send({
+				kind: "prompt",
+				key: KEY,
+				leaseId: ok.lease.leaseId,
+				proof: ok.lease.proof,
+				generation: ok.lease.generation,
+				cmdSeq: 1,
+				cmdId: "same-cmd",
+				ref: "p2",
+				text: "run me",
+			});
+			const accepted = (await second.waitForMessage(message => message.kind === "prompt_accepted")) as Extract<
+				AttachMessage,
+				{ kind: "prompt_accepted" }
+			>;
+			expect(accepted.ref).toBe("p2");
+			const result = (await second.waitForMessage(message => message.kind === "prompt_result")) as Extract<
+				AttachMessage,
+				{ kind: "prompt_result" }
+			>;
+			expect(result).toMatchObject({ ref: "p2", cmdId: "same-cmd", ok: true, payload: "first-run" });
+			// The callback ran exactly once: the replay was served from cache.
+			expect(calls).toEqual(["run me"]);
+			second.close();
+		});
+
+		it("rejects out-of-order, stale-lease, foreign-proof, and stale-generation prompts", async () => {
+			registry.register(KEY, null);
+			const client = await openPaneView();
+			const lease = await grantedLease(client);
+			const frame = (overrides: Partial<Extract<AttachMessage, { kind: "prompt" }>> = {}) => ({
+				kind: "prompt" as const,
+				key: KEY,
+				leaseId: lease.leaseId,
+				proof: lease.proof,
+				generation: lease.generation,
+				cmdSeq: 1,
+				cmdId: "cmd-x",
+				ref: "p-x",
+				text: "go",
+				...overrides,
+			});
+
+			client.send(frame({ cmdSeq: 1, cmdId: "cmd-1", ref: "p1" }));
+			await client.waitForMessage(message => message.kind === "prompt_accepted");
+			await client.waitForMessage(message => message.kind === "prompt_result");
+
+			// Duplicate sequence on the same connection.
+			client.send(frame({ cmdSeq: 1, cmdId: "cmd-dup", ref: "p-dup" }));
+			const outOfOrder = (await client.waitForMessage(
+				message => message.kind === "control_rejected" && message.cmdId === "cmd-dup",
+			)) as Extract<AttachMessage, { kind: "control_rejected" }>;
+			expect(outOfOrder).toMatchObject({ code: "out_of_order", cmdId: "cmd-dup" });
+
+			// Stale lease id.
+			client.send(frame({ leaseId: "wrong-lease", cmdSeq: 2, cmdId: "cmd-lease", ref: "p-lease" }));
+			const staleLease = (await client.waitForMessage(
+				message => message.kind === "control_rejected" && message.cmdId === "cmd-lease",
+			)) as Extract<AttachMessage, { kind: "control_rejected" }>;
+			expect(staleLease).toMatchObject({ code: "stale_lease", cmdId: "cmd-lease" });
+
+			// Foreign proof.
+			client.send(frame({ proof: PROOF, cmdSeq: 3, cmdId: "cmd-proof", ref: "p-proof" }));
+			const foreign = (await client.waitForMessage(
+				message => message.kind === "control_rejected" && message.cmdId === "cmd-proof",
+			)) as Extract<AttachMessage, { kind: "control_rejected" }>;
+			expect(foreign).toMatchObject({ code: "foreign_client", cmdId: "cmd-proof" });
+
+			// Stale generation.
+			client.send(frame({ generation: 0, cmdSeq: 4, cmdId: "cmd-gen", ref: "p-gen" }));
+			const staleGen = (await client.waitForMessage(
+				message => message.kind === "control_rejected" && message.cmdId === "cmd-gen",
+			)) as Extract<AttachMessage, { kind: "control_rejected" }>;
+			expect(staleGen).toMatchObject({ code: "stale_generation", cmdId: "cmd-gen" });
+			client.close();
+		});
+
+		it("rejects a prompt on a connection with no open view", async () => {
 			registry.register(KEY, null);
 			const client = await TestClient.connect(server.socketFile);
-			client.send(hello(token, { subscribe: true }));
+			client.send(hello(token));
 			await client.waitForMessage(message => message.kind === "hello_ok");
+			client.send({
+				kind: "prompt",
+				key: KEY,
+				leaseId: "none",
+				proof: PROOF,
+				generation: 1,
+				cmdSeq: 1,
+				cmdId: "cmd-1",
+				ref: "p1",
+				text: "go",
+			});
+			const rejected = (await client.waitForMessage(message => message.kind === "control_rejected")) as Extract<
+				AttachMessage,
+				{ kind: "control_rejected" }
+			>;
+			expect(rejected).toMatchObject({ code: "lease_required", cmdId: "cmd-1" });
+			client.close();
+		});
+	});
+
+	describe("abort_turn and detach", () => {
+		it("aborts the in-flight turn and broadcasts abort_accepted", async () => {
+			registry.register(KEY, null);
+			const client = await openPaneView();
+			const lease = await grantedLease(client);
+			client.send({
+				kind: "abort_turn",
+				key: KEY,
+				leaseId: lease.leaseId,
+				proof: lease.proof,
+				generation: lease.generation,
+				cmdSeq: 1,
+				cmdId: "abort-1",
+			});
+			const event = (await client.waitForMessage(
+				message =>
+					message.kind === "event" &&
+					(message as Extract<AttachMessage, { kind: "event" }>).event.type === "abort_accepted",
+			)) as Extract<AttachMessage, { kind: "event" }>;
+			expect(event.event).toMatchObject({ type: "abort_accepted", key: KEY });
+			client.close();
+		});
+
+		it("rejects abort_turn with an invalid lease", async () => {
+			registry.register(KEY, null);
+			const client = await openPaneView();
+			client.send({
+				kind: "abort_turn",
+				key: KEY,
+				leaseId: "wrong",
+				proof: PROOF,
+				generation: 1,
+				cmdSeq: 1,
+				cmdId: "abort-1",
+			});
+			const rejected = (await client.waitForMessage(message => message.kind === "control_rejected")) as Extract<
+				AttachMessage,
+				{ kind: "control_rejected" }
+			>;
+			expect(rejected).toMatchObject({ code: "stale_lease", cmdId: "abort-1" });
+			client.close();
+		});
+
+		it("detach releases the lease, replies bye, and never kills the worker", async () => {
+			registry.register(KEY, null);
+			const client = await openPaneView();
+			const lease = await grantedLease(client);
+
+			client.send({
+				kind: "detach",
+				key: KEY,
+				leaseId: lease.leaseId,
+				proof: lease.proof,
+				generation: lease.generation,
+				reason: "user",
+			});
+			const bye = await client.waitForMessage(message => message.kind === "bye");
+			expect(bye).toMatchObject({ kind: "bye", reason: "user" });
+			await client.waitForClose();
+
+			// The lease is released: a fresh pane client can take the view.
+			expect(registry.has(KEY)).toBe(true); // worker survives
+			const next = await TestClient.connect(server.socketFile);
+			next.send(hello(token));
+			await next.waitForMessage(message => message.kind === "hello_ok");
+			next.send({ kind: "view_open", key: KEY });
+			const ok = (await next.waitForMessage(message => message.kind === "view_open_ok")) as Extract<
+				AttachMessage,
+				{ kind: "view_open_ok" }
+			>;
+			expect(ok.lease.generation).toBe(1);
+			next.close();
+		});
+
+		it("rejects detach with a stale generation", async () => {
+			registry.register(KEY, null);
+			const client = await openPaneView();
+			const lease = await grantedLease(client);
+			client.send({
+				kind: "detach",
+				key: KEY,
+				leaseId: lease.leaseId,
+				proof: lease.proof,
+				generation: 99,
+				reason: "user",
+			});
+			const rejected = (await client.waitForMessage(message => message.kind === "control_rejected")) as Extract<
+				AttachMessage,
+				{ kind: "control_rejected" }
+			>;
+			expect(rejected).toMatchObject({ code: "stale_generation" });
+			client.close();
+		});
+	});
+
+	describe("worker removal and teardown", () => {
+		it("tears down the view and streams removed to the pane client", async () => {
+			registry.register(KEY, null);
+			const client = await openPaneView();
+
+			registry.unregister(KEY, "killed");
+			const event = (await client.waitForMessage(
+				message =>
+					message.kind === "event" &&
+					(message as Extract<AttachMessage, { kind: "event" }>).event.type === "removed",
+			)) as Extract<AttachMessage, { kind: "event" }>;
+			expect(event.event).toMatchObject({ type: "removed", key: KEY, reason: "killed" });
+			client.close();
+		});
+
+		it("detach on disconnect never unregisters the worker", async () => {
+			registry.register(KEY, null);
+			const client = await openPaneView();
 			expect(registry.snapshot().sessions[0].attachedClients).toBe(1);
 			client.close();
 			await client.waitForClose();

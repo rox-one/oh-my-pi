@@ -1,30 +1,73 @@
 import { describe, expect, it } from "bun:test";
 import { Buffer } from "node:buffer";
+import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import {
 	ATTACH_CAPABILITY_HEX_LENGTH,
+	ATTACH_CMD_ACK_CACHE_SIZE,
+	ATTACH_LEASE_PROOF_HEX_LENGTH,
 	ATTACH_MAX_FRAME_BYTES,
 	ATTACH_PROGRESS_MAX_LINE_LENGTH,
 	ATTACH_PROGRESS_MAX_OUTPUT_LINES,
 	ATTACH_PROGRESS_MAX_TOOL_LENGTH,
+	ATTACH_TRANSCRIPT_ITEMS_PER_FRAME,
+	ATTACH_TRANSCRIPT_MAX_STRING_CHARS,
 	AttachBoundedQueue,
 	AttachFrameAccumulator,
+	type AttachMessage,
 	AttachProtocolError,
+	type AttachSessionEntry,
 	type AttachSnapshot,
+	boundAttachTranscriptEntry,
+	boundAttachTranscriptItems,
 	decodeAttachLine,
 	encodeAttachMessage,
 	formatAttachKey,
 	generateAttachCapability,
+	generateAttachLeaseProof,
 	isAttachCapability,
+	isAttachLeaseProof,
+	isControllerRole,
 	isHelloMessage,
 	sanitizeAttachProgress,
 	shrinkAttachSnapshot,
 } from "../../src/attach/protocol";
 import { attachKeyString, parseAttachKeyString } from "../../src/attach/registry";
+import type { SessionMessageEntry } from "../../src/session/session-entries";
 
 const KEY = { workerId: "w1", ownerScope: "scope-a" };
+const PROOF = "b".repeat(64);
+const LEASE = { leaseId: "lease-1", proof: PROOF, generation: 1, graceMs: 30_000 };
 
-function hello(capability = "a".repeat(64)) {
-	return { kind: "hello" as const, version: 1, capability, client: { role: "pane" as const, name: "t" } };
+function hello(capability = "a".repeat(64), role: "pane" | "director" | "observer" = "pane") {
+	return { kind: "hello" as const, version: 2, capability, client: { role, name: "t" } };
+}
+
+function messageEntry(id: string, text: string): SessionMessageEntry {
+	return {
+		type: "message",
+		id,
+		parentId: null,
+		timestamp: "2026-08-11T00:00:00.000Z",
+		message: { role: "user", content: text, timestamp: 1 },
+	};
+}
+
+function entry(overrides: Partial<AttachSessionEntry> = {}): AttachSessionEntry {
+	return {
+		key: KEY,
+		state: "idle",
+		createdAt: 1,
+		updatedAt: 1,
+		lastActivityAt: null,
+		pendingFollowUps: 0,
+		attachedClients: 1,
+		summary: null,
+		...overrides,
+	};
+}
+
+function snapshot(sessions: AttachSessionEntry[] = []): AttachSnapshot {
+	return { version: 2, generatedAt: 1, sessions };
 }
 
 describe("attach protocol capability", () => {
@@ -45,10 +88,68 @@ describe("attach protocol capability", () => {
 	});
 });
 
+describe("attach protocol lease proof", () => {
+	it("generates a 64-char lowercase hex proof", () => {
+		const a = generateAttachLeaseProof();
+		const b = generateAttachLeaseProof();
+		expect(a).toHaveLength(ATTACH_LEASE_PROOF_HEX_LENGTH);
+		expect(a).toMatch(/^[0-9a-f]+$/);
+		expect(a).not.toBe(b);
+	});
+
+	it("validates proof shape exactly", () => {
+		expect(isAttachLeaseProof(generateAttachLeaseProof())).toBe(true);
+		expect(isAttachLeaseProof("short")).toBe(false);
+		expect(isAttachLeaseProof("Z".repeat(ATTACH_LEASE_PROOF_HEX_LENGTH))).toBe(false);
+		expect(isAttachLeaseProof(42)).toBe(false);
+		expect(isAttachLeaseProof(null)).toBe(false);
+	});
+});
+
 describe("attach frame encoding/decoding", () => {
 	it("round-trips every client message kind", () => {
 		const messages = [
 			hello(),
+			hello("a".repeat(64), "director"),
+			hello("a".repeat(64), "observer"),
+			{
+				kind: "view_open" as const,
+				key: KEY,
+			},
+			{
+				kind: "view_open" as const,
+				key: KEY,
+				resume: { leaseId: "lease-1", proof: PROOF, generation: 2 },
+			},
+			{
+				kind: "prompt" as const,
+				key: KEY,
+				leaseId: "lease-1",
+				proof: PROOF,
+				generation: 1,
+				cmdSeq: 1,
+				cmdId: "cmd-1",
+				ref: "r1",
+				text: "continue",
+				timeoutMs: 100,
+			},
+			{
+				kind: "abort_turn" as const,
+				key: KEY,
+				leaseId: "lease-1",
+				proof: PROOF,
+				generation: 1,
+				cmdSeq: 2,
+				cmdId: "cmd-2",
+			},
+			{
+				kind: "detach" as const,
+				key: KEY,
+				leaseId: "lease-1",
+				proof: PROOF,
+				generation: 1,
+				reason: "user",
+			},
 			{ kind: "subscribe" as const, workerIds: ["w1"], ownerScopes: ["scope-a"] },
 			{ kind: "follow_up" as const, ref: "r1", key: KEY, payload: "prompt", timeoutMs: 100 },
 			{ kind: "abort" as const, key: KEY, reason: "user" },
@@ -62,17 +163,84 @@ describe("attach frame encoding/decoding", () => {
 		}
 	});
 
-	it("round-trips server messages with nested snapshot and event", () => {
-		const message = {
-			kind: "event" as const,
-			event: {
-				type: "state" as const,
-				key: KEY,
-				state: "running" as const,
-				at: 5,
+	it("round-trips every server message kind", () => {
+		const messages: AttachMessage[] = [
+			{
+				kind: "hello_ok",
+				version: 2,
+				server: { pid: 1, startedAt: 2 },
+				snapshot: snapshot([entry()]),
 			},
-		};
-		expect(decodeAttachLine(encodeAttachMessage(message).subarray(0, -1))).toEqual(message);
+			{ kind: "view_open_ok", key: KEY, lease: LEASE, epoch: 1, entry: entry(), cwd: "/cwd" },
+			{
+				kind: "view_open_rejected",
+				key: KEY,
+				code: "lease_busy",
+				message: "controlled",
+				holder: { generation: 1, expiresInMs: 100 },
+			},
+			{ kind: "transcript_begin", key: KEY, epoch: 1, seq: 1 },
+			{ kind: "transcript_items", key: KEY, epoch: 1, seq: 2, items: [messageEntry("m1", "hi")] },
+			{ kind: "transcript_end", key: KEY, epoch: 1, seq: 3, watermark: 1, model: "deepseek/ds" },
+			{
+				kind: "transcript_append",
+				key: KEY,
+				epoch: 1,
+				seq: 4,
+				items: [messageEntry("m2", "more")],
+				watermark: 1,
+			},
+			{ kind: "transcript_reset", key: KEY, epoch: 1, seq: 5, reason: "branch switched" },
+			{ kind: "prompt_accepted", key: KEY, ref: "r1", cmdId: "cmd-1" },
+			{ kind: "prompt_result", key: KEY, ref: "r1", cmdId: "cmd-1", ok: true, payload: "out" },
+			{
+				kind: "control_rejected",
+				key: KEY,
+				cmdId: "cmd-1",
+				ref: "r1",
+				code: "out_of_order",
+				message: "stale sequence",
+			},
+			{ kind: "snapshot", snapshot: snapshot([entry()]) },
+			{
+				kind: "event",
+				event: {
+					type: "lease_granted",
+					key: KEY,
+					generation: 1,
+				},
+			},
+			{ kind: "pong", nonce: 7 },
+			// The decoder routes server `bye` through the client validator,
+			// which drops the `reason` field (see the dedicated test below).
+			{ kind: "bye" },
+			{ kind: "error", code: "auth_failed", message: "bad capability" },
+		];
+		for (const message of messages) {
+			const frame = encodeAttachMessage(message);
+			expect(decodeAttachLine(frame.subarray(0, -1))).toEqual(message);
+		}
+	});
+
+	it("round-trips a nested event with every event type", () => {
+		const events: AttachMessage["kind"] extends never ? never : Extract<AttachMessage, { kind: "event" }>["event"][] =
+			[
+				{ type: "registered", key: KEY, entry: entry() },
+				{ type: "updated", key: KEY, entry: entry({ state: "running" }) },
+				{ type: "state", key: KEY, state: "running", at: 5 },
+				{ type: "removed", key: KEY, reason: "killed" },
+				{ type: "follow_up_accepted", key: KEY, ref: "r1" },
+				{ type: "follow_up_result", key: KEY, ref: "r1", ok: true, payload: "out" },
+				{ type: "abort_accepted", key: KEY },
+				{ type: "lease_granted", key: KEY, generation: 1 },
+				{ type: "lease_expired", key: KEY, reason: "grace" },
+				{ type: "lease_revoked", key: KEY, reason: "detach" },
+				{ type: "progress", key: KEY, at: 1, currentTool: "bash", outputTail: ["out"] },
+			];
+		for (const event of events) {
+			const message: AttachMessage = { kind: "event", event };
+			expect(decodeAttachLine(encodeAttachMessage(message).subarray(0, -1))).toEqual(message);
+		}
 	});
 
 	it("rejects empty and malformed frames", () => {
@@ -110,6 +278,248 @@ describe("attach frame encoding/decoding", () => {
 	it("identifies hello messages for strict hello-first auth", () => {
 		expect(isHelloMessage(hello())).toBe(true);
 		expect(isHelloMessage({ kind: "ping" as const })).toBe(false);
+	});
+});
+
+describe("attach message validation", () => {
+	function expectMalformed(value: unknown): void {
+		try {
+			decodeAttachLine(Buffer.from(JSON.stringify(value), "utf8"));
+			expect.unreachable();
+		} catch (error) {
+			expect(error).toBeInstanceOf(AttachProtocolError);
+			expect((error as AttachProtocolError).code).toBe("malformed");
+		}
+	}
+
+	it("validates hello strictly (version, capability shape, role)", () => {
+		// v2 hello has no `subscribe` field; a stale v1 field is ignored and
+		// the normalized message carries no subscribe.
+		const stale = { ...hello(), subscribe: true };
+		const decoded = decodeAttachLine(Buffer.from(JSON.stringify(stale), "utf8")) as Extract<
+			AttachMessage,
+			{ kind: "hello" }
+		>;
+		expect(decoded).toEqual(hello());
+		expect("subscribe" in decoded).toBe(false);
+
+		try {
+			decodeAttachLine(Buffer.from(JSON.stringify({ ...hello(), version: 0 }), "utf8"));
+			expect.unreachable();
+		} catch (error) {
+			expect((error as AttachProtocolError).code).toBe("malformed");
+		}
+		try {
+			decodeAttachLine(Buffer.from(JSON.stringify({ ...hello(), capability: "not-hex!" }), "utf8"));
+			expect.unreachable();
+		} catch (error) {
+			expect((error as AttachProtocolError).code).toBe("auth_failed");
+		}
+		expectMalformed({ ...hello(), client: { role: "root", name: "x" } });
+		// A missing client name is fine; a non-object client is not.
+		expect(() =>
+			decodeAttachLine(Buffer.from(JSON.stringify({ ...hello(), client: { role: "pane" } }), "utf8")),
+		).not.toThrow();
+		expectMalformed({ ...hello(), client: "pane" });
+	});
+
+	it("validates view_open with and without resume", () => {
+		expectMalformed({ kind: "view_open", key: { workerId: "w1" } });
+		expectMalformed({ kind: "view_open", key: KEY, resume: { leaseId: "", proof: PROOF, generation: 1 } });
+		expectMalformed({ kind: "view_open", key: KEY, resume: { leaseId: "L", proof: "bad", generation: 1 } });
+		expectMalformed({ kind: "view_open", key: KEY, resume: { leaseId: "L", proof: PROOF } });
+		expect(() =>
+			decodeAttachLine(Buffer.from(JSON.stringify({ kind: "view_open", key: KEY, resume: undefined }), "utf8")),
+		).not.toThrow();
+	});
+
+	it("validates prompt control headers", () => {
+		const base = {
+			kind: "prompt",
+			key: KEY,
+			leaseId: "L",
+			proof: PROOF,
+			generation: 1,
+			cmdSeq: 1,
+			cmdId: "c1",
+			ref: "r1",
+			text: "go",
+		};
+		expect(() => decodeAttachLine(Buffer.from(JSON.stringify(base), "utf8"))).not.toThrow();
+		expectMalformed({ ...base, cmdSeq: 0 });
+		expectMalformed({ ...base, cmdSeq: 1.5 });
+		expectMalformed({ ...base, cmdId: "" });
+		expectMalformed({ ...base, ref: "" });
+		expectMalformed({ ...base, text: 42 });
+		expectMalformed({ ...base, proof: "short" });
+		expectMalformed({ ...base, leaseId: "" });
+	});
+
+	it("validates abort_turn and detach lease fields", () => {
+		const abort = {
+			kind: "abort_turn",
+			key: KEY,
+			leaseId: "L",
+			proof: PROOF,
+			generation: 1,
+			cmdSeq: 1,
+			cmdId: "c1",
+		};
+		expect(() => decodeAttachLine(Buffer.from(JSON.stringify(abort), "utf8"))).not.toThrow();
+		expectMalformed({ ...abort, cmdId: "" });
+
+		const detach = { kind: "detach", key: KEY, leaseId: "L", proof: PROOF, generation: 1, reason: "user" };
+		expect(() => decodeAttachLine(Buffer.from(JSON.stringify(detach), "utf8"))).not.toThrow();
+		expectMalformed({ ...detach, generation: "1" });
+		expectMalformed({ ...detach, proof: "bad" });
+	});
+
+	it("validates transcript frames and their item arrays", () => {
+		expectMalformed({
+			kind: "transcript_items",
+			key: KEY,
+			epoch: 1,
+			seq: 2,
+			items: [{ type: "model_change", id: "x", timestamp: "t" }],
+		});
+		expectMalformed({ kind: "transcript_items", key: KEY, epoch: 1, seq: 2, items: "nope" });
+		expectMalformed({ kind: "transcript_end", key: KEY, epoch: 1, seq: 3, watermark: "2" });
+		expectMalformed({ kind: "transcript_reset", key: KEY, epoch: 1, seq: 4 });
+	});
+
+	it("validates view_open_rejected codes and holder", () => {
+		for (const code of ["lease_busy", "unknown_worker", "stale_resume", "internal"]) {
+			const message = { kind: "view_open_rejected", key: KEY, code, message: "no" };
+			expect(() => decodeAttachLine(Buffer.from(JSON.stringify(message), "utf8"))).not.toThrow();
+		}
+		expectMalformed({ kind: "view_open_rejected", key: KEY, code: "nope", message: "no" });
+		expectMalformed({
+			kind: "view_open_rejected",
+			key: KEY,
+			code: "lease_busy",
+			message: "no",
+			holder: { generation: 1 },
+		});
+	});
+
+	it("validates control_rejected codes", () => {
+		const codes = [
+			"lease_required",
+			"stale_lease",
+			"stale_generation",
+			"foreign_client",
+			"duplicate",
+			"out_of_order",
+			"busy",
+			"forbidden",
+			"unknown_worker",
+			"internal",
+		];
+		for (const code of codes) {
+			const message = { kind: "control_rejected", key: KEY, cmdId: "c", ref: "r", code, message: "no" };
+			expect(() => decodeAttachLine(Buffer.from(JSON.stringify(message), "utf8"))).not.toThrow();
+		}
+		expectMalformed({ kind: "control_rejected", key: KEY, code: "nope", message: "no" });
+	});
+
+	it("validates error codes", () => {
+		expect(() =>
+			decodeAttachLine(Buffer.from(JSON.stringify({ kind: "error", code: "shutdown", message: "bye" }), "utf8")),
+		).not.toThrow();
+		expectMalformed({ kind: "error", code: "explode", message: "bye" });
+	});
+
+	it("drops the bye reason on decode (server bye routes through the client validator)", () => {
+		const decoded = decodeAttachLine(Buffer.from(JSON.stringify({ kind: "bye", reason: "shutting down" }), "utf8"));
+		expect(decoded).toEqual({ kind: "bye" });
+	});
+
+	it("classifies controller roles", () => {
+		expect(isControllerRole("pane")).toBe(true);
+		expect(isControllerRole("director")).toBe(true);
+		expect(isControllerRole("observer")).toBe(false);
+	});
+});
+
+describe("attach transcript item bounding", () => {
+	it("chunks at ATTACH_TRANSCRIPT_ITEMS_PER_FRAME entries", () => {
+		const items = Array.from({ length: ATTACH_TRANSCRIPT_ITEMS_PER_FRAME + 1 }, (_, i) =>
+			messageEntry(`m${i}`, `text-${i}`),
+		);
+		const chunks = boundAttachTranscriptItems(items);
+		expect(chunks).toHaveLength(2);
+		expect(chunks[0]).toHaveLength(ATTACH_TRANSCRIPT_ITEMS_PER_FRAME);
+		expect(chunks[1]).toHaveLength(1);
+		expect(chunks[1]![0]!.id).toBe(`m${ATTACH_TRANSCRIPT_ITEMS_PER_FRAME}`);
+	});
+
+	it("truncates long string content to the per-entry budget", () => {
+		const long = "x".repeat(ATTACH_TRANSCRIPT_MAX_STRING_CHARS * 2);
+		const bounded = boundAttachTranscriptEntry(messageEntry("m1", long));
+		// The fixture message is a user message with string content.
+		const boundedMessage = bounded.message as { content: string };
+		const content = boundedMessage.content;
+		expect(content.length).toBeLessThan(long.length);
+		expect(content.startsWith("x".repeat(ATTACH_TRANSCRIPT_MAX_STRING_CHARS))).toBe(true);
+		expect(content.endsWith("[truncated]")).toBe(true);
+		expect(bounded.id).toBe("m1");
+	});
+
+	it("truncates long strings inside content blocks recursively", () => {
+		const message = {
+			role: "assistant",
+			content: [
+				{ type: "text", text: "short" },
+				{ type: "text", text: "y".repeat(ATTACH_TRANSCRIPT_MAX_STRING_CHARS + 50) },
+				{ type: "text", text: "tail", extra: [{ label: "z".repeat(ATTACH_TRANSCRIPT_MAX_STRING_CHARS + 10) }] },
+			],
+			api: "test",
+			provider: "test",
+			model: "test/model",
+			usage: { inputTokens: 0, outputTokens: 0 },
+			stopReason: "end_turn",
+			timestamp: 1,
+		} as unknown as AgentMessage;
+		const entry: SessionMessageEntry = {
+			type: "message",
+			id: "m1",
+			parentId: null,
+			timestamp: "2026-08-11T00:00:00.000Z",
+			message,
+		};
+		const bounded = boundAttachTranscriptEntry(entry);
+		// The fixture message is an assistant message with text blocks.
+		const boundedMessage = bounded.message as unknown as {
+			content: Array<{ type: string; text: string; extra?: Array<{ label: string }> }>;
+		};
+		const blocks = boundedMessage.content;
+		expect(blocks[0]!.text).toBe("short");
+		expect(blocks[1]!.text).toHaveLength(ATTACH_TRANSCRIPT_MAX_STRING_CHARS + 13);
+		expect(blocks[1]!.text.endsWith("[truncated]")).toBe(true);
+		expect(blocks[2]!.text).toBe("tail");
+		expect(blocks[2]!.extra![0]!.label).toHaveLength(ATTACH_TRANSCRIPT_MAX_STRING_CHARS + 13);
+		expect(blocks[2]!.extra![0]!.label.endsWith("[truncated]")).toBe(true);
+	});
+
+	it("leaves short content and non-content messages untouched", () => {
+		const short = messageEntry("m1", "hello");
+		expect(boundAttachTranscriptEntry(short)).toBe(short);
+
+		// Messages without a `content` field (custom message kinds) are
+		// returned unchanged — their payloads are already bounded by the
+		// executor.
+		const custom = {
+			type: "bashExecution",
+			command: "x".repeat(ATTACH_TRANSCRIPT_MAX_STRING_CHARS * 2),
+		} as unknown as AgentMessage;
+		const entry: SessionMessageEntry = {
+			type: "message",
+			id: "m2",
+			parentId: null,
+			timestamp: "2026-08-11T00:00:00.000Z",
+			message: custom,
+		};
+		expect(boundAttachTranscriptEntry(entry)).toBe(entry);
 	});
 });
 
@@ -172,7 +582,7 @@ describe("attach bounded write queue (backpressure)", () => {
 });
 
 describe("attach snapshot shrinking", () => {
-	const entry = (workerId: string, updatedAt: number, summary: string) => ({
+	const makeEntry = (workerId: string, updatedAt: number, summary: string) => ({
 		key: { workerId, ownerScope: "scope-a" },
 		state: "idle" as const,
 		createdAt: 0,
@@ -184,28 +594,28 @@ describe("attach snapshot shrinking", () => {
 	});
 
 	it("keeps the most recently updated sessions when capped", () => {
-		const snapshot: AttachSnapshot = {
-			version: 1,
+		const snap: AttachSnapshot = {
+			version: 2,
 			generatedAt: 100,
-			sessions: [entry("old", 1, "s"), entry("mid", 2, "s"), entry("new", 3, "s")],
+			sessions: [makeEntry("old", 1, "s"), makeEntry("mid", 2, "s"), makeEntry("new", 3, "s")],
 		};
-		const shrunk = shrinkAttachSnapshot(snapshot, { maxSessions: 2 });
+		const shrunk = shrinkAttachSnapshot(snap, { maxSessions: 2 });
 		expect(shrunk.sessions.map(s => s.key.workerId)).toEqual(["new", "mid"]);
 	});
 
 	it("truncates summaries to maxSummaryLength", () => {
-		const snapshot: AttachSnapshot = {
-			version: 1,
+		const snap: AttachSnapshot = {
+			version: 2,
 			generatedAt: 100,
-			sessions: [entry("w", 1, "x".repeat(500))],
+			sessions: [makeEntry("w", 1, "x".repeat(500))],
 		};
-		const shrunk = shrinkAttachSnapshot(snapshot, { maxSummaryLength: 8 });
+		const shrunk = shrinkAttachSnapshot(snap, { maxSummaryLength: 8 });
 		expect(shrunk.sessions[0].summary).toHaveLength(8);
 	});
 
 	it("leaves snapshots within bounds untouched", () => {
-		const snapshot: AttachSnapshot = { version: 1, generatedAt: 1, sessions: [entry("w", 1, "fine")] };
-		expect(shrinkAttachSnapshot(snapshot)).toEqual(snapshot);
+		const snap: AttachSnapshot = { version: 2, generatedAt: 1, sessions: [makeEntry("w", 1, "fine")] };
+		expect(shrinkAttachSnapshot(snap)).toEqual(snap);
 	});
 });
 
@@ -266,5 +676,9 @@ describe("attach key helpers", () => {
 
 	it("formats stable labels", () => {
 		expect(formatAttachKey(KEY)).toBe("scope-a/w1");
+	});
+
+	it("exposes the command-ack cache bound constant", () => {
+		expect(ATTACH_CMD_ACK_CACHE_SIZE).toBeGreaterThan(0);
 	});
 });

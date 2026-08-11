@@ -1,61 +1,78 @@
 /**
  * attach/client.ts — interactive pane client for the local worker-attach substrate.
  *
- * Connects to the attach server over a Unix socket, authenticates with the
- * capability token, subscribes to a single worker, and forwards each stdin
- * line as a follow-up. All rendering is delegated to an {@link AttachView};
- * the client owns every I/O surface (socket, keepalive, reconnect backoff,
- * readline, signals, exit codes) so the transport is fully testable without a
- * TTY or a real server and interchangeable views (line dump, fullscreen TUI)
- * never touch the wire protocol.
+ * v2 client flow:
  *
- * Follow-ups are serialized: while one is in flight, further input is queued
- * client-side and flushed in order once the in-flight follow-up settles, so
- * rapid follow-ups never hit the server's `busy` rejection.
+ *   connect → hello { version: 2, role: "pane" } → hello_ok
+ *           → view_open { key, resume? } → view_open_ok { lease, epoch } | view_open_rejected
+ *           → transcript_begin / items* / end   (snapshot epoch)
+ *           → event transcript_append*          (live additions)
+ *           → event progress/updated/state/removed/…
+ *   prompt { lease, cmdSeq, cmdId, ref, text }  → prompt_accepted | control_rejected
+ *                                             → prompt_result { ref, cmdId, ok, payload? }
+ *   abort_turn { lease, cmdSeq, cmdId }          (never exits; never kills the worker)
+ *   detach { lease, reason? }                    → bye, close (restores terminal)
+ *
+ * Reconnect: the client keeps the last granted lease (id + proof + generation)
+ * and resumes it within the server's disconnect grace — the SAME pane instance
+ * reclaims its controller. A fresh view_open (no resume) is issued when the
+ * lease expired and nobody else took it; `lease_busy` means another pane now
+ * controls the worker and is terminal. Every reconnect replays the transcript
+ * from a fresh snapshot epoch — no terminal-byte recovery.
+ *
+ * Plain submissions become leased control intents with a client-monotonic
+ * command sequence and a random idempotency key; locally queued rapid
+ * submissions retain their order (one in flight per worker).
  */
 
 import * as net from "node:net";
 import { createInterface, type Interface } from "node:readline";
 import {
 	ATTACH_PROTOCOL_VERSION,
+	type AttachAbortTurn,
 	type AttachClientMessage,
+	type AttachControlRejected,
 	type AttachError,
 	type AttachEvent,
 	AttachFrameAccumulator,
+	type AttachLease,
 	type AttachMessage,
+	type AttachPrompt,
+	type AttachPromptResult,
 	type AttachSessionEntry,
-	type AttachSnapshot,
-	type AttachWorkerKey,
+	type AttachTranscriptAppend,
+	type AttachTranscriptBegin,
+	type AttachTranscriptEnd,
+	type AttachTranscriptItems,
+	type AttachTranscriptReset,
+	type AttachViewOpenOk,
+	type AttachViewOpenRejected,
 	type AttachWorkerState,
 	decodeAttachLine,
 	encodeAttachMessage,
+	generateAttachCmdId,
 } from "./protocol";
 
 /** Options for {@link AttachClient}; every field is injectable for tests. */
 export interface AttachClientOptions {
-	/** Stream rendered lines are written to. Defaults to `process.stdout`. */
-	readonly stdout?: NodeJS.WritableStream;
-	/** Stream read for follow-up input. Defaults to `process.stdin`. */
-	readonly stdin?: NodeJS.ReadableStream;
-	/** Milliseconds between keepalive pings. Defaults to 30000. */
-	readonly pingIntervalMs?: number;
-	/** Reconnect delays in milliseconds; the last value repeats. Defaults to [200, 500, 1000, 2000, 5000]. */
-	readonly backoffMs?: readonly number[];
-	/** Maximum lines kept in the rendered rolling window before trimming. Defaults to 500. */
-	readonly maxRenderedLines?: number;
-	/** Handle SIGINT (abort the in-flight follow-up, then bye). Defaults to true. */
-	readonly enableSignals?: boolean;
-	/**
-	 * Read follow-up input from a readline interface over `stdin`. Defaults to
-	 * true (line view). Fullscreen views that own the terminal (e.g. the TUI
-	 * pane) MUST set this to false and drive {@link AttachClient.sendFollowUp}
-	 * from their own input path — readline and the TUI cannot share stdin.
-	 */
-	readonly readline?: boolean;
-	/** Invoked with the exit code when the client terminates itself. */
-	readonly onExit?: (code: number) => void;
-	/** Rendering surface for worker state and output. Defaults to {@link AttachLineView}. */
-	readonly view?: AttachView;
+	/** Rendering surface (defaults to the line view). */
+	view?: AttachView;
+	/** Input stream (defaults to process.stdin). */
+	stdin?: NodeJS.ReadableStream;
+	/** Output stream for the default line view (defaults to process.stdout). */
+	stdout?: NodeJS.WritableStream;
+	/** Rolling render window for the default line view. */
+	maxRenderedLines?: number;
+	/** Keepalive ping interval (ms). */
+	pingIntervalMs?: number;
+	/** Reconnect delays (ms). */
+	backoffMs?: readonly number[];
+	/** Install SIGINT handling. */
+	enableSignals?: boolean;
+	/** Wrap stdin in readline (line mode). Disable for fullscreen TUIs. */
+	readline?: boolean;
+	/** Terminal exit callback. */
+	onExit?: (code: number) => void;
 }
 
 const DEFAULT_BACKOFF_MS: readonly number[] = [200, 500, 1000, 2000, 5000];
@@ -71,43 +88,49 @@ export const TRIM_MARKER = "[trimmed: earlier output dropped]";
  * this so a worker can never inject terminal escapes or unbounded output.
  */
 export function sanitizeAttachLine(text: string, maxLength = MAX_RENDERED_LINE_LENGTH): string {
-	let clean = text
-		.replace(/\u001b\][^\u0007\u001b]*(?:\u0007|\u001b\\)/g, "")
-		.replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, "")
-		.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, "")
-		.replace(/\r/g, "");
-	if (clean.length > maxLength) clean = clean.slice(0, maxLength);
-	return clean;
+	const clean = text
+		.replace(/\u001b\[[0-9;]*[a-zA-Z]/g, "")
+		.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, "");
+	return clean.length > maxLength ? clean.slice(0, maxLength) : clean;
 }
 
 /** Connection phase reported to views: first attempt, authenticated, or reconnecting. */
 export type AttachViewConnection = "connecting" | "connected" | "reconnecting";
 
+/** Outcome of a view_open (granted lease or rejection). */
+export type AttachViewOpenOutcome =
+	| { ok: true; lease: AttachLease; epoch: number; cwd?: string; entry: AttachSessionEntry }
+	| { ok: false; rejection: AttachViewOpenRejected };
+
 /**
  * Rendering surface driven by {@link AttachClient}. The transport calls these
- * hooks for every protocol-visible transition; implementations decide how to
- * present them (a line dump, a fullscreen TUI, a test spy). Every hook is
- * optional so lightweight views implement only what they render.
+ * callbacks as frames arrive; views decide how to render (lines, fullscreen
+ * TUI, tests).
  */
 export interface AttachView {
-	/** The transport started a connection attempt or re-authenticated. */
 	onConnection?(connection: AttachViewConnection): void;
-	/** The worker's registry entry changed (initial snapshot / registered / updated). */
 	onEntry?(entry: AttachSessionEntry): void;
-	/** The worker's lifecycle state changed. */
 	onState?(state: AttachWorkerState): void;
+	onViewOpen?(outcome: AttachViewOpenOutcome): void;
+	onTranscriptBegin?(frame: AttachTranscriptBegin): void;
+	onTranscriptItems?(frame: AttachTranscriptItems): void;
+	onTranscriptEnd?(frame: AttachTranscriptEnd): void;
+	onTranscriptAppend?(frame: AttachTranscriptAppend): void;
+	onTranscriptReset?(frame: AttachTranscriptReset): void;
 	/** Coalesced live progress: tool / intent / output tail. */
 	onProgress?(event: Extract<AttachEvent, { type: "progress" }>): void;
-	/** The server accepted the follow-up with the given ref. */
-	onFollowUpAccepted?(ref: string): void;
-	/** A follow-up settled with a result (or an error payload). */
-	onResult?(event: Extract<AttachEvent, { type: "follow_up_result" }>): void;
-	/** A protocol-level error arrived (e.g. `busy` from an external client). */
+	/** The server accepted the prompt with the given ref. */
+	onPromptAccepted?(ref: string): void;
+	/** A prompt settled with a result (or an error payload). */
+	onPromptResult?(event: AttachPromptResult): void;
+	/** A control frame was rejected (lease/sequence/idempotency/busy). */
+	onControlRejected?(rejection: AttachControlRejected): void;
+	/** A protocol-level error arrived. */
 	onError?(error: AttachError): void;
 	/** The worker was removed; the client exits 0 immediately after. */
 	onRemoved?(reason: string): void;
 	/** The server sent a polite `bye`; the client exits 0 immediately after. */
-	onBye?(): void;
+	onBye?(reason?: string): void;
 	/** The client terminated itself with the given code. */
 	onExit?(code: number): void;
 }
@@ -115,7 +138,7 @@ export interface AttachView {
 /**
  * Default line-oriented view: writes bounded sanitized lines to a writable
  * stream, keeping a rolling window that emits `TRIM_MARKER` once when it
- * first overflows. Byte-compatible with the pre-seam rendering so existing
+ * first overflows. Byte-compatible with the v1 line rendering so existing
  * line-based consumers and tests keep their exact output contract.
  */
 export class AttachLineView implements AttachView {
@@ -138,6 +161,12 @@ export class AttachLineView implements AttachView {
 		this.#renderLine(`[${state}]`);
 	}
 
+	onViewOpen(outcome: AttachViewOpenOutcome): void {
+		if (!outcome.ok) {
+			this.#renderLine(`[view] rejected: ${outcome.rejection.code}: ${outcome.rejection.message}`);
+		}
+	}
+
 	onProgress(event: Extract<AttachEvent, { type: "progress" }>): void {
 		if (event.currentTool !== undefined && event.currentTool.trim().length > 0) {
 			const args =
@@ -154,13 +183,17 @@ export class AttachLineView implements AttachView {
 		}
 	}
 
-	onResult(event: Extract<AttachEvent, { type: "follow_up_result" }>): void {
+	onPromptResult(event: AttachPromptResult): void {
 		if (!event.ok) this.#renderLine(`[result] error: ${event.error ?? "failed"}`);
 		else if (event.payload === undefined) this.#renderLine("[result] ok");
 		else
 			this.#renderLine(
 				`[result] ${typeof event.payload === "string" ? event.payload : JSON.stringify(event.payload)}`,
 			);
+	}
+
+	onControlRejected(rejection: AttachControlRejected): void {
+		this.#renderLine(`[control] ${rejection.code}: ${rejection.message}`);
 	}
 
 	onError(error: AttachError): void {
@@ -171,8 +204,8 @@ export class AttachLineView implements AttachView {
 		this.#renderLine(`[removed] ${reason}`);
 	}
 
-	onBye(): void {
-		this.#renderLine("[bye]");
+	onBye(reason?: string): void {
+		this.#renderLine(reason !== undefined && reason.length > 0 ? `[bye] ${reason}` : "[bye]");
 	}
 
 	/** Write one sanitized line, keeping the rolling window bounded. */
@@ -192,20 +225,23 @@ export class AttachLineView implements AttachView {
 }
 
 /**
- * Interactive pane client for the attach substrate.
+ * Interactive pane client for the attach substrate (protocol v2).
  *
- * Handshake: connect → `hello` (capability token) → `hello_ok` → `subscribe`
- * (worker id) → snapshot push. Afterwards the client forwards worker
- * state/summary, progress output, and follow-up results to the configured
- * {@link AttachView}, forwards each stdin line as a `follow_up` (queued while
- * one is in flight), pings to keep the connection alive, and reconnects with
- * backoff after unexpected disconnects. `removed`, a server `bye`, and
- * `auth_failed` are terminal (exit 0/0/1) and never reconnect.
+ * Handshake: connect → `hello` (capability token) → `hello_ok` → `view_open`
+ * (with resume when a lease is held) → `view_open_ok` → transcript snapshot
+ * epoch, then live events. The client forwards worker state/summary, progress
+ * output, transcript frames, and prompt results to the configured
+ * {@link AttachView}, forwards each submitted prompt as a leased `prompt`
+ * control (queued while one is in flight), pings to keep the connection
+ * alive, and reconnects with backoff after unexpected disconnects (resuming
+ * its lease within the grace window). `removed`, a server `bye`, `auth_failed`
+ * and `lease_busy` are terminal and never reconnect.
  */
 export class AttachClient {
 	readonly #socketPath: string;
 	readonly #token: string;
 	readonly #workerId: string;
+	readonly #ownerScope: string;
 	readonly #view: AttachView;
 	readonly #stdin: NodeJS.ReadableStream;
 	readonly #pingIntervalMs: number;
@@ -217,12 +253,12 @@ export class AttachClient {
 	#socket: net.Socket | null = null;
 	#accumulator = new AttachFrameAccumulator();
 	#authenticated = false;
-	#ownerScope: string | null = null;
 	#inFlightRef: string | null = null;
-	#pendingFollowUps: string[] = [];
-	#followUpCounter = 0;
-	#pingTimer: ReturnType<typeof setInterval> | null = null;
-	#reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+	#pendingPrompts: string[] = [];
+	#promptCounter = 0;
+	#cmdSeq = 0;
+	#pingTimer: NodeJS.Timeout | null = null;
+	#reconnectTimer: NodeJS.Timeout | null = null;
 	#reconnectAttempt = 0;
 	#readline: Interface | null = null;
 	#sigintHandler: (() => void) | null = null;
@@ -230,13 +266,21 @@ export class AttachClient {
 	#exiting = false;
 	#handshakeResolve: (() => void) | null = null;
 	#handshakePromise: Promise<void> | null = null;
-	#snapshotResolve: (() => void) | null = null;
-	#snapshotPromise: Promise<void> | null = null;
+	#viewOpenResolve: (() => void) | null = null;
+	#viewOpenPromise: Promise<void> | null = null;
+	/** Current lease granted by the server (resumed across reconnects). */
+	#lease: AttachLease | null = null;
+	#epoch = 0;
+	/** Expected transcript sequence within the current epoch. */
+	#expectedSeq = 0;
+	/** Whether we have transcript frames in flight (initial snapshot pending). */
+	#snapshotPending = false;
 
 	constructor(socketPath: string, token: string, workerId: string, options: AttachClientOptions = {}) {
 		this.#socketPath = socketPath;
 		this.#token = token;
 		this.#workerId = workerId;
+		this.#ownerScope = "";
 		this.#view =
 			options.view ?? new AttachLineView({ stdout: options.stdout, maxRenderedLines: options.maxRenderedLines });
 		this.#stdin = options.stdin ?? process.stdin;
@@ -248,9 +292,8 @@ export class AttachClient {
 	}
 
 	/**
-	 * Connect, authenticate, subscribe to the worker, and resolve once the
-	 * `hello_ok` handshake and the subscribe snapshot push have completed (or
-	 * the client exits early).
+	 * Connect, authenticate, open the worker view, and resolve once the
+	 * `view_open` has settled (or the client exits early).
 	 */
 	async start(): Promise<void> {
 		if (this.#started) return;
@@ -258,8 +301,8 @@ export class AttachClient {
 		this.#handshakePromise = new Promise<void>(resolve => {
 			this.#handshakeResolve = resolve;
 		});
-		this.#snapshotPromise = new Promise<void>(resolve => {
-			this.#snapshotResolve = resolve;
+		this.#viewOpenPromise = new Promise<void>(resolve => {
+			this.#viewOpenResolve = resolve;
 		});
 		this.#connect();
 		if (this.#useReadline) this.#setupReadline();
@@ -268,7 +311,7 @@ export class AttachClient {
 			process.on("SIGINT", this.#sigintHandler);
 		}
 		await this.#handshakePromise;
-		await this.#snapshotPromise;
+		await this.#viewOpenPromise;
 	}
 
 	/** Shut the client down without invoking `onExit`. Idempotent. */
@@ -277,7 +320,7 @@ export class AttachClient {
 		this.#exiting = true;
 		this.#cleanup();
 		this.#finishHandshake();
-		this.#finishSnapshot();
+		this.#finishViewOpen();
 	}
 
 	#finishHandshake(): void {
@@ -286,9 +329,9 @@ export class AttachClient {
 		resolve?.();
 	}
 
-	#finishSnapshot(): void {
-		const resolve = this.#snapshotResolve;
-		this.#snapshotResolve = null;
+	#finishViewOpen(): void {
+		const resolve = this.#viewOpenResolve;
+		this.#viewOpenResolve = null;
 		resolve?.();
 	}
 
@@ -358,10 +401,39 @@ export class AttachClient {
 	#handleMessage(message: AttachMessage): void {
 		switch (message.kind) {
 			case "hello_ok":
-				this.#onHelloOk(message);
+				this.#onHelloOk();
+				return;
+			case "view_open_ok":
+				this.#onViewOpenOk(message);
+				return;
+			case "view_open_rejected":
+				this.#onViewOpenRejected(message);
+				return;
+			case "transcript_begin":
+				this.#onTranscriptBegin(message);
+				return;
+			case "transcript_items":
+				this.#onTranscriptItems(message);
+				return;
+			case "transcript_end":
+				this.#onTranscriptEnd(message);
+				return;
+			case "transcript_append":
+				this.#onTranscriptAppend(message);
+				return;
+			case "transcript_reset":
+				this.#onTranscriptReset(message);
+				return;
+			case "prompt_accepted":
+				this.#view.onPromptAccepted?.(message.ref);
+				return;
+			case "prompt_result":
+				this.#onPromptResult(message);
+				return;
+			case "control_rejected":
+				this.#onControlRejected(message);
 				return;
 			case "snapshot":
-				this.#onSnapshot(message.snapshot);
 				return;
 			case "event":
 				this.#onEvent(message.event);
@@ -369,7 +441,7 @@ export class AttachClient {
 			case "pong":
 				return;
 			case "bye":
-				this.#view.onBye?.();
+				this.#view.onBye?.("reason" in message ? message.reason : undefined);
 				this.#exit(0);
 				return;
 			case "error":
@@ -378,36 +450,156 @@ export class AttachClient {
 		}
 	}
 
-	#onHelloOk(message: Extract<AttachMessage, { kind: "hello_ok" }>): void {
+	#onHelloOk(): void {
 		this.#reconnectAttempt = 0;
 		this.#authenticated = true;
 		this.#view.onConnection?.("connected");
-		this.#captureOwnerScope(message.snapshot);
-		const entry = this.#findEntry(message.snapshot);
-		if (entry) this.#view.onEntry?.(entry);
 		this.#finishHandshake();
 		if (this.#pingTimer === null) {
 			this.#pingTimer = setInterval(() => this.#send({ kind: "ping" }), this.#pingIntervalMs);
 		}
-		this.#send({ kind: "subscribe", workerIds: [this.#workerId] });
-		this.#flushPendingFollowUps();
+		// Open (or resume) the worker view. A held lease is presented as resume
+		// so the same pane instance reclaims its controller across reconnects.
+		this.#send({
+			kind: "view_open",
+			key: { workerId: this.#workerId, ownerScope: this.#ownerScope },
+			...(this.#lease !== null && {
+				resume: {
+					leaseId: this.#lease.leaseId,
+					proof: this.#lease.proof,
+					generation: this.#lease.generation,
+				},
+			}),
+		});
 	}
 
-	#onSnapshot(snapshot: AttachSnapshot): void {
-		this.#captureOwnerScope(snapshot);
-		const entry = this.#findEntry(snapshot);
-		if (entry) this.#view.onEntry?.(entry);
-		this.#finishSnapshot();
+	#onViewOpenOk(message: AttachViewOpenOk): void {
+		this.#lease = message.lease;
+		this.#epoch = message.epoch;
+		this.#expectedSeq = 0;
+		this.#snapshotPending = true;
+		this.#view.onViewOpen?.({
+			ok: true,
+			lease: message.lease,
+			epoch: message.epoch,
+			cwd: message.cwd,
+			entry: message.entry,
+		});
+		this.#view.onEntry?.(message.entry);
+		this.#finishViewOpen();
+		this.#flushPendingPrompts();
+	}
+
+	#onViewOpenRejected(message: AttachViewOpenRejected): void {
+		this.#view.onViewOpen?.({ ok: false, rejection: message });
+		if (message.code === "lease_busy") {
+			process.stderr.write(
+				`attach: worker is controlled by another pane client${message.holder ? ` (lease frees in ~${Math.ceil(message.holder.expiresInMs / 1000)}s)` : ""}\n`,
+			);
+			this.#exit(1);
+			return;
+		}
+		if (message.code === "unknown_worker") {
+			process.stderr.write(`attach: unknown worker: ${message.message}\n`);
+			this.#exit(1);
+			return;
+		}
+		if (message.code === "stale_resume") {
+			// Our lease expired without another client taking it: open a fresh
+			// view (a new lease is granted). Only try this once per rejection.
+			this.#lease = null;
+			this.#send({ kind: "view_open", key: { workerId: this.#workerId, ownerScope: this.#ownerScope } });
+			return;
+		}
+		this.#exit(1);
+	}
+
+	#expectTranscriptFrame(message: { epoch: number; seq: number }): boolean {
+		if (message.epoch !== this.#epoch) return false;
+		const expected = this.#expectedSeq + 1;
+		if (message.seq !== expected) return false;
+		this.#expectedSeq = message.seq;
+		return true;
+	}
+
+	#onTranscriptBegin(message: AttachTranscriptBegin): void {
+		if (!this.#expectTranscriptFrame(message)) {
+			this.#protocolViolation(`transcript_begin out of order (epoch ${message.epoch} seq ${message.seq})`);
+			return;
+		}
+		this.#view.onTranscriptBegin?.(message);
+	}
+
+	#onTranscriptItems(message: AttachTranscriptItems): void {
+		if (!this.#expectTranscriptFrame(message)) {
+			this.#protocolViolation(`transcript_items out of order (epoch ${message.epoch} seq ${message.seq})`);
+			return;
+		}
+		this.#view.onTranscriptItems?.(message);
+	}
+
+	#onTranscriptEnd(message: AttachTranscriptEnd): void {
+		if (!this.#expectTranscriptFrame(message)) {
+			this.#protocolViolation(`transcript_end out of order (epoch ${message.epoch} seq ${message.seq})`);
+			return;
+		}
+		this.#snapshotPending = false;
+		this.#view.onTranscriptEnd?.(message);
+	}
+
+	#onTranscriptAppend(message: AttachTranscriptAppend): void {
+		if (!this.#expectTranscriptFrame(message)) {
+			this.#protocolViolation(`transcript_append out of order (epoch ${message.epoch} seq ${message.seq})`);
+			return;
+		}
+		this.#view.onTranscriptAppend?.(message);
+	}
+
+	#onTranscriptReset(message: AttachTranscriptReset): void {
+		// A reset is a boundary marker: it may arrive at ANY point in the
+		// epoch (a live branch switch between snapshot frames). Validate the
+		// epoch only, then resync the sequence expectation to the reset's seq
+		// so the fresh snapshot's frames are monotonic from here.
+		if (message.epoch !== this.#epoch) {
+			this.#protocolViolation(`transcript_reset out of order (epoch ${message.epoch} seq ${message.seq})`);
+			return;
+		}
+		this.#expectedSeq = message.seq;
+		this.#view.onTranscriptReset?.(message);
+	}
+
+	/** Stale epoch/sequence frames mean the view was superseded: DESTROY the
+	 *  offending socket first (its frames must never keep arriving while the
+	 *  reconnect replays from a fresh snapshot epoch), then reconnect. */
+	#protocolViolation(detail: string): void {
+		process.stderr.write(`attach: protocol violation (${detail}); reconnecting\n`);
+		if (this.#socket !== null && !this.#socket.destroyed) {
+			this.#socket.destroy();
+			this.#socket = null;
+		}
+		this.#scheduleReconnect();
+	}
+
+	#onPromptResult(message: AttachPromptResult): void {
+		this.#inFlightRef = null;
+		this.#view.onPromptResult?.(message);
+		this.#flushPendingPrompts();
+	}
+
+	#onControlRejected(message: AttachControlRejected): void {
+		this.#view.onControlRejected?.(message);
+		// A ref-carrying rejection settled the in-flight prompt: the slot is
+		// free again, so drain the client-side queue.
+		if (message.ref !== undefined && (this.#inFlightRef === null || message.ref === this.#inFlightRef)) {
+			this.#inFlightRef = null;
+			this.#flushPendingPrompts();
+		}
 	}
 
 	#onEvent(event: AttachEvent): void {
 		switch (event.type) {
 			case "registered":
 				if (event.key.workerId !== this.#workerId) return;
-				if (this.#ownerScope === null) {
-					this.#ownerScope = event.key.ownerScope;
-					this.#flushPendingFollowUps();
-				}
 				this.#view.onEntry?.(event.entry);
 				return;
 			case "updated":
@@ -424,16 +616,13 @@ export class AttachClient {
 				this.#exit(0);
 				return;
 			case "follow_up_accepted":
-				if (event.key.workerId !== this.#workerId) return;
-				this.#view.onFollowUpAccepted?.(event.ref);
-				return;
 			case "follow_up_result":
-				if (event.key.workerId !== this.#workerId) return;
-				this.#inFlightRef = null;
-				this.#view.onResult?.(event);
-				this.#flushPendingFollowUps();
 				return;
 			case "abort_accepted":
+				return;
+			case "lease_granted":
+			case "lease_expired":
+			case "lease_revoked":
 				return;
 			case "progress":
 				if (event.key.workerId !== this.#workerId) return;
@@ -451,26 +640,10 @@ export class AttachClient {
 		this.#view.onError?.(error);
 		if (error.ref !== undefined && error.ref === this.#inFlightRef) {
 			this.#inFlightRef = null;
-			// An error settled the in-flight follow-up (e.g. `unknown_worker`):
+			// An error settled the in-flight prompt (e.g. `unknown_worker`):
 			// the slot is free again, so drain the client-side queue.
-			this.#flushPendingFollowUps();
+			this.#flushPendingPrompts();
 		}
-	}
-
-	#captureOwnerScope(snapshot: AttachSnapshot): void {
-		if (this.#ownerScope !== null) return;
-		const entry = this.#findEntry(snapshot);
-		if (!entry) return;
-		this.#ownerScope = entry.key.ownerScope;
-		this.#flushPendingFollowUps();
-	}
-
-	#findEntry(snapshot: AttachSnapshot): AttachSessionEntry | undefined {
-		return snapshot.sessions.find(
-			entry =>
-				entry.key.workerId === this.#workerId &&
-				(this.#ownerScope === null || entry.key.ownerScope === this.#ownerScope),
-		);
 	}
 
 	#setupReadline(): void {
@@ -483,59 +656,109 @@ export class AttachClient {
 	}
 
 	#onInputLine(line: string): void {
-		this.sendFollowUp(line);
+		this.sendPrompt(line);
 	}
 
 	/**
-	 * Queue or send one follow-up prompt. While the worker is unknown, the
-	 * connection is reconnecting, or another follow-up is in flight, the
-	 * prompt is held and flushed in order once the slot is free. Used by both
-	 * the readline line view and the fullscreen pane's composer.
+	 * Queue or send one prompt. While the view is not yet open, the connection
+	 * is reconnecting, or another prompt is in flight, the prompt is held and
+	 * flushed in order once the slot is free. Used by both the readline line
+	 * view and the fullscreen pane's composer.
 	 */
-	sendFollowUp(payload: string): void {
-		if (payload.trim().length === 0) return;
-		if (this.#ownerScope === null || !this.#authenticated || this.#inFlightRef !== null) {
-			this.#pendingFollowUps.push(payload);
+	sendPrompt(text: string): void {
+		if (text.trim().length === 0) return;
+		if (this.#lease === null || !this.#authenticated || this.#inFlightRef !== null || this.#snapshotPending) {
+			this.#pendingPrompts.push(text);
 			return;
 		}
-		this.#sendFollowUp(payload);
+		this.#sendPrompt(text);
 	}
 
-	#sendFollowUp(payload: string): void {
-		this.#followUpCounter += 1;
-		const ref = `f${this.#followUpCounter}`;
+	#sendPrompt(text: string): void {
+		this.#promptCounter += 1;
+		const ref = `p${this.#promptCounter}`;
+		this.#cmdSeq += 1;
+		const frame: AttachPrompt = {
+			kind: "prompt",
+			key: { workerId: this.#workerId, ownerScope: this.#ownerScope },
+			leaseId: this.#lease!.leaseId,
+			proof: this.#lease!.proof,
+			generation: this.#lease!.generation,
+			cmdSeq: this.#cmdSeq,
+			cmdId: generateAttachCmdId(),
+			ref,
+			text,
+		};
 		this.#inFlightRef = ref;
-		this.#send({ kind: "follow_up", ref, key: this.#followUpKey(), payload });
+		this.#send(frame);
 	}
 
-	#flushPendingFollowUps(): void {
-		while (this.#pendingFollowUps.length > 0 && this.#inFlightRef === null && this.#authenticated) {
-			const payload = this.#pendingFollowUps.shift();
-			if (payload === undefined) return;
-			this.#sendFollowUp(payload);
+	#flushPendingPrompts(): void {
+		while (
+			this.#pendingPrompts.length > 0 &&
+			this.#inFlightRef === null &&
+			this.#authenticated &&
+			this.#lease !== null
+		) {
+			const text = this.#pendingPrompts.shift();
+			if (text === undefined) return;
+			this.#sendPrompt(text);
 		}
 	}
 
-	#followUpKey(): AttachWorkerKey {
-		return { workerId: this.#workerId, ownerScope: this.#ownerScope ?? "" };
+	/**
+	 * Cancel the in-flight turn for the worker (abort-current-turn). Never
+	 * kills the worker and never closes the view; the pane stays attached.
+	 */
+	abortTurn(): void {
+		if (this.#exiting || this.#lease === null || !this.#authenticated) return;
+		this.#cmdSeq += 1;
+		const frame: AttachAbortTurn = {
+			kind: "abort_turn",
+			key: { workerId: this.#workerId, ownerScope: this.#ownerScope },
+			leaseId: this.#lease.leaseId,
+			proof: this.#lease.proof,
+			generation: this.#lease.generation,
+			cmdSeq: this.#cmdSeq,
+			cmdId: generateAttachCmdId(),
+		};
+		this.#send(frame);
 	}
 
 	/**
-	 * Cancel the in-flight follow-up (if any), send a polite `bye`, and exit
-	 * 0. Used by the SIGINT handler and by the fullscreen pane's Ctrl-C on an
-	 * empty draft.
+	 * Detach: release the controller lease and close the view. The server
+	 * replies `bye`; the client exits 0. Does NOT abort or kill the worker —
+	 * the worker keeps running.
 	 */
-	interrupt(): void {
-		this.#handleSigint();
+	detach(reason?: string): void {
+		if (this.#exiting || this.#lease === null || !this.#authenticated) {
+			this.#exit(0);
+			return;
+		}
+		this.#send({
+			kind: "detach",
+			key: { workerId: this.#workerId, ownerScope: this.#ownerScope },
+			leaseId: this.#lease.leaseId,
+			proof: this.#lease.proof,
+			generation: this.#lease.generation,
+			reason,
+		});
+		// The server closes the connection after bye; also guard against a
+		// stalled peer by finishing locally.
+		this.#exit(0);
+	}
+
+	/**
+	 * Legacy alias kept for tests: same as {@link sendPrompt}.
+	 */
+	sendFollowUp(payload: string): void {
+		this.sendPrompt(payload);
 	}
 
 	#handleSigint(): void {
 		if (this.#exiting) return;
-		if (this.#inFlightRef !== null && this.#ownerScope !== null) {
-			this.#send({ kind: "abort", key: this.#followUpKey() });
-		}
-		this.#send({ kind: "bye" });
-		this.#exit(0);
+		// v2 semantics: Ctrl-C aborts the in-flight turn; the pane stays open.
+		this.abortTurn();
 	}
 
 	#send(message: AttachClientMessage): void {
@@ -548,7 +771,7 @@ export class AttachClient {
 		this.#exiting = true;
 		this.#cleanup();
 		this.#finishHandshake();
-		this.#finishSnapshot();
+		this.#finishViewOpen();
 		this.#view.onExit?.(code);
 		this.#onExit?.(code);
 	}
