@@ -16,7 +16,7 @@ import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import { serviceTierFamily } from "@oh-my-pi/pi-ai";
 import { getOAuthProviders } from "@oh-my-pi/pi-ai/oauth";
 import { toolWireSchema } from "@oh-my-pi/pi-ai/utils/schema";
-import { $env, isEnoent, isRecord, readLines, Snowflake } from "@oh-my-pi/pi-utils";
+import { $env, isRecord, logger, readLines, Snowflake } from "@oh-my-pi/pi-utils";
 import { reset as resetCapabilities } from "../../capability";
 import { clearPluginRootsAndCaches, resolveActiveProjectRegistryPath } from "../../discovery/helpers";
 import {
@@ -1113,9 +1113,21 @@ export async function runRpcMode(
 
 	// Restore plan/vibe/goal mode across switch_session like the TUI does: drop
 	// the previous session's live mode state before the switch, then reconcile
-	// the target file's mode_change chain afterwards.
+	// the target file's mode_change chain afterwards. Reconcile the *current*
+	// session once up front too, so a session resumed with a persisted mode
+	// (e.g. --session pointing at a plan-mode journal) starts with live mode
+	// state instead of reporting "none" until the first switch (mirrors
+	// InteractiveMode's startup reconcile).
 	session.setSessionBeforeSwitchReconciler(() => suspendSessionMode(session));
 	session.setSessionSwitchReconciler(() => reconcileSessionMode(session));
+	try {
+		await reconcileSessionMode(session);
+	} catch (error) {
+		logger.warn("Failed to reconcile session mode on RPC startup", {
+			sessionFile: session.sessionManager.getSessionFile(),
+			error: String(error),
+		});
+	}
 
 	const getAvailableCommands = async () => buildAvailableSlashCommands(session);
 	const getAdvisorState = () => session.getAdvisorStateOverview();

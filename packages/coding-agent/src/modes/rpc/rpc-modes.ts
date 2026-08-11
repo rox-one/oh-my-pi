@@ -342,7 +342,10 @@ export async function reconcileSessionMode(session: AgentSession): Promise<void>
 			return;
 		}
 		session.setGoalModeState({ enabled: mode === "goal", mode: "active", goal });
-		const restored = await session.goalRuntime.onThreadResumed({});
+		// Preserve an active goal across in-process switches (the TUI's switch
+		// reconciler passes preserveActiveGoal: true too); without it an active
+		// goal is converted to goal_paused and persisted as such.
+		const restored = await session.goalRuntime.onThreadResumed({ preserveActiveGoal: true });
 		if (restored?.goal) {
 			const previousTools = session.getEnabledToolNames().filter(name => name !== "goal");
 			await session.setActiveToolsByName([...new Set([...previousTools, "goal"])]);

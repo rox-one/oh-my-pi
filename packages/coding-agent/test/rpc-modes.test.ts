@@ -11,7 +11,7 @@ const isModeChangeEntry = (entry: SessionEntry): entry is Extract<SessionEntry, 
 
 /** Minimal persisted session file: header + one mode_change entry. */
 function writeSessionFile(dir: string, name: string, mode: "plan" | "vibe" | "goal" | "none"): string {
-	const sessionId = Snowflake.next().toString();
+	const sessionId = Snowflake.next().slice(0, 16);
 	const header = {
 		type: "session",
 		version: 3,
@@ -27,6 +27,21 @@ function writeSessionFile(dir: string, name: string, mode: "plan" | "vibe" | "go
 		timestamp: new Date().toISOString(),
 		mode,
 		...(mode === "plan" ? { data: { planFilePath: "local://PLAN.md" } } : {}),
+		...(mode === "goal"
+			? {
+					data: {
+						goal: {
+							id: Snowflake.next(),
+							objective: "Do the thing",
+							status: "active",
+							tokensUsed: 0,
+							timeUsedSeconds: 0,
+							createdAt: Date.now(),
+							updatedAt: Date.now(),
+						},
+					},
+				}
+			: {}),
 	};
 	const file = path.join(dir, name);
 	fs.writeFileSync(file, `${JSON.stringify(header)}\n${JSON.stringify(modeChange)}\n`, "utf8");
@@ -131,5 +146,25 @@ describe("rpc session modes (headless controller)", () => {
 		await ctx.session.switchSession(freshFile);
 		expect(getSessionMode(ctx.session)).toBe("none");
 		expect(ctx.session.getPlanModeState()).toBeUndefined();
+	});
+
+	test("switch_session preserves an active goal instead of pausing it", async () => {
+		const goalFile = writeSessionFile(ctx.tempDir, `goal-${Snowflake.next()}.jsonl`, "goal");
+		const freshFile = writeSessionFile(ctx.tempDir, `fresh-${Snowflake.next()}.jsonl`, "none");
+
+		ctx.session.setSessionBeforeSwitchReconciler(() => suspendSessionMode(ctx.session));
+		ctx.session.setSessionSwitchReconciler(() => reconcileSessionMode(ctx.session));
+
+		await ctx.session.switchSession(goalFile);
+		expect(getSessionMode(ctx.session)).toBe("goal");
+		expect(ctx.session.getGoalModeState()?.goal.status).toBe("active");
+
+		// Switching away and back must not convert the active goal to goal_paused
+		// (GoalRuntime.onThreadResumed without preserveActiveGoal does exactly that).
+		await ctx.session.switchSession(freshFile);
+		expect(getSessionMode(ctx.session)).toBe("none");
+		await ctx.session.switchSession(goalFile);
+		expect(getSessionMode(ctx.session)).toBe("goal");
+		expect(ctx.session.getGoalModeState()?.goal.status).toBe("active");
 	});
 });

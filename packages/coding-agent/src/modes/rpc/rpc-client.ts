@@ -1019,7 +1019,8 @@ export class RpcClient {
 					: "maintenance";
 		return {
 			...state,
-			activityPhase,
+			// Older servers predate the `mode` field; treat it as absent → "none".
+			mode: state.mode ?? "none",
 			fastModeEnabled: state.fastModeEnabled === true,
 			fastModeActive: state.fastModeActive === true,
 			tokensPerSecond:
