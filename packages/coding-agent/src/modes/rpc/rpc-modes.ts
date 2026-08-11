@@ -61,6 +61,10 @@ export async function enterPlanMode(
 	session: AgentSession,
 	options?: { planFilePath?: string; persist?: boolean },
 ): Promise<void> {
+	// Idempotent: re-entering plan mode must not re-capture the write-augmented
+	// toolset into `previousToolsByMode` (a later exit would then leave `write`
+	// active). Mirrors InteractiveMode.#enterPlanMode.
+	if (session.getPlanModeState()?.enabled) return;
 	assertNoOtherMode(session, "plan");
 	if (!session.settings.get("plan.enabled")) {
 		throw new Error("Plan mode is disabled. Enable it in settings (plan.enabled).");
@@ -136,6 +140,8 @@ function vibeParentSession(session: AgentSession): VibeParentSession {
 }
 
 export async function enterVibeMode(session: AgentSession, options?: { persist?: boolean }): Promise<void> {
+	// Idempotent: re-entering must not re-capture the read-only toolset (see enterPlanMode).
+	if (session.getVibeModeState()?.enabled) return;
 	assertNoOtherMode(session, "vibe");
 	const vibeRegistry = VibeSessionRegistry.global();
 	const parent = vibeParentSession(session);
@@ -182,6 +188,9 @@ export async function enterGoalMode(
 	objective: string,
 	_options?: { persist?: boolean },
 ): Promise<void> {
+	// Idempotent: re-entering must not re-capture the goal-augmented toolset
+	// (see enterPlanMode). Mirrors InteractiveMode.#enterGoalMode.
+	if (session.getGoalModeState()?.enabled) return;
 	assertNoOtherMode(session, "goal");
 	if (!session.settings.get("goal.enabled")) {
 		throw new Error("Goal mode is disabled. Enable it in settings (goal.enabled).");
@@ -303,9 +312,7 @@ export async function reconcileSessionMode(session: AgentSession): Promise<void>
 		if (!session.settings.get("plan.enabled")) {
 			// Clear stale plan/plan_paused mode so re-enabling the setting
 			// later doesn't unexpectedly restore an old plan session.
-			if (mode === "plan" || mode === "plan_paused") {
-				session.sessionManager.appendModeChange("none");
-			}
+			session.sessionManager.appendModeChange("none");
 			return;
 		}
 		if (mode === "plan") {
@@ -317,6 +324,9 @@ export async function reconcileSessionMode(session: AgentSession): Promise<void>
 		return;
 	}
 	if (mode === "vibe") {
+		// Rehydrate suspended workers scoped to this parent before re-entering,
+		// mirroring InteractiveMode.#reconcileModeFromSession.
+		await VibeSessionRegistry.global().rehydrate(vibeParentSession(session));
 		await enterVibeMode(session, { persist: false });
 		return;
 	}

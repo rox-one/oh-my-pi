@@ -34,6 +34,9 @@ export interface TestSessionOptions {
 	extensionRunner?: ExtensionRunner;
 	/** Wire the ephemeral vibe tool factory (`vibe_spawn` etc.), needed to enter vibe mode. */
 	vibeTools?: boolean;
+	/** Populate the session's tool registry from the created tools, so
+	 *  `setActiveToolsByName` / `activateVibeTools` can restore toolsets. */
+	wireToolRegistry?: boolean;
 	/** Secret obfuscator to wire into the session (e.g. to test deobfuscation of persisted tool arguments) */
 	obfuscator?: SecretObfuscator;
 }
@@ -94,6 +97,7 @@ export async function createTestSession(options: TestSessionOptions = {}): Promi
 		settings: Settings.isolated(options.settingsOverrides),
 	};
 	const tools = await createTools(toolSession);
+	const toolRegistry = options.wireToolRegistry ? new Map(tools.map(tool => [tool.name, tool])) : undefined;
 
 	const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
 	const agent = new Agent({
@@ -119,6 +123,8 @@ export async function createTestSession(options: TestSessionOptions = {}): Promi
 		modelRegistry,
 		extensionRunner: options.extensionRunner,
 		obfuscator: options.obfuscator,
+		toolRegistry,
+		builtInToolNames: options.wireToolRegistry ? tools.map(tool => tool.name) : undefined,
 		createVibeTools: options.vibeTools ? () => createVibeTools(toolSession) : undefined,
 	});
 

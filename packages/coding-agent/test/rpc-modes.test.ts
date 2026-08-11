@@ -37,7 +37,7 @@ describe("rpc session modes (headless controller)", () => {
 	let ctx: TestSessionContext;
 
 	beforeEach(async () => {
-		ctx = await createTestSession({ vibeTools: true });
+		ctx = await createTestSession({ vibeTools: true, wireToolRegistry: true });
 	});
 
 	afterEach(async () => {
@@ -92,6 +92,24 @@ describe("rpc session modes (headless controller)", () => {
 		expect(await setSessionMode(ctx.session, "none")).toBe("none");
 		expect(ctx.session.getVibeModeState()).toBeUndefined();
 		expect(ctx.sessionManager.getEntries().filter(isModeChangeEntry).at(-1)?.mode).toBe("none");
+	});
+
+	test("re-entering the same mode is idempotent (does not corrupt tool restore)", async () => {
+		// Plan mode augments the toolset with `write`; re-entering while active
+		// must not re-capture the augmented set, or exit would leave `write` on.
+		const prePlanTools = ctx.session.getEnabledToolNames().slice();
+		await setSessionMode(ctx.session, "plan");
+		await setSessionMode(ctx.session, "plan");
+		expect(await setSessionMode(ctx.session, "plan")).toBe("plan");
+		await setSessionMode(ctx.session, "none");
+		expect(ctx.session.getEnabledToolNames()).toEqual(prePlanTools);
+
+		// Vibe mode replaces the toolset with read-only; same guard.
+		const preVibeTools = ctx.session.getEnabledToolNames().slice();
+		await setSessionMode(ctx.session, "vibe");
+		await setSessionMode(ctx.session, "vibe");
+		await setSessionMode(ctx.session, "none");
+		expect(ctx.session.getEnabledToolNames()).toEqual(preVibeTools);
 	});
 
 	test("switch_session restores the persisted mode (reconcile hooks)", async () => {
