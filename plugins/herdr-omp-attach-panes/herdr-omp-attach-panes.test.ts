@@ -793,20 +793,34 @@ describe("enabling", () => {
 
 describe("resolveAttachBin", () => {
   test("explicit non-empty attachBin wins", () => {
-    expect(resolveAttachBin("bun run /x/client.ts", "/proc/x")).toBe("bun run /x/client.ts");
+    expect(resolveAttachBin("bun run /x/client.ts", "/proc/x", "/proj/cli.ts")).toBe("bun run /x/client.ts");
   });
 
-  test("omitted, empty, null, or non-string bin resolves to the running executable (injectable execPath)", () => {
-    expect(resolveAttachBin(undefined, "/fork/dist/omp")).toBe("/fork/dist/omp");
-    expect(resolveAttachBin("", "/fork/dist/omp")).toBe("/fork/dist/omp");
-    expect(resolveAttachBin(null, "/fork/dist/omp")).toBe("/fork/dist/omp");
-    expect(resolveAttachBin(42, "/fork/dist/omp")).toBe("/fork/dist/omp");
+  test("source/npm launch: runtime + .ts/.js entry become one shell-quoted prefix", () => {
+    expect(resolveAttachBin(undefined, "/usr/local/bin/bun", "/proj/cli.ts")).toBe("'/usr/local/bin/bun' '/proj/cli.ts'");
+    expect(resolveAttachBin(undefined, "/opt/homebrew/bin/node", "/proj/dist/cli.js")).toBe("'/opt/homebrew/bin/node' '/proj/dist/cli.js'");
+    // Paths containing spaces/quotes stay safe inside the single-quoted prefix.
+    expect(resolveAttachBin(undefined, "/my bun/bin/bun", "/my dir/cli.ts")).toBe("'/my bun/bin/bun' '/my dir/cli.ts'");
   });
 
-  test("only when both are unavailable does DEFAULT_ATTACH_BIN apply", () => {
-    expect(resolveAttachBin(undefined, "")).toBe(DEFAULT_ATTACH_BIN);
-    expect(resolveAttachBin("", "")).toBe(DEFAULT_ATTACH_BIN);
-    expect(resolveAttachBin(undefined, null)).toBe(DEFAULT_ATTACH_BIN);
+  test("omitted, empty, null, or non-string bin resolves to the compiled executable (injectable execPath)", () => {
+    expect(resolveAttachBin(undefined, "/fork/dist/omp", null)).toBe("/fork/dist/omp");
+    expect(resolveAttachBin("", "/fork/dist/omp", null)).toBe("/fork/dist/omp");
+    expect(resolveAttachBin(null, "/fork/dist/omp", null)).toBe("/fork/dist/omp");
+    expect(resolveAttachBin(42, "/fork/dist/omp", null)).toBe("/fork/dist/omp");
+  });
+
+  test("a bare Bun/Node runtime with no CLI entry cannot route attach: DEFAULT_ATTACH_BIN applies", () => {
+    expect(resolveAttachBin(undefined, "/usr/local/bin/bun", null)).toBe(DEFAULT_ATTACH_BIN);
+    expect(resolveAttachBin(undefined, "/usr/local/bin/bun", "")).toBe(DEFAULT_ATTACH_BIN);
+    expect(resolveAttachBin(undefined, "/opt/homebrew/bin/node", null)).toBe(DEFAULT_ATTACH_BIN);
+    expect(resolveAttachBin(undefined, "C:\\bun\\bun.exe", null)).toBe(DEFAULT_ATTACH_BIN);
+  });
+
+  test("only when both the executable and entry are unavailable does DEFAULT_ATTACH_BIN apply", () => {
+    expect(resolveAttachBin(undefined, "", null)).toBe(DEFAULT_ATTACH_BIN);
+    expect(resolveAttachBin("", "", null)).toBe(DEFAULT_ATTACH_BIN);
+    expect(resolveAttachBin(undefined, null, null)).toBe(DEFAULT_ATTACH_BIN);
   });
 
   test("the controller constructor applies the same fallback to the running executable", async () => {
@@ -825,7 +839,12 @@ describe("resolveAttachBin", () => {
     await controller.flushPending();
     const texts = rpc.byMethod("pane.send_text");
     expect(texts).toHaveLength(1);
-    expect(texts[0].params.text).toBe(`${process.execPath} attach 9001 --session-file '${parentFile("9001")}'`);
+    // Under a source/npm launch (bun test argv[1] is this .ts file) the pane
+    // command carries the runtime + CLI entry, each shell-quoted, so `attach`
+    // routes to the subcommand instead of `bun attach`.
+    expect(texts[0].params.text).toBe(
+      `${quoteShellArg(process.execPath)} ${quoteShellArg(process.argv[1])} attach 9001 --session-file '${parentFile("9001")}'`,
+    );
   });
 });
 
@@ -1614,12 +1633,17 @@ describe("production wiring (default export)", () => {
     return pi;
   }
 
-  test("unset HERDR_OMP_ATTACH_BIN uses the running executable in the pane command", async () => {
+  test("unset HERDR_OMP_ATTACH_BIN uses the running CLI (runtime + entry) in the pane command", async () => {
     driveWorker({});
     await waitFor(() => received.some(entry => entry.method === "pane.send_text"));
     const sendText = received.find(entry => entry.method === "pane.send_text");
-    expect(sendText.params.text).toBe(`${process.execPath} attach 9001 --session-file '${parent("9001")}'`);
+    // Source/npm launch: the runtime plus the .ts/.js entry, shell-quoted, so
+    // `attach` routes to the subcommand (never a bare `bun attach`).
+    expect(sendText.params.text).toBe(
+      `${quoteShellArg(process.execPath)} ${quoteShellArg(process.argv[1])} attach 9001 --session-file '${parent("9001")}'`,
+    );
     expect(sendText.params.text.startsWith("omp attach")).toBe(false);
+    expect(sendText.params.text.startsWith("bun attach")).toBe(false);
     // The split env still carries exactly the two path variables.
     const split = received.find(entry => entry.method === "pane.split");
     expect(Object.keys(split.params.env).sort()).toEqual([ATTACH_SOCKET_PATH_ENV, ATTACH_TOKEN_FILE_PATH_ENV].sort());

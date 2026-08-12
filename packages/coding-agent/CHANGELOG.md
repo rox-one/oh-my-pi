@@ -1232,6 +1232,9 @@
 - Fixed retry-fallback selection switching to a fallback model with a context window too small to hold the current session context.
 - Fixed OpenCode discovery ignoring `opencode.jsonc` files and rejecting comments in `opencode.json`.
 - Fixed WSL2 startup hanging forever when the Windows interop pipe is wedged: the WSL host-home discovery probes (`cmd.exe`, `wslpath`) now run under a 500ms hard timeout and fall back to the Linux `$HOME`/`~/.omp` candidates ([#8402](https://github.com/can1357/oh-my-pi/issues/8402)).
+### Added
+
+- Added `omp attach <workerId>` for lease-controlled fullscreen interaction with live Vibe workers, including reconnect-safe transcript replay, prompt and abort controls, and attach endpoint metadata for pane integrations.
 
 ## [17.2.15] - 2026-08-12
 

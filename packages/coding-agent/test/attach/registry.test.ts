@@ -412,6 +412,41 @@ describe("attach registry serialized prompts", () => {
 		registry.register(KEY, null);
 		await expect(registry.runPrompt(KEY, "p")).resolves.toEqual({ ok: false, error: "boom" });
 	});
+
+	it("a stale claim settling after unregister/re-register cannot delete the new slot or contaminate the cache", async () => {
+		const gates: Record<string, () => void> = {};
+		const registry = new AttachRegistry({
+			runPrompt: async (_key, text) => {
+				await new Promise<void>(resolve => {
+					gates[text] = resolve;
+				});
+				return { ok: true, payload: text };
+			},
+		});
+		registry.register(KEY, null);
+
+		// A claims cmd-A and runs DEFERRED.
+		const claimA = registry.claimPrompt(KEY, "cmd-A", "a");
+		if (claimA.status !== "started") throw new Error("expected A to start");
+
+		// The worker is removed and re-registered while A's run is still in
+		// flight: entry and active slot now belong to the NEW worker.
+		registry.unregister(KEY, "restart");
+		registry.register(KEY, null);
+		const claimB = registry.claimPrompt(KEY, "cmd-B", "b");
+		if (claimB.status !== "started") throw new Error("expected B to start");
+
+		// A settles: the stale claim must leave B's slot and B's cache alone.
+		gates["a"]();
+		await expect(claimA.outcome).resolves.toEqual({ ok: true, payload: "a" });
+		expect(registry.claimPrompt(KEY, "cmd-C", "c").status).toBe("busy");
+		expect(registry.cachedCommand(KEY, "cmd-A")).toBeUndefined();
+
+		// B settles normally afterwards and its own outcome IS cached.
+		gates["b"]();
+		await expect(claimB.outcome).resolves.toEqual({ ok: true, payload: "b" });
+		expect(registry.cachedCommand(KEY, "cmd-B")).toEqual({ ok: true, payload: "b" });
+	});
 });
 
 describe("attach registry serialized follow-up", () => {
@@ -558,6 +593,28 @@ describe("attach registry attached-client accounting", () => {
 		registry.detach(KEY, "client-2");
 		expect(registry.snapshot().sessions[0].attachedClients).toBe(0);
 		expect(registry.has(KEY)).toBe(true);
+	});
+
+	it("emits updated wire entries only when attachedClients membership changes", () => {
+		const { registry } = makeRegistry();
+		registry.register(KEY, null);
+		const events = collectEvents(registry, () => {
+			registry.attach(KEY, "client-1");
+			registry.attach(KEY, "client-1"); // duplicate: no emit
+			registry.attach(KEY, "client-2");
+			registry.detach(KEY, "ghost"); // absent: no emit
+			registry.detach(KEY, "client-1");
+			registry.detach(KEY, "client-2");
+		});
+		const updated = events.filter(event => event.type === "updated");
+		expect(updated).toHaveLength(4);
+		expect(
+			updated.map(event => {
+				if (event.type !== "updated") throw new Error("expected updated");
+				return event.entry.attachedClients;
+			}),
+		).toEqual([1, 2, 1, 0]);
+		expect(updated.every(event => event.type === "updated" && event.key.workerId === KEY.workerId)).toBe(true);
 	});
 
 	it("ignores attach/detach for unknown workers", () => {

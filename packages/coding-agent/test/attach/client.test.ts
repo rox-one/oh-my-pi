@@ -6,7 +6,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { PassThrough, Writable } from "node:stream";
 import Attach, { readAttachToken, resolveAttachPaths } from "../../src/attach/cli";
-import { AttachClient } from "../../src/attach/client";
+import { AttachClient, type AttachView } from "../../src/attach/client";
 import {
 	type AttachClientMessage,
 	AttachFrameAccumulator,
@@ -350,6 +350,8 @@ describe("attach client", () => {
 			readonly maxRenderedLines?: number;
 			readonly backoffMs?: readonly number[];
 			readonly pingIntervalMs?: number;
+			readonly detachTimeoutMs?: number;
+			readonly view?: AttachView;
 			readonly onExit?: (code: number) => void;
 			readonly stdout?: CollectingStream;
 			readonly stdin?: PassThrough;
@@ -374,6 +376,8 @@ describe("attach client", () => {
 				pingIntervalMs: overrides.pingIntervalMs ?? 60_000,
 				backoffMs: overrides.backoffMs ?? [10, 20, 40],
 				maxRenderedLines: overrides.maxRenderedLines ?? 500,
+				detachTimeoutMs: overrides.detachTimeoutMs,
+				view: overrides.view,
 				onExit: code => {
 					exits.push(code);
 					overrides.onExit?.(code);
@@ -767,6 +771,200 @@ describe("attach client", () => {
 			generation: server.lastGrantedLease!.generation,
 			reason: "user",
 		});
+	});
+
+	it("queues a prompt submitted during reconnect backoff and delivers it after the view reopens", async () => {
+		const server = await listenServer();
+		const connections: string[] = [];
+		const { client } = startClient({
+			backoffMs: [250],
+			view: { onConnection: connection => connections.push(connection) },
+		});
+		await client.start();
+		expect(connections).toEqual(["connecting", "connected"]);
+
+		// Drop the socket; the client clears its live send state and enters
+		// backoff (the next attempt is 250ms away).
+		server.dropConnections();
+		// Give the close handler a beat to run before submitting, so the
+		// submission lands squarely inside the backoff window.
+		await new Promise(resolve => setTimeout(resolve, 50));
+
+		// While the socket is down, a submission must be queued, not lost.
+		client.sendPrompt("typed while offline");
+		// Still inside the backoff window (reconnect starts at ~250ms):
+		// nothing may have left the wire yet.
+		await new Promise(resolve => setTimeout(resolve, 100));
+		expect(server.received.filter(message => message.kind === "prompt")).toHaveLength(0);
+		expect(connections.includes("reconnecting")).toBe(false);
+
+		// After the reconnect + view reopen + snapshot epoch, the queued
+		// prompt flushes.
+		const prompt = await poll(() => server.received.find(message => message.kind === "prompt"));
+		expect(prompt).toMatchObject({ kind: "prompt", ref: "p1", text: "typed while offline", cmdSeq: 1 });
+	});
+
+	it("replays an accepted-then-disconnected prompt unchanged after reconnect and settles it", async () => {
+		let first: Extract<AttachClientMessage, { kind: "prompt" }> | null = null;
+		const server = await listenServer({
+			onMessage: (connection, message, next) => {
+				next(connection, message);
+				if (message.kind !== "prompt" || first !== null) return;
+				first = message;
+				connection.send({ kind: "prompt_accepted", key: KEY, ref: message.ref, cmdId: message.cmdId });
+				// Accepted, then the connection dies before any prompt_result.
+				connection.close();
+			},
+		});
+
+		const { client, stdout } = startClient();
+		await client.start();
+
+		client.sendPrompt("run exactly once");
+		await poll(() => server.received.find(message => message.kind === "prompt"));
+
+		// The reconnecting client resends the SAME command identity.
+		const replay = await poll(() => {
+			const prompts = server.received.filter(
+				(message): message is Extract<AttachClientMessage, { kind: "prompt" }> => message.kind === "prompt",
+			);
+			return prompts.length >= 2 ? prompts.at(-1) : undefined;
+		});
+		expect(replay.ref).toBe(first!.ref);
+		expect(replay.text).toBe(first!.text);
+		expect(replay.cmdSeq).toBe(first!.cmdSeq);
+		expect(replay.cmdId).toBe(first!.cmdId);
+		expect(replay.leaseId).toBe(first!.leaseId);
+		expect(replay.proof).toBe(first!.proof);
+		// The resumed lease bumps the generation; the replay presents it so
+		// the server's generation validation accepts the command.
+		expect(replay.generation).toBe(first!.generation + 1);
+
+		// Settle the replayed command with its result.
+		server.connections.at(-1)!.send({
+			kind: "prompt_result",
+			key: KEY,
+			ref: replay.ref,
+			cmdId: replay.cmdId,
+			ok: true,
+			payload: "recovered",
+		});
+		const result = await poll(() => lineWith(stdout, "[result]"));
+		expect(result).toContain("recovered");
+
+		// The slot settled: the next submission flows immediately.
+		client.sendPrompt("next");
+		const next = await poll(() => server.received.find(message => message.kind === "prompt" && message.ref === "p2"));
+		expect(next).toMatchObject({ kind: "prompt", ref: "p2", text: "next" });
+	});
+
+	it("holds prompts submitted during the snapshot replay until transcript_end, then flushes", async () => {
+		let viewOpens = 0;
+		let sentEnd = false;
+		const server = await listenServer({
+			onMessage: (connection, message, next) => {
+				if (message.kind !== "view_open") {
+					next(connection, message);
+					return;
+				}
+				viewOpens += 1;
+				if (viewOpens === 1) {
+					next(connection, message); // default grant + snapshot epoch
+					return;
+				}
+				// Reconnect: open the view but DELAY the transcript snapshot so
+				// there is a window where the view is open while the snapshot
+				// is still pending.
+				connection.send({
+					kind: "view_open_ok",
+					key: message.key,
+					lease: { leaseId: "lease-2", proof: "e".repeat(64), generation: 1, graceMs: 30_000 },
+					epoch: 2,
+					entry: entry(),
+					cwd: "/cwd",
+				});
+				setTimeout(() => {
+					connection.send({ kind: "transcript_begin", key: KEY, epoch: 2, seq: 1 });
+					connection.send({ kind: "transcript_items", key: KEY, epoch: 2, seq: 2, items: [] });
+					connection.send({ kind: "transcript_end", key: KEY, epoch: 2, seq: 3, watermark: 0 });
+					sentEnd = true;
+				}, 300);
+			},
+		});
+
+		const viewOpened: boolean[] = [];
+		const { client } = startClient({
+			backoffMs: [10, 20, 40],
+			view: { onViewOpen: () => viewOpened.push(true) },
+		});
+		await client.start();
+		expect(viewOpened).toHaveLength(1);
+
+		// Drop the connection; the client reconnects and reopens the view with
+		// a delayed snapshot.
+		server.dropConnections();
+		await poll(() => (viewOpened.length >= 2 ? true : undefined));
+
+		// The view is open but the snapshot has not completed: a submission
+		// must stay queued rather than leave the wire.
+		client.sendPrompt("wait for the snapshot");
+		await new Promise(resolve => setTimeout(resolve, 120));
+		expect(server.received.filter(message => message.kind === "prompt")).toHaveLength(0);
+		expect(sentEnd).toBe(false);
+
+		// transcript_end arrives → the queued prompt flushes, after the end.
+		const prompt = await poll(() => server.received.find(message => message.kind === "prompt"));
+		expect(prompt).toMatchObject({ kind: "prompt", ref: "p1", text: "wait for the snapshot" });
+		expect(sentEnd).toBe(true);
+	});
+
+	it("detach waits for the server bye before exiting, even when bye is delayed", async () => {
+		const server = await listenServer({
+			onMessage: (connection, message, next) => {
+				if (message.kind === "detach") {
+					// Delay the bye: an immediate-exit implementation would
+					// tear the socket down before the server processed the
+					// detach frame.
+					setTimeout(() => {
+						connection.send({ kind: "bye", reason: "detached" });
+						connection.close();
+					}, 150);
+					return;
+				}
+				next(connection, message);
+			},
+		});
+
+		const { client, exits } = startClient({ detachTimeoutMs: 5000 });
+		await client.start();
+
+		client.detach("user");
+		// The server observes the detach frame while the client is still alive.
+		await poll(() => server.received.find(message => message.kind === "detach"));
+		await new Promise(resolve => setTimeout(resolve, 80));
+		expect(exits).toEqual([]);
+
+		// bye arrives → the client exits 0 only then.
+		await poll(() => (exits.length > 0 ? exits[0] : undefined));
+		expect(exits[0]).toBe(0);
+	});
+
+	it("detach exits via the bounded fallback timer when the server never sends bye", async () => {
+		const server = await listenServer({
+			onMessage: (connection, message, next) => {
+				if (message.kind === "detach") return; // never reply
+				next(connection, message);
+			},
+		});
+
+		const { client, exits } = startClient({ detachTimeoutMs: 60 });
+		await client.start();
+
+		client.detach("user");
+		// The detach frame reached the server before the client gave up.
+		await poll(() => server.received.find(message => message.kind === "detach"));
+		await poll(() => (exits.length > 0 ? exits[0] : undefined));
+		expect(exits[0]).toBe(0);
 	});
 
 	it("treats an out-of-order transcript frame as a protocol violation and reconnects", async () => {

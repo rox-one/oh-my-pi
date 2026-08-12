@@ -29,12 +29,13 @@ import {
 	TUI,
 	visibleWidth,
 } from "@oh-my-pi/pi-tui";
+import { sanitizeText } from "@oh-my-pi/pi-utils";
 import {
 	SessionTranscriptPresenter as Presenter,
 	type SessionTranscriptPresenter,
 } from "../modes/presentation/shared-transcript";
 import { getEditorTheme, type ThemeColor, theme } from "../modes/theme/theme";
-import { truncateToWidth } from "../tools/render-utils";
+import { replaceTabs, shortenPath, truncateToWidth } from "../tools/render-utils";
 import { AttachClient, type AttachView, type AttachViewConnection, type AttachViewOpenOutcome } from "./client";
 import type {
 	AttachControlRejected,
@@ -370,22 +371,45 @@ export class AttachPane {
 	}
 }
 
-/** Renders a live streaming line below the committed transcript. */
-function liveLineFor(event: Extract<AttachEvent, { type: "progress" }>): string | undefined {
+/**
+ * Shared TUI sanitization for a progress fragment before it can reach the
+ * ScrollView: strip ANSI/control sequences, expand tabs to spaces, collapse
+ * embedded line breaks (ScrollView rows are single lines), and shorten home
+ * paths. The escape/control strip runs before any width-aware truncation so
+ * escape bytes can never reach the rendered row.
+ */
+function sanitizeProgressFragment(text: string): string {
+	const normalized = replaceTabs(sanitizeText(text)).replace(/\n/g, " ");
+	return shortenPath(normalized);
+}
+
+/**
+ * Renders a live streaming line below the committed transcript. Every
+ * candidate fragment (tool, args, intent, output tail) goes through the
+ * shared TUI sanitizers, and the composed line is width-capped to the
+ * terminal columns at event time — raw worker output never reaches the
+ * ScrollView.
+ */
+function liveLineFor(event: Extract<AttachEvent, { type: "progress" }>, width: number): string | undefined {
 	if (event.currentTool !== undefined && event.currentTool.trim().length > 0) {
-		const args =
-			event.currentToolArgs !== undefined && event.currentToolArgs.trim().length > 0
-				? ` ${event.currentToolArgs}`
-				: "";
-		return `⚙ ${event.currentTool}${args}`;
+		const tool = sanitizeProgressFragment(event.currentTool).trim();
+		if (tool.length > 0) {
+			const argsText =
+				event.currentToolArgs !== undefined && event.currentToolArgs.trim().length > 0
+					? sanitizeProgressFragment(event.currentToolArgs).trim()
+					: "";
+			const args = argsText.length > 0 ? ` ${argsText}` : "";
+			return truncateToWidth(`⚙ ${tool}${args}`, width);
+		}
 	}
 	if (event.lastIntent !== undefined && event.lastIntent.trim().length > 0) {
-		return event.lastIntent;
+		const intent = sanitizeProgressFragment(event.lastIntent).trim();
+		if (intent.length > 0) return truncateToWidth(intent, width);
 	}
 	const tail = event.outputTail;
 	for (let i = tail.length - 1; i >= 0; i -= 1) {
-		const line = tail[i]!.trim();
-		if (line.length > 0) return line;
+		const line = sanitizeProgressFragment(tail[i]!).trim();
+		if (line.length > 0) return truncateToWidth(line, width);
 	}
 	return undefined;
 }
@@ -500,7 +524,9 @@ class PaneViewAdapter implements AttachView {
 	}
 
 	onProgress(event: Extract<AttachEvent, { type: "progress" }>): void {
-		const line = liveLineFor(event);
+		// Width derives from terminal columns at event time (minus the
+		// scrollbar column); the ScrollView re-truncates on resize renders.
+		const line = liveLineFor(event, Math.max(1, this.#ui.terminal.columns - 1));
 		if (line !== undefined) this.#liveLineInternal = line;
 		this.#patch({
 			currentTool: event.currentTool !== undefined && event.currentTool.trim().length > 0 ? event.currentTool : null,

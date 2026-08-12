@@ -18,7 +18,11 @@
  * reclaims its controller. A fresh view_open (no resume) is issued when the
  * lease expired and nobody else took it; `lease_busy` means another pane now
  * controls the worker and is terminal. Every reconnect replays the transcript
- * from a fresh snapshot epoch — no terminal-byte recovery.
+ * from a fresh snapshot epoch — no terminal-byte recovery. An in-flight prompt
+ * survives the disconnect: its full frame is kept and replayed unchanged (same
+ * cmdId/cmdSeq/ref) once the view reopens so the server's acknowledgement cache
+ * settles it exactly once. Prompts queued while disconnected or mid-snapshot
+ * are held until the snapshot epoch's transcript_end before flushing.
  *
  * Plain submissions become leased control intents with a client-monotonic
  * command sequence and a random idempotency key; locally queued rapid
@@ -65,6 +69,11 @@ export interface AttachClientOptions {
 	maxRenderedLines?: number;
 	/** Keepalive ping interval (ms). */
 	pingIntervalMs?: number;
+	/**
+	 * Max time to wait for the server `bye` after {@link AttachClient.detach}
+	 * before exiting locally (ms). Bounds a stalled peer that never replies.
+	 */
+	detachTimeoutMs?: number;
 	/** Reconnect delays (ms). */
 	backoffMs?: readonly number[];
 	/** Install SIGINT handling. */
@@ -76,6 +85,9 @@ export interface AttachClientOptions {
 }
 
 const DEFAULT_BACKOFF_MS: readonly number[] = [200, 500, 1000, 2000, 5000];
+
+/** Fallback bound for waiting on the server `bye` after `detach()` (ms). */
+const DEFAULT_DETACH_TIMEOUT_MS = 2000;
 
 const MAX_RENDERED_LINE_LENGTH = 200;
 
@@ -246,6 +258,7 @@ export class AttachClient {
 	readonly #stdin: NodeJS.ReadableStream;
 	readonly #pingIntervalMs: number;
 	readonly #backoffMs: readonly number[];
+	readonly #detachTimeoutMs: number;
 	readonly #enableSignals: boolean;
 	readonly #useReadline: boolean;
 	readonly #onExit: ((code: number) => void) | undefined;
@@ -254,11 +267,15 @@ export class AttachClient {
 	#accumulator = new AttachFrameAccumulator();
 	#authenticated = false;
 	#inFlightRef: string | null = null;
+	/** Full frame of the in-flight prompt; replayed unchanged on reconnect. */
+	#inFlightFrame: AttachPrompt | null = null;
 	#pendingPrompts: string[] = [];
 	#promptCounter = 0;
 	#cmdSeq = 0;
 	#pingTimer: NodeJS.Timeout | null = null;
 	#reconnectTimer: NodeJS.Timeout | null = null;
+	#detachTimer: NodeJS.Timeout | null = null;
+	#detaching = false;
 	#reconnectAttempt = 0;
 	#readline: Interface | null = null;
 	#sigintHandler: (() => void) | null = null;
@@ -286,6 +303,7 @@ export class AttachClient {
 		this.#stdin = options.stdin ?? process.stdin;
 		this.#pingIntervalMs = options.pingIntervalMs ?? 30_000;
 		this.#backoffMs = options.backoffMs ?? DEFAULT_BACKOFF_MS;
+		this.#detachTimeoutMs = options.detachTimeoutMs ?? DEFAULT_DETACH_TIMEOUT_MS;
 		this.#enableSignals = options.enableSignals ?? true;
 		this.#useReadline = options.readline ?? true;
 		this.#onExit = options.onExit;
@@ -384,7 +402,18 @@ export class AttachClient {
 	}
 
 	#onSocketClose(): void {
+		// The connection is gone: drop the live send path immediately so a
+		// submission during the reconnect backoff is queued instead of being
+		// silently dropped through a destroyed socket.
+		this.#socket = null;
+		this.#authenticated = false;
 		if (this.#exiting) return;
+		if (this.#detaching) {
+			// `bye` can never arrive on a dead socket; the server observed the
+			// close and releases the lease through its disconnect path.
+			this.#exit(0);
+			return;
+		}
 		this.#scheduleReconnect();
 	}
 
@@ -487,7 +516,22 @@ export class AttachClient {
 		});
 		this.#view.onEntry?.(message.entry);
 		this.#finishViewOpen();
-		this.#flushPendingPrompts();
+		// A reconnect resumed the view while a prompt was in flight: resend the
+		// persisted frame with the SAME cmdId/cmdSeq/ref/text so the server's
+		// acknowledgement cache settles it (never executing it twice),
+		// refreshing only the lease fields to the just-granted (resumed) lease
+		// so the server's generation validation accepts the replay.
+		if (this.#inFlightFrame !== null && this.#lease !== null) {
+			const lease = this.#lease;
+			this.#send({
+				...this.#inFlightFrame,
+				leaseId: lease.leaseId,
+				proof: lease.proof,
+				generation: lease.generation,
+			});
+		}
+		// New queued prompts are NOT flushed here: they stay gated on the
+		// snapshot epoch and flush at the matching transcript_end.
 	}
 
 	#onViewOpenRejected(message: AttachViewOpenRejected): void {
@@ -545,6 +589,9 @@ export class AttachClient {
 		}
 		this.#snapshotPending = false;
 		this.#view.onTranscriptEnd?.(message);
+		// The snapshot epoch completed: flush prompts that were queued while
+		// the transcript was being (re)played.
+		this.#flushPendingPrompts();
 	}
 
 	#onTranscriptAppend(message: AttachTranscriptAppend): void {
@@ -565,6 +612,9 @@ export class AttachClient {
 			return;
 		}
 		this.#expectedSeq = message.seq;
+		// A reset is always followed by a fresh snapshot within the epoch:
+		// gate queued prompts again until that snapshot's transcript_end.
+		this.#snapshotPending = true;
 		this.#view.onTranscriptReset?.(message);
 	}
 
@@ -581,7 +631,7 @@ export class AttachClient {
 	}
 
 	#onPromptResult(message: AttachPromptResult): void {
-		this.#inFlightRef = null;
+		this.#clearInFlight();
 		this.#view.onPromptResult?.(message);
 		this.#flushPendingPrompts();
 	}
@@ -591,7 +641,7 @@ export class AttachClient {
 		// A ref-carrying rejection settled the in-flight prompt: the slot is
 		// free again, so drain the client-side queue.
 		if (message.ref !== undefined && (this.#inFlightRef === null || message.ref === this.#inFlightRef)) {
-			this.#inFlightRef = null;
+			this.#clearInFlight();
 			this.#flushPendingPrompts();
 		}
 	}
@@ -639,9 +689,9 @@ export class AttachClient {
 		}
 		this.#view.onError?.(error);
 		if (error.ref !== undefined && error.ref === this.#inFlightRef) {
-			this.#inFlightRef = null;
 			// An error settled the in-flight prompt (e.g. `unknown_worker`):
 			// the slot is free again, so drain the client-side queue.
+			this.#clearInFlight();
 			this.#flushPendingPrompts();
 		}
 	}
@@ -667,7 +717,14 @@ export class AttachClient {
 	 */
 	sendPrompt(text: string): void {
 		if (text.trim().length === 0) return;
-		if (this.#lease === null || !this.#authenticated || this.#inFlightRef !== null || this.#snapshotPending) {
+		if (
+			this.#lease === null ||
+			!this.#authenticated ||
+			this.#inFlightRef !== null ||
+			this.#snapshotPending ||
+			this.#socket === null ||
+			this.#socket.destroyed
+		) {
 			this.#pendingPrompts.push(text);
 			return;
 		}
@@ -690,15 +747,25 @@ export class AttachClient {
 			text,
 		};
 		this.#inFlightRef = ref;
+		this.#inFlightFrame = frame;
 		this.#send(frame);
+	}
+
+	/** The in-flight prompt settled: free the slot and drop its persisted frame. */
+	#clearInFlight(): void {
+		this.#inFlightRef = null;
+		this.#inFlightFrame = null;
 	}
 
 	#flushPendingPrompts(): void {
 		while (
 			this.#pendingPrompts.length > 0 &&
 			this.#inFlightRef === null &&
+			!this.#snapshotPending &&
 			this.#authenticated &&
-			this.#lease !== null
+			this.#lease !== null &&
+			this.#socket !== null &&
+			!this.#socket.destroyed
 		) {
 			const text = this.#pendingPrompts.shift();
 			if (text === undefined) return;
@@ -727,14 +794,18 @@ export class AttachClient {
 
 	/**
 	 * Detach: release the controller lease and close the view. The server
-	 * replies `bye`; the client exits 0. Does NOT abort or kill the worker —
-	 * the worker keeps running.
+	 * replies `bye`; the client waits for it and exits 0, so the detach frame
+	 * is definitely processed (lease released) before the socket is torn down.
+	 * A bounded fallback timer covers a stalled peer that never replies. Does
+	 * NOT abort or kill the worker — the worker keeps running.
 	 */
 	detach(reason?: string): void {
-		if (this.#exiting || this.#lease === null || !this.#authenticated) {
+		if (this.#exiting || this.#detaching) return;
+		if (this.#lease === null || !this.#authenticated) {
 			this.#exit(0);
 			return;
 		}
+		this.#detaching = true;
 		this.#send({
 			kind: "detach",
 			key: { workerId: this.#workerId, ownerScope: this.#ownerScope },
@@ -743,9 +814,10 @@ export class AttachClient {
 			generation: this.#lease.generation,
 			reason,
 		});
-		// The server closes the connection after bye; also guard against a
-		// stalled peer by finishing locally.
-		this.#exit(0);
+		this.#detachTimer = setTimeout(() => {
+			this.#detachTimer = null;
+			this.#exit(0);
+		}, this.#detachTimeoutMs);
 	}
 
 	/**
@@ -784,6 +856,10 @@ export class AttachClient {
 		if (this.#reconnectTimer !== null) {
 			clearTimeout(this.#reconnectTimer);
 			this.#reconnectTimer = null;
+		}
+		if (this.#detachTimer !== null) {
+			clearTimeout(this.#detachTimer);
+			this.#detachTimer = null;
 		}
 		if (this.#readline !== null) {
 			this.#readline.close();

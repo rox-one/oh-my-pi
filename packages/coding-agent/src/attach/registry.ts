@@ -144,6 +144,14 @@ export class AttachRegistry {
 	 * it twice. Bounded FIFO per worker (see {@link ATTACH_CMD_ACK_CACHE_SIZE}).
 	 */
 	readonly #cmdCache = new Map<string, Map<string, AttachPromptOutcome>>();
+	/**
+	 * In-flight pane-prompt command identity + SHARED outcome per worker key
+	 * string. A reconnect that replays the same `cmdId` while the original run
+	 * is still in flight joins this outcome instead of re-executing or getting
+	 * `busy`. Populated by {@link claimPrompt}; released (after the outcome is
+	 * cached) when the run settles.
+	 */
+	readonly #activeCmd = new Map<string, { cmdId: string; outcome: Promise<AttachPromptOutcome> }>();
 
 	constructor(options: AttachRegistryOptions) {
 		this.#runPrompt = options.runPrompt;
@@ -196,6 +204,7 @@ export class AttachRegistry {
 		this.#attachments.delete(keyString);
 		this.#releaseLease(keyString, `worker removed: ${reason}`);
 		this.#cmdCache.delete(keyString);
+		this.#activeCmd.delete(keyString);
 		this.#emit({ type: "removed", key, reason });
 		return true;
 	}
@@ -216,11 +225,6 @@ export class AttachRegistry {
 			return this.#liveSessionOf(key) ?? null;
 		}
 		return this.#entries.get(attachKeyString(key))?.liveSession ?? null;
-	}
-
-	/** True when a prompt/follow-up is currently in flight for the worker. */
-	isPromptInFlight(key: AttachWorkerKey): boolean {
-		return (this.#entries.get(attachKeyString(key))?.pendingFollowUps ?? 0) > 0;
 	}
 
 	// -----------------------------------------------------------------------
@@ -287,13 +291,16 @@ export class AttachRegistry {
 	/** Record that `clientId` is attached to `key`. */
 	attach(key: AttachWorkerKey, clientId: string): void {
 		const keyString = attachKeyString(key);
-		if (!this.#entries.has(keyString)) return;
+		const entry = this.#entries.get(keyString);
+		if (!entry) return;
 		let set = this.#attachments.get(keyString);
 		if (!set) {
 			set = new Set();
 			this.#attachments.set(keyString, set);
 		}
+		if (set.has(clientId)) return; // duplicate attach: no membership change
 		set.add(clientId);
+		this.#emit({ type: "updated", key, entry: this.#wireEntry(entry) });
 	}
 
 	/**
@@ -310,9 +317,12 @@ export class AttachRegistry {
 	detach(key: AttachWorkerKey, clientId: string): void {
 		const keyString = attachKeyString(key);
 		const set = this.#attachments.get(keyString);
-		if (!set) return;
+		if (!set?.has(clientId)) return; // absent detach: no membership change
 		set.delete(clientId);
 		if (set.size === 0) this.#attachments.delete(keyString);
+		const entry = this.#entries.get(keyString);
+		if (!entry) return;
+		this.#emit({ type: "updated", key, entry: this.#wireEntry(entry) });
 	}
 
 	// -----------------------------------------------------------------------
@@ -485,6 +495,91 @@ export class AttachRegistry {
 	// -----------------------------------------------------------------------
 	// Prompt / follow-up (serialized per key)
 	// -----------------------------------------------------------------------
+
+	/**
+	 * Claim (or join) the worker's serialized pane-prompt slot for a command.
+	 *
+	 * The slot is keyed by command identity: a reconnect that replays the SAME
+	 * `cmdId` while the original run is still in flight JOINS the shared
+	 * outcome (the run executes exactly once) instead of being rejected
+	 * `busy`.
+	 *
+	 * Returns:
+	 * - `busy`: a DIFFERENT command, or a director follow-up, holds the slot;
+	 * - `joined` + outcome: the same `cmdId` is already active — await the
+	 *   shared outcome and deliver the result to this connection too;
+	 * - `started` + outcome: this call reserved the slot and launched the run.
+	 *
+	 * When the run settles, the outcome is cached under `cmdId` BEFORE the
+	 * active slot is released, so a replay landing in the settle window reads
+	 * the cache and never re-executes.
+	 */
+	claimPrompt(
+		key: AttachWorkerKey,
+		cmdId: string,
+		text: string,
+		timeoutMs?: number,
+	):
+		| { status: "busy" }
+		| { status: "joined"; outcome: Promise<AttachPromptOutcome> }
+		| { status: "started"; outcome: Promise<AttachPromptOutcome> } {
+		const keyString = attachKeyString(key);
+		const entry = this.#entries.get(keyString);
+		if (!entry) {
+			throw new AttachProtocolError("unknown_worker", `no such attach worker: ${attachKeyString(key)}`);
+		}
+		const active = this.#activeCmd.get(keyString);
+		if (active !== undefined) {
+			if (active.cmdId === cmdId) return { status: "joined", outcome: active.outcome };
+			return { status: "busy" };
+		}
+		if (entry.pendingFollowUps > 0) {
+			// A director follow-up (or a prompt that started before the active
+			// map was populated) holds the serialized slot without command
+			// identity: treat as busy.
+			return { status: "busy" };
+		}
+		// The claim object IS the slot identity: an unregister + re-register
+		// replaces the entry AND the active slot, so settling a stale claim
+		// (checked by identity in #settleClaim) must neither delete the new
+		// worker's slot nor contaminate its cache.
+		const claim = { cmdId } as { cmdId: string; outcome: Promise<AttachPromptOutcome> };
+		const outcome = this.runPrompt(key, text, timeoutMs).then(
+			result => this.#settleClaim(key, keyString, entry, claim, cmdId, result),
+			error => {
+				// runPrompt never rejects, but keep the slot consistent anyway.
+				const result = { ok: false, error: error instanceof Error ? error.message : String(error) };
+				return this.#settleClaim(key, keyString, entry, claim, cmdId, result);
+			},
+		);
+		claim.outcome = outcome;
+		this.#activeCmd.set(keyString, claim);
+		return { status: "started", outcome };
+	}
+
+	/**
+	 * Settle a claimed prompt run: cache the outcome and release the active
+	 * slot ONLY when the worker still owns this exact claim. If the worker was
+	 * unregistered and re-registered while the run was in flight, the entry
+	 * and the active slot belong to the NEW worker — the stale claim must not
+	 * delete the new slot or cache its outcome into the new worker's cache.
+	 */
+	#settleClaim(
+		key: AttachWorkerKey,
+		keyString: string,
+		entry: MutableEntry,
+		claim: { cmdId: string; outcome: Promise<AttachPromptOutcome> },
+		cmdId: string,
+		result: AttachPromptOutcome,
+	): AttachPromptOutcome {
+		if (this.#entries.get(keyString) === entry && this.#activeCmd.get(keyString) === claim) {
+			// Cache the outcome BEFORE releasing the slot so a replay in the
+			// settle window reads the cache, never a re-run.
+			this.rememberCommand(key, cmdId, result);
+			this.#activeCmd.delete(keyString);
+		}
+		return result;
+	}
 
 	/**
 	 * Run one controller prompt for a worker. Rejects with `unknown_worker`

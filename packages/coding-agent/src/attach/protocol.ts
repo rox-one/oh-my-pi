@@ -1462,8 +1462,8 @@ function boundMessageForWire(message: AgentMessage): AgentMessage {
  * so a hostile peer cannot grow memory without bound.
  */
 export class AttachFrameAccumulator {
-	private chunks: Buffer[] = [];
-	private buffered = 0;
+	#chunks: Buffer[] = [];
+	#buffered = 0;
 
 	/** Feed a chunk; returns complete frames (without their trailing newline). */
 	push(chunk: Buffer): Buffer[] {
@@ -1471,9 +1471,9 @@ export class AttachFrameAccumulator {
 		let start = 0;
 		for (let i = 0; i < chunk.byteLength; i++) {
 			if (chunk[i] === ATTACH_FRAME_DELIMITER) {
-				const frame = Buffer.concat([...this.chunks, chunk.subarray(start, i)]);
-				this.chunks = [];
-				this.buffered = 0;
+				const frame = Buffer.concat([...this.#chunks, chunk.subarray(start, i)]);
+				this.#chunks = [];
+				this.#buffered = 0;
 				if (frame.byteLength > ATTACH_MAX_FRAME_BYTES) {
 					throw new AttachProtocolError(
 						"frame_too_large",
@@ -1486,21 +1486,21 @@ export class AttachFrameAccumulator {
 		}
 		const rest = chunk.subarray(start);
 		if (rest.byteLength > 0) {
-			this.buffered += rest.byteLength;
-			if (this.buffered > ATTACH_MAX_FRAME_BYTES) {
+			this.#buffered += rest.byteLength;
+			if (this.#buffered > ATTACH_MAX_FRAME_BYTES) {
 				throw new AttachProtocolError(
 					"frame_too_large",
-					`partial frame reached ${this.buffered} bytes; limit is ${ATTACH_MAX_FRAME_BYTES}`,
+					`partial frame reached ${this.#buffered} bytes; limit is ${ATTACH_MAX_FRAME_BYTES}`,
 				);
 			}
-			this.chunks.push(Buffer.from(rest));
+			this.#chunks.push(Buffer.from(rest));
 		}
 		return frames;
 	}
 
 	/** Bytes currently buffered awaiting a newline. */
 	get pendingBytes(): number {
-		return this.buffered;
+		return this.#buffered;
 	}
 }
 
@@ -1514,45 +1514,52 @@ export class AttachFrameAccumulator {
  * connection in that case instead of growing the queue.
  */
 export class AttachBoundedQueue<T> {
-	private readonly items: T[] = [];
-	private totalBytes = 0;
+	#items: T[] = [];
+	#totalBytes = 0;
+	#sizeOf: (item: T) => number;
+	#maxFrames: number;
+	#maxBytes: number;
 
 	constructor(
-		private readonly sizeOf: (item: T) => number,
-		private readonly maxFrames = ATTACH_WRITE_QUEUE_MAX_FRAMES,
-		private readonly maxBytes = ATTACH_WRITE_QUEUE_HIGH_WATER_BYTES,
-	) {}
+		sizeOf: (item: T) => number,
+		maxFrames = ATTACH_WRITE_QUEUE_MAX_FRAMES,
+		maxBytes = ATTACH_WRITE_QUEUE_HIGH_WATER_BYTES,
+	) {
+		this.#sizeOf = sizeOf;
+		this.#maxFrames = maxFrames;
+		this.#maxBytes = maxBytes;
+	}
 
 	/** True iff the item was accepted; false when a cap is exceeded. */
 	enqueue(item: T): boolean {
-		const size = this.sizeOf(item);
-		if (this.items.length >= this.maxFrames || this.totalBytes + size > this.maxBytes) {
+		const size = this.#sizeOf(item);
+		if (this.#items.length >= this.#maxFrames || this.#totalBytes + size > this.#maxBytes) {
 			return false;
 		}
-		this.items.push(item);
-		this.totalBytes += size;
+		this.#items.push(item);
+		this.#totalBytes += size;
 		return true;
 	}
 
 	/** Remove and return the oldest item, or undefined when empty. */
 	dequeue(): T | undefined {
-		const item = this.items.shift();
+		const item = this.#items.shift();
 		if (item !== undefined) {
-			this.totalBytes -= this.sizeOf(item);
+			this.#totalBytes -= this.#sizeOf(item);
 		}
 		return item;
 	}
 
 	get length(): number {
-		return this.items.length;
+		return this.#items.length;
 	}
 
 	get bytes(): number {
-		return this.totalBytes;
+		return this.#totalBytes;
 	}
 
 	get isOverHighWater(): boolean {
-		return this.length >= this.maxFrames || this.bytes >= this.maxBytes;
+		return this.length >= this.#maxFrames || this.bytes >= this.#maxBytes;
 	}
 }
 

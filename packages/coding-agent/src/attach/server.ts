@@ -52,6 +52,7 @@ import {
 	encodeAttachMessage,
 	formatAttachKey,
 	generateAttachCapability,
+	isAttachCapability,
 	isHelloMessage,
 	shrinkAttachSnapshot,
 } from "./protocol";
@@ -335,10 +336,6 @@ export class AttachServer {
 
 	#handleFrame(connection: AttachClientConnection, frame: Buffer): void {
 		let message: AttachMessage;
-		logger.debug("attach: inbound frame", {
-			id: connection.id,
-			head: frame.subarray(0, 60).toString("utf8").replace(/\n/g, ""),
-		});
 		try {
 			message = decodeAttachLine(frame);
 		} catch (error) {
@@ -352,6 +349,13 @@ export class AttachServer {
 			connection.close();
 			return;
 		}
+		// Log only decoded non-secret metadata — never raw frame bytes (hello
+		// carries the capability in the first ~60 bytes).
+		logger.debug("attach: inbound frame", {
+			id: connection.id,
+			kind: message.kind,
+			authenticated: connection.helloTimeout === undefined,
+		});
 		if (connection.helloTimeout !== undefined) {
 			// First frame must be hello.
 			if (!isHelloMessage(message)) {
@@ -542,11 +546,27 @@ export class AttachServer {
 		if (!view) return;
 		const source = this.#registry.liveSession(view.key);
 		if (!source) {
-			// No live session (worker's session not materialized yet): park an
-			// empty feed state; #onRegistryEvent retries when the worker's
-			// session materializes (a later `updated` for this key).
+			// No live session (worker's session not materialized yet): emit an
+			// EMPTY snapshot boundary for the current epoch (monotonic seq,
+			// watermark 0) so the client's prompt gate opens, then park an
+			// empty feed state; #onRegistryEvent re-syncs (transcript_reset +
+			// fresh snapshot) when the worker's session materializes.
 			logger.debug("attach feed: source not materialized yet", { key: formatAttachKey(view.key) });
-			connection.transcript = { branchId: "", sentIds: new Set(), seq: 0, unsubscribe: null };
+			const state: AttachViewTranscriptState = {
+				branchId: "",
+				sentIds: new Set(),
+				seq: 0,
+				unsubscribe: null,
+			};
+			connection.transcript = state;
+			this.#send(connection, { kind: "transcript_begin", key: view.key, epoch: view.epoch, seq: ++state.seq });
+			this.#send(connection, {
+				kind: "transcript_end",
+				key: view.key,
+				epoch: view.epoch,
+				seq: ++state.seq,
+				watermark: 0,
+			});
 			return;
 		}
 		const state: AttachViewTranscriptState = {
@@ -576,12 +596,15 @@ export class AttachServer {
 		const entries = extractSessionMessages(source.getBranchEntries());
 		const state = connection.transcript;
 		if (!state || state.branchId !== source.branchId) {
-			// Branch switched/rotated: discard and re-snapshot in the same epoch.
+			// Branch switched/rotated — or the parked empty feed (empty
+			// boundary, no source yet) now has a live source: subscribe when
+			// the feed was parked, then discard and re-snapshot in the same
+			// epoch.
 			const fresh: AttachViewTranscriptState = {
 				branchId: source.branchId,
 				sentIds: new Set(),
 				seq: 0,
-				unsubscribe: state?.unsubscribe ?? null,
+				unsubscribe: state?.unsubscribe ?? source.subscribe(() => this.#syncTranscript(connection)),
 			};
 			connection.transcript = fresh;
 			this.#send(connection, {
@@ -753,7 +776,7 @@ export class AttachServer {
 			prompt.key.ownerScope === "" ? { ...prompt.key, ownerScope: this.ownerScope } : prompt.key;
 		const cached = this.#registry.cachedCommand(key, prompt.cmdId);
 		if (cached) {
-			// Reconnect replay: the command already ran; deliver the cached
+			// Reconnect replay after the command settled: deliver the cached
 			// outcome without executing it again.
 			this.#send(connection, { kind: "prompt_accepted", key, ref: prompt.ref, cmdId: prompt.cmdId });
 			this.#send(connection, {
@@ -767,7 +790,28 @@ export class AttachServer {
 			});
 			return;
 		}
-		if (this.#registry.isPromptInFlight(key)) {
+		// Claim (or join) the worker's active prompt slot by command identity:
+		// the same cmdId while the original run is still in flight JOINS the
+		// shared outcome; a different command stays busy.
+		let claim: ReturnType<AttachRegistry["claimPrompt"]>;
+		try {
+			claim = this.#registry.claimPrompt(key, prompt.cmdId, prompt.text, prompt.timeoutMs);
+		} catch (error) {
+			// Unknown worker (registry entry vanished mid-view): settle as a
+			// failed prompt, matching the pre-claim runPrompt contract.
+			const failed = { ok: false, error: error instanceof Error ? error.message : String(error) };
+			this.#registry.rememberCommand(key, prompt.cmdId, failed);
+			this.#send(connection, { kind: "prompt_accepted", key, ref: prompt.ref, cmdId: prompt.cmdId });
+			this.#send(connection, {
+				kind: "prompt_result",
+				key,
+				ref: prompt.ref,
+				cmdId: prompt.cmdId,
+				...failed,
+			});
+			return;
+		}
+		if (claim.status === "busy") {
 			this.#rejectControl(connection, {
 				kind: "control_rejected",
 				key,
@@ -778,15 +822,12 @@ export class AttachServer {
 			});
 			return;
 		}
-		connection.lastCmdSeq = prompt.cmdSeq;
+		// Started and joined both deliver prompt_accepted now; only a started
+		// command advances this connection's command sequence (a joined replay
+		// is idempotent — re-sending it must keep joining, never re-run).
+		if (claim.status === "started") connection.lastCmdSeq = prompt.cmdSeq;
 		this.#send(connection, { kind: "prompt_accepted", key, ref: prompt.ref, cmdId: prompt.cmdId });
-		let result: { ok: boolean; payload?: unknown; error?: string };
-		try {
-			result = await this.#registry.runPrompt(key, prompt.text, prompt.timeoutMs);
-		} catch (error) {
-			result = { ok: false, error: error instanceof Error ? error.message : String(error) };
-		}
-		this.#registry.rememberCommand(key, prompt.cmdId, result);
+		const result = await claim.outcome;
 		this.#send(connection, {
 			kind: "prompt_result",
 			key,
@@ -934,7 +975,11 @@ export class AttachServer {
 			if (connection.view && attachKeyString(connection.view.key) === attachKeyString(event.key)) {
 				const state = connection.transcript;
 				if (state && state.unsubscribe === null && this.#registry.liveSession(connection.view.key) !== null) {
-					this.#beginTranscriptFeed(connection);
+					// The empty boundary already opened the client's prompt
+					// gate; re-syncing now hits the parked branchId mismatch
+					// ("") and emits transcript_reset + a fresh snapshot while
+					// installing the live subscription.
+					this.#syncTranscript(connection);
 				}
 			}
 			if (event.type === "registered") {
@@ -1035,13 +1080,15 @@ export class AttachServer {
 	async #readOrCreateToken(): Promise<string> {
 		try {
 			const existing = (await fs.readFile(this.#tokenFile, "utf8")).trim();
-			if (existing.length > 0) {
+			if (isAttachCapability(existing)) {
 				await fs.chmod(this.#tokenFile, ATTACH_TOKEN_FILE_MODE);
 				return existing;
 			}
 		} catch {
 			// Missing or unreadable: create below.
 		}
+		// Invalid/truncated/corrupt content (or missing file): mint a fresh
+		// 64-char lowercase hex capability and replace the token file.
 		const token = generateAttachCapability();
 		await fs.writeFile(this.#tokenFile, token, { mode: ATTACH_TOKEN_FILE_MODE });
 		await fs.chmod(this.#tokenFile, ATTACH_TOKEN_FILE_MODE);

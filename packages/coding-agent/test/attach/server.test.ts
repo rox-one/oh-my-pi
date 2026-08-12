@@ -1,8 +1,9 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
+import { logger } from "@oh-my-pi/pi-utils";
 import type { AttachLiveSessionSource } from "../../src/attach/live-session";
 import { ATTACH_MAX_FRAME_BYTES, type AttachMessage, encodeAttachMessage } from "../../src/attach/protocol";
 import { AttachRegistry } from "../../src/attach/registry";
@@ -195,6 +196,74 @@ describe("attach server", () => {
 			expect(path.basename(server.socketFile)).toBe(ATTACH_SOCKET_FILE);
 			expect(path.basename(server.tokenFile)).toBe(ATTACH_TOKEN_FILE);
 		});
+
+		it("replaces a corrupt persisted token with a fresh valid capability", async () => {
+			await server.stop();
+			const tokenPath = path.join(runtimeDir, ATTACH_TOKEN_FILE);
+			await fs.writeFile(tokenPath, "not-a-valid-capability\n", { mode: 0o600 });
+			server = new AttachServer({
+				runtimeDir,
+				ownerScope: "scope-a",
+				registry,
+				helloTimeoutMs: 500,
+			});
+			await server.start();
+			token = (await fs.readFile(server.tokenFile, "utf8")).trim();
+			expect(token).toMatch(/^[0-9a-f]{64}$/);
+			expect(token).not.toBe("not-a-valid-capability");
+			const tokenMode = (await fs.stat(server.tokenFile)).mode & 0o777;
+			expect(tokenMode).toBe(0o600);
+
+			const client = await TestClient.connect(server.socketFile);
+			client.send(hello(token));
+			const ok = await client.waitForMessage(message => message.kind === "hello_ok");
+			expect(ok).toMatchObject({ kind: "hello_ok", version: 2 });
+			client.close();
+		});
+	});
+
+	describe("capability never reaches logs", () => {
+		it("does not place the hello capability in any logger.debug argument", async () => {
+			const calls: unknown[][] = [];
+			const debugSpy = spyOn(logger, "debug").mockImplementation((...args: unknown[]) => {
+				calls.push(args);
+			});
+			try {
+				const client = await TestClient.connect(server.socketFile);
+				client.send(hello(token));
+				await client.waitForMessage(message => message.kind === "hello_ok");
+				client.close();
+
+				const serialized = JSON.stringify(calls);
+				expect(serialized).not.toContain(token);
+				for (const args of calls) {
+					const text = typeof args[0] === "string" ? args[0] : "";
+					const payload = args[1];
+					if (payload && typeof payload === "object") {
+						expect("head" in payload).toBe(false);
+						expect("capability" in (payload as object)).toBe(false);
+						for (const value of Object.values(payload as Record<string, unknown>)) {
+							if (typeof value === "string") {
+								expect(value).not.toContain(token);
+							}
+						}
+					}
+					expect(text).not.toContain(token);
+				}
+				// Sanity: the decoded-kind log path still fired for hello.
+				expect(
+					calls.some(
+						args =>
+							args[0] === "attach: inbound frame" &&
+							typeof args[1] === "object" &&
+							args[1] !== null &&
+							(args[1] as { kind?: string }).kind === "hello",
+					),
+				).toBe(true);
+			} finally {
+				debugSpy.mockRestore();
+			}
+		});
 	});
 
 	describe("strict hello-first authentication", () => {
@@ -280,10 +349,22 @@ describe("attach server", () => {
 			await client.waitForMessage(message => message.kind === "snapshot");
 
 			registry.register(KEY, null, "spawned");
-			const registered = await client.waitForMessage(message => message.kind === "event");
+			// register → server attach() for subscribed clients → updated may arrive
+			// before registered; wait specifically for the registration event.
+			const registered = await client.waitForMessage(
+				message =>
+					message.kind === "event" &&
+					(message as Extract<AttachMessage, { kind: "event" }>).event.type === "registered",
+			);
 			expect((registered as Extract<AttachMessage, { kind: "event" }>).event).toMatchObject({
 				type: "registered",
 				key: KEY,
+			});
+			// Live attachedClients: the director subscription auto-attaches and emits updated.
+			await client.waitForMessage(message => {
+				if (message.kind !== "event") return false;
+				const event = message.event;
+				return event.type === "updated" && event.entry.attachedClients === 1;
 			});
 
 			registry.updateState(KEY, "running", "turn 1");
@@ -665,6 +746,99 @@ describe("attach server", () => {
 		});
 	});
 
+	describe("no-live-session snapshot boundary", () => {
+		it("opens the prompt gate with an empty boundary before the session materializes, then resnapshots", async () => {
+			let materialized: AttachLiveSessionSource | null = null;
+			const serverRegistry = new AttachRegistry({
+				runPrompt: async () => ({ ok: true, payload: "pre-materialize" }),
+				liveSessionOf: () => materialized,
+			});
+			await server.stop();
+			server = new AttachServer({
+				runtimeDir,
+				ownerScope: "scope-a",
+				registry: serverRegistry,
+				helloTimeoutMs: 500,
+			});
+			await server.start();
+			registry = serverRegistry;
+			token = (await fs.readFile(server.tokenFile, "utf8")).trim();
+			// Worker registered, but its session has NOT materialized yet.
+			registry.register(KEY, null);
+
+			const client = await TestClient.connect(server.socketFile);
+			client.send(hello(token));
+			await client.waitForMessage(message => message.kind === "hello_ok");
+			client.send({ kind: "view_open", key: KEY });
+			const ok = (await client.waitForMessage(message => message.kind === "view_open_ok")) as Extract<
+				AttachMessage,
+				{ kind: "view_open_ok" }
+			>;
+
+			// A valid EMPTY snapshot boundary for the current epoch: monotonic
+			// seq, watermark 0 — the boundary the client's prompt gate needs.
+			const begin = (await client.waitForMessage(message => message.kind === "transcript_begin")) as Extract<
+				AttachMessage,
+				{ kind: "transcript_begin" }
+			>;
+			expect(begin).toMatchObject({ epoch: ok.epoch, seq: 1 });
+			const end = (await client.waitForMessage(message => message.kind === "transcript_end")) as Extract<
+				AttachMessage,
+				{ kind: "transcript_end" }
+			>;
+			expect(end).toMatchObject({ epoch: ok.epoch, seq: 2, watermark: 0 });
+
+			// The gate is OPEN: a prompt can run before the session materializes.
+			const lease = ok.lease;
+			client.send({
+				kind: "prompt",
+				key: KEY,
+				leaseId: lease.leaseId,
+				proof: lease.proof,
+				generation: lease.generation,
+				cmdSeq: 1,
+				cmdId: "cmd-pre",
+				ref: "p1",
+				text: "go",
+			});
+			const accepted = (await client.waitForMessage(message => message.kind === "prompt_accepted")) as Extract<
+				AttachMessage,
+				{ kind: "prompt_accepted" }
+			>;
+			expect(accepted.ref).toBe("p1");
+			const result = (await client.waitForMessage(message => message.kind === "prompt_result")) as Extract<
+				AttachMessage,
+				{ kind: "prompt_result" }
+			>;
+			expect(result).toMatchObject({ ref: "p1", cmdId: "cmd-pre", ok: true, payload: "pre-materialize" });
+
+			// The session materializes: the parked feed emits transcript_reset
+			// + a fresh snapshot (branch mismatch) and subscribes going forward.
+			const { source } = fakeSource([messageEntry("e1", "materialized")]);
+			materialized = source;
+			registry.updateState(KEY, "running", "materialized");
+			const reset = (await client.waitForMessage(message => message.kind === "transcript_reset")) as Extract<
+				AttachMessage,
+				{ kind: "transcript_reset" }
+			>;
+			expect(reset).toMatchObject({ epoch: ok.epoch, reason: expect.stringContaining("branch") });
+			const resetBegin = (await client.waitForMessage(
+				message => message.kind === "transcript_begin" && message.seq === reset.seq + 1,
+			)) as Extract<AttachMessage, { kind: "transcript_begin" }>;
+			expect(resetBegin.seq).toBe(reset.seq + 1);
+			const items = (await client.waitForMessage(message => message.kind === "transcript_items")) as Extract<
+				AttachMessage,
+				{ kind: "transcript_items" }
+			>;
+			expect(items.items.map(item => item.id)).toEqual(["e1"]);
+			const resetEnd = (await client.waitForMessage(
+				message => message.kind === "transcript_end" && message.seq > 2,
+			)) as Extract<AttachMessage, { kind: "transcript_end" }>;
+			expect(resetEnd).toMatchObject({ watermark: 1 });
+			client.close();
+		});
+	});
+
 	describe("controller prompts", () => {
 		it("accepts a prompt, runs it through the registry, and delivers the result", async () => {
 			const seen: Array<{ key: unknown; text: string }> = [];
@@ -913,6 +1087,112 @@ describe("attach server", () => {
 			>;
 			expect(rejected).toMatchObject({ code: "lease_required", cmdId: "cmd-1" });
 			client.close();
+		});
+
+		it("joins the shared outcome when a reconnected client replays the in-flight cmdId", async () => {
+			let release!: () => void;
+			const gate = new Promise<void>(resolve => {
+				release = resolve;
+			});
+			const calls: string[] = [];
+			const serverRegistry = new AttachRegistry({
+				runPrompt: async (_key, text) => {
+					calls.push(text);
+					await gate;
+					return { ok: true, payload: "deferred-done" };
+				},
+			});
+			await server.stop();
+			server = new AttachServer({
+				runtimeDir,
+				ownerScope: "scope-a",
+				registry: serverRegistry,
+				helloTimeoutMs: 500,
+			});
+			await server.start();
+			registry = serverRegistry;
+			token = (await fs.readFile(server.tokenFile, "utf8")).trim();
+			registry.register(KEY, null);
+
+			// Connection A starts a DEFERRED prompt: accepted, run in flight.
+			const first = await openPaneView();
+			const lease = await grantedLease(first);
+			const replayFrame = {
+				kind: "prompt" as const,
+				key: KEY,
+				leaseId: lease.leaseId,
+				proof: lease.proof,
+				generation: lease.generation,
+				cmdSeq: 1,
+				cmdId: "same-cmd",
+				ref: "p1",
+				text: "run me",
+			};
+			first.send(replayFrame);
+			await first.waitForMessage(message => message.kind === "prompt_accepted");
+			expect(calls).toEqual(["run me"]);
+
+			// A drops mid-run (socket death); the run keeps going.
+			first.close();
+			await first.waitForClose();
+
+			// B (same client instance) resumes the lease and replays the SAME
+			// cmdId while the original is still running: it must JOIN the
+			// shared outcome — accepted then result — never busy, never re-run.
+			const second = await TestClient.connect(server.socketFile);
+			second.send(hello(token));
+			await second.waitForMessage(message => message.kind === "hello_ok");
+			second.send({
+				kind: "view_open",
+				key: KEY,
+				resume: { leaseId: lease.leaseId, proof: lease.proof, generation: lease.generation },
+			});
+			const ok = (await second.waitForMessage(message => message.kind === "view_open_ok")) as Extract<
+				AttachMessage,
+				{ kind: "view_open_ok" }
+			>;
+			expect(ok.lease.generation).toBe(2);
+			second.send({
+				...replayFrame,
+				leaseId: ok.lease.leaseId,
+				proof: ok.lease.proof,
+				generation: ok.lease.generation,
+			});
+			const accepted = (await second.waitForMessage(message => message.kind === "prompt_accepted")) as Extract<
+				AttachMessage,
+				{ kind: "prompt_accepted" }
+			>;
+			expect(accepted).toMatchObject({ ref: "p1", cmdId: "same-cmd" });
+
+			// A DIFFERENT command while the original is still running: busy.
+			second.send({
+				kind: "prompt",
+				key: KEY,
+				leaseId: ok.lease.leaseId,
+				proof: ok.lease.proof,
+				generation: ok.lease.generation,
+				cmdSeq: 2,
+				cmdId: "other-cmd",
+				ref: "p2",
+				text: "different",
+			});
+			const rejected = (await second.waitForMessage(message => message.kind === "control_rejected")) as Extract<
+				AttachMessage,
+				{ kind: "control_rejected" }
+			>;
+			expect(rejected).toMatchObject({ code: "busy", cmdId: "other-cmd", ref: "p2" });
+
+			// The deferred run settles: the JOINED connection receives the
+			// result (the destroyed original connection is harmless).
+			release();
+			const result = (await second.waitForMessage(message => message.kind === "prompt_result")) as Extract<
+				AttachMessage,
+				{ kind: "prompt_result" }
+			>;
+			expect(result).toMatchObject({ ref: "p1", cmdId: "same-cmd", ok: true, payload: "deferred-done" });
+			// The underlying run executed exactly once across both connections.
+			expect(calls).toEqual(["run me"]);
+			second.close();
 		});
 	});
 

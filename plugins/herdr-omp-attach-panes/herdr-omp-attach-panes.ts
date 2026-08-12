@@ -40,7 +40,7 @@
 //     token/capability — the client reads the 0600 token file itself); the
 //     split cwd is the project cwd (HERDR_OMP_VIBE_PANES_CWD override, so a
 //     relative HERDR_OMP_ATTACH_BIN resolves there). The pane then runs
-//     `<HERDR_OMP_ATTACH_BIN, default: the running omp executable> attach
+//     `<HERDR_OMP_ATTACH_BIN, default: the running omp CLI> attach
 //     <workerId> --session-file <quoted parentSessionFile>`.
 //   - Layout: the first pane splits the root pane right at the configured
 //     ratio; each later pane splits the most recently created live owned pane
@@ -72,9 +72,10 @@
 //   HERDR_OMP_VIBE_PANES_DEBOUNCE_MS delay before the first client-exit
 //                                     check (default 150)
 //   HERDR_OMP_ATTACH_BIN             attach client command prefix (default:
-//                                     the running omp executable; passed
-//                                     verbatim, e.g. "bun run
-//                                     /path/to/client.ts")
+//                                     the running omp CLI — runtime + .ts/.js
+//                                     entry under source/npm launches, the
+//                                     compiled omp executable, else "omp";
+//                                     passed verbatim)
 //
 // Deterministic tests (dependency-injected) live in
 // ~/Projects/omp-workspace/herdr-omp-attach-panes.test.ts.
@@ -181,16 +182,42 @@ export function buildAttachCommandWithEndpoints(bin, workerId, socketPath, token
   return `${bin || DEFAULT_ATTACH_BIN} attach ${workerId} --socket ${quoteShellArg(socketPath)} --token-file ${quoteShellArg(tokenFile)}`;
 }
 
+/** Basenames of Bun/Node runtimes: without a CLI entry they cannot route `attach`. */
+const RUNTIME_EXEC_NAMES: Record<string, true> = {
+  bun: true,
+  bunx: true,
+  node: true,
+  "bun.exe": true,
+  "node.exe": true,
+};
+
 /**
- * Resolve the attach client command prefix. The explicit `attachBin` wins;
- * otherwise the running omp executable (`execPath` — under a fork parent this
- * IS the fork binary with the attach substrate); only when neither is
- * available does the bare `DEFAULT_ATTACH_BIN` ("omp") apply. An explicit
- * value is an operator-supplied command prefix and is passed verbatim.
+ * Resolve the attach client command prefix. The explicit `attachBin` wins
+ * and is passed verbatim. Otherwise the running CLI is used, mirroring
+ * src/task/omp-command.ts: under a source/npm launch (the argv entry ends
+ * `.ts`/`.js`) the prefix is the runtime (`execPath`) plus the CLI entry,
+ * each shell-quoted, so `attach` routes to the subcommand; a compiled
+ * non-runtime executable (e.g. a fork omp binary with the attach substrate)
+ * is used verbatim. Only a bare Bun/Node runtime with no CLI entry — or
+ * nothing at all — falls back to the bare `DEFAULT_ATTACH_BIN` ("omp").
  */
-export function resolveAttachBin(attachBin, execPath = process.execPath) {
+export function resolveAttachBin(attachBin, execPath = process.execPath, argvEntry = process.argv[1]) {
   if (typeof attachBin === "string" && attachBin.length > 0) return attachBin;
-  if (typeof execPath === "string" && execPath.length > 0) return execPath;
+  if (
+    typeof execPath === "string" &&
+    execPath.length > 0 &&
+    typeof argvEntry === "string" &&
+    (argvEntry.endsWith(".ts") || argvEntry.endsWith(".js"))
+  ) {
+    return `${quoteShellArg(execPath)} ${quoteShellArg(argvEntry)}`;
+  }
+  if (
+    typeof execPath === "string" &&
+    execPath.length > 0 &&
+    RUNTIME_EXEC_NAMES[path.basename(execPath.replaceAll(path.win32.sep, path.posix.sep))] !== true
+  ) {
+    return execPath;
+  }
   return DEFAULT_ATTACH_BIN;
 }
 
@@ -325,9 +352,9 @@ export class AttachPaneController {
     this.#cwd = options.cwd ?? process.cwd();
     this.#ratio = Number.isFinite(options.ratio) && options.ratio > 0 && options.ratio < 1 ? options.ratio : DEFAULT_RATIO;
     this.#debounceMs = Number.isFinite(options.debounceMs) && options.debounceMs >= 0 ? options.debounceMs : DEFAULT_DEBOUNCE_MS;
-    // Explicit attach bin wins; otherwise the running omp executable
-    // (process.execPath — under a fork parent this IS the fork binary with the
-    // attach substrate); bare "omp" applies only when neither exists.
+    // Explicit attach bin wins; otherwise the running CLI (runtime + the
+    // .ts/.js entry under source/npm launches, or the compiled omp binary);
+    // bare "omp" applies only for a bare runtime or when nothing is set.
     this.#attachBin = resolveAttachBin(options.attachBin);
     // Client-exit polling is opt-in: tests drive checkClientExit() directly.
     this.#exitPollMs = Number.isFinite(options.exitPollMs) && options.exitPollMs > 0 ? options.exitPollMs : 0;

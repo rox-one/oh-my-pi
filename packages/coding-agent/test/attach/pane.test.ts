@@ -4,7 +4,7 @@ import * as fs from "node:fs/promises";
 import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
-import { ProcessTerminal, TUI } from "@oh-my-pi/pi-tui";
+import { ProcessTerminal, TUI, visibleWidth } from "@oh-my-pi/pi-tui";
 import { AttachPane } from "../../src/attach/pane";
 import {
 	type AttachClientMessage,
@@ -207,7 +207,7 @@ class FakeServer {
 
 /** Fake TUI surface the pane needs (components never render through it in
  *  these tests; the presenter only reads terminal columns + imageBudget). */
-function fakeTui(listeners: Array<(data: string) => { consume?: boolean } | undefined>) {
+function fakeTui(listeners: Array<(data: string) => { consume?: boolean } | undefined>, columns = 120) {
 	return {
 		addInputListener: vi.fn((listener: (data: string) => { consume?: boolean } | undefined) => {
 			listeners.push(listener);
@@ -220,7 +220,7 @@ function fakeTui(listeners: Array<(data: string) => { consume?: boolean } | unde
 		setFocus: vi.fn(),
 		start: vi.fn(),
 		stop: vi.fn(),
-		terminal: { rows: 24, columns: 120 },
+		terminal: { rows: 24, columns },
 		imageBudget: undefined,
 	} as unknown as TUI;
 }
@@ -475,6 +475,98 @@ describe("attach pane fullscreen host", () => {
 			return rendered.includes("bash") ? rendered : undefined;
 		});
 		expect(text).toContain("⚙ bash ls -la");
+	});
+
+	it("sanitizes progress tool/args: tabs, escapes, and control chars", async () => {
+		await startPane();
+		server.send({
+			kind: "event",
+			event: progress({ currentTool: "bash", currentToolArgs: "\tls -la\x1b[31m\x07" }),
+		});
+		const text = await poll(() => {
+			const rendered = pane.getTranscriptText();
+			return rendered.includes("bash") ? rendered : undefined;
+		});
+		// Tabs are expanded; ANSI/control sequences never reach the rendered row.
+		expect(text).toContain("⚙ bash ls -la");
+		expect(text).not.toContain("\t");
+		expect(text).not.toContain("\x1b");
+		expect(text).not.toContain("\x07");
+	});
+
+	it("shortens absolute home paths in progress candidates", async () => {
+		await startPane();
+		server.send({
+			kind: "event",
+			event: progress({ lastIntent: path.join(os.homedir(), "notes.md") }),
+		});
+		const text = await poll(() => {
+			const rendered = pane.getTranscriptText();
+			return rendered.includes("notes.md") ? rendered : undefined;
+		});
+		expect(text).toContain("~/notes.md");
+		expect(text).not.toContain(os.homedir());
+
+		server.send({
+			kind: "event",
+			event: progress({ outputTail: ["", path.join(os.homedir(), "repo", "src", "main.ts")] }),
+		});
+		const tailText = await poll(() => {
+			const rendered = pane.getTranscriptText();
+			return rendered.includes("main.ts") ? rendered : undefined;
+		});
+		expect(tailText).toContain("~/repo/src/main.ts");
+		expect(tailText).not.toContain(os.homedir());
+	});
+
+	it("sanitizes progress lastIntent and outputTail escape/control candidates", async () => {
+		await startPane();
+		server.send({
+			kind: "event",
+			event: progress({ lastIntent: "read\t/home/notes\x1b[0m" }),
+		});
+		const text = await poll(() => {
+			const rendered = pane.getTranscriptText();
+			return rendered.includes("read") ? rendered : undefined;
+		});
+		expect(text).not.toContain("\t");
+		expect(text).not.toContain("\x1b");
+
+		server.send({
+			kind: "event",
+			event: progress({ outputTail: ["", "done\x1b[32m at \x07/home/x"] }),
+		});
+		const tailText = await poll(() => {
+			const rendered = pane.getTranscriptText();
+			return rendered.includes("done") ? rendered : undefined;
+		});
+		expect(tailText).toContain("done at /home/x");
+		expect(tailText).not.toContain("\x1b");
+		expect(tailText).not.toContain("\x07");
+	});
+
+	it("truncates the live progress line to the terminal width at event time", async () => {
+		ui = fakeTui(listeners, 24); // narrow terminal: live line capped at 23
+		await startPane();
+		server.send({ kind: "event", event: progress({ outputTail: ["x".repeat(200)] }) });
+		const text = await poll(() => {
+			const rendered = pane.getTranscriptText();
+			return rendered.includes("x") ? rendered : undefined;
+		});
+		const line = text.split("\n").find(l => l.includes("x"))!;
+		expect(visibleWidth(line)).toBeLessThanOrEqual(23);
+		expect(line.length).toBeLessThan(200);
+	});
+
+	it("keeps live lines that fit the terminal width (no fixed ad-hoc cap)", async () => {
+		await startPane(); // fake terminal columns: 120 → live line width 119
+		const line = "y".repeat(100);
+		server.send({ kind: "event", event: progress({ outputTail: [line] }) });
+		const text = await poll(() => {
+			const rendered = pane.getTranscriptText();
+			return rendered.includes("y") ? rendered : undefined;
+		});
+		expect(text).toContain(line);
 	});
 
 	it("renders transcript snapshot frames through the shared presenter", async () => {
