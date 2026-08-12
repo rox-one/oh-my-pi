@@ -1206,6 +1206,13 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 			},
 			{ once: true, signal: listenerSignal },
 		);
+		// AbortSignal never re-dispatches to late listeners: a signal already
+		// aborted before this monitor registered (e.g. an attach Ctrl-C landing
+		// while the follow-up turn was still starting) must abort immediately
+		// instead of running the whole turn untouched.
+		if (signal.aborted && !resolved) {
+			requestAbort("signal");
+		}
 	}
 
 	// Wall-clock hard limit. Defense-in-depth for the case where a provider stream

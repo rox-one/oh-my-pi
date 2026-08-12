@@ -17,6 +17,7 @@ import {
 	decodeAttachLine,
 	encodeAttachMessage,
 } from "../../src/attach/protocol";
+import { Settings } from "../../src/config/settings";
 import { initTheme } from "../../src/modes/theme/theme";
 import type { SessionMessageEntry } from "../../src/session/session-entries";
 
@@ -84,7 +85,6 @@ class FakeServer {
 	readonly socketFile: string;
 	readonly received: AttachClientMessage[] = [];
 	lastGrantedLease: AttachLease | null = null;
-	readonly #socket: net.Socket | null = null;
 	readonly #server: net.Server;
 	readonly #accumulator = new AttachFrameAccumulator();
 	#sockets = new Set<net.Socket>();
@@ -232,6 +232,7 @@ describe("attach pane constructor and keys (thin host)", () => {
 
 	beforeEach(async () => {
 		await initTheme();
+		await Settings.init();
 		listeners = [];
 		exits = [];
 		ui = fakeTui(listeners);
@@ -310,6 +311,7 @@ describe("attach pane fullscreen host", () => {
 
 	beforeEach(async () => {
 		await initTheme();
+		await Settings.init();
 		dir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-attach-pane-e2e-"));
 		listeners = [];
 		exits = [];
@@ -545,6 +547,7 @@ describe("attach pane focus (real TUI)", () => {
 
 	beforeEach(async () => {
 		await initTheme();
+		await Settings.init();
 		dir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-attach-pane-focus-"));
 		ui = new TUI(new ProcessTerminal());
 	});

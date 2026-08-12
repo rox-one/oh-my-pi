@@ -804,13 +804,20 @@ export class AttachServer {
 			this.#rejectControl(connection, rejection);
 			return;
 		}
-		if (this.#registry.cachedCommand(abortTurn.key, abortTurn.cmdId)) {
+		// Same empty-ownerScope normalization as view_open/prompt: the client
+		// derives the worker id only, so the abort key must be resolved to this
+		// server's scope before the registry (which registered the worker under
+		// the real scope) can find the entry. Without this, abort() misses the
+		// entry and the abort silently never fires.
+		const key: AttachWorkerKey =
+			abortTurn.key.ownerScope === "" ? { ...abortTurn.key, ownerScope: this.ownerScope } : abortTurn.key;
+		if (this.#registry.cachedCommand(key, abortTurn.cmdId)) {
 			// Reconnect replay of an accepted abort: idempotent by construction.
 			return;
 		}
 		connection.lastCmdSeq = abortTurn.cmdSeq;
-		void this.#registry.abort(abortTurn.key, "pane abort").then(() => {
-			this.#registry.rememberCommand(abortTurn.key, abortTurn.cmdId, { ok: true });
+		void this.#registry.abort(key, "pane abort").then(() => {
+			this.#registry.rememberCommand(key, abortTurn.cmdId, { ok: true });
 		});
 	}
 

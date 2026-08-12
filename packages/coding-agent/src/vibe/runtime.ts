@@ -22,7 +22,7 @@ import { type AttachLiveSessionSource, createAttachLiveSessionSource } from "../
 import type { AttachWorkerKey } from "../attach/protocol";
 import type { AttachFollowUpResult } from "../attach/registry";
 import { AttachVibeBridge, attachFallbackBaseDir } from "../attach/vibe-bridge";
-import { resolveAgentModelPatterns } from "../config/model-resolver";
+import { resolveAgentModelSelection } from "../config/model-resolver";
 import type { LocalProtocolOptions } from "../internal-urls";
 import { registerArtifactsDir } from "../internal-urls/registry-helpers";
 import { MCPManager } from "../mcp/manager";
@@ -612,11 +612,21 @@ export class VibeSessionRegistry {
 		const session = entry.session;
 		if (!session) return false;
 		const cancelled = this.#manager(session).cancel(record.turn.jobId, { ownerId: record.ownerId });
-		if (cancelled) {
+		const activeSession = this.#registeredAgent(record)?.session;
+		if (activeSession) {
+			// Defense-in-depth: manager.cancel() only fires the job's abort
+			// signal. The follow-up monitor registers its listener after two
+			// awaits (lifecycle append + session revive), so a Ctrl-C landing
+			// in that window is never observed and the session would run the
+			// whole turn untouched. Abort the adopted session directly so the
+			// in-flight turn always stops.
+			await activeSession.abort();
+		}
+		if (cancelled || activeSession) {
 			record.lastActivity = firstLine(`aborted: ${reason ?? "follow-up cancelled"}`);
 			record.lastActivityAt = Date.now();
 		}
-		return cancelled;
+		return cancelled || activeSession !== undefined;
 	}
 
 	#attachLiveSessionOf(scope: VibeOwnerScope, workerKey: AttachWorkerKey): AttachLiveSessionSource | null {

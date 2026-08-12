@@ -939,6 +939,35 @@ describe("attach server", () => {
 			client.close();
 		});
 
+		it("normalizes an empty ownerScope on abort_turn before resolving the registry entry", async () => {
+			// Regression: the abort path must resolve the client's empty
+			// ownerScope to the server scope BEFORE the registry lookup.
+			// The pane client derives only the worker id, so an un-normalized
+			// key misses the registered entry and abort() returns false — no
+			// abort_accepted is emitted and the abort silently never fires.
+			registry.register(KEY, null);
+			const client = await openPaneView();
+			const lease = await grantedLease(client);
+			client.send({
+				kind: "abort_turn",
+				key: { workerId: "w1", ownerScope: "" },
+				leaseId: lease.leaseId,
+				proof: lease.proof,
+				generation: lease.generation,
+				cmdSeq: 1,
+				cmdId: "abort-empty-scope",
+			});
+			// The event must carry the RESOLVED key (real owner scope), proving
+			// the registry entry was found and the abort actually fired.
+			const event = (await client.waitForMessage(
+				message =>
+					message.kind === "event" &&
+					(message as Extract<AttachMessage, { kind: "event" }>).event.type === "abort_accepted",
+			)) as Extract<AttachMessage, { kind: "event" }>;
+			expect(event.event).toMatchObject({ type: "abort_accepted", key: KEY });
+			client.close();
+		});
+
 		it("rejects abort_turn with an invalid lease", async () => {
 			registry.register(KEY, null);
 			const client = await openPaneView();

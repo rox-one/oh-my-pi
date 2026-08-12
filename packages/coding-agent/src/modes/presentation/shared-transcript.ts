@@ -81,11 +81,9 @@ export interface SessionTranscriptPresenterDeps {
  */
 export class SessionTranscriptPresenter {
 	readonly #builder: ChatTranscriptBuilder;
-	readonly #deps: SessionTranscriptPresenterDeps;
 	#model: string | undefined;
 
 	constructor(deps: SessionTranscriptPresenterDeps) {
-		this.#deps = deps;
 		this.#builder = new ChatTranscriptBuilder({
 			ui: deps.ui,
 			getTool: deps.getTool,
