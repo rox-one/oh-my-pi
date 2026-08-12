@@ -399,6 +399,17 @@ const subagentsSegment: StatusLineSegment = {
 	},
 };
 
+const subagentCostSegment: StatusLineSegment = {
+	id: "subagent_cost",
+	render(ctx) {
+		if (!Number.isFinite(ctx.subagentCost) || ctx.subagentCost <= 0) {
+			return { content: "", visible: false };
+		}
+		const content = withIcon(theme.icon.agents, `$${ctx.subagentCost.toFixed(2)}`);
+		return { content: theme.fg("statusLineSubagents", content), visible: true };
+	},
+};
+
 const tokenInSegment: StatusLineSegment = {
 	id: "token_in",
 	render(ctx) {
@@ -736,6 +747,7 @@ export const SEGMENTS: Record<StatusLineSegmentId, StatusLineSegment> = {
 	git: gitSegment,
 	pr: prSegment,
 	subagents: subagentsSegment,
+	subagent_cost: subagentCostSegment,
 	token_in: tokenInSegment,
 	token_out: tokenOutSegment,
 	token_total: tokenTotalSegment,
