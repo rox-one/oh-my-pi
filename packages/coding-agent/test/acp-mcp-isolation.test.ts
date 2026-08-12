@@ -148,6 +148,7 @@ describe("createAcpSessionFactory MCP isolation (issue #1234)", () => {
 
 			expect(captured?.eventBus).toBeDefined();
 			expect(captured?.preloadedExtensions?.extensions).toHaveLength(1);
+			expect(captured?.preloadedExtensions?.extensions[0]?.trusted).toBe(true);
 			expect(await Bun.file(firedPath).text()).toBe("fired");
 			expect(await Bun.file(ambientFiredPath).exists()).toBe(false);
 		} finally {

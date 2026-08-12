@@ -12,8 +12,8 @@ import {
 	formatToolResultErrorPreview,
 	PRIMARY_CONTEXT_CUSTOM_TYPES,
 } from "../session/session-history-format";
-import { ADVISOR_RENDER_OPTIONS, renderAdvisorDeltaChunks } from "./delta-split";
 import type { AdvisorPolicyAttribution } from "./advise-tool";
+import { ADVISOR_RENDER_OPTIONS, renderAdvisorDeltaChunks } from "./delta-split";
 
 export interface AdvisorExtensionContext {
 	text: string;
@@ -1249,9 +1249,7 @@ export class AdvisorRuntime {
 					// Deliver ordinary Session updates as multiple messages for prompt-cache
 					// growth. Extension context is already appended to `batch`, so preserve
 					// that single authoritative payload instead of dropping it from the split.
-					const splitMessages = extensionContext
-						? null
-						: this.#formatRawDeltaMessageChunks(preparedMessages, wip);
+					const splitMessages = extensionContext ? null : this.#formatRawDeltaMessageChunks(preparedMessages, wip);
 					const promptInput: string | AgentMessage[] = splitMessages ?? batch;
 					const prompt = this.agent.prompt(promptInput);
 					this.#promptInFlight = prompt;
@@ -1503,10 +1501,8 @@ export class AdvisorRuntime {
 							// re-dedups on retry, so this preview render must not mutate
 							// #seenContext.
 							const recoveryBatch =
-								this.#appendExtensionContext(
-									this.#formatRawDelta(rawMessages, wip, false),
-									extensionContext,
-								) ?? batch;
+								this.#appendExtensionContext(this.#formatRawDelta(rawMessages, wip, false), extensionContext) ??
+								batch;
 							this.#pending.unshift({
 								text: recoveryBatch,
 								rawMessages,

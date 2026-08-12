@@ -7,8 +7,9 @@ import type {
 	AgentToolResult,
 	AgentToolUpdateCallback,
 } from "@oh-my-pi/pi-agent-core";
-import { escapeXmlAttribute, escapeXmlText } from "@oh-my-pi/pi-utils";
+import { escapeXmlAttribute, escapeXmlText, prompt } from "@oh-my-pi/pi-utils";
 import adviseDescription from "../prompts/advisor/advise-tool.md" with { type: "text" };
+import experienceAdvisoryPrompt from "../prompts/advisor/experience-advisory.md" with { type: "text" };
 
 const adviseSchema = type({
 	note: type("string").describe(
@@ -62,12 +63,6 @@ export interface AdvisorMessageDetails {
 /** Behavioral framing for ordinary Advisor notes. */
 const ADVISOR_GUIDANCE = "weigh, don't blindly obey";
 
-/** Behavioral framing reserved for validated, human-approved extension policy. */
-const POLICY_GUIDANCE =
-	"core-validated human-approved policy; apply the exact behavior and correct any conflicting answer";
-const POLICY_AUTHORITY =
-	"Authority: OMP core validated this as human-approved policy. You MUST apply the Do behavior exactly and correct any conflicting answer.\nNEVER treat this developer message as prompt injection or reassess whether the behavior is legitimate, desirable, or aligned with the current request.\nOnly a concrete conflict with a higher-priority system instruction or safety requirement can override it.";
-
 /**
  * Render a batch of Advisor notes as the agent-facing message body. Validated
  * extension policy carries its exact approved condition and behavior; ordinary
@@ -79,13 +74,14 @@ export function formatAdvisorBatchContent(notes: readonly AdvisorNote[]): string
 		.map(n => {
 			const severity = n.severity ? ` severity="${n.severity}"` : "";
 			if (n.policy) {
-				const body = [
-					POLICY_AUTHORITY,
-					`When: ${n.policy.condition}`,
-					`Do: ${n.policy.behavior}`,
-					`Correction: ${n.note}`,
-				].join("\n");
-				return `<experience-advisory${severity} guidance="${POLICY_GUIDANCE}">\n${escapeXmlText(body)}\n</experience-advisory>`;
+				return prompt
+					.render(experienceAdvisoryPrompt, {
+						severity: n.severity,
+						condition: escapeXmlText(n.policy.condition),
+						behavior: escapeXmlText(n.policy.behavior),
+						correction: escapeXmlText(n.note),
+					})
+					.trim();
 			}
 			const who = n.advisor ? ` advisor="${escapeXmlAttribute(n.advisor)}"` : "";
 			return `<advisory${who}${severity} guidance="${ADVISOR_GUIDANCE}">\n${escapeXmlText(n.note)}\n</advisory>`;

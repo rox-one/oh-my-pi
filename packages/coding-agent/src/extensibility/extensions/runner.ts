@@ -336,6 +336,7 @@ const MAX_ADVISOR_ATTRIBUTION_CHARS = 256;
 const MAX_ADVISOR_SOURCE_CHARS = 80;
 const MAX_ADVISOR_POLICY_TEXT_CHARS = 2_000;
 const MAX_ADVISOR_CONTEXT_COLLECTION_MS = 2_000;
+const VISIBLE_POLICY_CONTROL_CHARACTERS = /[\p{Cc}\p{Cf}]/u;
 
 function boundedAdvisorPolicyAttributions(value: unknown): AdvisorContextPolicyAttribution[] {
 	if (!Array.isArray(value)) return [];
@@ -354,10 +355,13 @@ function boundedAdvisorPolicyAttributions(value: unknown): AdvisorContextPolicyA
 			/\s|[\p{Cc}\p{Cf}]/u.test(attribution) ||
 			!source ||
 			source.length > MAX_ADVISOR_SOURCE_CHARS ||
+			VISIBLE_POLICY_CONTROL_CHARACTERS.test(source) ||
 			!condition ||
 			condition.length > MAX_ADVISOR_POLICY_TEXT_CHARS ||
+			VISIBLE_POLICY_CONTROL_CHARACTERS.test(condition) ||
 			!behavior ||
-			behavior.length > MAX_ADVISOR_POLICY_TEXT_CHARS
+			behavior.length > MAX_ADVISOR_POLICY_TEXT_CHARS ||
+			VISIBLE_POLICY_CONTROL_CHARACTERS.test(behavior)
 		)
 			continue;
 		policies.push({ attribution, source, condition, behavior });
@@ -1566,14 +1570,12 @@ export class ExtensionRunner {
 					remainingMs,
 					undefined,
 					signal,
-				)) as
-					| AdvisorContextEventResult
-					| undefined;
+				)) as AdvisorContextEventResult | undefined;
 				const context = result?.context;
 				if (typeof context !== "string" || !context.trim()) continue;
 				contributions.push({
 					context: context.slice(0, MAX_ADVISOR_CONTEXT_CHARS),
-					policies: boundedAdvisorPolicyAttributions(result?.policies),
+					policies: ext.trusted ? boundedAdvisorPolicyAttributions(result?.policies) : [],
 				});
 				if (contributions.length >= MAX_ADVISOR_CONTEXT_CONTRIBUTIONS) return contributions;
 			}

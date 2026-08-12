@@ -453,7 +453,12 @@ export async function loadExtensionFromFactory(
  * sequentially in the original path order, so registration semantics
  * (last-wins collisions, shared runtime flag defaults) stay deterministic.
  */
-export async function loadExtensions(paths: string[], cwd: string, eventBus?: EventBus): Promise<LoadExtensionsResult> {
+export async function loadExtensions(
+	paths: string[],
+	cwd: string,
+	eventBus?: EventBus,
+	options: { trusted?: boolean } = {},
+): Promise<LoadExtensionsResult> {
 	const extensions: Extension[] = [];
 	const errors: Array<{ path: string; error: string }> = [];
 	const resolvedEventBus = eventBus ?? new EventBus();
@@ -471,6 +476,7 @@ export async function loadExtensions(paths: string[], cwd: string, eventBus?: Ev
 		}
 
 		if (extension) {
+			if (options.trusted) extension.trusted = true;
 			extensions.push(extension);
 		}
 	}

@@ -993,7 +993,7 @@ describe("advisor", () => {
 		}
 
 		it("includes extension context only in the matching Advisor update", async () => {
-			const promptInputs: string[] = [];
+			const promptInputs: Array<string | AgentMessage[]> = [];
 			const messages: AgentMessage[] = [{ role: "user", content: "first", timestamp: 1 } as AgentMessage];
 			const runtime = new AdvisorRuntime(makeAgent(promptInputs), {
 				snapshotMessages: () => messages,
@@ -1009,8 +1009,8 @@ describe("advisor", () => {
 			messages.push({ role: "user", content: "second", timestamp: 2 } as AgentMessage);
 			runtime.onTurnEnd(messages);
 			await runtime.waitForCatchup(1000, 1);
-			expect(promptInputs[1]).toContain("second");
-			expect(promptInputs[1]).not.toContain("approved experience guidance");
+			expect(promptText(promptInputs[1])).toContain("second");
+			expect(promptText(promptInputs[1])).not.toContain("approved experience guidance");
 		});
 
 		it("coalesces multiple onTurnEnd calls while a prompt is in-flight", async () => {
@@ -2183,14 +2183,16 @@ describe("advisor", () => {
 				{ type: "plain", content: "OTHERSECRET", friendlyName: "TOKABC123" },
 				{ type: "regex", content: "tok_[a-z0-9]+", mode: "replace" },
 			]);
-			const promptInputs: string[] = [];
+			const promptInputs: Array<string | AgentMessage[]> = [];
 			const agent = makeAgent(promptInputs);
 			const firstStoredPrompt = (): string => {
 				const message = agent.state.messages[0];
-				if (message?.role !== "user" || typeof message.content !== "string") {
+				if (message?.role !== "user") {
 					throw new Error("Expected the first advisor history item to be a user prompt");
 				}
-				return message.content;
+				return typeof message.content === "string"
+					? message.content
+					: message.content.map(block => (block.type === "text" ? block.text : "")).join("\n");
 			};
 			const messages: AgentMessage[] = [
 				{ role: "user", content: "remember OTHERSECRET", timestamp: 1 } as AgentMessage,
@@ -2204,7 +2206,11 @@ describe("advisor", () => {
 
 			runtime.onTurnEnd();
 			await runtime.waitForCatchup(1000, 1);
-			agent.state.messages.push({ role: "user", content: promptInputs[0]!, timestamp: 1 } as AgentMessage);
+			agent.state.messages.push({
+				role: "user",
+				content: promptText(promptInputs[0]!),
+				timestamp: 1,
+			} as AgentMessage);
 			expect(firstStoredPrompt()).toContain("TOKABC123_");
 
 			messages.push({ role: "user", content: "continue", timestamp: 2 } as AgentMessage);
@@ -2215,8 +2221,8 @@ describe("advisor", () => {
 
 			expect(promptInputs).toHaveLength(2);
 			expect(firstStoredPrompt()).not.toContain("TOKABC123_");
-			expect(promptInputs[1]).not.toContain("tok_abc123");
-			expect(promptInputs[1]).not.toContain("TOKABC123_");
+			expect(promptText(promptInputs[1])).not.toContain("tok_abc123");
+			expect(promptText(promptInputs[1])).not.toContain("TOKABC123_");
 		});
 
 		it("redacts secrets inside assistant thinking blocks, honoring the whole-delta friendly-prefix collision set", async () => {
