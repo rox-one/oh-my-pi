@@ -118,6 +118,50 @@ describe("ExtensionRunner", () => {
 		expect(result.extensions[0]?.trusted).toBe(true);
 	});
 
+	it("renders trusted structured policies into model-facing Advisor context", async () => {
+		fs.writeFileSync(
+			path.join(extensionsDir, "policy-only-advisor-context.ts"),
+			`export default function (pi) {
+				pi.on("advisor_context", () => ({
+					policies: [{
+						attribution: "opaque-policy-1",
+						source: "Experience",
+						condition: "When a release claim is made",
+						behavior: "Verify the release artifact first",
+					}],
+				}));
+			}`,
+		);
+		const result = await loadTestExtensions();
+		result.extensions[0]!.trusted = true;
+		const runner = new ExtensionRunner(
+			result.extensions,
+			result.runtime,
+			tempDir.path(),
+			sessionManager,
+			modelRegistry,
+		);
+
+		const contributions = await runner.emitAdvisorContext({
+			type: "advisor_context",
+			scopeKey: "scope",
+			updates: [{ role: "user", content: "current" }],
+		});
+
+		expect(contributions).toHaveLength(1);
+		expect(contributions[0]?.context).toContain("opaque-policy-1");
+		expect(contributions[0]?.context).toContain("When a release claim is made");
+		expect(contributions[0]?.context).toContain("Verify the release artifact first");
+		expect(contributions[0]?.policies).toEqual([
+			{
+				attribution: "opaque-policy-1",
+				source: "Experience",
+				condition: "When a release claim is made",
+				behavior: "Verify the release artifact first",
+			},
+		]);
+	});
+
 	it("aggregates bounded Advisor context contributions", async () => {
 		fs.writeFileSync(
 			path.join(extensionsDir, "advisor-context.ts"),
@@ -183,17 +227,17 @@ describe("ExtensionRunner", () => {
 			scopeKey: "scope",
 			updates,
 		});
-		expect(contributions).toEqual([
+		expect(contributions).toHaveLength(1);
+		expect(contributions[0]?.context).toHaveLength(8000);
+		expect(contributions[0]?.context).toContain("OMP core-validated current-review policies:");
+		expect(contributions[0]?.context).toContain("opaque-policy-1");
+		expect(contributions[0]?.context).toContain("x".repeat(100));
+		expect(contributions[0]?.policies).toEqual([
 			{
-				context: "x".repeat(8000),
-				policies: [
-					{
-						attribution: "opaque-policy-1",
-						source: "Experience",
-						condition: "When a release claim is made",
-						behavior: "Verify the release artifact first",
-					},
-				],
+				attribution: "opaque-policy-1",
+				source: "Experience",
+				condition: "When a release claim is made",
+				behavior: "Verify the release artifact first",
 			},
 		]);
 		expect(updates).toEqual([{ role: "user", content: "current" }]);

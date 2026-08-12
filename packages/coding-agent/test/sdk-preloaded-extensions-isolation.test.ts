@@ -83,4 +83,31 @@ describe("createAgentSession preloadedExtensions isolation (issue #2190)", () =>
 			await session.dispose();
 		}
 	});
+
+	it("preserves exact-path trust when a child reloads the parent's extension paths", async () => {
+		const trustedPath = path.join(sharedDir, "trusted-child-extension.ts");
+		await Bun.write(trustedPath, "export default function () {}");
+
+		const child = await createAgentSession({
+			cwd: sharedDir,
+			agentDir: sharedDir,
+			sessionManager: SessionManager.inMemory(),
+			modelRegistry,
+			settings: Settings.isolated(),
+			preloadedExtensionPaths: [trustedPath],
+			preloadedTrustedExtensionPaths: [trustedPath],
+			enableLsp: false,
+			enableMCP: false,
+			skipPythonPreflight: true,
+			skills: [],
+			rules: [],
+			preloadedCustomToolPaths: [],
+			contextFiles: [],
+			promptTemplates: [],
+		});
+
+		const reloaded = child.extensionsResult.extensions.find(extension => extension.resolvedPath === trustedPath);
+		expect(reloaded).toBeDefined();
+		expect(reloaded?.trusted).toBe(true);
+	});
 });

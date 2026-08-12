@@ -465,6 +465,14 @@ export interface CreateAgentSessionOptions {
 	 */
 	preloadedExtensionPaths?: string[];
 	/**
+	 * Exact resolved paths from `preloadedExtensionPaths` that were trusted in
+	 * the parent session. Child sessions reapply trust only to these reloaded
+	 * modules; all other preloaded paths remain ordinary extensions.
+	 *
+	 * @internal
+	 */
+	preloadedTrustedExtensionPaths?: string[];
+	/**
 	 * Pre-discovered custom-tool source paths from `.omp/tools/`, `.claude/tools/`,
 	 * plugins, etc. When provided, the filesystem-scan inside
 	 * `discoverCustomToolPaths()` is skipped — subagents inherit the parent's
@@ -2069,6 +2077,10 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			for (const { path, error } of extensionsResult.errors) {
 				logger.error("Failed to load extension", { path, error });
 			}
+			const trustedPaths = new Set(options.preloadedTrustedExtensionPaths ?? []);
+			for (const extension of extensionsResult.extensions) {
+				if (trustedPaths.has(extension.resolvedPath)) extension.trusted = true;
+			}
 		} else {
 			extensionPaths = await logger.time("discoverSessionExtensionPaths", () =>
 				discoverSessionExtensionPaths(options, cwd, settings),
@@ -2081,6 +2093,9 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		// Forward the source-path list (NOT the loaded instances) so subagents
 		// rebuild their own session-scoped extensions.
 		toolSession.extensionPaths = extensionPaths;
+		toolSession.trustedExtensionPaths = extensionsResult.extensions
+			.filter(extension => extension.trusted === true && !extension.resolvedPath.startsWith("<inline"))
+			.map(extension => extension.resolvedPath);
 
 		// Load inline extensions from factories
 		if (inlineExtensions.length > 0) {

@@ -370,6 +370,33 @@ function boundedAdvisorPolicyAttributions(value: unknown): AdvisorContextPolicyA
 	return policies;
 }
 
+function buildAdvisorContextContribution(
+	result: AdvisorContextEventResult | undefined,
+	trusted: boolean,
+): AdvisorContextContribution | undefined {
+	const validatedPolicies = trusted ? boundedAdvisorPolicyAttributions(result?.policies) : [];
+	let policies: AdvisorContextPolicyAttribution[] = [];
+	let policyContext = "";
+	for (const policy of validatedPolicies) {
+		const nextPolicies = [...policies, policy];
+		const nextContext = `OMP core-validated current-review policies:\n${JSON.stringify({ policies: nextPolicies })}`;
+		if (nextContext.length > MAX_ADVISOR_CONTEXT_CHARS) continue;
+		policies = nextPolicies;
+		policyContext = nextContext;
+	}
+
+	const rawContext = typeof result?.context === "string" ? result.context : "";
+	if (!policyContext && !rawContext.trim()) return undefined;
+	if (!policyContext) return { context: rawContext.slice(0, MAX_ADVISOR_CONTEXT_CHARS), policies };
+
+	const separator = rawContext.trim() ? "\n\n" : "";
+	const remaining = MAX_ADVISOR_CONTEXT_CHARS - policyContext.length - separator.length;
+	return {
+		context: `${policyContext}${separator}${remaining > 0 ? rawContext.slice(0, remaining) : ""}`,
+		policies,
+	};
+}
+
 /**
  * Events handled by the generic emit() method.
  * Events with dedicated emitXxx() methods are excluded for stronger type safety.
@@ -1571,12 +1598,9 @@ export class ExtensionRunner {
 					undefined,
 					signal,
 				)) as AdvisorContextEventResult | undefined;
-				const context = result?.context;
-				if (typeof context !== "string" || !context.trim()) continue;
-				contributions.push({
-					context: context.slice(0, MAX_ADVISOR_CONTEXT_CHARS),
-					policies: ext.trusted ? boundedAdvisorPolicyAttributions(result?.policies) : [],
-				});
+				const contribution = buildAdvisorContextContribution(result, ext.trusted === true);
+				if (!contribution) continue;
+				contributions.push(contribution);
 				if (contributions.length >= MAX_ADVISOR_CONTEXT_CONTRIBUTIONS) return contributions;
 			}
 		}

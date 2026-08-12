@@ -3,7 +3,7 @@
 ## [Unreleased]
 ### Added
 
-- Added a bounded `advisor_context` extension event before native Advisor reviews, with detached recent updates and current-review opaque policy aliases. Only extensions loaded through the exact-path `--trusted-extension` allowlist may provide authoritative policy aliases; ordinary extensions remain quoted context only. Valid trusted aliases produce visible source/condition/behavior provenance and core-validated human-approved policy guidance on the native Advisor card; the primary must correct conflicting behavior, repeated findings for the same policy are deduplicated, and unknown aliases remain generic non-authoritative advice.
+- Added a bounded `advisor_context` extension event before native Advisor reviews, with detached recent updates and current-review opaque policy aliases. Only extensions loaded through the exact-path `--trusted-extension` allowlist may provide authoritative policy aliases; that trust is preserved when the same extension path is reloaded for a child session, while ordinary extensions remain quoted context only. Valid trusted aliases produce visible source/condition/behavior provenance and core-validated human-approved policy guidance on the native Advisor card; the primary must correct conflicting behavior, repeated findings for the same policy are deduplicated, and unknown aliases remain generic non-authoritative advice.
 
 ### Changed
 

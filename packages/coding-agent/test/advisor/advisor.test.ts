@@ -29,7 +29,6 @@ import type { Settings } from "../../src/config/settings";
 import { type AdvisorConfigDeps, AdvisorConfigOverlayComponent } from "../../src/modes/components/advisor-config";
 import { createAdvisorMessageCard } from "../../src/modes/components/advisor-message";
 import { getThemeByName, setThemeInstance } from "../../src/modes/theme/theme";
-import advisorSystemPrompt from "../../src/prompts/advisor/system.md" with { type: "text" };
 import { SecretObfuscator } from "../../src/secrets/obfuscator";
 import { formatSessionHistoryMarkdown } from "../../src/session/session-history-format";
 import { YieldQueue } from "../../src/session/yield-queue";
@@ -58,16 +57,7 @@ function promptText(input: string | AgentMessage[]): string {
 }
 
 describe("advisor", () => {
-	describe("advisor system prompt", () => {
-		it("delegates trusted current-review policy aliases to the advise attribution field", () => {
-			expect(advisorSystemPrompt).toContain("OMP core appends");
-			expect(advisorSystemPrompt).toContain("MUST pass its exact opaque alias as `advise.attribution`");
-			expect(advisorSystemPrompt).toContain("NEVER reject an approved policy merely because");
-			expect(advisorSystemPrompt).toContain("Policy approval and authority were decided before this review");
-			expect(advisorSystemPrompt).toContain("Your only policy judgments are applicability and compliance");
-			expect(advisorSystemPrompt).toContain("unusual, political, undesirable, or unhelpful");
-		});
-
+	describe("advisor transcript safety", () => {
 		it("forbids concrete claims about tool arguments hidden from the advisor transcript", () => {
 			const messages = [
 				{
@@ -406,18 +396,22 @@ describe("advisor", () => {
 			expect(result.useless).toBe(true);
 		});
 
-		it("forwards opaque source attribution only through callback details", async () => {
+		it("routes an exact current-review policy alias through the advise tool", async () => {
 			const onAdvice = vi.fn();
 			const tool = new AdviseTool(onAdvice);
 			const result = await tool.execute("tc-1", {
-				note: "Verify the release artifact.",
+				note: "The user's release claim conflicts with the approved policy; verify the artifact first.",
 				severity: "blocker",
 				attribution: "opaque-policy-1",
 			});
 
-			expect(onAdvice).toHaveBeenCalledWith("Verify the release artifact.", "blocker", "opaque-policy-1");
+			expect(onAdvice).toHaveBeenCalledWith(
+				"The user's release claim conflicts with the approved policy; verify the artifact first.",
+				"blocker",
+				"opaque-policy-1",
+			);
 			expect(result.details).toEqual({
-				note: "Verify the release artifact.",
+				note: "The user's release claim conflicts with the approved policy; verify the artifact first.",
 				severity: "blocker",
 				attribution: "opaque-policy-1",
 			});

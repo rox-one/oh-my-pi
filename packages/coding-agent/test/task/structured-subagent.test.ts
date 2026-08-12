@@ -462,13 +462,14 @@ describe("structured subagent primitive", () => {
 		mockDiscovery();
 		const mcpManager = {} as NonNullable<ToolSession["mcpManager"]>;
 		const extensionPaths = ["/plugins/example.ts"];
+		const trustedExtensionPaths = ["/plugins/trusted.ts"];
 		const customToolPaths = [{ path: "/tools/example.ts", source: "project" }] as unknown as NonNullable<
 			ToolSession["customToolPaths"]
 		>;
 		const planSession = session({ planMode: true });
-		Object.assign(planSession, { mcpManager, extensionPaths, customToolPaths });
+		Object.assign(planSession, { mcpManager, extensionPaths, trustedExtensionPaths, customToolPaths });
 		const nonPlanSession = session();
-		Object.assign(nonPlanSession, { mcpManager, extensionPaths, customToolPaths });
+		Object.assign(nonPlanSession, { mcpManager, extensionPaths, trustedExtensionPaths, customToolPaths });
 		const mcpDisabledSession = session();
 		mcpDisabledSession.enableMCP = false;
 		const restrictedSession = session();
@@ -478,6 +479,7 @@ describe("structured subagent primitive", () => {
 			getApiKey,
 			mcpManager,
 			extensionPaths,
+			trustedExtensionPaths,
 			customToolPaths,
 		});
 		const options = [] as executorModule.ExecutorOptions[];
@@ -497,6 +499,7 @@ describe("structured subagent primitive", () => {
 			enableMCP: false,
 			restrictToolNames: true,
 			preloadedExtensionPaths: [],
+			preloadedTrustedExtensionPaths: [],
 			preloadedCustomToolPaths: [],
 		});
 		expect(options[0]?.mcpManager).toBeUndefined();
@@ -504,6 +507,7 @@ describe("structured subagent primitive", () => {
 			enableMCP: true,
 			mcpManager,
 			preloadedExtensionPaths: extensionPaths,
+			preloadedTrustedExtensionPaths: trustedExtensionPaths,
 			preloadedCustomToolPaths: customToolPaths,
 		});
 		expect(options[1]?.restrictToolNames).toBe(false);
@@ -513,6 +517,7 @@ describe("structured subagent primitive", () => {
 			enableMCP: false,
 			restrictToolNames: true,
 			preloadedExtensionPaths: [],
+			preloadedTrustedExtensionPaths: [],
 			preloadedCustomToolPaths: [],
 		});
 		expect(options[3]?.mcpManager).toBeUndefined();
