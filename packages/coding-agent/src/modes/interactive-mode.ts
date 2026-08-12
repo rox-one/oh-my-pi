@@ -201,7 +201,11 @@ import {
 	parseLoopLimitArgs,
 } from "./loop-limit";
 import { OAuthManualInputManager } from "./oauth-manual-input";
-import { countRunningSubagentBadgeAgents, getRunningSubagentBadgeRegistry } from "./running-subagent-badge";
+import {
+	countRunningSubagentBadgeAgents,
+	getRunningSubagentBadgeRegistry,
+	sumSubagentCost,
+} from "./running-subagent-badge";
 import {
 	type ObservableSession,
 	type SessionObserverChangeKind,
@@ -2124,6 +2128,8 @@ export class InteractiveMode implements InteractiveModeContext {
 		}
 		const count = countRunningSubagentBadgeAgents(registry);
 		this.statusLine.setSubagentCount(count);
+		const subagentCost = sumSubagentCost(registry, [...this.#observerRegistry.getSessions()]);
+		this.statusLine.setSubagentCost(subagentCost);
 		if (options.requestRender !== false) this.ui.requestRender();
 	}
 
