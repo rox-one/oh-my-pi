@@ -4,7 +4,7 @@ import * as fs from "node:fs/promises";
 import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
-import { ProcessTerminal, TUI, visibleWidth } from "@oh-my-pi/pi-tui";
+import { type Container, ProcessTerminal, TUI, visibleWidth } from "@oh-my-pi/pi-tui";
 import { AttachPane } from "../../src/attach/pane";
 import {
 	type AttachClientMessage,
@@ -385,6 +385,43 @@ describe("attach pane fullscreen host", () => {
 		await new Promise(resolve => setTimeout(resolve, 100));
 		expect(server.received.some(message => message.kind === "prompt")).toBe(false);
 		expect(ui.requestRender).toHaveBeenCalled();
+	});
+
+	/** Concatenated render of every overlay child at `width`. */
+	function renderedOverlay(width = 120): string {
+		const [root] = (ui.showOverlay as ReturnType<typeof vi.fn>).mock.calls[0]! as [Container];
+		return root.children.flatMap(child => [...child.render(width)]).join("\n");
+	}
+
+	it("renders the notice row for a rejected slash command and clears it on submit", async () => {
+		await startPane();
+		expect(renderedOverlay()).not.toContain("owner-only session commands");
+
+		// A leading-`/` submission is rejected with a visible notice row.
+		submit("/model gpt-5");
+		expect(renderedOverlay()).toContain("owner-only session commands are not supported in a worker pane");
+
+		// A successful submission clears the notice.
+		submit("continue");
+		expect(renderedOverlay()).not.toContain("owner-only session commands");
+	});
+
+	it("renders the abort feedback notice on Ctrl-C with an empty draft", async () => {
+		await startPane();
+		listeners[0]!("\x03");
+		expect(renderedOverlay()).toContain("aborting current turn…");
+	});
+
+	it("keeps the notice row to a single width-capped line on narrow terminals", async () => {
+		await startPane();
+		submit("/model gpt-5");
+
+		// The overlay children are header, notice row, transcript, editor.
+		const [root] = (ui.showOverlay as ReturnType<typeof vi.fn>).mock.calls[0]! as [Container];
+		expect(root.children).toHaveLength(4);
+		const noticeLines = [...root.children[1]!.render(24)];
+		expect(noticeLines).toHaveLength(1);
+		expect(visibleWidth(noticeLines[0]!)).toBeLessThanOrEqual(24);
 	});
 
 	it("tracks queued/in-flight through prompt_accepted and results", async () => {

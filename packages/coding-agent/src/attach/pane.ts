@@ -112,6 +112,28 @@ class HeightAdjustedScroll implements Component {
 }
 
 /**
+ * Single-row notice line between the header and the transcript: slash-command
+ * rejections, abort feedback, view-open rejections, and control errors. It
+ * renders nothing while no notice is set; the text is TUI-sanitized and
+ * width-capped at render time so exactly one row is produced at any terminal
+ * width (the scroll reserves one row while a notice is set).
+ */
+class NoticeRow implements Component {
+	#text = "";
+
+	invalidate(): void {}
+
+	setText(text: string | undefined): void {
+		this.#text = text ?? "";
+	}
+
+	render(width: number): readonly string[] {
+		if (this.#text.length === 0) return [];
+		return [truncateToWidth(sanitizeProgressFragment(this.#text), Math.max(1, width))];
+	}
+}
+
+/**
  * Fullscreen overlay root for the pane. The TUI pins focus to the topmost
  * overlay's component unless that component declares itself an
  * {@link OverlayFocusOwner}; a plain Container would silently re-own focus
@@ -153,6 +175,7 @@ export class AttachPane {
 	readonly #ui: TUI;
 	readonly #view: PaneViewAdapter;
 	readonly #editor: Editor;
+	readonly #noticeRow: NoticeRow;
 	readonly #root: Component;
 	readonly #onExit: ((code: number) => void) | undefined;
 	#presenter: SessionTranscriptPresenter | null = null;
@@ -171,6 +194,9 @@ export class AttachPane {
 
 		const header = new Text(`attach ${workerId}`, 1, 0);
 		header.setStyleFn(text => themeBold(text));
+
+		const noticeRow = new NoticeRow();
+		this.#noticeRow = noticeRow;
 
 		const scroll = new ScrollView([], { height: 1, scrollbar: "auto" });
 		const editor = new Editor(getEditorTheme());
@@ -196,8 +222,7 @@ export class AttachPane {
 				this.#status = status;
 			},
 			onNotice: notice => {
-				this.#notice = notice;
-				this.#ui.requestRender();
+				this.#setNotice(notice);
 			},
 			getStatus: () => this.#status,
 		});
@@ -214,6 +239,7 @@ export class AttachPane {
 
 		const root = new AttachPaneRoot(editor);
 		root.addChild(header);
+		root.addChild(this.#noticeRow);
 		root.addChild(
 			new HeightAdjustedScroll(
 				scroll,
@@ -306,18 +332,24 @@ export class AttachPane {
 		return { content, width: visibleWidth(content) };
 	}
 
+	/** Set the notice row (slash rejections, abort feedback, control errors). */
+	#setNotice(notice: string | undefined): void {
+		this.#notice = notice;
+		this.#noticeRow.setText(notice);
+		this.#ui.requestRender();
+	}
+
 	#submit(text: string): void {
 		const trimmed = text.trim();
 		if (trimmed.length === 0) return;
 		if (trimmed.startsWith("/")) {
 			// Owner-only session commands (/new, /resume, /model, …) belong to
 			// the parent session; the worker pane cannot apply them.
-			this.#notice = "owner-only session commands are not supported in a worker pane";
+			this.#setNotice("owner-only session commands are not supported in a worker pane");
 			this.#editor.setText("");
-			this.#ui.requestRender();
 			return;
 		}
-		this.#notice = undefined;
+		this.#setNotice(undefined);
 		this.#status = {
 			...this.#status,
 			queued: this.#status.queued + 1,
@@ -332,7 +364,7 @@ export class AttachPane {
 		if (matchesKey(data, "ctrl+c")) {
 			if (this.#editor.textEquals("")) {
 				// Abort-current-turn: the pane stays attached.
-				this.#notice = "aborting current turn…";
+				this.#setNotice("aborting current turn…");
 				this.#client.abortTurn();
 			} else {
 				this.#editor.setText("");

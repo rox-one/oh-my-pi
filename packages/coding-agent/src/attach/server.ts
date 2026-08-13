@@ -934,7 +934,19 @@ export class AttachServer {
 		});
 	}
 
-	#handleAbort(_connection: AttachClientConnection, message: Extract<AttachClientMessage, { kind: "abort" }>): void {
+	#handleAbort(connection: AttachClientConnection, message: Extract<AttachClientMessage, { kind: "abort" }>): void {
+		if (connection.role === "observer") {
+			// Observers are read-only subscribers; they hold no controller
+			// lease and must not cancel a worker's in-flight turn (same
+			// boundary as follow_up).
+			this.#rejectControl(connection, {
+				kind: "control_rejected",
+				key: message.key,
+				code: "forbidden",
+				message: "observer clients are read-only",
+			});
+			return;
+		}
 		void this.#registry.abort(message.key, message.reason).catch(() => {
 			// Abort is best-effort: a missing worker is already gone.
 		});

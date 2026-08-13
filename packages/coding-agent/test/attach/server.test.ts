@@ -472,6 +472,42 @@ describe("attach server", () => {
 			expect(rejected.ref).toBe("r1");
 			client.close();
 		});
+
+		it("rejects a legacy abort frame from an observer role with control_rejected forbidden", async () => {
+			// Regression: the legacy `abort` frame ran unconditionally, so a
+			// read-only observer holding the local capability token could
+			// cancel the worker's in-flight turn without a controller lease.
+			registry.register(KEY, null);
+			const client = await TestClient.connect(server.socketFile);
+			client.send(hello(token, { role: "observer" }));
+			await client.waitForMessage(message => message.kind === "hello_ok");
+			client.send({ kind: "subscribe" as const });
+			await client.waitForMessage(message => message.kind === "snapshot");
+			client.send({ kind: "abort" as const, key: KEY, reason: "observer-nudge" });
+			const rejected = (await client.waitForMessage(message => message.kind === "control_rejected")) as Extract<
+				AttachMessage,
+				{ kind: "control_rejected" }
+			>;
+			expect(rejected.code).toBe("forbidden");
+			client.close();
+		});
+
+		it("still allows a director role to send the legacy abort frame", async () => {
+			registry.register(KEY, null);
+			const client = await TestClient.connect(server.socketFile);
+			client.send(hello(token, { role: "director" }));
+			await client.waitForMessage(message => message.kind === "hello_ok");
+			client.send({ kind: "subscribe" as const });
+			await client.waitForMessage(message => message.kind === "snapshot");
+			client.send({ kind: "abort" as const, key: KEY, reason: "director-abort" });
+			const event = (await client.waitForMessage(
+				message =>
+					message.kind === "event" &&
+					(message as Extract<AttachMessage, { kind: "event" }>).event.type === "abort_accepted",
+			)) as Extract<AttachMessage, { kind: "event" }>;
+			expect(event.event).toMatchObject({ type: "abort_accepted", key: KEY });
+			client.close();
+		});
 	});
 
 	describe("serialized follow-up over the wire (director path)", () => {
