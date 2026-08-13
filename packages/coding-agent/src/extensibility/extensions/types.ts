@@ -457,6 +457,8 @@ export interface ExtensionContext {
 	ui: ExtensionUIContext;
 	/** Current run mode. Use `"tui"` to guard terminal-only UI such as custom components. */
 	mode: ExtensionMode;
+	/** Cancellation scoped to the current extension handler invocation. */
+	signal: AbortSignal;
 	/** Get current context usage for the active model. */
 	getContextUsage(): ContextUsage | undefined;
 	/** Get a read-only snapshot of async jobs owned by this session. */

@@ -89,6 +89,7 @@ export type ExtensionErrorListener = (error: ExtensionError) => void;
 
 export const EXTENSION_HANDLER_TIMEOUT_MS = 30_000;
 let extensionHandlerTimeoutMs = EXTENSION_HANDLER_TIMEOUT_MS;
+const NEVER_ABORTED_SIGNAL = new AbortController().signal;
 
 function throwUnsupportedServiceTierAction(): never {
 	throw new Error("This extension host does not support service-tier actions");
@@ -225,6 +226,11 @@ function createHandlerContext(
 	const scoped: ExtensionContext = Object.create(ctx);
 	Object.defineProperty(scoped, "ui", {
 		value: createHandlerUIContext(ctx.ui, handlerSignal, timeoutBudget),
+		enumerable: true,
+		configurable: true,
+	});
+	Object.defineProperty(scoped, "signal", {
+		value: handlerSignal,
 		enumerable: true,
 		configurable: true,
 	});
@@ -1229,6 +1235,7 @@ export class ExtensionRunner {
 		return {
 			ui: this.#uiContext,
 			mode: this.#mode,
+			signal: delegation?.signal ?? NEVER_ABORTED_SIGNAL,
 			getContextUsage: () => this.#getContextUsageFn(),
 			compact: instructionsOrOptions => this.#compactFn(instructionsOrOptions),
 			getAsyncJobSnapshot: () => this.#getAsyncJobSnapshotFn(),
@@ -1578,7 +1585,7 @@ export class ExtensionRunner {
 			ctx ??= this.createContext();
 			for (const handler of handlers) {
 				if (signal?.aborted) return [];
-				const remainingMs = deadline - Date.now();
+				let remainingMs = deadline - Date.now();
 				if (remainingMs <= 0) return contributions;
 				let isolatedEvent: AdvisorContextEvent;
 				try {
@@ -1589,6 +1596,8 @@ export class ExtensionRunner {
 					});
 					return [];
 				}
+				remainingMs = deadline - Date.now();
+				if (remainingMs <= 0) return contributions;
 				const result = (await this.#runHandlerWithTimeout(
 					handler,
 					isolatedEvent,

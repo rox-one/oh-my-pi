@@ -11,11 +11,7 @@ import type { ImageContent, TextContent } from "@oh-my-pi/pi-ai";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import {
-	discoverAndLoadExtensions,
-	ExtensionRuntime,
-	loadExtensions,
-} from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
+import { ExtensionRuntime, loadExtensions } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
 import {
 	EXTENSION_HANDLER_TIMEOUT_MS,
 	ExtensionRunner,
@@ -350,6 +346,63 @@ describe("ExtensionRunner", () => {
 		);
 		controller.abort();
 		expect(await pending).toEqual([]);
+	});
+
+	it("exposes the per-handler cancellation signal in Advisor context", async () => {
+		fs.writeFileSync(
+			path.join(extensionsDir, "advisor-context-signal.ts"),
+			`export default function (pi) {
+				pi.on("advisor_context", (_event, ctx) => ({
+					context: ctx.signal instanceof AbortSignal ? "signal available" : "signal missing",
+				}));
+			}`,
+		);
+		const result = await loadTestExtensions();
+		const runner = new ExtensionRunner(
+			result.extensions,
+			result.runtime,
+			tempDir.path(),
+			sessionManager,
+			modelRegistry,
+		);
+
+		const contributions = await runner.emitAdvisorContext({
+			type: "advisor_context",
+			scopeKey: "scope",
+			updates: [{ role: "user", content: "current" }],
+		});
+
+		expect(contributions.map(value => value.context)).toEqual(["signal available"]);
+	});
+
+	it("includes event-cloning time in the aggregate Advisor context budget", async () => {
+		fs.writeFileSync(
+			path.join(extensionsDir, "advisor-context-clone-budget.ts"),
+			`export default function (pi) {
+				pi.on("advisor_context", () => ({ context: "ran after deadline" }));
+			}`,
+		);
+		const result = await loadTestExtensions();
+		const runner = new ExtensionRunner(
+			result.extensions,
+			result.runtime,
+			tempDir.path(),
+			sessionManager,
+			modelRegistry,
+		);
+		const now = vi.spyOn(Date, "now").mockReturnValueOnce(1_000).mockReturnValueOnce(1_000).mockReturnValue(3_001);
+
+		try {
+			expect(
+				await runner.emitAdvisorContext({
+					type: "advisor_context",
+					scopeKey: "scope",
+					updates: [{ role: "user", content: "current" }],
+				}),
+			).toEqual([]);
+		} finally {
+			now.mockRestore();
+		}
 	});
 
 	it("exposes caller localProtocolOptions through extension context", async () => {
