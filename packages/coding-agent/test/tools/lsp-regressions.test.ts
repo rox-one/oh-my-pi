@@ -1359,10 +1359,18 @@ describe("lsp regressions", () => {
 				.map(block => block.text)
 				.join("\n");
 
-			expect(output).toContain('Symbols matching "topmatches"');
+			expect(output).toContain("Symbols in symbols.ts:");
+			expect(output).toContain('Matching query: "topmatches"');
 			expect(output).toContain("TopMatches");
 			expect(output).toContain("push");
 			expect(output).not.toContain("FuzzyFindOptions");
+
+			const theme = await getThemeByName("dark");
+			const rendered = sanitizeText(
+				renderResult(result, { expanded: false, isPartial: false }, theme!).render(120).join("\n"),
+			);
+			expect(rendered).toContain("in symbols.ts");
+			expect(rendered).not.toContain("Symbols in symbols.ts:");
 		} finally {
 			configCache.delete(tempDir.path());
 			tempDir.removeSync();
