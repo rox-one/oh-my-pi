@@ -1190,6 +1190,9 @@
 - Fixed omp plugin install failing with cloning errors for legacy Pi extensions whose tool schemas use legacy-typebox builders.
 - Fixed omp update aborting with chmod ENOENT when concurrent update runs overlapped by using unique download temporary paths.
 - Fixed the browser tool executable probe launching the user's installed GUI Chromium on Windows: the `--version` version probe from ecb22957 was Linux-scoped but ran for every platform candidate, so on Windows it could hand off to a running `chrome.exe`, open a normal browser window, then reject the candidate and fall back to cached Chrome for Testing. The probe is now confined to Linux ([#8445](https://github.com/can1357/oh-my-pi/issues/8445)).
+### Fixed
+
+- Fixed attach pane Ctrl-C not aborting a vibe worker's in-flight turn: the abort key now resolves the pane client's empty owner scope to the server's real scope before the registry lookup, and the abort callback runs even when no attach prompt slot is occupied (pendingFollowUps=0) so a Ctrl-C during a director-owned initial spawn cancels the spawn turn instead of being silently acknowledged. An interrupted worker session now survives as an idle revivable worker instead of being unregistered and closing its pane; a pane abort landing during spawn no longer strands the worker — the next follow-up re-spawns a fresh session. The abort interrupts only the current turn: messages queued during abort unwinding stay queued and run with the next explicit prompt instead of racing the session abort. Failed session aborts are now logged instead of silently swallowed.
 
 ## [17.3.0] - 2026-08-13
 

@@ -13,6 +13,7 @@
  * - the serialized follow-up/prompt runner shared with `vibe_send`.
  */
 
+import { logger } from "@oh-my-pi/pi-utils";
 import type { AttachLiveSessionSource } from "./live-session";
 import {
 	ATTACH_CMD_ACK_CACHE_SIZE,
@@ -662,28 +663,38 @@ export class AttachRegistry {
 	}
 
 	/**
-	 * Abort the in-flight prompt/follow-up for a worker (best-effort). Returns
-	 * true when a prompt was in flight. Never kills the worker.
+	 * Abort the worker's in-flight turn (best-effort). Returns true when either
+	 * the attach prompt slot was occupied or the runtime abort callback found
+	 * a turn. Never kills the worker.
 	 *
 	 * The pending-follow-up counter is NOT touched here: the in-flight
 	 * runPrompt()/followUp() owns that slot and clears it only when ITS
 	 * callback settles, so an abort that resolves before the turn winds down
-	 * can never admit a concurrent prompt.
+	 * can never admit a concurrent prompt. The callback runs even without an
+	 * attach-origin prompt because the worker's initial spawn is director-owned
+	 * and therefore does not increment pendingFollowUps.
 	 */
 	async abort(key: AttachWorkerKey, reason?: string): Promise<boolean> {
 		const keyString = attachKeyString(key);
 		const entry = this.#entries.get(keyString);
 		if (!entry) return false;
 		const hadPrompt = entry.pendingFollowUps > 0;
-		if (hadPrompt && this.#abort) {
+		let aborted = false;
+		if (this.#abort) {
 			try {
-				await this.#abort(key, reason);
-			} catch {
-				// Abort is best-effort; the prompt result will surface the error.
+				aborted = await this.#abort(key, reason);
+			} catch (error) {
+				// Log the readable worker id (not the NUL-joined key string) so
+				// the failure is actionable in logs; the abort stays best-effort
+				// and the frame flow continues.
+				logger.warn("attach: runtime abort callback failed", {
+					workerId: key.workerId,
+					error: error instanceof Error ? error.message : String(error),
+				});
 			}
 		}
 		this.#emit({ type: "abort_accepted", key, ref: undefined });
-		return hadPrompt;
+		return hadPrompt || aborted;
 	}
 
 	// -----------------------------------------------------------------------

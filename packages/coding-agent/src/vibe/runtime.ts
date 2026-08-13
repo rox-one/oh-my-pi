@@ -28,7 +28,7 @@ import { registerArtifactsDir } from "../internal-urls/registry-helpers";
 import { MCPManager } from "../mcp/manager";
 import vibeTurnResultTemplate from "../prompts/tools/vibe-turn-result.md" with { type: "text" };
 import { AgentLifecycleManager } from "../registry/agent-lifecycle";
-import { type AgentRef, AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
+import { type AgentRef, AgentRegistry, type AgentStatus, MAIN_AGENT_ID } from "../registry/agent-registry";
 import { SessionManager, SessionPersistenceIndeterminateError } from "../session/session-manager";
 import { getBundledAgent } from "../task/agents";
 import { type ExecutorOptions, runSubagentFollowUpTurn, runSubprocess } from "../task/executor";
@@ -206,6 +206,42 @@ interface VibeRecord {
 	suspended: boolean;
 	/** True only after a terminal lifecycle event has durably flushed. */
 	terminalPersisted: boolean;
+	/**
+	 * Set by the attach pane's Ctrl-C abort (#abortAttachTurn) while the
+	 * in-flight turn is being cancelled. The settle that follows is a USER
+	 * INTERRUPT, not a kill: the worker session must survive registered/idle
+	 * and accept the next follow-up. Consumed (and cleared) by #finishTurn.
+	 */
+	paneAbortPending?: boolean;
+}
+
+/**
+ * Whether a vibe worker survives its turn settling.
+ *
+ * Kill, suspension, and a concurrent hard-kill that already tombstoned the
+ * agent ref (`aborted`) stay terminal. A pane Ctrl-C abort
+ * (`paneAbortPending`) is a user interrupt with a revivable worker: the
+ * record must remain registered/idle even when the abort unwinding has not
+ * yet synced the agent ref to `idle` (attach contract — the pane and the
+ * worker both stay alive). A MISSING ref is also survivable: that is the
+ * pre-monitor/spawn window, where the worker's session never completed —
+ * the record stays idle WITHOUT a phantom session claim, and the next prompt
+ * re-spawns a fresh session. Exported for the focused runtime regression
+ * (test/vibe/runtime-abort-revive.test.ts).
+ */
+export function vibeWorkerSurvivesTurnSettle(args: {
+	killed: boolean;
+	suspended: boolean;
+	paneAbortPending: boolean;
+	registeredStatus: AgentStatus | undefined;
+}): boolean {
+	if (args.killed || args.suspended) return false;
+	if (args.paneAbortPending) {
+		// Missing ref (spawn window) and live refs survive; a terminal
+		// `aborted` ref means a concurrent hard kill already won.
+		return args.registeredStatus !== "aborted";
+	}
+	return args.registeredStatus === "idle" || args.registeredStatus === "parked";
 }
 
 /**
@@ -454,10 +490,25 @@ export class VibeSessionRegistry {
 		cli?: VibeCli;
 		ownerId: string;
 		state?: VibeSessionState;
-		jobId?: string;
+1: 		jobId?: string;
+		queue?: string[];
 	}): void {
 		const now = Date.now();
-		this.#records.set(record.id, {
+		// Key by the same scopeKey the runtime lookups use (send/#record), so a
+		// record registered here is reachable through a matching fake parent
+		// session (getSessionId "test-parent-session", sessionFile null).
+		const scope: VibeOwnerScope = {
+			ownerId: record.ownerId,
+			parentSessionId: "test-parent-session",
+			parentSessionFile: null,
+		};
+		this.#records.set(scopeKey(scope, record.id), {
+2: 			createdAt: now,
+			lastActivityAt: now,
+			turn: record.jobId
+				? { jobId: record.jobId, message: "test turn", startedAt: now, trace: [], toolCount: 0 }
+				: undefined,
+			queue: [...(record.queue ?? [])],
 			id: record.id,
 			cli: record.cli ?? "fast",
 			ownerId: record.ownerId,
@@ -465,17 +516,38 @@ export class VibeSessionRegistry {
 			parentSessionFile: null,
 			agent: getBundledAgent("sonic")!,
 			state: record.state ?? "running",
-			createdAt: now,
+1: 		jobId?: string;
+		queue?: string[];
+	}): void {
+		const now = Date.now();
+		// Key by the same scopeKey the runtime lookups use (send/#record), so a
+		// record registered here is reachable through a matching fake parent
+		// session (getSessionId "test-parent-session", sessionFile null).
+		const scope: VibeOwnerScope = {
+			ownerId: record.ownerId,
+			parentSessionId: "test-parent-session",
+			parentSessionFile: null,
+		};
+		this.#records.set(scopeKey(scope, record.id), {
+2: 			createdAt: now,
 			lastActivityAt: now,
 			turn: record.jobId
 				? { jobId: record.jobId, message: "test turn", startedAt: now, trace: [], toolCount: 0 }
 				: undefined,
-			queue: [],
+			queue: [...(record.queue ?? [])],
 			turnCount: 0,
 			killed: false,
 			suspended: false,
 			terminalPersisted: false,
 		});
+	}
+
+	/** Mark and cancel an in-flight turn exactly like pane Ctrl-C. Test-only. */
+	abortAttachTurnForTests(session: ToolSession, id: string): boolean {
+		const record = this.#record(this.ownerScope(session), id);
+		if (!record.turn) return false;
+		record.paneAbortPending = true;
+		return this.#manager(session).cancel(record.turn.jobId, { ownerId: record.ownerId });
 	}
 
 	readonly #records = new Map<string, VibeRecord>();
@@ -611,6 +683,15 @@ export class VibeSessionRegistry {
 		if (!entry || !record?.turn) return false;
 		const session = entry.session;
 		if (!session) return false;
+		// Attach-scoped resumability: this abort is a pane Ctrl-C (user
+		// interrupt), not a kill. Set BEFORE the job signal fires so the
+		// turn's executor monitor observes it synchronously; #finishTurn also
+		// reads and clears the marker at settle. For FIRST spawns the marker
+		// is threaded into the executor options (see #buildSpawnOptions) so
+		// the lifecycle finalizer keeps the adopted session resumable; the
+		// follow-up path has no executor flag — its survival is decided here
+		// in #finishTurn at settle.
+		record.paneAbortPending = true;
 		const cancelled = this.#manager(session).cancel(record.turn.jobId, { ownerId: record.ownerId });
 		const activeSession = this.#registeredAgent(record)?.session;
 		if (activeSession) {
@@ -619,8 +700,18 @@ export class VibeSessionRegistry {
 			// awaits (lifecycle append + session revive), so a Ctrl-C landing
 			// in that window is never observed and the session would run the
 			// whole turn untouched. Abort the adopted session directly so the
-			// in-flight turn always stops.
-			await activeSession.abort();
+			// in-flight turn always stops. A failed session abort must not
+			// swallow the outcome silently: log it and still record the
+			// interrupt below (the job signal already fired, so the turn
+			// winds down through the normal settle path).
+			try {
+				await activeSession.abort();
+			} catch (error) {
+				logger.warn("vibe: pane abort failed to stop the adopted session", {
+					id: record.id,
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
 		}
 		if (cancelled || activeSession) {
 			record.lastActivity = firstLine(`aborted: ${reason ?? "follow-up cancelled"}`);
@@ -1239,13 +1330,33 @@ export class VibeSessionRegistry {
 			return { id: record.id, mode: "queued" };
 		}
 
+		let first = false;
 		if (!registered || (registered.status !== "idle" && registered.status !== "parked")) {
-			throw new ToolError(`Vibe session "${record.id}" no longer resolves to this parent session.`);
+			// Pane-abort recovery: the worker's session never completed (the
+			// pane Ctrl-C landed in the pre-monitor/spawn window, so no agent
+			// ref exists — only the record + attach entry survived). The
+			// record is idle WITHOUT a phantom session claim; this prompt
+			// re-spawns a fresh session instead of failing. An existing ref
+			// that is terminal/ownership-mismatched still throws below.
+			if (record.state === "idle" && !registered) {
+				first = true;
+			} else {
+				throw new ToolError(`Vibe session "${record.id}" no longer resolves to this parent session.`);
+			}
 		}
 
-		const manager = this.#manager(session);
-		const jobId = this.#registerTurnJob(session, manager, record, message, { first: false });
-		return { id: record.id, mode: "turn", jobId };
+		// A pane abort leaves any messages that arrived during its unwind
+		// queued. Preserve their order ahead of this explicit follow-up.
+		const queued = record.queue.splice(0, record.queue.length);
+		const turnMessage = [...queued, message].join("\n\n");
+		try {
+			const manager = this.#manager(session);
+			const jobId = this.#registerTurnJob(session, manager, record, turnMessage, { first });
+			return { id: record.id, mode: "turn", jobId };
+		} catch (error) {
+			record.queue.unshift(...queued);
+			throw error;
+		}
 	}
 
 	/**
@@ -1666,6 +1777,10 @@ export class VibeSessionRegistry {
 			parentAgentId: session.getAgentId?.() ?? MAIN_AGENT_ID,
 			parentServiceTier: session.getServiceTierByFamily ? (session.getServiceTierByFamily() ?? null) : undefined,
 			keepAlive: true,
+			// Attach-scoped resumability: a pane Ctrl-C abort during spawn is a
+			// user interrupt, not a kill — the lifecycle finalizer must keep the
+			// adopted session resumable instead of tombstoning it.
+			revivableAbort: () => record.paneAbortPending === true,
 		};
 	}
 
@@ -1773,12 +1888,48 @@ export class VibeSessionRegistry {
 		record.live = undefined;
 		record.lastActivityAt = Date.now();
 		if (record.killed || record.suspended) {
+			// A concurrent kill/suspend won over a pane abort: consume the
+			// marker so it cannot mislabel a later settle, and stay terminal.
+			record.paneAbortPending = false;
 			record.state = "dead";
 			return;
 		}
 		// Only an idle/parked ref with this parent's exact child file is resumable.
 		const registered = this.#registeredAgent(record);
-		record.state = registered && (registered.status === "idle" || registered.status === "parked") ? "idle" : "dead";
+		const paneAborted = record.paneAbortPending === true;
+		if (paneAborted) {
+			// A pane Ctrl-C aborted the in-flight turn: the worker session must
+			// survive (attach contract — the pane and the worker both stay
+			// alive and the next follow-up is accepted). The abort unwinding
+			// can race the agent_end → idle status sync, so the ref may still
+			// be "running" here; reconcile it to a live status instead of
+			// treating the interrupt as an unrecoverable failure.
+			record.paneAbortPending = false;
+			if (
+				vibeWorkerSurvivesTurnSettle({
+					killed: false,
+					suspended: false,
+					paneAbortPending: true,
+					registeredStatus: registered?.status,
+				})
+			) {
+				if (registered && registered.status !== "idle" && registered.status !== "parked") {
+					AgentRegistry.global().setStatus(record.id, "idle", registered);
+				}
+				record.state = "idle";
+			} else {
+				record.state = "dead";
+			}
+		} else {
+			record.state = vibeWorkerSurvivesTurnSettle({
+				killed: false,
+				suspended: false,
+				paneAbortPending: false,
+				registeredStatus: registered?.status,
+			})
+				? "idle"
+				: "dead";
+		}
 		if (record.state === "dead") {
 			record.terminalPersisted = await this.#appendTombstone(session, record, "unrecoverable");
 			this.#attachForRecord(record)?.unregister(attachKeyOfRecord(record), "unrecoverable turn failure");
@@ -1798,10 +1949,27 @@ export class VibeSessionRegistry {
 			record.state = "dead";
 			return;
 		}
+		// Pane Ctrl-C interrupts only the current turn. Keep messages queued
+		// while abort unwinding finishes; the next explicit send starts them
+		// against the settled worker instead of racing a follow-up here.
+		if (paneAborted) return;
 		if (record.queue.length === 0) return;
 		const nextMessage = record.queue.splice(0, record.queue.length).join("\n\n");
 		try {
-			this.#registerTurnJob(session, manager, record, nextMessage, { first: false });
+			// A concurrent kill/suspend racing the settle must never respawn
+			// work for a dying record: preserve the messages (mirroring the
+			// failure path below) instead of spawning an empty turn.
+			if (record.killed || record.suspended) {
+				if (nextMessage) record.queue.unshift(nextMessage);
+				return;
+			}
+			// Pane-abort recovery: when the worker's session never completed
+			// (or is gone), a queued message must SPAWN a fresh session
+			// (first turn) instead of failing a follow-up on a missing ref.
+			const nextRegistered = this.#registeredAgent(record);
+			const resumable =
+				nextRegistered !== undefined && (nextRegistered.status === "idle" || nextRegistered.status === "parked");
+			this.#registerTurnJob(session, manager, record, nextMessage, { first: !resumable });
 		} catch (error) {
 			// Leave the messages recoverable: a later vibe_send flushes again.
 			record.queue.unshift(nextMessage);

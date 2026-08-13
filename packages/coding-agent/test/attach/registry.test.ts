@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "bun:test";
+import { logger } from "@oh-my-pi/pi-utils";
 import { type AttachLiveSessionSource, createAttachLiveSessionSource } from "../../src/attach/live-session";
 import {
 	ATTACH_CMD_ACK_CACHE_SIZE,
@@ -542,6 +543,45 @@ describe("attach registry abort (never kills)", () => {
 		registry.register(KEY, null);
 		await expect(registry.abort(KEY, "user")).resolves.toBe(false);
 		expect(registry.has(KEY)).toBe(true); // abort never unregisters
+	});
+
+	it("invokes the runtime abort callback during a director-owned initial spawn", async () => {
+		const aborted: { key: AttachWorkerKey; reason?: string }[] = [];
+		const registry = new AttachRegistry({
+			runPrompt: async () => ({ ok: true }),
+			abort: async (key, reason) => {
+				aborted.push({ key, reason });
+				return true;
+			},
+		});
+		registry.register(KEY, null);
+
+		await expect(registry.abort(KEY, "user-cancel")).resolves.toBe(true);
+		expect(aborted).toEqual([{ key: KEY, reason: "user-cancel" }]);
+		expect(registry.snapshot().sessions[0].pendingFollowUps).toBe(0);
+		expect(registry.has(KEY)).toBe(true);
+	});
+
+	it("logs a rejected runtime abort callback without rejecting the protocol abort", async () => {
+		const warn = vi.spyOn(logger, "warn").mockImplementation(() => {});
+		try {
+			const registry = new AttachRegistry({
+				runPrompt: async () => ({ ok: true }),
+				abort: async () => {
+					throw new Error("abort failed");
+				},
+			});
+			registry.register(KEY, null);
+
+			await expect(registry.abort(KEY, "user-cancel")).resolves.toBe(false);
+			expect(warn).toHaveBeenCalledWith("attach: runtime abort callback failed", {
+				workerId: "w1",
+				error: "abort failed",
+			});
+			expect(registry.has(KEY)).toBe(true);
+		} finally {
+			warn.mockRestore();
+		}
 	});
 
 	it("cancels an in-flight prompt via the abort callback and returns true", async () => {

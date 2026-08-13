@@ -503,6 +503,14 @@ export interface ExecutorOptions {
 	 * set this false so disposal unregisters them instead of leaving idle peers.
 	 */
 	keepAlive?: boolean;
+	/**
+	 * Attach-scoped resumability: consultable during a caller-signal abort.
+	 * When it returns true the abort is a pane Ctrl-C user interrupt on a
+	 * revivable worker session (must survive as idle), not a hard kill.
+	 * Wired by the vibe runtime from its pane-abort marker; never set for
+	 * task-tool/kill/terminate aborts.
+	 */
+	revivableAbort?: () => boolean;
 	/** Internal ownership handoff for cleanup that outlives the visible Task result. */
 	onCleanupDeferred?: (completion: Promise<void>) => void;
 	/** Internal cleanup grace override for deterministic lifecycle tests. */
@@ -949,6 +957,14 @@ interface RunMonitorArgs {
 	softRequestBudgetNotice: boolean;
 	/** Wall-clock cap in ms; 0 disables the timer. */
 	maxRuntimeMs: number;
+	/**
+	 * Attach-scoped resumability predicate: when a caller-signal abort arrives
+	 * while this returns true, the run is a pane Ctrl-C user interrupt with a
+	 * revivable session (the vibe worker must survive), not a hard kill. Only
+	 * consultable for `signal` aborts — budget already has its own resumable
+	 * path, and timeout/terminate stays terminal.
+	 */
+	revivableAbort?: () => boolean;
 }
 
 /**
@@ -984,6 +1000,13 @@ interface SubagentRunMonitor {
 	waitForYieldTurnStop(): Promise<void>;
 	/** The abort kind for this run, when an abort was requested. */
 	abortKind(): AbortReason | undefined;
+	/**
+	 * True when this run's abort is attach-scoped revivable (pane Ctrl-C
+	 * user interrupt on a vibe worker): the session must survive as idle
+	 * instead of being tombstoned. Never true for timeout/terminate/budget
+	 * or for a plain caller-signal abort.
+	 */
+	isRevivableAbort(): boolean;
 	terminalError(): string | undefined;
 	/** True when the abort carries a precise external reason (signal / wall-clock / budget). */
 	hasExplicitAbortReason(): boolean;
@@ -1094,6 +1117,8 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 	let consecutiveYieldToolErrors = 0;
 	let lastAssistantSalvageText: string | undefined;
 	let activeSessionAbortPromise: Promise<void> | undefined;
+	/** True once a caller-signal abort was marked attach-scoped revivable. */
+	let revivableAbort = false;
 
 	const abortActiveSession = (): Promise<void> => {
 		const session = activeSession;
@@ -1147,6 +1172,12 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 		}
 		abortSent = true;
 		abortReason = reason;
+		// Attach-scoped resumability: only a caller-signal abort whose owner
+		// explicitly marked it revivable (pane Ctrl-C on a vibe worker) counts;
+		// every other signal/terminate/timeout/budget abort stays as-is.
+		if (reason === "signal" && args.revivableAbort?.()) {
+			revivableAbort = true;
+		}
 		abortController.abort();
 		void abortActiveSession();
 	};
@@ -1833,6 +1864,7 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 		// A soft stop that never escalated still identifies as a budget abort so
 		// the lifecycle can park the agent as resumable instead of killing it.
 		abortKind: () => abortReason ?? (budgetStopRequested ? "budget" : undefined),
+		isRevivableAbort: () => revivableAbort,
 		isAbortedRun: () =>
 			abortReason === "signal" ||
 			abortReason === "shutdown" ||
@@ -2464,6 +2496,13 @@ export async function finalizeSubagentLifecycle(args: {
 	aborted: boolean;
 	/** Which watchdog (if any) requested the abort; decides revivability. */
 	abortKind?: AbortReason;
+	/**
+	 * Attach-scoped resumability: when true, a caller-signal abort was a pane
+	 * Ctrl-C user interrupt on a revivable vibe worker (not a kill). Only
+	 * ever true alongside `abortKind === "signal"`; set by the vibe runtime's
+	 * pane-abort marker via the run monitor.
+	 */
+	revivableAbort?: boolean;
 	keepAlive: boolean;
 	isolated: boolean;
 	agentIdleTtlMs: number;
@@ -2504,9 +2543,15 @@ export async function finalizeSubagentLifecycle(args: {
 	// A budget abort leaves a consistent session with its transcript on disk.
 	// Manager shutdown also preserves the transcript, but disposes and unregisters
 	// the process-local session. Caller signals, wall-clock timeouts, and internal
-	// terminations are genuine kills and stay terminal.
+	// terminations are genuine kills and stay terminal. The single exception for
+	// caller signals is the attach-scoped pane Ctrl-C marker (`revivableAbort`):
+	// the vibe worker session is a user interrupt with a revivable adopted
+	// session and must survive as idle.
 	const resumableAbort =
-		args.abortKind === "budget" && args.keepAlive && !args.isolated && args.reviveSession !== null;
+		(args.abortKind === "budget" || args.revivableAbort === true) &&
+		args.keepAlive &&
+		!args.isolated &&
+		args.reviveSession !== null;
 	if (args.aborted && !resumableAbort) {
 		if (ref && ownsRef) {
 			if (args.abortKind === "shutdown") {
@@ -2720,8 +2765,10 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 	// loop dispatches a chat request to the provider — the launch-complete boundary.
 	let firstChatDispatchAt: number | undefined;
 
-	// Check if already aborted
-	if (signal?.aborted) {
+	// Check if already aborted. A revivable (attach pane Ctrl-C) abort is NOT
+	// short-circuited here: the session must still materialize so the normal
+	// lifecycle finalizer can park it (the drive phase stops immediately).
+	if (signal?.aborted && !options.revivableAbort?.()) {
 		return {
 			index,
 			id,
@@ -2853,6 +2900,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 		softRequestBudget,
 		softRequestBudgetNotice,
 		maxRuntimeMs,
+		revivableAbort: options.revivableAbort,
 	});
 	const progress = monitor.progress;
 	let unsubscribe: (() => void) | null = null;
@@ -2890,7 +2938,10 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 		let aborted = false;
 		let abortReasonText: string | undefined;
 		const checkAbort = () => {
-			if (abortSignal.aborted) {
+			// A revivable (attach pane Ctrl-C) abort must NOT short-circuit the
+			// launch: the session materializes and the normal lifecycle
+			// finalizer parks it. The drive phase below still stops at once.
+			if (abortSignal.aborted && !monitor.isRevivableAbort()) {
 				throw new ToolAbortError();
 			}
 		};
@@ -3453,6 +3504,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					session,
 					aborted,
 					abortKind: monitor.abortKind(),
+					revivableAbort: monitor.isRevivableAbort(),
 					keepAlive: options.keepAlive !== false,
 					isolated: worktree !== undefined,
 					agentIdleTtlMs,
