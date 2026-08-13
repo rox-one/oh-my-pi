@@ -631,7 +631,7 @@ export class AttachServer {
 		const view = connection.view;
 		if (!view) return;
 		this.#send(connection, { kind: "transcript_begin", key: view.key, epoch: view.epoch, seq: ++state.seq });
-		for (const chunk of boundAttachTranscriptItems(entries)) {
+		for (const chunk of this.#boundTranscriptChunks(connection, entries, "transcript_items")) {
 			this.#send(connection, {
 				kind: "transcript_items",
 				key: view.key,
@@ -658,7 +658,7 @@ export class AttachServer {
 	): void {
 		const view = connection.view;
 		if (!view) return;
-		for (const chunk of boundAttachTranscriptItems(entries)) {
+		for (const chunk of this.#boundTranscriptChunks(connection, entries, "transcript_append")) {
 			this.#send(connection, {
 				kind: "transcript_append",
 				key: view.key,
@@ -1025,6 +1025,37 @@ export class AttachServer {
 	// Outbound path
 	// -----------------------------------------------------------------------
 
+	/**
+	 * Bound transcript entries into chunks that each fit a single encoded
+	 * frame. On a protocol-level violation (an entry too large to ever
+	 * transmit, even after bounding) the connection is failed explicitly
+	 * instead of emitting an oversized frame or crashing the sync callback.
+	 */
+	#boundTranscriptChunks(
+		connection: AttachClientConnection,
+		entries: readonly SessionMessageEntry[],
+		kind: "transcript_items" | "transcript_append",
+	): readonly (readonly SessionMessageEntry[])[] {
+		const view = connection.view;
+		if (!view) return [];
+		try {
+			return boundAttachTranscriptItems(entries, { kind, key: view.key, epoch: view.epoch });
+		} catch (error) {
+			logger.warn("attach server cannot fit transcript entries into a frame", {
+				kind,
+				error: error instanceof Error ? error.message : String(error),
+			});
+			this.#reject(connection, {
+				kind: "error",
+				code: "internal",
+				message: "transcript entry exceeds protocol frame limits",
+			});
+			connection.closeReason = "transcript frame overflow";
+			connection.close();
+			return [];
+		}
+	}
+
 	#send(connection: AttachClientConnection, message: AttachServerMessage): void {
 		if (connection.destroyed || connection.socket.destroyed) return;
 		let frame: Buffer;
@@ -1035,6 +1066,16 @@ export class AttachServer {
 				kind: message.kind,
 				error: error instanceof Error ? error.message : String(error),
 			});
+			// Never drop a frame silently: a missing transcript seq makes the
+			// client's epoch unresolvable and reconnects forever. Fail the
+			// connection explicitly instead.
+			this.#reject(connection, {
+				kind: "error",
+				code: "internal",
+				message: "outbound frame exceeds protocol limits",
+			});
+			connection.closeReason = "encode failure";
+			connection.close();
 			return;
 		}
 		if (!connection.queue.enqueue(frame)) {

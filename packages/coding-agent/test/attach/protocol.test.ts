@@ -10,6 +10,7 @@ import {
 	ATTACH_PROGRESS_MAX_OUTPUT_LINES,
 	ATTACH_PROGRESS_MAX_TOOL_LENGTH,
 	ATTACH_TRANSCRIPT_ITEMS_PER_FRAME,
+	ATTACH_TRANSCRIPT_MAX_ENTRY_BYTES,
 	ATTACH_TRANSCRIPT_MAX_STRING_CHARS,
 	AttachBoundedQueue,
 	AttachFrameAccumulator,
@@ -442,15 +443,92 @@ describe("attach message validation", () => {
 });
 
 describe("attach transcript item bounding", () => {
-	it("chunks at ATTACH_TRANSCRIPT_ITEMS_PER_FRAME entries", () => {
+	const FRAME = { kind: "transcript_items" as const, key: KEY, epoch: 1 };
+
+	/** Encoded UTF-8 byte length of a value's JSON serialization. */
+	function encodedBytes(value: unknown): number {
+		return Buffer.byteLength(JSON.stringify(value), "utf8");
+	}
+
+	/** Assistant message whose content is `blockCount` blocks of `text`. */
+	function bigBlocksEntry(
+		id: string,
+		blockCount: number,
+		text = "x".repeat(ATTACH_TRANSCRIPT_MAX_STRING_CHARS),
+	): SessionMessageEntry {
+		return {
+			type: "message",
+			id,
+			parentId: null,
+			timestamp: "2026-08-11T00:00:00.000Z",
+			message: {
+				role: "assistant",
+				content: Array.from({ length: blockCount }, () => ({ type: "text", text })),
+				timestamp: 1,
+			} as unknown as AgentMessage,
+		};
+	}
+
+	function hasLoneSurrogate(value: string): boolean {
+		for (let i = 0; i < value.length; i++) {
+			const code = value.charCodeAt(i);
+			if (code >= 0xd800 && code <= 0xdbff) {
+				const next = value.charCodeAt(i + 1);
+				if (i + 1 >= value.length || next < 0xdc00 || next > 0xdfff) return true;
+				i += 1;
+			} else if (code >= 0xdc00 && code <= 0xdfff) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	it("chunks at ATTACH_TRANSCRIPT_ITEMS_PER_FRAME entries (count remains a maximum)", () => {
 		const items = Array.from({ length: ATTACH_TRANSCRIPT_ITEMS_PER_FRAME + 1 }, (_, i) =>
 			messageEntry(`m${i}`, `text-${i}`),
 		);
-		const chunks = boundAttachTranscriptItems(items);
+		const chunks = boundAttachTranscriptItems(items, FRAME);
 		expect(chunks).toHaveLength(2);
 		expect(chunks[0]).toHaveLength(ATTACH_TRANSCRIPT_ITEMS_PER_FRAME);
 		expect(chunks[1]).toHaveLength(1);
 		expect(chunks[1]![0]!.id).toBe(`m${ATTACH_TRANSCRIPT_ITEMS_PER_FRAME}`);
+		for (const chunk of chunks) {
+			const frame = encodeAttachMessage({ ...FRAME, seq: 1, items: chunk });
+			expect(frame.byteLength).toBeLessThanOrEqual(ATTACH_MAX_FRAME_BYTES);
+		}
+	});
+
+	it("returns no chunks for empty input (begin/end watermark-0 path)", () => {
+		expect(boundAttachTranscriptItems([], FRAME)).toEqual([]);
+	});
+
+	it("splits near-budget entries by encoded frame bytes, not count alone", () => {
+		// Each entry is 23 × 16 KiB ≈ 377 KiB encoded (under the 384 KiB
+		// per-entry cap, so no truncation): three of them (~1.13 MiB) cannot
+		// fit a 1 MiB frame even though the count cap (25) is nowhere near
+		// hit — the chunker must split on bytes.
+		const items = ["m1", "m2", "m3"].map(id => bigBlocksEntry(id, 23));
+		const chunks = boundAttachTranscriptItems(items, FRAME);
+		expect(chunks.map(chunk => chunk.map(entry => entry.id))).toEqual([["m1", "m2"], ["m3"]]);
+		for (const chunk of chunks) {
+			const frame = encodeAttachMessage({ ...FRAME, seq: 1, items: chunk });
+			expect(frame.byteLength).toBeLessThanOrEqual(ATTACH_MAX_FRAME_BYTES);
+		}
+	});
+
+	it("measures multibyte UTF-8 in bytes when packing chunks", () => {
+		// 11 blocks × 16K code units of U+1F600 = ~32 KiB UTF-8 bytes per
+		// block ≈ 361 KiB per entry: three entries exceed the 1 MiB frame in
+		// BYTES while a char-based accountant (≈ 270K chars total) would keep
+		// them in one chunk.
+		const text = "\u{1F600}".repeat(ATTACH_TRANSCRIPT_MAX_STRING_CHARS / 2);
+		const items = ["m1", "m2", "m3"].map(id => bigBlocksEntry(id, 11, text));
+		const chunks = boundAttachTranscriptItems(items, FRAME);
+		expect(chunks.map(chunk => chunk.map(entry => entry.id))).toEqual([["m1", "m2"], ["m3"]]);
+		for (const chunk of chunks) {
+			const frame = encodeAttachMessage({ ...FRAME, seq: 1, items: chunk });
+			expect(frame.byteLength).toBeLessThanOrEqual(ATTACH_MAX_FRAME_BYTES);
+		}
 	});
 
 	it("truncates long string content to the per-entry budget", () => {
@@ -501,13 +579,117 @@ describe("attach transcript item bounding", () => {
 		expect(blocks[2]!.extra![0]!.label.endsWith("[truncated]")).toBe(true);
 	});
 
+	it("never truncates into a surrogate pair", () => {
+		// The slice boundary lands on a high surrogate (first half of
+		// U+1F600): the tail must drop it so the wire round-trip stays
+		// code-point clean instead of a JSON-escaped lone surrogate.
+		const text = "x".repeat(ATTACH_TRANSCRIPT_MAX_STRING_CHARS - 2) + "\u{1F600}".repeat(2);
+		const bounded = boundAttachTranscriptEntry(messageEntry("m1", text));
+		const boundedMessage = bounded.message as { content: string };
+		expect(hasLoneSurrogate(boundedMessage.content)).toBe(false);
+		expect(boundedMessage.content.endsWith("[truncated]")).toBe(true);
+		const decoded = decodeAttachLine(
+			encodeAttachMessage({ ...FRAME, seq: 1, items: [bounded] }).subarray(0, -1),
+		) as Extract<AttachMessage, { kind: "transcript_items" }>;
+		const round = decoded.items[0]!.message as { content: string };
+		expect(hasLoneSurrogate(round.content)).toBe(false);
+	});
+
+	it("enforces the encoded per-entry byte cap for content-array messages", () => {
+		// 26 blocks × 16 KiB ≈ 426 KiB: every string sits at the per-string
+		// char cap, so only a byte-accurate pass can force further truncation.
+		const entry = bigBlocksEntry("m1", 26);
+		expect(encodedBytes(entry)).toBeGreaterThan(ATTACH_TRANSCRIPT_MAX_ENTRY_BYTES);
+		const bounded = boundAttachTranscriptEntry(entry);
+		expect(encodedBytes(bounded)).toBeLessThanOrEqual(ATTACH_TRANSCRIPT_MAX_ENTRY_BYTES);
+		const boundedMessage = bounded.message as { content: Array<{ type: string; text: string }> };
+		expect(boundedMessage.content[0]!.text.length).toBeLessThan(ATTACH_TRANSCRIPT_MAX_STRING_CHARS);
+		// The bounded entry still fits a frame on its own.
+		const frame = encodeAttachMessage({ ...FRAME, seq: 1, items: [bounded] });
+		expect(frame.byteLength).toBeLessThanOrEqual(ATTACH_MAX_FRAME_BYTES);
+	});
+
+	it("enforces the encoded per-entry byte cap for nested-object payloads", () => {
+		// toolCall-style args: strings nested inside objects inside content
+		// blocks — the content char pass does not recurse into nested objects.
+		const message = {
+			role: "assistant",
+			content: [
+				{
+					type: "toolCall",
+					args: {
+						files: Array.from(
+							{ length: 40 },
+							(_, i) => `path-${i}/${"y".repeat(ATTACH_TRANSCRIPT_MAX_STRING_CHARS)}`,
+						),
+					},
+				},
+			],
+			api: "test",
+			provider: "test",
+			model: "test/model",
+			usage: { inputTokens: 0, outputTokens: 0 },
+			stopReason: "end_turn",
+			timestamp: 1,
+		} as unknown as AgentMessage;
+		const entry: SessionMessageEntry = {
+			type: "message",
+			id: "m1",
+			parentId: null,
+			timestamp: "2026-08-11T00:00:00.000Z",
+			message,
+		};
+		expect(encodedBytes(entry)).toBeGreaterThan(ATTACH_TRANSCRIPT_MAX_ENTRY_BYTES);
+		const bounded = boundAttachTranscriptEntry(entry);
+		expect(encodedBytes(bounded)).toBeLessThanOrEqual(ATTACH_TRANSCRIPT_MAX_ENTRY_BYTES);
+	});
+
+	it("enforces the encoded per-entry byte cap for non-content message kinds", () => {
+		const custom = {
+			type: "bashExecution",
+			command: "x".repeat(600_000),
+		} as unknown as AgentMessage;
+		const entry: SessionMessageEntry = {
+			type: "message",
+			id: "m2",
+			parentId: null,
+			timestamp: "2026-08-11T00:00:00.000Z",
+			message: custom,
+		};
+		expect(encodedBytes(entry)).toBeGreaterThan(ATTACH_TRANSCRIPT_MAX_ENTRY_BYTES);
+		const bounded = boundAttachTranscriptEntry(entry);
+		expect(encodedBytes(bounded)).toBeLessThanOrEqual(ATTACH_TRANSCRIPT_MAX_ENTRY_BYTES);
+		const boundedMessage = bounded.message as { command: string };
+		expect(boundedMessage.command.length).toBeLessThan(600_000);
+	});
+
+	it("rejects an entry that cannot fit a frame even after bounding", () => {
+		// Tens of thousands of short strings survive even maximal truncation
+		// (each ≥ 14 chars with the suffix), so the encoded entry stays far
+		// over the frame budget: the chunker must fail rather than emit an
+		// oversized frame.
+		const message = {
+			role: "assistant",
+			content: Array.from({ length: 40_000 }, (_, i) => ({ type: "text", text: `field-${i}-payload` })),
+			timestamp: 1,
+		} as unknown as AgentMessage;
+		const entry: SessionMessageEntry = {
+			type: "message",
+			id: "m1",
+			parentId: null,
+			timestamp: "2026-08-11T00:00:00.000Z",
+			message,
+		};
+		expect(() => boundAttachTranscriptItems([entry], FRAME)).toThrow(AttachProtocolError);
+	});
+
 	it("leaves short content and non-content messages untouched", () => {
 		const short = messageEntry("m1", "hello");
 		expect(boundAttachTranscriptEntry(short)).toBe(short);
 
 		// Messages without a `content` field (custom message kinds) are
-		// returned unchanged — their payloads are already bounded by the
-		// executor.
+		// returned unchanged while they stay under the encoded per-entry
+		// budget — their payloads are already bounded by the executor.
 		const custom = {
 			type: "bashExecution",
 			command: "x".repeat(ATTACH_TRANSCRIPT_MAX_STRING_CHARS * 2),

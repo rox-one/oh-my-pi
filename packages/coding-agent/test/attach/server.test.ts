@@ -3,9 +3,15 @@ import * as fs from "node:fs/promises";
 import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
+import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import { logger } from "@oh-my-pi/pi-utils";
 import type { AttachLiveSessionSource } from "../../src/attach/live-session";
-import { ATTACH_MAX_FRAME_BYTES, type AttachMessage, encodeAttachMessage } from "../../src/attach/protocol";
+import {
+	ATTACH_MAX_FRAME_BYTES,
+	ATTACH_TRANSCRIPT_MAX_STRING_CHARS,
+	type AttachMessage,
+	encodeAttachMessage,
+} from "../../src/attach/protocol";
 import { AttachRegistry } from "../../src/attach/registry";
 import { ATTACH_SOCKET_FILE, ATTACH_TOKEN_FILE, AttachServer } from "../../src/attach/server";
 import type { SessionMessageEntry } from "../../src/session/session-entries";
@@ -121,6 +127,24 @@ function messageEntry(id: string, text: string): SessionMessageEntry {
 		parentId: null,
 		timestamp: "2026-08-11T00:00:00.000Z",
 		message: { role: "user", content: text, timestamp: 1 },
+	};
+}
+
+/** ~377 KiB encoded entry: 23 blocks at the per-string char cap. */
+function bigEntry(id: string): SessionMessageEntry {
+	return {
+		type: "message",
+		id,
+		parentId: null,
+		timestamp: "2026-08-11T00:00:00.000Z",
+		message: {
+			role: "assistant",
+			content: Array.from({ length: 23 }, () => ({
+				type: "text",
+				text: "x".repeat(ATTACH_TRANSCRIPT_MAX_STRING_CHARS),
+			})),
+			timestamp: 1,
+		} as unknown as AgentMessage,
 	};
 }
 
@@ -634,6 +658,72 @@ describe("attach server", () => {
 				{ kind: "transcript_items" }
 			>;
 			expect(items.items.map(item => item.id)).toEqual(["e4"]);
+			client.close();
+		});
+
+		it("streams near-budget entries over contiguous seq without oversized frames", async () => {
+			const { source } = fakeSource([bigEntry("e1"), bigEntry("e2"), bigEntry("e3")]);
+			registry.register(KEY, source, "spawned");
+
+			const client = await TestClient.connect(server.socketFile);
+			client.send(hello(token));
+			await client.waitForMessage(message => message.kind === "hello_ok");
+			client.send({ kind: "view_open", key: KEY });
+			await client.waitForMessage(message => message.kind === "view_open_ok");
+			const end = (await client.waitForMessage(
+				message => message.kind === "transcript_end" && message.watermark === 3,
+			)) as Extract<AttachMessage, { kind: "transcript_end" }>;
+
+			// Three ~377 KiB entries cannot share one 1 MiB frame: the initial
+			// feed arrives as two bounded appends ([e1,e2], [e3]) followed by
+			// a contiguous transcript_end — no dropped seq, no reconnect.
+			const appends = client.messages.filter(
+				(message): message is Extract<AttachMessage, { kind: "transcript_append" }> =>
+					message.kind === "transcript_append",
+			);
+			expect(appends.map(append => append.items.map(item => item.id))).toEqual([["e1", "e2"], ["e3"]]);
+			expect(appends.map(append => append.seq)).toEqual([1, 2]);
+			expect(end.seq).toBe(appends.length + 1);
+			expect(end.watermark).toBe(3);
+			for (const append of appends) {
+				expect(encodeAttachMessage(append).byteLength).toBeLessThanOrEqual(ATTACH_MAX_FRAME_BYTES);
+			}
+			client.close();
+		});
+
+		it("re-snapshots near-budget entries over bounded transcript_items frames", async () => {
+			const { source, setBranch, setBranchId, notify } = fakeSource([messageEntry("e1", "old")]);
+			registry.register(KEY, source);
+			const client = await openPaneView();
+			await client.waitForMessage(message => message.kind === "transcript_end");
+
+			setBranchId("b2");
+			setBranch([bigEntry("e4"), bigEntry("e5"), bigEntry("e6")]);
+			notify();
+
+			const reset = (await client.waitForMessage(message => message.kind === "transcript_reset")) as Extract<
+				AttachMessage,
+				{ kind: "transcript_reset" }
+			>;
+			const begin = (await client.waitForMessage(message => message.kind === "transcript_begin")) as Extract<
+				AttachMessage,
+				{ kind: "transcript_begin" }
+			>;
+			const end = (await client.waitForMessage(
+				message => message.kind === "transcript_end" && message.watermark === 3,
+			)) as Extract<AttachMessage, { kind: "transcript_end" }>;
+			const items = client.messages.filter(
+				(message): message is Extract<AttachMessage, { kind: "transcript_items" }> =>
+					message.kind === "transcript_items",
+			);
+			expect(items.map(frame => frame.items.map(item => item.id))).toEqual([["e4", "e5"], ["e6"]]);
+			expect(begin.seq).toBe(reset.seq + 1);
+			expect(items.map(frame => frame.seq)).toEqual([begin.seq + 1, begin.seq + 2]);
+			expect(end.seq).toBe(begin.seq + 3);
+			expect(end.watermark).toBe(3);
+			for (const frame of items) {
+				expect(encodeAttachMessage(frame).byteLength).toBeLessThanOrEqual(ATTACH_MAX_FRAME_BYTES);
+			}
 			client.close();
 		});
 

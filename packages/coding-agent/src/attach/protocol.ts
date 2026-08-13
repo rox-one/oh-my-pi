@@ -26,9 +26,10 @@
  * ------------------------
  * - Frames are bounded: `ATTACH_MAX_FRAME_BYTES` (1 MiB) per line. The decoder
  *   and `AttachFrameAccumulator` fail fast on oversized frames instead of
- *   buffering without bound. Transcript items are bounded per entry before
- *   encoding (see `boundAttachTranscriptItems`) so a full snapshot always
- *   fits within bounded frames.
+ *   buffering without bound. Transcript entries are byte-bounded per entry and
+ *   chunked by the encoded frame byte budget (see `boundAttachTranscriptItems`)
+ *   so every generated `transcript_items` / `transcript_append` frame fits
+ *   within a bounded frame.
  * - Writes go through a bounded queue (`AttachBoundedQueue`): when a slow
  *   client pushes the queue past its high-water mark the server drops the
  *   connection rather than buffering unboundedly. `detach`/disconnect never
@@ -146,13 +147,14 @@ export const ATTACH_PROGRESS_MAX_OUTPUT_LINES = 3;
 /** Max characters per `outputTail` line in a progress event. */
 export const ATTACH_PROGRESS_MAX_LINE_LENGTH = 100;
 
-/** Transcript entries per `transcript_items` frame. */
+/** Maximum transcript entries per frame; chunks also split on the encoded byte budget. */
 export const ATTACH_TRANSCRIPT_ITEMS_PER_FRAME = 25;
 
 /**
- * Per-entry transcript serialization budget. Entries whose encoded size
- * exceeds this are truncated (see {@link boundAttachTranscriptItems}) so a
- * full snapshot always fits bounded frames.
+ * Per-entry transcript serialization budget, enforced on the ENCODED entry
+ * (JSON + UTF-8 bytes, see {@link boundAttachTranscriptEntry}). Entries that
+ * exceed it are truncated, so a single entry always fits a frame alone and
+ * byte-based chunking can never produce an oversized `transcript_items` frame.
  */
 export const ATTACH_TRANSCRIPT_MAX_ENTRY_BYTES = 384 * 1024;
 
@@ -1359,48 +1361,206 @@ function expectEvent(value: unknown): AttachEvent {
 
 /**
  * Bound a transcript entry for the wire: long strings inside the message are
- * truncated to `ATTACH_TRANSCRIPT_MAX_STRING_CHARS` and the encoded entry is
- * kept under `ATTACH_TRANSCRIPT_MAX_ENTRY_BYTES`. Applied before encoding so
- * snapshot chunks can never exceed their frame budget. Mutates nothing —
- * returns a new entry when truncation was needed.
+ * truncated to `ATTACH_TRANSCRIPT_MAX_STRING_CHARS` and, when the encoded
+ * entry still exceeds `ATTACH_TRANSCRIPT_MAX_ENTRY_BYTES`, every string in
+ * the message is shrunk until the encoded entry fits the per-entry budget.
+ * Applied to every message shape (content arrays, nested objects, and
+ * non-content kinds such as `bashExecution`). Mutates nothing — returns the
+ * same entry when no truncation was needed, otherwise a new entry.
  */
 export function boundAttachTranscriptEntry(entry: SessionMessageEntry): SessionMessageEntry {
-	const bounded = boundMessageForWire(entry.message);
-	if (bounded === entry.message) return entry;
-	return { ...entry, message: bounded };
+	return boundAttachTranscriptEntryWithSize(entry).entry;
 }
 
 /**
- * Bound an array of transcript entries for the wire, splitting into bounded
- * chunks of at most `ATTACH_TRANSCRIPT_ITEMS_PER_FRAME` entries.
+ * Bound one entry and measure its encoded JSON byte length (UTF-8, after
+ * `JSON.stringify`, so escape inflation and multibyte text count) in a single
+ * pass — byte-based chunking reuses the measurement instead of re-serializing.
+ */
+function boundAttachTranscriptEntryWithSize(entry: SessionMessageEntry): { entry: SessionMessageEntry; bytes: number } {
+	const boundedMessage = boundMessageForWire(entry.message);
+	const candidate = boundedMessage === entry.message ? entry : { ...entry, message: boundedMessage };
+	const bytes = encodedAttachJsonBytes(candidate);
+	if (bytes <= ATTACH_TRANSCRIPT_MAX_ENTRY_BYTES) {
+		return { entry: candidate, bytes };
+	}
+	// The char pass only bounds strings inside `content`, leaves short content
+	// untouched, and skips non-content messages entirely, so many bounded
+	// strings, nested objects, or a non-content message can still exceed the
+	// byte budget. Shrink every string in the message, halving the per-string
+	// cap, until the encoded entry fits.
+	return boundEntryToBudget(entry, ATTACH_TRANSCRIPT_MAX_ENTRY_BYTES);
+}
+
+/** The frame a chunk will be carried in: its kind and fixed fields. */
+export interface AttachTranscriptChunkFrame {
+	/** Frame kind; `transcript_append` frames also carry a `watermark` field. */
+	readonly kind: "transcript_items" | "transcript_append";
+	readonly key: AttachWorkerKey;
+	readonly epoch: number;
+}
+
+/**
+ * Bound an array of transcript entries for the wire, splitting into chunks
+ * that each fit a single encoded frame. Chunks split on the ENCODED byte
+ * budget (`ATTACH_MAX_FRAME_BYTES`, including the frame wrapper
+ * kind/key/epoch/seq, per-entry JSON, separators, and the trailing newline),
+ * with `ATTACH_TRANSCRIPT_ITEMS_PER_FRAME` as a maximum count. Entry order is
+ * preserved across chunks and every returned chunk encodes within the frame
+ * budget. Throws `AttachProtocolError('frame_too_large')` when a single entry
+ * cannot fit a frame even after bounding — such an entry can never be
+ * transmitted, so the caller must fail the connection rather than emit an
+ * oversized frame.
  */
 export function boundAttachTranscriptItems(
 	items: readonly SessionMessageEntry[],
+	frame: AttachTranscriptChunkFrame,
 ): readonly (readonly SessionMessageEntry[])[] {
+	const shellBytes = attachTranscriptShellBytes(frame);
 	const chunks: SessionMessageEntry[][] = [];
+	let chunk: SessionMessageEntry[] | null = null;
+	let chunkBytes = 0;
 	for (const item of items) {
-		const bounded = boundAttachTranscriptEntry(item);
-		if (chunks.length === 0 || chunks[chunks.length - 1]!.length >= ATTACH_TRANSCRIPT_ITEMS_PER_FRAME) {
-			chunks.push([bounded]);
-		} else {
-			chunks[chunks.length - 1]!.push(bounded);
+		const { entry, bytes } = boundAttachTranscriptEntryWithSize(item);
+		// One byte per entry reserves the JSON comma separator; the leading
+		// entry's unused comma keeps the estimate conservative.
+		const added = bytes + 1;
+		if (
+			chunk !== null &&
+			(chunk.length >= ATTACH_TRANSCRIPT_ITEMS_PER_FRAME || chunkBytes + added > ATTACH_MAX_FRAME_BYTES)
+		) {
+			chunks.push(chunk);
+			chunk = null;
 		}
+		if (chunk === null) {
+			if (shellBytes + added > ATTACH_MAX_FRAME_BYTES) {
+				throw new AttachProtocolError(
+					"frame_too_large",
+					`transcript entry encodes to ${bytes} bytes and cannot fit a single frame`,
+				);
+			}
+			chunk = [];
+			chunkBytes = shellBytes;
+		}
+		chunk.push(entry);
+		chunkBytes += added;
 	}
+	if (chunk !== null) chunks.push(chunk);
 	return chunks;
+}
+
+/**
+ * Encoded size of a transcript chunk frame with an empty `items` array: the
+ * wrapper fields (kind/key/epoch/seq, plus watermark on append frames), the
+ * array brackets, and the trailing newline. `seq` and `watermark` are
+ * budgeted at `Number.MAX_SAFE_INTEGER` (16 digits), which is at least as
+ * wide as any real counter the server can produce (`++seq` on an exact
+ * integer), so the estimated frame is an upper bound on the real frame.
+ */
+function attachTranscriptShellBytes(frame: AttachTranscriptChunkFrame): number {
+	const shell: AttachServerMessage =
+		frame.kind === "transcript_append"
+			? {
+					kind: "transcript_append",
+					key: frame.key,
+					epoch: frame.epoch,
+					seq: Number.MAX_SAFE_INTEGER,
+					items: [],
+					watermark: Number.MAX_SAFE_INTEGER,
+				}
+			: {
+					kind: "transcript_items",
+					key: frame.key,
+					epoch: frame.epoch,
+					seq: Number.MAX_SAFE_INTEGER,
+					items: [],
+				};
+	return Buffer.byteLength(JSON.stringify(shell), "utf8") + 1;
+}
+
+/** Exact UTF-8 byte length of a value's JSON serialization (escape-inflated). */
+function encodedAttachJsonBytes(value: unknown): number {
+	return Buffer.byteLength(JSON.stringify(value), "utf8");
+}
+
+/**
+ * Shrink every string in a message (recursively, all shapes) until the whole
+ * entry encodes within `budget`, halving the per-string character cap each
+ * pass. Bounded by `ATTACH_TRANSCRIPT_MAX_STRING_CHARS` down to 1 (≤ 15
+ * passes), so a realistic message always converges.
+ */
+function boundEntryToBudget(entry: SessionMessageEntry, budget: number): { entry: SessionMessageEntry; bytes: number } {
+	let cap = ATTACH_TRANSCRIPT_MAX_STRING_CHARS;
+	let candidate: SessionMessageEntry = { ...entry, message: truncateAllStrings(entry.message, cap) as AgentMessage };
+	let bytes = encodedAttachJsonBytes(candidate);
+	while (bytes > budget && cap > 1) {
+		cap = Math.ceil(cap / 2);
+		candidate = { ...entry, message: truncateAllStrings(candidate.message, cap) as AgentMessage };
+		bytes = encodedAttachJsonBytes(candidate);
+	}
+	return { entry: candidate, bytes };
+}
+
+/**
+ * Deep copy of a JSON-ish value with every string truncated to at most `max`
+ * characters (code-point safe). Values that serialize themselves (`toJSON`)
+ * are left untouched.
+ */
+function truncateAllStrings(value: unknown, max: number): unknown {
+	if (typeof value === "string") {
+		return value.length <= max ? value : `${boundStringSlice(value, max)}\n…[truncated]`;
+	}
+	if (Array.isArray(value)) {
+		let mutated: unknown[] | null = null;
+		for (let i = 0; i < value.length; i++) {
+			const next = truncateAllStrings(value[i], max);
+			if (next !== value[i]) {
+				if (mutated === null) mutated = value.slice();
+				mutated[i] = next;
+			}
+		}
+		return mutated ?? value;
+	}
+	if (typeof value === "object" && value !== null) {
+		if (typeof (value as { toJSON?: unknown }).toJSON === "function") return value;
+		const record = value as Record<string, unknown>;
+		let mutated: Record<string, unknown> | null = null;
+		for (const key of Object.keys(record)) {
+			const next = truncateAllStrings(record[key], max);
+			if (next !== record[key]) {
+				if (mutated === null) mutated = { ...record };
+				mutated[key] = next;
+			}
+		}
+		return mutated ?? value;
+	}
+	return value;
+}
+
+/** `value.slice(0, max)` without ever splitting a surrogate pair (a lone high
+ *  surrogate would serialize as a `\udXXX` escape and decode as a broken code
+ *  point). */
+function boundStringSlice(value: string, max: number): string {
+	if (value.length <= max) return value;
+	const sliced = value.slice(0, max);
+	const last = sliced.charCodeAt(sliced.length - 1);
+	return last >= 0xd800 && last <= 0xdbff ? sliced.slice(0, -1) : sliced;
 }
 
 /**
  * Truncate long strings in a message to keep the encoded entry bounded.
  * Non-content message kinds (bashExecution, pythonExecution, …) carry their
  * payload in role-specific fields and are returned untouched — their strings
- * are already bounded by the executor.
+ * are already bounded by the executor. The per-entry ENCODED byte budget is
+ * enforced separately by {@link boundAttachTranscriptEntry}, which falls back
+ * to {@link truncateAllStrings} over every field when this pass is not enough.
  */
 function boundMessageForWire(message: AgentMessage): AgentMessage {
 	if (!("content" in message)) return message;
 	const max = ATTACH_TRANSCRIPT_MAX_STRING_CHARS;
 
 	const boundString = (value: string): string => {
-		return value.length <= max ? value : `${value.slice(0, max)}\n…[truncated]`;
+		return value.length <= max ? value : `${boundStringSlice(value, max)}\n…[truncated]`;
 	};
 
 	const boundBlocks = (blocks: readonly unknown[]): readonly unknown[] | null => {
