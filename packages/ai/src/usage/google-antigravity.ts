@@ -66,7 +66,11 @@ interface AntigravityQuotaSummaryGroup {
 
 interface AntigravityQuotaSummaryResponse {
 	groups?: AntigravityQuotaSummaryGroup[];
-	response?: { groups?: AntigravityQuotaSummaryGroup[] };
+	buckets?: AntigravityQuotaSummaryBucket[];
+	response?: {
+		groups?: AntigravityQuotaSummaryGroup[];
+		buckets?: AntigravityQuotaSummaryBucket[];
+	};
 }
 
 const DEFAULT_ENDPOINT = "https://daily-cloudcode-pa.googleapis.com";
@@ -264,7 +268,11 @@ function normalizeQuotaInfos(info: AntigravityModelInfo): AntigravityQuotaInfo[]
 }
 
 function quotaSummaryGroups(data: AntigravityQuotaSummaryResponse): AntigravityQuotaSummaryGroup[] {
-	return data.response?.groups ?? data.groups ?? [];
+	const groups = data.response?.groups ?? data.groups;
+	if (groups && groups.length > 0) return groups;
+	const buckets = data.response?.buckets ?? data.buckets;
+	if (buckets && buckets.length > 0) return [{ buckets }];
+	return [];
 }
 
 function quotaSummaryRemainingFraction(bucket: AntigravityQuotaSummaryBucket): number | undefined {

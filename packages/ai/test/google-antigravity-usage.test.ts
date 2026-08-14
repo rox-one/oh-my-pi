@@ -138,6 +138,58 @@ describe("antigravity usage provider", () => {
 		expect(thirdPartyWeekly?.label).toBe("Claude and GPT Models");
 	});
 
+	it("uses flat top-level quota summary buckets", async () => {
+		const now = Date.now();
+		const urls: string[] = [];
+		const payload = {
+			buckets: [
+				{
+					bucketId: "gemini-weekly",
+					displayName: "Weekly Limit Remaining",
+					remainingFraction: 0.4,
+					resetTime: new Date(now + 5 * 24 * 3600_000).toISOString(),
+				},
+				{
+					bucketId: "gemini-5h",
+					displayName: "Five Hour Limit Remaining",
+					remainingFraction: 0.2,
+					resetTime: new Date(now + 4 * 3600_000).toISOString(),
+				},
+				{ bucketId: "3p-weekly", remainingFraction: 0.7 },
+				{ bucketId: "3p-5h", remainingFraction: 0.5 },
+			],
+		};
+		const fetchImpl: FetchImpl = async input => {
+			urls.push(String(input));
+			return new Response(JSON.stringify(payload), {
+				status: 200,
+				headers: { "content-type": "application/json" },
+			});
+		};
+
+		const report = await antigravityUsageProvider.fetchUsage!(
+			{ provider: "google-antigravity", credential: makeCredential(), signal: undefined },
+			makeCtx(fetchImpl),
+		);
+
+		expect(urls).toHaveLength(1);
+		expect(urls[0]).toEndWith("/v1internal:retrieveUserQuotaSummary");
+		expect(report?.metadata?.usageSource).toBe("retrieveUserQuotaSummary");
+		expect(report?.limits).toHaveLength(4);
+		const geminiWeekly = report?.limits.find(limit => limit.id === "google-antigravity:google:default:weekly");
+		const geminiFiveHour = report?.limits.find(limit => limit.id === "google-antigravity:google:default:5h");
+		const thirdPartyWeekly = report?.limits.find(
+			limit => limit.id === "google-antigravity:third-party:default:weekly",
+		);
+		const thirdPartyFiveHour = report?.limits.find(limit => limit.id === "google-antigravity:third-party:default:5h");
+		expect(geminiWeekly?.label).toBe("Gemini Models");
+		expect(geminiWeekly?.amount.remainingFraction).toBe(0.4);
+		expect(geminiFiveHour?.amount.remainingFraction).toBe(0.2);
+		expect(thirdPartyWeekly?.label).toBe("Claude and GPT Models");
+		expect(thirdPartyWeekly?.amount.remainingFraction).toBe(0.7);
+		expect(thirdPartyFiveHour?.amount.remainingFraction).toBe(0.5);
+	});
+
 	it("falls back to model quotas when the summary response is malformed", async () => {
 		let requestCount = 0;
 		const payload = { models: { gemini: makeApiModel("Gemini", { remainingFraction: 0.6 }) } };
