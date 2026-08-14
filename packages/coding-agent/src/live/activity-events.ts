@@ -1,3 +1,4 @@
+import { isRecord } from "@oh-my-pi/pi-utils";
 import type { LivePhase } from "./visualizer";
 
 /** Shared EventBus channel for privacy-bounded realtime voice activity. */
@@ -29,18 +30,17 @@ export interface LiveActivityEvent {
 
 /** Narrow an unknown shared-bus payload to the public live activity contract. */
 export function isLiveActivityEvent(value: unknown): value is LiveActivityEvent {
-	if (!value || typeof value !== "object") return false;
-	const candidate = value as Partial<LiveActivityEvent>;
+	if (!isRecord(value)) return false;
 	return (
-		typeof candidate.phase === "string" &&
-		Object.hasOwn(LIVE_ACTIVITY_PHASES, candidate.phase) &&
-		typeof candidate.inputLevel === "number" &&
-		Number.isFinite(candidate.inputLevel) &&
-		candidate.inputLevel >= 0 &&
-		candidate.inputLevel <= 1 &&
-		typeof candidate.outputLevel === "number" &&
-		Number.isFinite(candidate.outputLevel) &&
-		candidate.outputLevel >= 0 &&
-		candidate.outputLevel <= 1
+		typeof value.phase === "string" &&
+		Object.hasOwn(LIVE_ACTIVITY_PHASES, value.phase) &&
+		typeof value.inputLevel === "number" &&
+		Number.isFinite(value.inputLevel) &&
+		value.inputLevel >= 0 &&
+		value.inputLevel <= 1 &&
+		typeof value.outputLevel === "number" &&
+		Number.isFinite(value.outputLevel) &&
+		value.outputLevel >= 0 &&
+		value.outputLevel <= 1
 	);
 }

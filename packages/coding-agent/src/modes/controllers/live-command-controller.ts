@@ -272,7 +272,7 @@ export class LiveCommandController {
 			outputLevel: this.#outputLevel,
 		};
 		this.#lastLiveActivity = next;
-		eventBus.emit(LIVE_ACTIVITY_EVENT_CHANNEL, next);
+		eventBus.emitLatest(LIVE_ACTIVITY_EVENT_CHANNEL, next);
 	}
 
 	#restoreEditor(): void {

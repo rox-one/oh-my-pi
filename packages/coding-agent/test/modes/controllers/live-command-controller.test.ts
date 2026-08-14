@@ -99,6 +99,8 @@ describe("LiveCommandController", () => {
 			activity.push(value);
 		});
 		expect(isLiveActivityEvent({ phase: "listening", inputLevel: 2, outputLevel: 0 })).toBe(false);
+		const arrayPayload = Object.assign([], { phase: "listening", inputLevel: 0, outputLevel: 0 });
+		expect(isLiveActivityEvent(arrayPayload)).toBe(false);
 		let callbacks: LiveSessionCallbacks | undefined;
 		const controller = new LiveCommandController(ctx, options => {
 			callbacks = options.callbacks;
@@ -147,6 +149,54 @@ describe("LiveCommandController", () => {
 			}
 		} finally {
 			unsubscribe();
+			await controller.stop();
+		}
+	});
+
+	it("coalesces changing levels while an extension observer is busy", async () => {
+		vi.useFakeTimers();
+		const { ctx, eventBus } = createContext();
+		const releaseObserver = Promise.withResolvers<void>();
+		const receivedLatest = Promise.withResolvers<void>();
+		const activity: LiveActivityEvent[] = [];
+		let first = true;
+		const unsubscribe = eventBus.on(LIVE_ACTIVITY_EVENT_CHANNEL, async value => {
+			if (!isLiveActivityEvent(value)) throw new Error("invalid live activity event");
+			activity.push(value);
+			if (first) {
+				first = false;
+				await releaseObserver.promise;
+			} else {
+				receivedLatest.resolve();
+			}
+		});
+		let callbacks: LiveSessionCallbacks | undefined;
+		const controller = new LiveCommandController(ctx, options => {
+			callbacks = options.callbacks;
+			const session = new LiveSessionController(options);
+			vi.spyOn(session, "start").mockResolvedValue();
+			vi.spyOn(session, "stop").mockResolvedValue();
+			return session;
+		});
+
+		try {
+			await controller.handleCommand();
+			if (!callbacks) throw new Error("expected live session callbacks");
+			callbacks.onLevels(0.1, 0.2);
+			vi.advanceTimersByTime(80);
+			callbacks.onLevels(0.3, 0.4);
+			vi.advanceTimersByTime(80);
+
+			expect(activity).toEqual([{ phase: "connecting", inputLevel: 0, outputLevel: 0 }]);
+			releaseObserver.resolve();
+			await receivedLatest.promise;
+			expect(activity).toEqual([
+				{ phase: "connecting", inputLevel: 0, outputLevel: 0 },
+				{ phase: "connecting", inputLevel: 0.3, outputLevel: 0.4 },
+			]);
+		} finally {
+			unsubscribe();
+			releaseObserver.resolve();
 			await controller.stop();
 		}
 	});

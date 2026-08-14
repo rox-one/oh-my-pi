@@ -35,6 +35,7 @@ export default function liveIndicator(pi: ExtensionAPI): void {
 - Phase changes publish immediately.
 - Level changes are coalesced onto the live visualizer's 80 ms animation cadence; consumers must not expect one event per audio frame.
 - Unchanged snapshots are suppressed.
+- Delivery is serialized independently per observer. While a handler is busy, intermediate snapshots are replaced by one latest pending snapshot, preventing concurrent callbacks and stale backlogs.
 - Session teardown publishes `inactive` with both levels set to zero.
 - Delivery is local and best-effort through `ExtensionAPI.events`; consumers should render the latest event rather than treating the stream as an audit log.
 
