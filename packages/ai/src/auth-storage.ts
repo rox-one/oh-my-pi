@@ -69,6 +69,7 @@ import { syntheticUsageProvider } from "./usage/synthetic";
 import { umansUsageProvider } from "./usage/umans";
 import { xaiOauthUsageProvider } from "./usage/xai-oauth";
 import { zaiRankingStrategy, zaiUsageProvider } from "./usage/zai";
+import { zhipuRankingStrategy, zhipuUsageProvider } from "./usage/zhipu";
 
 export {
 	isSqliteBusyError,
@@ -670,6 +671,7 @@ const DEFAULT_USAGE_PROVIDERS: UsageProvider[] = [
 	cursorUsageProvider,
 	syntheticUsageProvider,
 	xaiOauthUsageProvider,
+	zhipuUsageProvider,
 ];
 
 const DEFAULT_USAGE_PROVIDER_MAP = new Map<Provider, UsageProvider>(
@@ -1111,6 +1113,7 @@ const DEFAULT_RANKING_STRATEGIES = new Map<Provider, CredentialRankingStrategy>(
 	["google-antigravity", antigravityRankingStrategy],
 	["kimi-code", kimiRankingStrategy],
 	["zai", zaiRankingStrategy],
+	["zhipu-coding-plan", zhipuRankingStrategy],
 	["opencode-go", opencodeGoRankingStrategy],
 ]);
 
