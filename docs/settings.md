@@ -628,23 +628,23 @@ workspace:
   identifier: path           # path, git-remote, git-root
 ```
 
-| Key | Type | Default | Notes |
-|---|---|---|---|
-| `contextPromotion.enabled` | boolean | `true` | Promote relevant earlier context. |
-| `compaction.enabled` | boolean | `true` | Automatic conversation compaction. |
-| `compaction.midTurnEnabled` | boolean | `true` | Check thresholds at safe mid-turn tool-loop boundaries before the next provider request. |
-| `compaction.strategy` | enum | `snapcompact` | `context-full`, `handoff`, `shake`, `snapcompact`, `off`. |
-| `compaction.thresholdPercent` | number | `-1` | Percent-of-context trigger; `-1` = reserve-based default. |
-| `compaction.thresholdTokens` | number | `-1` | Fixed token trigger when `> 0`. |
-| `compaction.reserveTokens` | number | `16384` | Tokens reserved for the next turn. |
-| `compaction.keepRecentTokens` | number | `20000` | Recent tokens always preserved. |
-| `compaction.remoteEnabled` | boolean | `true` | Allow remote compaction service. |
-| `compaction.autoContinue` | boolean | `true` | Continue automatically after compaction. |
-| `memory.backend` | enum | `off` | `off`, `local`, `hindsight`, `mnemopi`. Each backend has its own `hindsight.*` / `mnemopi.*` / `memories.*` tuning keys. |
-| `workspace.identifier` | enum | `path` | Controls how default session directories and per-project memory banks are keyed. `path` uses the canonical working directory; `git-remote` uses `origin` or the first configured remote URL; `git-root` uses the repository's first reachable commit. Git modes fall back to `path` outside Git, in shallow repositories for `git-root`, or when `git` is unavailable. |
-| `autolearn.enabled` | boolean | `false` | Experimental: after the agent stops, nudge it to capture lessons to memory and create/enhance isolated managed skills under `~/.omp/agent/managed-skills`. Enables the `manage_skill` tool (and `learn` when a memory backend is active). |
-| `autolearn.autoContinue` | boolean | `false` | When `autolearn.enabled`, auto-run one capture turn at stop (uses extra tokens). Off = a passive reminder rides your next turn. |
-| `autolearn.minToolCalls` | number | `5` | Only nudge after a turn that used at least this many tools. |
+| Key                           | Type    | Default       | Notes                                                                                                                                                                                                                                     |
+| ----------------------------- | ------- | ------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `contextPromotion.enabled`    | boolean | `false`       | Promote to the active model's explicit `contextPromotionTarget` on context overflow.                                                                                                                                                      |
+| `compaction.enabled`          | boolean | `true`        | Automatic conversation compaction.                                                                                                                                                                                                        |
+| `compaction.midTurnEnabled`   | boolean | `true`        | Check thresholds at safe mid-turn tool-loop boundaries before the next provider request.                                                                                                                                                  |
+| `compaction.strategy`         | enum    | `snapcompact` | `context-full`, `handoff`, `shake`, `snapcompact`, `off`.                                                                                                                                                                                 |
+| `compaction.thresholdPercent` | number  | `-1`          | Percent-of-context trigger; `-1` = reserve-based default.                                                                                                                                                                                 |
+| `compaction.thresholdTokens`  | number  | `-1`          | Fixed token trigger when `> 0`.                                                                                                                                                                                                           |
+| `compaction.reserveTokens`    | number  | _(unset)_     | Absolute reserve floor. When unset, the effective reserve is the larger of `16384` and 15% of the context window; if that default would leave no practical small-window budget, it falls back to the 15% reserve.                         |
+| `compaction.keepRecentTokens` | number  | `20000`       | Recent tokens always preserved.                                                                                                                                                                                                           |
+| `compaction.remoteEnabled`    | boolean | `true`        | Allow remote compaction service.                                                                                                                                                                                                          |
+| `compaction.autoContinue`     | boolean | `true`        | Continue automatically after compaction.                                                                                                                                                                                                  |
+| `memory.backend`              | enum    | `off`         | `off`, `local`, `hindsight`, `mnemopi`. Each backend has its own `hindsight.*` / `mnemopi.*` / `memories.*` tuning keys.                                                                                                                  |
+| `autolearn.enabled`           | boolean | `false`       | Experimental: after the agent stops, nudge it to capture lessons to memory and create/enhance isolated managed skills under `~/.omp/agent/managed-skills`. Enables the `manage_skill` tool (and `learn` when a memory backend is active). |
+| `autolearn.autoContinue`      | boolean | `false`       | When `autolearn.enabled`, auto-run one capture turn at stop (uses extra tokens). Off = a passive reminder rides your next turn.                                                                                                           |
+| `autolearn.minToolCalls`      | number  | `5`           | Only nudge after a turn that used at least this many tools.
+| `autolearn.skillLocation`     | enum    | `global`      | Where `learn`/`manage_skill` write skills: `global` (`~/.omp/agent/managed-skills`, loads everywhere) or `project` (`<repo>/.omp/skills` at the primary checkout — only sessions in that repo, including linked worktrees, load them). |                                                                                                                                                                               |
 
 `compaction` has additional tuning keys (idle compaction, supersede/drop heuristics) visible in `omp config list`. See [Compaction](./compaction.md) for the full strategy reference.
 

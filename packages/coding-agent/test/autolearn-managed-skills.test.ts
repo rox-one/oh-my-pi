@@ -6,6 +6,8 @@ import {
 	deleteManagedSkill,
 	getManagedSkillsDir,
 	MAX_MANAGED_SKILL_BYTES,
+	resolveProjectSkillsDir,
+	resolveSkillWriteRoot,
 	sanitizeSkillName,
 	toSkillFrontmatter,
 	writeManagedSkill,
@@ -251,5 +253,103 @@ describe("managed-skills primitives", () => {
 				await removeWithRetries(outside);
 			}
 		});
+	});
+});
+
+describe("project skill location", () => {
+	// Managed-dir calls must hit a sandbox: without this mock the default
+	// agentDir is the real ~/.omp/agent.
+	let tempHome: string;
+	let originalAgentDir: string;
+	beforeEach(async () => {
+		originalAgentDir = getAgentDir();
+		tempHome = await fs.mkdtemp(path.join(os.tmpdir(), "omp-managed-skills-proj-"));
+		spyOn(os, "homedir").mockReturnValue(tempHome);
+		setAgentDir(path.join(tempHome, ".omp", "agent"));
+	});
+	afterEach(async () => {
+		spyOn(os, "homedir").mockRestore();
+		setAgentDir(originalAgentDir);
+		await removeWithRetries(tempHome);
+	});
+
+	const git = (cwd: string, args: string[]) => {
+		const proc = Bun.spawnSync(["git", ...args], { cwd, stdout: "pipe", stderr: "pipe" });
+		if (proc.exitCode !== 0) throw new Error(`git ${args[0]} failed: ${proc.stderr.toString()}`);
+		return proc.stdout.toString().trim();
+	};
+	const initRepo = async (dir: string) => {
+		await fs.mkdir(dir, { recursive: true });
+		git(dir, ["init", "-b", "main"]);
+		git(dir, ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "--allow-empty", "-m", "init"]);
+	};
+
+	it("resolveProjectSkillsDir falls back to cwd outside a repository", async () => {
+		const dir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "omp-projskill-norepo-")));
+		try {
+			expect(await resolveProjectSkillsDir(dir)).toBe(path.join(dir, ".omp", "skills"));
+		} finally {
+			await removeWithRetries(dir);
+		}
+	});
+
+	it("resolveProjectSkillsDir anchors at the primary checkout from a linked worktree", async () => {
+		// realpath up front: git reports resolved paths, so keep both sides comparable.
+		const base = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "omp-projskill-")));
+		const main = path.join(base, "repo");
+		const worktree = path.join(base, "repo-wt");
+		try {
+			await initRepo(main);
+			git(main, ["worktree", "add", worktree, "-b", "wt"]);
+			expect(await resolveProjectSkillsDir(worktree)).toBe(path.join(main, ".omp", "skills"));
+			expect(await resolveProjectSkillsDir(main)).toBe(path.join(main, ".omp", "skills"));
+		} finally {
+			await removeWithRetries(base);
+		}
+	});
+
+	it("writeManagedSkill/deleteManagedSkill honor an explicit rootDir", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "omp-projskill-root-"));
+		try {
+			const { path: file } = await writeManagedSkill({
+				action: "create",
+				name: "proj-skill",
+				description: "d",
+				body: "b",
+				rootDir: root,
+			});
+			expect(file).toBe(path.join(root, "proj-skill", "SKILL.md"));
+			expect(await Bun.file(file).exists()).toBe(true);
+			expect(await Bun.file(path.join(getManagedSkillsDir(), "proj-skill", "SKILL.md")).exists()).toBe(false);
+
+			await deleteManagedSkill("proj-skill", root);
+			expect(await Bun.file(file).exists()).toBe(false);
+		} finally {
+			await removeWithRetries(root);
+		}
+	});
+
+	it("resolveSkillWriteRoot returns undefined for global and the project dir for project", async () => {
+		const dir = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "omp-projskill-scope-")));
+		try {
+			await initRepo(dir);
+			expect(await resolveSkillWriteRoot(dir, "global", "whatever")).toBeUndefined();
+			const projectRoot = path.join(dir, ".omp", "skills");
+			expect(await resolveSkillWriteRoot(dir, "project", "new-skill")).toBe(projectRoot);
+			// A skill that only exists globally is updated in place, not relocated.
+			await writeManagedSkill({ action: "create", name: "global-only", description: "d", body: "b" });
+			expect(await resolveSkillWriteRoot(dir, "project", "global-only")).toBeUndefined();
+			// A skill already in the project dir stays there.
+			await writeManagedSkill({
+				action: "create",
+				name: "proj-here",
+				description: "d",
+				body: "b",
+				rootDir: projectRoot,
+			});
+			expect(await resolveSkillWriteRoot(dir, "project", "proj-here")).toBe(projectRoot);
+		} finally {
+			await removeWithRetries(dir);
+		}
 	});
 });

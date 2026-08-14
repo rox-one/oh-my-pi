@@ -3067,6 +3067,29 @@ export const SETTINGS_SCHEMA = {
 	},
 	// Config-file-only knob (numbers without `options` are hidden from the UI).
 	"autolearn.minToolCalls": { type: "number", default: 5 },
+	// Where `learn`/`manage_skill` mint managed skills: the global
+	// managed-skills dir, or the project's `.omp/skills` (repo-scoped loading).
+	"autolearn.skillLocation": {
+		type: "enum",
+		values: ["global", "project"] as const,
+		default: "global",
+		ui: {
+			tab: "memory",
+			group: "Auto-Learn",
+			label: "Skill location",
+			description:
+				"Where auto-learned skills are written: global (every session) or the project's .omp/skills (only this repo)",
+			options: [
+				{ value: "global", label: "Global", description: "Load in every session (~/.omp/agent/managed-skills)" },
+				{
+					value: "project",
+					label: "Project",
+					description: "Write to <repo>/.omp/skills; only sessions in that repo load them",
+				},
+			],
+			condition: "autolearnActive",
+		},
+	},
 
 	// Mnemopi local SQLite memory backend.
 	"mnemopi.dbPath": {
