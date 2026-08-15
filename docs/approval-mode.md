@@ -81,6 +81,43 @@ Tools can add approval-prompt body lines with `formatApprovalDetails(args)`. The
 - `Reason: <reason>` when the tool decision supplies one
 - tool-specific details such as command, path, code, browser action, or subagent assignment
 
+## Session-scoped approvals
+
+An interactive approval prompt offers two extra options between `Approve` and `Deny`:
+
+- `Approve <tool> Commands for Session` — every later call of that tool skips the prompt.
+- `Approve Similar <tool> Commands for Session` — records the approved call, then compares later calls of that tool against the recorded ones with a small model. A `yes` verdict approves the call silently; anything else prompts again with the same options.
+
+What is recorded is the tool's own approval-prompt detail text (`Command: …`, `Path: …`, `Action: …`), so the classifier compares what you actually saw and approved. At most 10 subjects per tool are kept, newest first, each capped at 4,096 characters. Approving the whole tool discards its recorded subjects, since it subsumes them.
+
+Both grants live in memory only. Nothing is written to config or session files, and no grant is shared between processes or sessions.
+
+### Grant lifetime
+
+A grant belongs to one session id:
+
+- It is released on `/new`, `/reset`, fork, rewind/branch, and session switch, and on process exit. After any of those the next call of the tool prompts again — a live grant disappearing after a fork or rewind is expected.
+- `/fresh` only rotates provider-facing state, so grants survive it.
+- Subagents run headless in `yolo` with their own session ids, so a parent grant never reaches them.
+
+### What a grant never bypasses
+
+A grant only answers a prompt you were free to answer once. It does not apply to:
+
+- a tool-declared or user `deny` — that denies before any prompt;
+- provider `pendingSafetyChecks` — each pending check must be acknowledged for that call;
+- a tool-demanded prompt (`override: true`), such as `bash` critical patterns and configured `bash.patterns: prompt` rules.
+
+Those calls always prompt, and the two session options are not offered for them at all.
+
+### The similarity classifier
+
+The classifier runs before the prompt is shown, so a `yes` verdict skips it. It is fail-safe in every other case: no recorded subjects, an empty subject, an unparsable answer, a request error, no available model, or a timeout all produce a normal prompt, never an approval. The wait is time-bounded and also ends with the tool call's abort signal.
+
+Choose the backend with `providers.approvalSimilarityModel`: `online` (the default — the `TINY` role from `/models`, else `smol`) or a local on-device model. With the `online` backend, each gated call of a similar-approved tool spends one small-model request.
+
+Non-TUI surfaces receive the same options as plain labels: RPC clients and ACP form elicitation drop the descriptions the TUI shows next to each label.
+
 ## Defining approval on tools
 
 Built-in and custom tools share the same shape:
