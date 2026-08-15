@@ -3,9 +3,11 @@
  *
  * Backs the "Approve <tool> Commands for Session" and "Approve Similar <tool>
  * Commands for Session" approval-prompt options. State is keyed by the session
- * id the approval gate already derives from `sessionManager.getSessionId()`,
- * lives for the process lifetime (or until `clearSessionApprovals`), and is
- * never persisted to settings or session files.
+ * id the approval gate already derives from `sessionManager.getSessionId()`, is
+ * never persisted to settings or session files, and dies with the logical
+ * session: `AgentSession` releases the entry at every conversation boundary
+ * (`/new`, `/reset`, fork, rewind/branch, session switch) via
+ * `clearSessionApprovals`, so nothing survives the session that granted it.
  */
 import type { AgentTool } from "@oh-my-pi/pi-agent-core";
 import { logger } from "@oh-my-pi/pi-utils";
@@ -15,6 +17,14 @@ export type ApprovalSubjectTool = Pick<AgentTool, "formatApprovalDetails">;
 
 /** Maximum recorded similar-approval subjects per tool, newest first. */
 const MAX_SIMILAR_SUBJECTS = 10;
+
+/**
+ * Retention bound per recorded subject. The classifier head-truncates approved
+ * subjects far below this (`MAX_SUBJECT_CHARS` in `approval-similarity.ts`), so
+ * everything past it is retention only — and a subject can be a whole `write`
+ * payload or patch.
+ */
+const MAX_RETAINED_SUBJECT_CHARS = 4096;
 
 export interface SessionApprovalState {
 	/** Tools approved for the rest of the session, by tool name. */
@@ -51,8 +61,10 @@ export function approveToolForSession(sessionId: string, toolName: string): void
 export function addSimilarApproval(sessionId: string, toolName: string, subject: string): void {
 	const state = mutableState(sessionId);
 	if (!state || !subject) return;
+	const bounded =
+		subject.length > MAX_RETAINED_SUBJECT_CHARS ? `${subject.slice(0, MAX_RETAINED_SUBJECT_CHARS - 1)}…` : subject;
 	const existing = state.similar.get(toolName) ?? [];
-	const next = [subject, ...existing.filter(entry => entry !== subject)];
+	const next = [bounded, ...existing.filter(entry => entry !== bounded)];
 	state.similar.set(toolName, next.slice(0, MAX_SIMILAR_SUBJECTS));
 }
 

@@ -77,6 +77,23 @@ describe("session approval store", () => {
 		expect(getSimilarApprovals(sid, "write")).toEqual([]);
 	});
 
+	it("truncates a bulk subject so a recorded write payload is not retained whole", () => {
+		const sid = newSessionId();
+		const head = `Path: src/a.ts\nContent: ${"x".repeat(200)}`;
+		const bulk = `${head}${"y".repeat(64 * 1024)}`;
+		addSimilarApproval(sid, "write", bulk);
+		const [recorded, ...rest] = getSimilarApprovals(sid, "write");
+		expect(rest).toEqual([]);
+		// Bounded, but the head the classifier compares on survives intact.
+		expect(recorded?.length).toBe(4096);
+		expect(recorded?.startsWith(head)).toBe(true);
+		expect(recorded?.endsWith("…")).toBe(true);
+		// Subjects that differ only past the bound collapse into one entry, so the
+		// store bounds retained bytes and not just the entry count.
+		addSimilarApproval(sid, "write", `${bulk}-different-tail`);
+		expect(getSimilarApprovals(sid, "write")).toEqual([recorded]);
+	});
+
 	it("whole-tool approval supersedes that tool's similar list but not other tools'", () => {
 		const sid = newSessionId();
 		addSimilarApproval(sid, "bash", "git status");

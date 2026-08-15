@@ -210,6 +210,7 @@ import {
 	PROPOSE_DEVICE_NAME,
 	writeDeviceDispatch,
 } from "../tools/resolve";
+import { clearSessionApprovals } from "../tools/session-approvals";
 import { supportsExternalThinking } from "../tools/think";
 import type { TodoPhase } from "../tools/todo";
 import { ToolError } from "../tools/tool-errors";
@@ -4840,6 +4841,12 @@ export class AgentSession {
 		if (this.#observedSessionId === undefined) {
 			this.#observedSessionId = currentSessionId;
 		} else if (this.#observedSessionId !== currentSessionId) {
+			// Only this branch still knows the id we are leaving: `tools/session-approvals`
+			// keys "Approve … for Session" grants by session id in a module-global map, so
+			// the abandoned entry is released here — both the fail-safe answer for a
+			// session that is no longer live and the only thing that stops a process
+			// hopping sessions from retaining one entry per id forever.
+			clearSessionApprovals(this.#observedSessionId);
 			this.#observedSessionId = currentSessionId;
 			if (notifyChange) this.#notifySessionChangeCallbacks();
 		}
@@ -6269,6 +6276,11 @@ export class AgentSession {
 		this.#toolChoiceQueue.clear();
 		this.#tools.clearAcpPermissionDecisions();
 		this.#tools.resetAnnouncedMounts();
+		// The in-memory approval grants are the same class of state as the ACP
+		// `allow_always` decisions above. `#syncAgentSessionId` already released the
+		// id we left; this covers the boundaries that keep the id — `/reset` and a
+		// switch that reloads the current session with a changed conversation.
+		clearSessionApprovals(this.sessionManager.getSessionId());
 	}
 
 	/**
