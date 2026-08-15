@@ -1146,6 +1146,10 @@
 - Made the two per-session approval menu options single-line — same height as Approve/Deny, no grey description rows — and colored the tool name inside them green in the TUI; the option labels (what the selector returns and RPC/ACP clients see) are unchanged ([#4608](https://github.com/can1357/oh-my-pi/issues/4608)).
 - Changed the approval-similarity classifier prompts to an explicit rubric: a later call is similar only when it shares the approved calls' effect class (read-only versus side-effecting, a compound command taking the strongest class of its parts) and either their essential command — arguments, flags, loops, and pipes do not change it — or a different command with the same effect on the same kind of target, and the recorded list is read as a statement of intent rather than matched as text. Approving `ls` now covers a `find` loop over the working directory, while `ls && touch ./foo` still prompts ([#4608](https://github.com/can1357/oh-my-pi/issues/4608)).
 
+### Fixed
+
+- Fixed session-scoped tool approval grants outliving the session that made them: disposing a session now releases its grants, so re-opening the same session id in one process (lifecycle revival, `history://`, SDK re-entry) no longer resurrects an approval a fresh process would prompt for ([#4608](https://github.com/can1357/oh-my-pi/issues/4608)).
+
 ## [17.3.4] - 2026-08-14
 
 ### Changed

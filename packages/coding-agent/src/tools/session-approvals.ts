@@ -6,8 +6,9 @@
  * id the approval gate already derives from `sessionManager.getSessionId()`, is
  * never persisted to settings or session files, and dies with the logical
  * session: `AgentSession` releases the entry at every conversation boundary
- * (`/new`, `/reset`, fork, rewind/branch, session switch) via
- * `clearSessionApprovals`, so nothing survives the session that granted it.
+ * (`/new`, `/reset`, fork, rewind/branch, session switch) and on dispose via
+ * `clearSessionApprovals`, so nothing survives the session that granted it —
+ * not even a revival that re-opens the same session id in the same process.
  */
 import type { AgentTool } from "@oh-my-pi/pi-agent-core";
 import { logger } from "@oh-my-pi/pi-utils";

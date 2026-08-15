@@ -96,7 +96,7 @@ Both grants live in memory only. Nothing is written to config or session files, 
 
 A grant belongs to one session id:
 
-- It is released on `/new`, `/reset`, fork, rewind/branch, and session switch, and on process exit. After any of those the next call of the tool prompts again — a live grant disappearing after a fork or rewind is expected.
+- It is released on `/new`, `/reset`, fork, rewind/branch, and session switch, and when the session is disposed (process exit included). After any of those the next call of the tool prompts again — a live grant disappearing after a fork or rewind is expected. Re-opening a disposed session id, in the same process or a later one, starts ungranted.
 - `/fresh` only rotates provider-facing state, so grants survive it.
 - Subagents run headless in `yolo` with their own session ids, so a parent grant never reaches them.
 

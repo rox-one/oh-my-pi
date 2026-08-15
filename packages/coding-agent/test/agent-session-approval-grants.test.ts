@@ -76,6 +76,23 @@ function expectNoGrants(sessionId: string): void {
 	expect(getSimilarApprovals(sessionId, "write")).toEqual([]);
 }
 
+/** A minimal persisted session, so the same session id can be re-opened later. */
+async function writeSessionFile(dir: string): Promise<string> {
+	const id = `approval-grant-target-${Bun.nanoseconds()}`;
+	const sessionPath = path.join(dir, `${id}.jsonl`);
+	await Bun.write(
+		sessionPath,
+		`${JSON.stringify({
+			type: "session",
+			version: 3,
+			id,
+			timestamp: new Date().toISOString(),
+			cwd: dir,
+		})}\n`,
+	);
+	return sessionPath;
+}
+
 it.each(["new", "switch"] as const)(
 	"a %s session boundary releases the grants of the session it leaves",
 	async transition => {
@@ -85,19 +102,7 @@ it.each(["new", "switch"] as const)(
 		if (transition === "new") {
 			expect(await session.newSession()).toBe(true);
 		} else {
-			const targetId = `approval-grant-target-${Bun.nanoseconds()}`;
-			const targetPath = path.join(tempDir.path(), `${targetId}.jsonl`);
-			await Bun.write(
-				targetPath,
-				`${JSON.stringify({
-					type: "session",
-					version: 3,
-					id: targetId,
-					timestamp: new Date().toISOString(),
-					cwd: tempDir.path(),
-				})}\n`,
-			);
-			expect(await session.switchSession(targetPath)).toBe(true);
+			expect(await session.switchSession(await writeSessionFile(tempDir.path()))).toBe(true);
 		}
 
 		const currentSessionId = sessionManager.getSessionId();
@@ -128,4 +133,27 @@ it("rotating only the provider session id keeps the grants of the live session",
 	expect(sessionManager.getSessionId()).toBe(sessionId);
 	expect(isToolApprovedForSession(sessionId, "bash")).toBe(true);
 	expect(getSimilarApprovals(sessionId, "write")).toEqual(["Path: src/a.ts"]);
+});
+
+it("disposing a session releases its grants and a re-opened session id starts ungranted", async () => {
+	const { session, sessionManager, tempDir } = await createHarness();
+	// Grant inside a persisted session, so the granted id survives on disk and can
+	// be re-opened after dispose.
+	const sessionPath = await writeSessionFile(tempDir.path());
+	expect(await session.switchSession(sessionPath)).toBe(true);
+	const sessionId = grantForCurrentSession(sessionManager);
+
+	await session.dispose();
+
+	expectNoGrants(sessionId);
+
+	// Revive that id the way a lifecycle revival / `history://` re-entry does: a
+	// fresh manager over the same file. Reviving through AgentSession.switchSession
+	// would prove nothing — that path clears the grants of the session it lands in
+	// by itself, whether or not dispose released them.
+	const revived = SessionManager.create(tempDir.path(), path.join(tempDir.path(), "sessions"));
+	await revived.setSessionFile(sessionPath);
+	expect(revived.getSessionId()).toBe(sessionId);
+	expectNoGrants(revived.getSessionId());
+	await revived.close();
 });

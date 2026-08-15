@@ -5201,12 +5201,21 @@ export class AgentSession {
 		}
 	}
 
-	/** Drop the in-memory conversation state after the terminal dispose flush. */
+	/**
+	 * Drop the in-memory conversation state and the session-scoped approval
+	 * grants after the terminal dispose flush.
+	 */
 	#releaseRetainedSessionMemory(): void {
 		this.agent.reset();
 		this.agent.setAppendOnlyContext(undefined);
 		this.rawSseDebugBuffer.clear();
 		this.sessionManager.releaseRetainedEntries();
+		// A grant lasts one session id, so a disposed session must not leave one
+		// behind for a revival of the same id to inherit. getSessionId() is a plain
+		// field read, valid after seal()/close(). The deferred dispose pass re-runs
+		// this method, so a late approval resolved by a parked handler is dropped
+		// too.
+		clearSessionApprovals(this.sessionManager.getSessionId());
 	}
 
 	#closeAllProviderSessions(reason: string): void {
