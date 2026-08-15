@@ -3058,6 +3058,26 @@ describe("ExtensionRunner", () => {
 				]);
 			});
 
+			it("classifies with a registry-less context: only the online backend needs a registry", async () => {
+				addSimilarApproval(sessionManager.getSessionId(), "dangerous_tool", "git status");
+				const classify = vi.spyOn(approvalSimilarity, "isSimilarToApprovedCommand").mockResolvedValue(true);
+				const select = vi.fn(async (_title: string, _options: ExtensionUISelectItem[]) => "Deny");
+				const runner = await makeRunner(select);
+				const wrapper = new ExtensionToolWrapper(approvalTool, runner);
+
+				const result = await (wrapper as ExtensionToolWrapper<any>).execute(
+					"call-no-registry",
+					{ command: "git status --short" },
+					undefined,
+					undefined,
+					makeContext({ modelRegistry: undefined }),
+				);
+
+				expect(resultText(result)).toBe("ok");
+				expect(select).not.toHaveBeenCalled();
+				expect(classify.mock.calls[0]?.[0].registry).toBeUndefined();
+			});
+
 			it("dismiss never grants: an undefined choice denies and later calls prompt again", async () => {
 				const select = vi.fn(
 					async (_title: string, _options: ExtensionUISelectItem[]): Promise<string | undefined> => undefined,

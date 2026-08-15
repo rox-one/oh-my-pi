@@ -201,6 +201,9 @@ describe("isSimilarToApprovedCommand", () => {
 				makeDeps({ settings: onlineSettings("online", false), registry: onlineRegistry([]) }),
 			),
 		).toBe(false);
+		// A context that carries no registry cannot resolve a classifier model
+		// either — same fail-safe, still no request.
+		expect(await isSimilarToApprovedCommand(makeDeps({ registry: undefined }))).toBe(false);
 		expect(completeSimple).not.toHaveBeenCalled();
 	});
 
@@ -227,13 +230,13 @@ describe("isSimilarToApprovedCommand", () => {
 				return "YES";
 			});
 
-		expect(await isSimilarToApprovedCommand(makeDeps({ settings, registry: null as never }))).toBe(true);
+		expect(await isSimilarToApprovedCommand(makeDeps({ settings, registry: undefined }))).toBe(true);
 		expect(classifierPrompt).toContain("- git log --oneline");
 		expect(classifierPrompt).toContain("git diff HEAD");
 		expect(maxTokens).toBe(16);
 
 		localComplete.mockResolvedValueOnce("NO");
-		expect(await isSimilarToApprovedCommand(makeDeps({ settings, registry: null as never }))).toBe(false);
+		expect(await isSimilarToApprovedCommand(makeDeps({ settings, registry: undefined }))).toBe(false);
 	});
 
 	it("fails safe to false when the local model returns no output", async () => {
@@ -241,7 +244,7 @@ describe("isSimilarToApprovedCommand", () => {
 		const settings = Settings.isolated({ "providers.approvalSimilarityModel": "lfm2-1.2b" });
 		vi.spyOn(tinyModelClient, "complete").mockResolvedValue(null);
 
-		expect(await isSimilarToApprovedCommand(makeDeps({ settings, registry: null as never }))).toBe(false);
+		expect(await isSimilarToApprovedCommand(makeDeps({ settings, registry: undefined }))).toBe(false);
 	});
 
 	it("combines the caller's abort signal with the classification timeout", async () => {

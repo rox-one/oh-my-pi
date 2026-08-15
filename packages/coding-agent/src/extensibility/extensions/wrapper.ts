@@ -286,16 +286,16 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 		if (policyPrompts && !safetyOverride && pendingSafetyChecks.length === 0 && sessionId) {
 			if (isToolApprovedForSession(sessionId, this.tool.name)) {
 				sessionAllowed = true;
-			} else if (settings && context?.modelRegistry && getSimilarApprovals(sessionId, this.tool.name).length > 0) {
+			} else if (settings && getSimilarApprovals(sessionId, this.tool.name).length > 0) {
 				sessionAllowed = await isSimilarToApprovedCommand({
 					sessionId,
 					toolName: this.tool.name,
 					subject: approvalSubject(this.tool, resolvedArgs),
 					settings,
-					registry: context.modelRegistry,
+					registry: context?.modelRegistry,
 					// Attribute the classification to this session's provider identity,
 					// like every other side request (title, auto-thinking, recovery).
-					metadataResolver: context.metadataForProvider,
+					metadataResolver: context?.metadataForProvider,
 					signal,
 				});
 			}

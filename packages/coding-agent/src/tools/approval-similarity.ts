@@ -63,7 +63,8 @@ export interface ApprovalSimilarityDeps {
 	/** Raw subject of the pending call — `approvalSubject(tool, args)` output. */
 	subject: string;
 	settings: Settings;
-	registry: ModelRegistry;
+	/** Required by the `online` backend only; the local backend classifies on-device. */
+	registry?: ModelRegistry;
 	signal?: AbortSignal;
 	metadataResolver?: (provider: string) => Record<string, unknown> | undefined;
 }
@@ -126,12 +127,19 @@ async function classifyOnline(
 	candidate: string,
 	deps: ApprovalSimilarityDeps,
 ): Promise<boolean | undefined> {
-	const resolved = resolveRoleSelection(["tiny", "smol"], deps.settings, deps.registry.getAvailable());
+	// Only this backend needs the registry, so the requirement lives here: a
+	// context without one still reaches the local backend, and here it joins the
+	// throws below under the caller's fail-safe (a normal approval prompt).
+	const registry = deps.registry;
+	if (!registry) {
+		throw new Error("approval-similarity: no model registry for online classification");
+	}
+	const resolved = resolveRoleSelection(["tiny", "smol"], deps.settings, registry.getAvailable());
 	const model = resolved?.model;
 	if (!model) {
 		throw new Error("approval-similarity: no tiny/smol model available for classification");
 	}
-	const apiKey = await deps.registry.getApiKey(model, deps.sessionId);
+	const apiKey = await registry.getApiKey(model, deps.sessionId);
 	if (!apiKey) {
 		throw new Error(`approval-similarity: no API key for ${model.provider}/${model.id}`);
 	}
@@ -150,7 +158,7 @@ async function classifyOnline(
 			],
 		},
 		{
-			apiKey: deps.registry.resolver(model, deps.sessionId),
+			apiKey: registry.resolver(model, deps.sessionId),
 			maxTokens: REASONING_SAFE_MAX_TOKENS,
 			disableReasoning: true,
 			metadata,
@@ -178,9 +186,7 @@ async function classifyLocal(
 	if (!isTinyMemoryLocalModelKey(modelKey)) {
 		throw new Error(`approval-similarity: unsupported local classifier model: ${modelKey}`);
 	}
-	const maxTokens = isTinyMemoryReasoningModelKey(modelKey)
-		? Math.max(ANSWER_MAX_TOKENS, REASONING_SAFE_MAX_TOKENS)
-		: ANSWER_MAX_TOKENS;
+	const maxTokens = isTinyMemoryReasoningModelKey(modelKey) ? REASONING_SAFE_MAX_TOKENS : ANSWER_MAX_TOKENS;
 	const builtPrompt = prompt.render(approvalSimilarityLocalPrompt, { approved, candidate });
 	const output = await tinyModelClient.complete(modelKey, builtPrompt, {
 		maxTokens,
