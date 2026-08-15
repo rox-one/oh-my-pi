@@ -31,8 +31,13 @@ import type {
 import { ExtensionToolWrapper } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/wrapper";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import type { ToolApprovalDecision } from "@oh-my-pi/pi-coding-agent/tools/approval";
 import * as approvalSimilarity from "@oh-my-pi/pi-coding-agent/tools/approval-similarity";
-import { approveToolForSession, clearSessionApprovals } from "@oh-my-pi/pi-coding-agent/tools/session-approvals";
+import {
+	addSimilarApproval,
+	approveToolForSession,
+	clearSessionApprovals,
+} from "@oh-my-pi/pi-coding-agent/tools/session-approvals";
 
 import { getProjectAgentDir, logger, TempDir } from "@oh-my-pi/pi-utils";
 
@@ -3122,6 +3127,43 @@ describe("ExtensionRunner", () => {
 				expect(select).toHaveBeenCalledTimes(1);
 				// Safety acknowledgement is per-call: no session-granting options offered.
 				expect(select.mock.calls[0][1]).toEqual(["Approve", "Deny"]);
+			});
+
+			it("tool-demanded prompts still gate despite a session grant and recorded subject", async () => {
+				// `bash` returns this decision for critical patterns (`rm -rf /`) and for
+				// user `bash.patterns: prompt` rules — a safety gate the user never opted
+				// out of, so no session grant may answer it and no session-scoped option
+				// may be offered for it.
+				const overrideTool = {
+					name: "override_tool",
+					label: "Override Tool",
+					description: "Test tool",
+					parameters: {} as never,
+					approval: (): ToolApprovalDecision => ({
+						tier: "exec",
+						override: true,
+						reason: "Critical pattern detected",
+					}),
+					execute: async () => ({ content: [{ type: "text" as const, text: "ok" }] }),
+				};
+				approveToolForSession(sessionManager.getSessionId(), "override_tool");
+				addSimilarApproval(sessionManager.getSessionId(), "override_tool", "rm -rf /tmp/scratch");
+				const classify = vi.spyOn(approvalSimilarity, "isSimilarToApprovedCommand");
+				const select = vi.fn(async (_title: string, _options: ExtensionUISelectItem[]) => "Approve");
+				const runner = await makeRunner(select);
+				const wrapper = new ExtensionToolWrapper(overrideTool, runner);
+
+				const result = await (wrapper as ExtensionToolWrapper<any>).execute(
+					"call-override",
+					{ command: "rm -rf /" },
+					undefined,
+					undefined,
+					makeContext(),
+				);
+				expect(resultText(result)).toBe("ok");
+				expect(select).toHaveBeenCalledTimes(1);
+				expect(select.mock.calls[0][1]).toEqual(["Approve", "Deny"]);
+				expect(classify).not.toHaveBeenCalled();
 			});
 		});
 	});

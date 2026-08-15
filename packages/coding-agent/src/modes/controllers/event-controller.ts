@@ -1447,18 +1447,22 @@ export class EventController {
 	 *
 	 * A session approval ("… Commands for Session") downgrades the `prompt`
 	 * resolution to allow in the wrapper, so it must not flip the title here
-	 * either. Provider safety checks stay per-call: the computer tool's
-	 * synthetic `{actions, pendingSafetyChecks}` event args mark a call the
-	 * wrapper will always prompt for, session state or not. The similarity
-	 * classifier is deliberately NOT consulted — a similar-only state may still
-	 * prompt, which is the conservative correct answer for the title.
+	 * either. Two classes of prompt are never downgraded and so always mean
+	 * `attention`: a tool-demanded `override` (bash critical patterns,
+	 * `bash.patterns: prompt`) and pending provider safety checks, which the
+	 * computer tool's synthetic `{actions, pendingSafetyChecks}` event args
+	 * mark. The similarity classifier is deliberately NOT consulted — a
+	 * similar-only state may still prompt, which is the conservative correct
+	 * answer for the title.
 	 */
 	#toolWillPromptForApproval(toolName: string, args: unknown): boolean {
 		const tool = this.ctx.viewSession.getToolByName(toolName);
 		if (!tool) return false;
 		const mode = (settings.get("tools.approvalMode") ?? "yolo") as ApprovalMode;
 		const userPolicies = (settings.get("tools.approval") ?? {}) as Record<string, unknown>;
-		if (resolveApproval(tool, args, mode, userPolicies).policy !== "prompt") return false;
+		const resolved = resolveApproval(tool, args, mode, userPolicies);
+		if (resolved.policy !== "prompt") return false;
+		if (resolved.override) return true;
 		const synthetic = args as { actions?: unknown; pendingSafetyChecks?: unknown } | null;
 		if (
 			Array.isArray(synthetic?.actions) &&

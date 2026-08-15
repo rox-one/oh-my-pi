@@ -5,9 +5,10 @@
  * The wrapper blocks on `uiContext.select` after `tool_execution_start`; the
  * controller mirrors that to set the `attention` title. Session approvals
  * ("… Commands for Session") downgrade `prompt` → allow in the wrapper, so the
- * title must not flip to `attention` for them — while provider safety checks
- * (the computer tool's synthetic event args) still block per call and must
- * keep the `attention` title even for a session-approved tool.
+ * title must not flip to `attention` for them — while the two prompts a session
+ * grant may never answer (pending provider safety checks, carried by the
+ * computer tool's synthetic event args, and a tool-demanded `override`) still
+ * block per call and must keep the `attention` title.
  */
 import { afterEach, beforeAll, beforeEach, describe, expect, it, type Mock, vi } from "bun:test";
 import type { AgentTool } from "@oh-my-pi/pi-agent-core";
@@ -27,7 +28,16 @@ const SESSION_ID = "approval-title-test-session";
 /** Exec-tier tool: resolves `prompt` under `always-ask` without user policies. */
 const execTool = { name: "bash", approval: { tier: "exec" } } as unknown as AgentTool;
 
-function createFixture(): InteractiveModeContext {
+/**
+ * Tool-demanded prompt, as `bash` returns for critical patterns: the wrapper
+ * refuses to let a session grant answer it, so the title must stay `attention`.
+ */
+const overrideTool = {
+	name: "bash",
+	approval: { tier: "exec", override: true, reason: "Critical pattern detected" },
+} as unknown as AgentTool;
+
+function createFixture(tool: AgentTool = execTool): InteractiveModeContext {
 	const pendingTools = new Map<string, ToolExecutionComponent>();
 	const ctx = {
 		isInitialized: true,
@@ -37,7 +47,7 @@ function createFixture(): InteractiveModeContext {
 		chatContainer: new TranscriptContainer(),
 		toolOutputExpanded: false,
 		session: { isAborting: false },
-		viewSession: { getToolByName: () => execTool, hasBuiltInTool: () => false },
+		viewSession: { getToolByName: () => tool, hasBuiltInTool: () => false },
 		sessionManager: { getSessionId: () => SESSION_ID, getCwd: () => process.cwd() },
 	} as unknown as InteractiveModeContext;
 	return ctx;
@@ -106,6 +116,13 @@ describe("EventController approval title mirror", () => {
 			actions: [{ type: "key", key: "Return" }],
 			pendingSafetyChecks: [{ checkId: "c1", prompt: "Confirm" }],
 		});
+		expect(attentionCalls(titleSpy)).toBe(1);
+	});
+
+	it("stays attention for a tool-demanded override despite session approval", async () => {
+		approveToolForSession(SESSION_ID, "bash");
+		ctx = createFixture(overrideTool);
+		await startToolCall(ctx, "tc-6", { command: "rm -rf /" });
 		expect(attentionCalls(titleSpy)).toBe(1);
 	});
 });

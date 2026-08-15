@@ -1137,7 +1137,7 @@
 - Added a privacy-bounded `live:activity` extension event exposing the built-in `/live` session's semantic phase and normalized microphone and speaker RMS levels.
 ### Added
 
-- Added per-session approval options to tool approval prompts: "Approve <tool> Commands for Session" skips further prompts for that tool until the session ends, and "Approve Similar <tool> Commands for Session" auto-approves later commands a small classifier judges similar to the approved one, failing safe to a prompt on any classifier error ([#4608](https://github.com/can1357/oh-my-pi/issues/4608)).
+- Added per-session approval options to tool approval prompts: "Approve <tool> Commands for Session" skips further prompts for that tool until the session ends, and "Approve Similar <tool> Commands for Session" auto-approves later commands a small classifier judges similar to the approved one, failing safe to a prompt on any classifier error. Neither option is offered for — or can answer — a `deny` policy, pending provider safety checks, or a prompt the tool itself demanded (bash critical patterns and `bash.patterns: prompt` rules) ([#4608](https://github.com/can1357/oh-my-pi/issues/4608)).
 - Added the `providers.approvalSimilarityModel` setting selecting the similarity-classifier backend: `online` (the tiny/smol model role) or a local on-device model ([#4608](https://github.com/can1357/oh-my-pi/issues/4608)).
 
 ## [17.3.4] - 2026-08-14

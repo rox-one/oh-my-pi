@@ -272,14 +272,18 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 		const policyPrompts = resolved.policy === "prompt" && (explicitPrompt || !xdevBypass);
 
 		// Session approvals ("… Commands for Session" prompt options) can only
-		// downgrade a `prompt` resolution to allow: they never satisfy provider
-		// safety checks (each of those must be acknowledged per call) and never
-		// override the `deny` short-circuit above. The similarity classifier runs
-		// before the prompt so a "similar" verdict skips it entirely; it is
-		// fail-safe (`false` ⇒ prompt) and time-bounded by contract.
+		// downgrade a `prompt` resolution the user is free to answer once: they
+		// never satisfy provider safety checks (each of those must be
+		// acknowledged per call), never override the `deny` short-circuit above,
+		// and never answer a tool-demanded prompt (`resolved.override` — bash
+		// critical patterns, `bash.patterns: prompt`), which is a safety gate the
+		// user never opted out of. The similarity classifier runs before the
+		// prompt so a "similar" verdict skips it entirely; it is fail-safe
+		// (`false` ⇒ prompt) and time-bounded by contract.
+		const safetyOverride = resolved.override === true;
 		const sessionId = context?.sessionManager?.getSessionId() ?? "";
 		let sessionAllowed = false;
-		if (policyPrompts && pendingSafetyChecks.length === 0 && sessionId) {
+		if (policyPrompts && !safetyOverride && pendingSafetyChecks.length === 0 && sessionId) {
 			if (isToolApprovedForSession(sessionId, this.tool.name)) {
 				sessionAllowed = true;
 			} else if (settings && context?.modelRegistry && getSimilarApprovals(sessionId, this.tool.name).length > 0) {
@@ -358,10 +362,13 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 				pendingSafetyChecks.length > 0
 					? `${basePrompt}\nProvider safety checks:\n${safetyCheckLines(pendingSafetyChecks).join("\n")}`
 					: basePrompt;
-			// Session-scoped options appear only when a session identity exists
-			// and no provider safety checks are pending — a safety acknowledgement
-			// is per-call and must not be broadened into a session-wide grant.
-			const sessionChoiceAvailable = sessionId.length > 0 && pendingSafetyChecks.length === 0;
+			// Session-scoped options appear only when a session identity exists,
+			// no provider safety checks are pending, and the tool did not demand
+			// this prompt — a safety acknowledgement is per-call and must not be
+			// broadened into a session-wide grant that later calls answer for the
+			// user. Offering an option the gate above refuses to honor would also
+			// silently drop the grant.
+			const sessionChoiceAvailable = sessionId.length > 0 && pendingSafetyChecks.length === 0 && !safetyOverride;
 			const approveSessionToolLabel = `Approve ${this.tool.name} Commands for Session`;
 			const approveSimilarLabel = `Approve Similar ${this.tool.name} Commands for Session`;
 			const options: ExtensionUISelectItem[] = sessionChoiceAvailable
