@@ -21,6 +21,7 @@ import { resolveRoleSelection } from "../config/model-resolver";
 import type { Settings } from "../config/settings";
 import approvalSimilarityPrompt from "../prompts/system/approval-similarity.md" with { type: "text" };
 import approvalSimilarityLocalPrompt from "../prompts/system/approval-similarity-local.md" with { type: "text" };
+import approvalSimilarityUserPrompt from "../prompts/system/approval-similarity-user.md" with { type: "text" };
 import { stripAnsi } from "../tiny/message-preproc";
 import { isTinyMemoryLocalModelKey, isTinyMemoryReasoningModelKey, ONLINE_MEMORY_MODEL_KEY } from "../tiny/models";
 import { tinyModelClient } from "../tiny/title-client";
@@ -152,7 +153,7 @@ async function classifyOnline(
 			messages: [
 				{
 					role: "user",
-					content: `Approved commands:\n${approved.map(subject => `- ${subject}`).join("\n")}\n\nNew command:\n${candidate}`,
+					content: prompt.render(approvalSimilarityUserPrompt, { approved, candidate }),
 					timestamp: Date.now(),
 				},
 			],
