@@ -112,6 +112,15 @@ Those calls always prompt, and the two session options are not offered for them 
 
 ### The similarity classifier
 
+A verdict follows two properties of the compared calls:
+
+- **Essential command** — the program doing the work. Arguments, flags, paths, and wrapper constructs (loops, pipes, `&&`, command substitution) do not change it: `ls`, `ls -la src`, and `for d in */; do ls "$d"; done` are all `ls`.
+- **Effect class** — read-only (changes nothing on disk, nor any state outside the session) or side-effecting (can change something). A call built from several parts takes the strongest class of its parts, so `ls && touch ./foo` is side-effecting.
+
+A call is similar when its effect class matches the approved ones and either its essential command is one of theirs, or it is a different command with the same effect on the same kind of target and scope — approving `ls` covers a `find` loop over the working directory. A difference in effect class is never similar, however much text the two calls share: after approving `ls`, `ls && touch ./foo` prompts again.
+
+The recorded list is read as intent, not as an allow-list to match text against. Approving `ls` calls and then `find .` calls says "stop asking about read-only traversal of this project", and later read-only traversals of it are covered. The rubric is instruction to a small model, not enforcement — see the three gates above that no verdict can open.
+
 The classifier runs before the prompt is shown, so a `yes` verdict skips it. It is fail-safe in every other case: no recorded subjects, an empty subject, an unparsable answer, a request error, no available model, or a timeout all produce a normal prompt, never an approval. The wait is capped at 3 seconds — a slower verdict is worse than answering the prompt yourself — and also ends with the tool call's abort signal.
 
 Choose the backend with `providers.approvalSimilarityModel`: `online` (the default — the `TINY` role from `/models`, else `smol`) or a local on-device model. With the `online` backend, every gated call that is not an exact repeat spends one small-model request. A local backend usually loses its first classification to the 3-second cap while the model loads, and classifies normally once the worker is warm.
