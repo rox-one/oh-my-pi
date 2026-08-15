@@ -10,8 +10,9 @@
  * - a local key: the on-device memory model classifies via
  *   {@link tinyModelClient.complete} with an inline prompt.
  *
- * Fail-safe by contract: any error, timeout, abort, or unparsable output
- * resolves to `false` (the approval gate prompts again). Never throws.
+ * Fail-safe by contract: any error, timeout, abort, unparsable output, or input
+ * it cannot read whole resolves to `false` (the approval gate prompts again).
+ * Never throws.
  */
 import { completeSimple } from "@oh-my-pi/pi-ai";
 import { logger, prompt, withTimeout } from "@oh-my-pi/pi-utils";
@@ -25,6 +26,7 @@ import approvalSimilarityUserPrompt from "../prompts/system/approval-similarity-
 import { stripAnsi } from "../tiny/message-preproc";
 import { isTinyMemoryLocalModelKey, isTinyMemoryReasoningModelKey, ONLINE_MEMORY_MODEL_KEY } from "../tiny/models";
 import { tinyModelClient } from "../tiny/title-client";
+import { isTruncatedForPrompt } from "./approval";
 import { getSimilarApprovals } from "./session-approvals";
 
 const SIMILARITY_SYSTEM_PROMPT = prompt.render(approvalSimilarityPrompt);
@@ -40,10 +42,17 @@ const SIMILARITY_SYSTEM_PROMPT = prompt.render(approvalSimilarityPrompt);
  */
 const CLASSIFY_TIMEOUT_MS = 3_000;
 
-/** Per-approved-subject character budget (head-truncated); keeps the classifier prompt small. */
-const MAX_SUBJECT_CHARS = 160;
-/** Budget for the pending call's subject — it deserves more context than one approved entry. */
-const MAX_CANDIDATE_CHARS = 400;
+/**
+ * Character budgets for classifier input. Nothing is cut to fit them: a
+ * head-truncated command hides the operation behind a shared benign prefix
+ * (`ls` vs `ls && touch …`), and the rubric reasons over the whole command, so
+ * cutting would manufacture wrong YES verdicts. Over budget means "not
+ * classified" instead — the candidate falls back to a prompt, and a recorded
+ * subject is left out of the comparison.
+ */
+const MAX_SUBJECT_CHARS = 1_000;
+/** The pending call's subject deserves more room than one approved entry. */
+const MAX_CANDIDATE_CHARS = 2_000;
 
 /**
  * Local classifiers occasionally need more room for chat-template boilerplate.
@@ -77,12 +86,13 @@ export interface ApprovalSimilarityDeps {
  * `deps.toolName` this session. With no recorded subjects (or an unknown
  * session) there is nothing to compare against: returns `false` without a
  * model call. A call whose arguments the user already approved answers itself,
- * also without a model call.
+ * also without a model call, and so does anything the model could only read in
+ * part — see the budgets above.
  */
 export async function isSimilarToApprovedCommand(deps: ApprovalSimilarityDeps): Promise<boolean> {
 	const approvedEntries = getSimilarApprovals(deps.sessionId, deps.toolName);
-	const candidateRaw = stripAnsi(deps.subject).trim();
-	if (approvedEntries.length === 0 || candidateRaw.length === 0) return false;
+	const candidate = stripAnsi(deps.subject).trim();
+	if (approvedEntries.length === 0 || candidate.length === 0) return false;
 
 	// The very call the user read in the prompt and approved: no model can add
 	// anything, so the repeat costs neither a request nor the wait for one.
@@ -90,15 +100,20 @@ export async function isSimilarToApprovedCommand(deps: ApprovalSimilarityDeps): 
 	// long before it is recorded, so calls differing past the cut share it.
 	if (approvedEntries.some(entry => entry.identity === deps.identity)) return true;
 
+	// Material the model could not read in full is never judged: over budget, or
+	// already elided by the tool that formatted it for the prompt.
+	if (candidate.length > MAX_CANDIDATE_CHARS || isTruncatedForPrompt(candidate)) return false;
+
 	const backend = deps.settings.get("providers.approvalSimilarityModel");
 	// Both backends render approved subjects as `- <subject>` list items, and a
 	// subject is the tool's multi-line approval detail text ("Path: …\nContent:
 	// …"); indenting the continuation lines keeps each entry one list item.
-	const approved = approvedEntries.map(entry =>
-		boundedSubject(entry.subject, MAX_SUBJECT_CHARS).replaceAll("\n", "\n  "),
-	);
-	const candidate = boundedSubject(candidateRaw, MAX_CANDIDATE_CHARS);
-	const bounded: ApprovalSimilarityDeps = {
+	const approved = approvedEntries
+		.map(entry => stripAnsi(entry.subject).trim())
+		.filter(subject => subject.length > 0 && subject.length <= MAX_SUBJECT_CHARS && !isTruncatedForPrompt(subject))
+		.map(subject => subject.replaceAll("\n", "\n  "));
+	if (approved.length === 0) return false;
+	const timeBounded: ApprovalSimilarityDeps = {
 		...deps,
 		signal: deps.signal
 			? AbortSignal.any([deps.signal, AbortSignal.timeout(CLASSIFY_TIMEOUT_MS)])
@@ -113,8 +128,8 @@ export async function isSimilarToApprovedCommand(deps: ApprovalSimilarityDeps): 
 		// classification promise, leaving that rejection unhandled.
 		const classify =
 			backend === ONLINE_MEMORY_MODEL_KEY
-				? classifyOnline(approved, candidate, bounded)
-				: classifyLocal(approved, candidate, backend, bounded);
+				? classifyOnline(approved, candidate, timeBounded)
+				: classifyLocal(approved, candidate, backend, timeBounded);
 		const similar = await withTimeout(classify, CLASSIFY_TIMEOUT_MS, "classification timed out");
 		return similar ?? false;
 	} catch (error) {
@@ -208,11 +223,4 @@ export function parseApprovalSimilarity(text: string): boolean | undefined {
 	if (trimmed.startsWith("yes")) return true;
 	if (trimmed.startsWith("no")) return false;
 	return undefined;
-}
-
-/** ANSI-free, head-truncated subject; the head carries the operation, the tail is usually arguments. */
-function boundedSubject(subject: string, maxChars: number): string {
-	const cleaned = stripAnsi(subject).trim();
-	if (cleaned.length <= maxChars) return cleaned;
-	return `${cleaned.slice(0, maxChars - 1)}…`;
 }

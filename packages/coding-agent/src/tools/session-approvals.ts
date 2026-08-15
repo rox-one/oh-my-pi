@@ -20,10 +20,11 @@ export type ApprovalSubjectTool = Pick<AgentTool, "formatApprovalDetails">;
 const MAX_SIMILAR_SUBJECTS = 10;
 
 /**
- * Retention bound per recorded subject. The classifier head-truncates approved
- * subjects far below this (`MAX_SUBJECT_CHARS` in `approval-similarity.ts`), so
- * everything past it is retention only — and a subject can be a whole `write`
- * payload or patch.
+ * Retention bound per recorded subject — a subject can be a whole `write`
+ * payload or patch. The classifier never cuts a subject to fit its own, much
+ * smaller budget (`MAX_SUBJECT_CHARS` in `approval-similarity.ts`): it skips
+ * the oversized ones, so everything past that budget is retention and display
+ * only.
  */
 const MAX_RETAINED_SUBJECT_CHARS = 4096;
 

@@ -3,6 +3,7 @@ import * as ai from "@oh-my-pi/pi-ai";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { tinyModelClient } from "@oh-my-pi/pi-coding-agent/tiny/title-client";
+import { truncateForPrompt } from "@oh-my-pi/pi-coding-agent/tools/approval";
 import type { ApprovalSimilarityDeps } from "@oh-my-pi/pi-coding-agent/tools/approval-similarity";
 import {
 	isSimilarToApprovedCommand,
@@ -160,23 +161,18 @@ describe("isSimilarToApprovedCommand", () => {
 		expect(localComplete).not.toHaveBeenCalled();
 	});
 
-	it("classifies two calls that share a truncated subject but ran different arguments", async () => {
-		// Approval subjects arrive already cut — every tool elides its bulk
-		// payloads for the prompt — so these two writes are recorded as the same
-		// text. Matching that text would auto-approve the second one; the digest
-		// differs, so the verdict is the classifier's (mocked NO ⇒ prompt).
-		const head = "x".repeat(2_000);
-		const subject = `Path: src/a.ts\nContent:\n${head}[…4 chars elided…]`;
-		grantSimilar("write", subject, { content: `${head}SAFE`, path: "src/a.ts" });
+	it("classifies two calls that share a display subject but ran different arguments", async () => {
+		// A subject is display text and omits arguments the call carries (`bash`
+		// shows the command, not `cwd`/`env`), so matching subjects are not a
+		// repeat: the digest differs, and the verdict is the classifier's
+		// (mocked NO ⇒ prompt).
+		const subject = "Command: bun run build";
+		grantSimilar("bash", subject, { command: "bun run build", cwd: "packages/tui" });
 		const completeSimple = mockOnlineAnswer({ stopReason: "stop", text: "NO" });
 
 		expect(
 			await isSimilarToApprovedCommand(
-				makeDeps({
-					identity: approvalIdentity({ content: `${head}PWN!`, path: "src/a.ts" }),
-					subject,
-					toolName: "write",
-				}),
+				makeDeps({ identity: approvalIdentity({ command: "bun run build", cwd: "/etc" }), subject }),
 			),
 		).toBe(false);
 		expect(completeSimple).toHaveBeenCalledTimes(1);
@@ -200,13 +196,13 @@ describe("isSimilarToApprovedCommand", () => {
 		expect(options).toMatchObject({ disableReasoning: true, maxTokens: 1024 });
 	});
 
-	it("keeps a multi-line subject's target line inside the per-subject budget and in one list item", async () => {
+	it("sends a multi-line subject to the model whole, as one list item", async () => {
 		// `approvalSubject` records the tool's approval detail text, e.g. write's
-		// "Path: …\nContent:\n…". Each approved subject is head-truncated before
-		// it reaches the model: the target line must survive, or the classifier
-		// judges file writes by their import prologue alone.
-		const content = 'import * as fs from "node:fs/promises";\n'.repeat(20);
-		grantSimilar("write", `Path: src/deep/module/handler.ts\nContent:\n${content}`);
+		// "Path: …\nContent:\n…". Within budget it reaches the model uncut: a head
+		// cut would let the classifier judge file writes by their import prologue.
+		const subject =
+			`Path: src/deep/module/handler.ts\nContent:\n${'import * as fs from "node:fs/promises";\n'.repeat(20)}`.trim();
+		grantSimilar("write", subject);
 		const completeSimple = mockOnlineAnswer({ stopReason: "stop", text: "NO" });
 
 		expect(
@@ -219,10 +215,36 @@ describe("isSimilarToApprovedCommand", () => {
 		if (!call) throw new Error("expected a classifier model call");
 		const userMessage = call[1].messages[0];
 		if (!userMessage || typeof userMessage.content !== "string") throw new Error("expected a user message");
-		expect(userMessage.content).toContain("- Path: src/deep/module/handler.ts");
-		// Continuation lines are indented so the entry stays a single list item.
-		expect(userMessage.content).toContain("\n  Content:");
+		// Continuation lines are indented, so the whole subject stays one list item.
+		expect(userMessage.content).toContain(`- ${subject.replaceAll("\n", "\n  ")}`);
 		expect(userMessage.content).toContain("Path: src/other.ts");
+	});
+
+	it("returns false without a model call for a candidate it cannot read whole", async () => {
+		grantSimilar("bash", "git log --oneline");
+		const completeSimple = mockOnlineAnswer({ stopReason: "stop", text: "YES" });
+		const oversized = `Command: ${"echo hi; ".repeat(250)}`;
+
+		expect(await isSimilarToApprovedCommand(makeDeps({ subject: oversized }))).toBe(false);
+		// Already elided by the tool that formatted it for the prompt: past the cut
+		// this call and the approved one may share nothing.
+		expect(await isSimilarToApprovedCommand(makeDeps({ subject: truncateForPrompt(oversized, 60) }))).toBe(false);
+		expect(completeSimple).not.toHaveBeenCalled();
+	});
+
+	it("skips recorded subjects it cannot read whole instead of cutting them", async () => {
+		// One entry is over the per-subject budget, the other arrived elided. Both
+		// are left out, and with nothing left to compare the gate prompts rather
+		// than judging a benign head.
+		const bulk = `Path: src/generated.ts\nContent:\n${"export const x = 1;\n".repeat(60)}`;
+		grantSimilar("write", bulk);
+		grantSimilar("edit", truncateForPrompt(bulk, 60));
+		const completeSimple = mockOnlineAnswer({ stopReason: "stop", text: "YES" });
+		const candidate = "Path: src/other.ts\nContent:\nexport {};";
+
+		expect(await isSimilarToApprovedCommand(makeDeps({ toolName: "write", subject: candidate }))).toBe(false);
+		expect(await isSimilarToApprovedCommand(makeDeps({ toolName: "edit", subject: candidate }))).toBe(false);
+		expect(completeSimple).not.toHaveBeenCalled();
 	});
 
 	it("prompts again when the online classifier answers NO", async () => {
