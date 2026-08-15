@@ -3114,9 +3114,10 @@ describe("ACP agent", () => {
 		});
 
 		it("degrades rich select options to label-only enum entries and returns the label", async () => {
-			// The approval gate's session options are `{label, description}` items
-			// matched by exact label on return; the elicitation enum must carry
-			// exactly those labels so the client's answer round-trips.
+			// The approval gate's session options are `{label, labelHighlight}`
+			// items matched by exact label on return; the elicitation enum must
+			// carry exactly those labels — the TUI-only highlight stays in the
+			// host process — so the client's answer round-trips.
 			const { connection, calls } = createElicitConnection(async () => ({
 				action: "accept",
 				content: { value: "Approve bash Commands for Session" },
@@ -3127,7 +3128,7 @@ describe("ACP agent", () => {
 				"Approve",
 				{
 					label: "Approve bash Commands for Session",
-					description: "Skip approval prompts for this tool until the session ends.",
+					labelHighlight: "bash",
 				},
 				"Deny",
 			]);

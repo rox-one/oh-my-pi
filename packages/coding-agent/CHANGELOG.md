@@ -1141,6 +1141,10 @@
 - Added the `providers.approvalSimilarityModel` setting selecting the similarity-classifier backend: `online` (the tiny/smol model role) or a local on-device model ([#4608](https://github.com/can1357/oh-my-pi/issues/4608)).
 - Added `metadataForProvider(provider)` to the custom-tool context, so side model requests a tool makes — including the approval-similarity classifier — carry the session's provider request metadata and are attributed to the same provider session and OAuth account as the conversation ([#4608](https://github.com/can1357/oh-my-pi/issues/4608)).
 
+### Changed
+
+- Made the two per-session approval menu options single-line — same height as Approve/Deny, no grey description rows — and colored the tool name inside them green in the TUI; the option labels (what the selector returns and RPC/ACP clients see) are unchanged ([#4608](https://github.com/can1357/oh-my-pi/issues/4608)).
+
 ## [17.3.4] - 2026-08-14
 
 ### Changed

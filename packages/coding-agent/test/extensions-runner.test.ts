@@ -2683,14 +2683,8 @@ describe("ExtensionRunner", () => {
 			]);
 			expect(select).toHaveBeenCalledWith(expect.stringContaining("Allow tool: dangerous_tool"), [
 				"Approve",
-				{
-					label: "Approve dangerous_tool Commands for Session",
-					description: "Skip approval prompts for this tool until the session ends.",
-				},
-				{
-					label: "Approve Similar dangerous_tool Commands for Session",
-					description: "Later calls a small model judges similar auto-approve; others prompt.",
-				},
+				{ label: "Approve dangerous_tool Commands for Session", labelHighlight: "dangerous_tool" },
+				{ label: "Approve Similar dangerous_tool Commands for Session", labelHighlight: "dangerous_tool" },
 				"Deny",
 			]);
 			delete globalState.__approvalEvents;

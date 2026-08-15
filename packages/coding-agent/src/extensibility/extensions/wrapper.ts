@@ -377,14 +377,8 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 			const options: ExtensionUISelectItem[] = sessionChoiceAvailable
 				? [
 						"Approve",
-						{
-							label: approveSessionToolLabel,
-							description: "Skip approval prompts for this tool until the session ends.",
-						},
-						{
-							label: approveSimilarLabel,
-							description: "Later calls a small model judges similar auto-approve; others prompt.",
-						},
+						{ label: approveSessionToolLabel, labelHighlight: this.tool.name },
+						{ label: approveSimilarLabel, labelHighlight: this.tool.name },
 						"Deny",
 					]
 				: ["Approve", "Deny"];

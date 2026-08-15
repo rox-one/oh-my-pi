@@ -116,7 +116,7 @@ The classifier runs before the prompt is shown, so a `yes` verdict skips it. It 
 
 Choose the backend with `providers.approvalSimilarityModel`: `online` (the default — the `TINY` role from `/models`, else `smol`) or a local on-device model. With the `online` backend, every gated call that is not an exact repeat spends one small-model request. A local backend usually loses its first classification to the 3-second cap while the model loads, and classifies normally once the worker is warm.
 
-Non-TUI surfaces receive the same options as plain labels: RPC clients and ACP form elicitation drop the descriptions the TUI shows next to each label.
+The options are single-line labels on every surface; in the TUI the tool name inside the two session options is additionally colored green.
 
 ## Defining approval on tools
 
