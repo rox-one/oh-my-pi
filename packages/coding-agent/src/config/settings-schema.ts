@@ -5723,6 +5723,19 @@ export const SETTINGS_SCHEMA = {
 			options: TINY_MEMORY_MODEL_OPTIONS,
 		},
 	},
+	"providers.approvalSimilarityModel": {
+		type: "enum",
+		values: TINY_MEMORY_MODEL_VALUES,
+		default: ONLINE_MEMORY_MODEL_KEY,
+		ui: {
+			tab: "providers",
+			group: "Tiny Model",
+			label: "Approval Similarity Model",
+			description:
+				"Classifier for 'Approve Similar <tool> Commands for Session' approvals: online (the TINY role from /models, else smol) by default, or a local on-device model.",
+			options: TINY_MEMORY_MODEL_OPTIONS,
+		},
+	},
 
 	"providers.kimiApiFormat": {
 		type: "enum",
