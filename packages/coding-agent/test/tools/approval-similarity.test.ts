@@ -116,6 +116,31 @@ describe("isSimilarToApprovedCommand", () => {
 		expect(options).toMatchObject({ disableReasoning: true, maxTokens: 1024 });
 	});
 
+	it("keeps a multi-line subject's target line inside the per-subject budget and in one list item", async () => {
+		// `approvalSubject` records the tool's approval detail text, e.g. write's
+		// "Path: …\nContent:\n…". Each approved subject is head-truncated before
+		// it reaches the model: the target line must survive, or the classifier
+		// judges file writes by their import prologue alone.
+		const content = 'import * as fs from "node:fs/promises";\n'.repeat(20);
+		addSimilarApproval(sessionId, "write", `Path: src/deep/module/handler.ts\nContent:\n${content}`);
+		const completeSimple = mockOnlineAnswer({ stopReason: "stop", text: "NO" });
+
+		expect(
+			await isSimilarToApprovedCommand(
+				makeDeps({ toolName: "write", subject: "Path: src/other.ts\nContent:\nexport {};" }),
+			),
+		).toBe(false);
+
+		const call = completeSimple.mock.calls[0];
+		if (!call) throw new Error("expected a classifier model call");
+		const userMessage = call[1].messages[0];
+		if (!userMessage || typeof userMessage.content !== "string") throw new Error("expected a user message");
+		expect(userMessage.content).toContain("- Path: src/deep/module/handler.ts");
+		// Continuation lines are indented so the entry stays a single list item.
+		expect(userMessage.content).toContain("\n  Content:");
+		expect(userMessage.content).toContain("Path: src/other.ts");
+	});
+
 	it("prompts again when the online classifier answers NO", async () => {
 		addSimilarApproval(sessionId, "bash", "git log --oneline");
 		mockOnlineAnswer({ stopReason: "stop", text: "NO" });

@@ -290,7 +290,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 				sessionAllowed = await isSimilarToApprovedCommand({
 					sessionId,
 					toolName: this.tool.name,
-					subject: approvalSubject(resolvedArgs),
+					subject: approvalSubject(this.tool, resolvedArgs),
 					settings,
 					registry: context.modelRegistry,
 					signal,
@@ -395,7 +395,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 			if (choice === approveSessionToolLabel) {
 				approveToolForSession(sessionId, this.tool.name);
 			} else if (choice === approveSimilarLabel) {
-				addSimilarApproval(sessionId, this.tool.name, approvalSubject(resolvedArgs));
+				addSimilarApproval(sessionId, this.tool.name, approvalSubject(this.tool, resolvedArgs));
 			}
 			const approved = choice === "Approve" || choice === approveSessionToolLabel || choice === approveSimilarLabel;
 			await emitApprovalResolved(approved, approved ? undefined : "denied by user");

@@ -101,30 +101,74 @@ describe("session approval store", () => {
 });
 
 describe("approvalSubject", () => {
-	it("uses the raw command string for command-shaped args", () => {
-		expect(approvalSubject({ command: "git status", timeout: 30 })).toBe("git status");
+	/** A tool declaring no approval detail lines — the structural fallback path. */
+	const plain = {};
+	/** Shaped like the real `write` tool's formatter (`src/tools/write.ts`). */
+	const writeLike = {
+		formatApprovalDetails: (args: unknown): string[] => {
+			const params = args as { path?: string; content?: string };
+			return [`Path: ${params.path ?? "(missing)"}`, `Content:\n${params.content ?? ""}`];
+		},
+	};
+
+	it("prefers the tool's approval detail lines so truncation cannot hide the target", () => {
+		const content = 'import * as fs from "node:fs/promises";\n'.repeat(20);
+		const subject = approvalSubject(writeLike, { content, path: "src/deep/module/handler.ts" });
+		expect(subject.startsWith("Path: src/deep/module/handler.ts\nContent:\n")).toBe(true);
+		// The classifier head-truncates each recorded subject to 160 chars; the
+		// path must survive that budget or every file sharing an import
+		// prologue classifies as "similar".
+		expect(subject.slice(0, 160)).toContain("src/deep/module/handler.ts");
+	});
+
+	it("accepts a single detail string and drops empty detail lines", () => {
+		expect(approvalSubject({ formatApprovalDetails: () => "Command: git status" }, { command: "ls" })).toBe(
+			"Command: git status",
+		);
+		expect(approvalSubject({ formatApprovalDetails: () => ["", "Action: open"] }, {})).toBe("Action: open");
+	});
+
+	it("falls back to the raw command when details are absent, empty, or throw", () => {
+		expect(approvalSubject(plain, { command: "git status", timeout: 30 })).toBe("git status");
+		expect(approvalSubject({ formatApprovalDetails: () => [] }, { command: "git status" })).toBe("git status");
+		// A third-party formatter that throws must not fail the tool call.
+		const thrower = {
+			formatApprovalDetails: (): string => {
+				throw new Error("formatter exploded");
+			},
+		};
+		expect(approvalSubject(thrower, { command: "git status" })).toBe("git status");
+	});
+
+	it("puts bulk payload fields last in the JSON fallback", () => {
+		const content = "x".repeat(400);
+		const subject = approvalSubject(plain, { content, path: "src/a.ts" });
+		expect(subject.startsWith('{"path":"src/a.ts","content":')).toBe(true);
+		// Key insertion order must not change the subject: recorded and
+		// candidate subjects are compared as strings.
+		expect(approvalSubject(plain, { path: "src/a.ts", content })).toBe(subject);
 	});
 
 	it("falls back to sorted-key JSON that is independent of key insertion order", () => {
-		expect(approvalSubject({ b: 2, a: 1 })).toBe('{"a":1,"b":2}');
+		expect(approvalSubject(plain, { b: 2, a: 1 })).toBe('{"a":1,"b":2}');
 		// Equivalent nested args must produce the identical subject — the
 		// similarity classifier compares these strings for equality.
-		const first = approvalSubject({ x: { b: 2, a: 1 }, c: 3 });
-		const second = approvalSubject({ c: 3, x: { a: 1, b: 2 } });
+		const first = approvalSubject(plain, { x: { b: 2, a: 1 }, c: 3 });
+		const second = approvalSubject(plain, { c: 3, x: { a: 1, b: 2 } });
 		expect(first).toBe('{"c":3,"x":{"a":1,"b":2}}');
 		expect(second).toBe(first);
 	});
 
 	it("treats a non-string or empty command field as absent", () => {
-		expect(approvalSubject({ command: 42, a: 1 })).toBe('{"a":1,"command":42}');
-		expect(approvalSubject({ command: "" })).toBe('{"command":""}');
+		expect(approvalSubject(plain, { command: 42, a: 1 })).toBe('{"a":1,"command":42}');
+		expect(approvalSubject(plain, { command: "" })).toBe('{"command":""}');
 	});
 
 	it("stringifies non-object args deterministically", () => {
-		expect(approvalSubject(undefined)).toBe("null");
-		expect(approvalSubject("echo hi")).toBe('"echo hi"');
-		expect(approvalSubject([1, "a"])).toBe('[1,"a"]');
+		expect(approvalSubject(plain, undefined)).toBe("null");
+		expect(approvalSubject(plain, "echo hi")).toBe('"echo hi"');
+		expect(approvalSubject(plain, [1, "a"])).toBe('[1,"a"]');
 		// JSON.stringify drops undefined-valued properties; so does the subject.
-		expect(approvalSubject({ a: undefined, b: 1 })).toBe('{"b":1}');
+		expect(approvalSubject(plain, { a: undefined, b: 1 })).toBe('{"b":1}');
 	});
 });

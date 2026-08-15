@@ -7,6 +7,11 @@
  * lives for the process lifetime (or until `clearSessionApprovals`), and is
  * never persisted to settings or session files.
  */
+import type { AgentTool } from "@oh-my-pi/pi-agent-core";
+import { logger } from "@oh-my-pi/pi-utils";
+
+/** The only part of a tool `approvalSubject` needs: its approval-prompt detail lines. */
+export type ApprovalSubjectTool = Pick<AgentTool, "formatApprovalDetails">;
 
 /** Maximum recorded similar-approval subjects per tool, newest first. */
 const MAX_SIMILAR_SUBJECTS = 10;
@@ -59,22 +64,59 @@ export function clearSessionApprovals(sessionId: string): void {
 	sessionApprovals.delete(sessionId);
 }
 
+/**
+ * Serialized values longer than this are bulk payloads (file content, patches,
+ * scripts) and sort after the compact fields.
+ */
+const BULK_VALUE_CHARS = 96;
+
 function stableStringify(value: unknown): string {
 	if (value === null || typeof value !== "object") return JSON.stringify(value) ?? "null";
 	if (Array.isArray(value)) return `[${value.map(stableStringify).join(",")}]`;
-	const entries = Object.entries(value as Record<string, unknown>)
+	// Compact fields first, bulk payloads last, each group by key name. The
+	// classifier only reads the head of a subject, so a `path`/`url`-style
+	// discriminator must not sit behind a whole file's content merely because
+	// its key sorts later in the alphabet.
+	const fields = Object.entries(value as Record<string, unknown>)
 		.filter(entry => entry[1] !== undefined)
-		.sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
-	return `{${entries.map(([key, entry]) => `${JSON.stringify(key)}:${stableStringify(entry)}`).join(",")}}`;
+		.map(([key, entry]) => ({ key, json: stableStringify(entry) }))
+		.sort((a, b) => {
+			const bulk = Number(a.json.length > BULK_VALUE_CHARS) - Number(b.json.length > BULK_VALUE_CHARS);
+			if (bulk !== 0) return bulk;
+			return a.key < b.key ? -1 : a.key > b.key ? 1 : 0;
+		});
+	return `{${fields.map(field => `${JSON.stringify(field.key)}:${field.json}`).join(",")}}`;
+}
+
+function approvalDetails(tool: ApprovalSubjectTool, args: unknown): string | undefined {
+	let details: string | string[] | undefined;
+	try {
+		details = tool.formatApprovalDetails?.(args);
+	} catch (error) {
+		// Extension-supplied formatters are third-party code; a throw here must
+		// not turn an approval prompt into a failed tool call.
+		logger.debug("session-approvals: formatApprovalDetails failed", {
+			error: error instanceof Error ? error.message : String(error),
+		});
+		return undefined;
+	}
+	const text = Array.isArray(details) ? details.filter(line => line.length > 0).join("\n") : details;
+	return text && text.length > 0 ? text : undefined;
 }
 
 /**
- * Extract the comparable approval subject for a tool call: the raw `command`
- * string when the tool takes one (bash & friends), otherwise a stable JSON
- * form with sorted keys so structurally identical args compare equal. Kept
- * raw — the similarity classifier applies its own truncation.
+ * Extract the comparable approval subject for a tool call.
+ *
+ * Preference order: the tool's own approval-prompt detail lines — the exact
+ * text the user approved, and the only form that keeps the discriminating
+ * field (`Path:`, `Command:`, `Action:`) at the head where the classifier's
+ * truncation can't drop it — then a raw `command` string for command-shaped
+ * args without a formatter, then stable JSON with bulk fields last. Kept raw:
+ * the similarity classifier applies its own truncation.
  */
-export function approvalSubject(args: unknown): string {
+export function approvalSubject(tool: ApprovalSubjectTool, args: unknown): string {
+	const details = approvalDetails(tool, args);
+	if (details) return details;
 	if (typeof args === "object" && args !== null && !Array.isArray(args)) {
 		const command = (args as Record<string, unknown>).command;
 		if (typeof command === "string" && command.length > 0) return command;

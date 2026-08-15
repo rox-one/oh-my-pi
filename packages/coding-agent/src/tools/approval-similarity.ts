@@ -55,7 +55,7 @@ const REASONING_SAFE_MAX_TOKENS = 1024;
 export interface ApprovalSimilarityDeps {
 	sessionId: string;
 	toolName: string;
-	/** Raw subject of the pending call — `approvalSubject(args)` output. */
+	/** Raw subject of the pending call — `approvalSubject(tool, args)` output. */
 	subject: string;
 	settings: Settings;
 	registry: ModelRegistry;
@@ -75,7 +75,10 @@ export async function isSimilarToApprovedCommand(deps: ApprovalSimilarityDeps): 
 	if (approvedRaw.length === 0 || candidateRaw.length === 0) return false;
 
 	const backend = deps.settings.get("providers.approvalSimilarityModel");
-	const approved = approvedRaw.map(subject => boundedSubject(subject, MAX_SUBJECT_CHARS));
+	// Both backends render approved subjects as `- <subject>` list items, and a
+	// subject is the tool's multi-line approval detail text ("Path: …\nContent:
+	// …"); indenting the continuation lines keeps each entry one list item.
+	const approved = approvedRaw.map(subject => boundedSubject(subject, MAX_SUBJECT_CHARS).replaceAll("\n", "\n  "));
 	const candidate = boundedSubject(candidateRaw, MAX_CANDIDATE_CHARS);
 	const bounded: ApprovalSimilarityDeps = {
 		...deps,
