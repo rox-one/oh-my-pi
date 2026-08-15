@@ -13,9 +13,16 @@ import { addSimilarApproval, clearSessionApprovals } from "@oh-my-pi/pi-coding-a
 const classifierModel = getBundledModel("anthropic", "claude-sonnet-4-6");
 if (!classifierModel) throw new Error("Expected bundled Claude Sonnet 4.6 model");
 
-/** Session store is module-global; every test owns a fresh session id and clears it. */
+/** Session store is module-global; every id this file touches is released after the test. */
 let sessionId: string;
 let testCount = 0;
+const usedSessionIds: string[] = [];
+
+function newSessionId(): string {
+	const id = `approval-similarity-test-${++testCount}-${Date.now()}`;
+	usedSessionIds.push(id);
+	return id;
+}
 
 function onlineSettings(backend = "online", withSmolRole = true): ApprovalSimilarityDeps["settings"] {
 	return {
@@ -64,11 +71,12 @@ async function drainMicrotasks(): Promise<void> {
 }
 
 beforeEach(() => {
-	sessionId = `approval-similarity-test-${++testCount}-${Date.now()}`;
+	sessionId = newSessionId();
 });
 
 afterEach(() => {
-	clearSessionApprovals(sessionId);
+	for (const id of usedSessionIds) clearSessionApprovals(id);
+	usedSessionIds.length = 0;
 	vi.useRealTimers();
 	vi.restoreAllMocks();
 });
@@ -97,10 +105,20 @@ describe("isSimilarToApprovedCommand", () => {
 	it("returns false without a model call when the session has no similar approvals", async () => {
 		const completeSimple = mockOnlineAnswer({ stopReason: "stop", text: "YES" });
 		// Another session's approvals must not leak into this session's gate.
-		addSimilarApproval(`other-session-${testCount}`, "bash", "git log --oneline");
+		addSimilarApproval(newSessionId(), "bash", "git log --oneline");
 
 		expect(await isSimilarToApprovedCommand(makeDeps())).toBe(false);
+		expect(completeSimple).not.toHaveBeenCalled();
+	});
+
+	it("returns false without a model call for a subject with no content to compare", async () => {
+		// Recorded approvals exist here, so only the empty candidate can stop the
+		// call: a blank subject carries nothing for a model to judge.
+		const completeSimple = mockOnlineAnswer({ stopReason: "stop", text: "YES" });
+		addSimilarApproval(sessionId, "bash", "git log --oneline");
+
 		expect(await isSimilarToApprovedCommand(makeDeps({ subject: "" }))).toBe(false);
+		expect(await isSimilarToApprovedCommand(makeDeps({ subject: " \n\t " }))).toBe(false);
 		expect(completeSimple).not.toHaveBeenCalled();
 	});
 

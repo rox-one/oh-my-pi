@@ -2906,6 +2906,7 @@ describe("ExtensionRunner", () => {
 					reason: "no interactive UI available",
 				},
 			]);
+			delete globalState.__partialContextApprovalEvents;
 		});
 
 		describe("session approval options", () => {
