@@ -144,7 +144,8 @@ execute(toolCallId, params, onUpdate, ctx, signal);
 - `params` is statically typed from its omptype or TypeBox schema via `Static<TParams>`.
 - Runtime argument validation happens before execution in the agent loop.
 - `onUpdate` emits partial results for UI streaming.
-- `ctx` includes `sessionManager`, `modelRegistry`, current `model`, `isIdle()`, `hasQueuedMessages()`, `abort()`, and optional `settings`, `fetch`, `localProtocolOptions`, and `autoApprove`.
+- `ctx` includes `sessionManager`, `modelRegistry`, current `model`, `isIdle()`, `hasQueuedMessages()`, `abort()`, and optional `settings`, `fetch`, `localProtocolOptions`, `autoApprove`, and `metadataForProvider(provider)`.
+- `metadataForProvider(provider)` returns the session's per-provider request metadata (`metadata.user_id`); pass it to any side model request the tool makes so the call is attributed to the same provider session and OAuth account as the conversation. Call it per request — after the credential is selected — and treat it as optional: contexts built without an agent handle omit it.
 - `signal` carries cancellation and may be `undefined`.
 
 The session bootstrap bridge converts custom tools to extension `ToolDefinition`s and forwards calls in the correct argument order. `CustomToolAdapter` remains available to library consumers that directly adapt a custom tool to the agent tool interface.

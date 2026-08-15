@@ -293,6 +293,9 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 					subject: approvalSubject(this.tool, resolvedArgs),
 					settings,
 					registry: context.modelRegistry,
+					// Attribute the classification to this session's provider identity,
+					// like every other side request (title, auto-thinking, recovery).
+					metadataResolver: context.metadataForProvider,
 					signal,
 				});
 			}

@@ -3025,17 +3025,20 @@ describe("ExtensionRunner", () => {
 					{ command: "git status --short" },
 					undefined,
 					undefined,
-					makeContext(),
+					makeContext({ metadataForProvider: (provider: string) => ({ user_id: provider }) }),
 				);
 				expect(resultText(similar)).toBe("ok");
 				expect(select).toHaveBeenCalledTimes(1);
-				expect(classify).toHaveBeenCalledWith(
-					expect.objectContaining({
-						sessionId: sessionManager.getSessionId(),
-						toolName: "dangerous_tool",
-						subject: "git status --short",
-					}),
-				);
+				const deps = classify.mock.calls[0]?.[0];
+				if (!deps) throw new Error("expected a classifier call");
+				expect(deps).toMatchObject({
+					sessionId: sessionManager.getSessionId(),
+					toolName: "dangerous_tool",
+					subject: "git status --short",
+				});
+				// The classification is a provider request made for this session: it
+				// carries the session's request metadata like every other side request.
+				expect(deps.metadataResolver?.("anthropic")).toEqual({ user_id: "anthropic" });
 
 				await expect(
 					(wrapper as ExtensionToolWrapper<any>).execute(
