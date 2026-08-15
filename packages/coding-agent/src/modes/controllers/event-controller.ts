@@ -28,6 +28,7 @@ import { isSilentAbort, isUserInvokedSkillPrompt, readQueueChipText, resolveAbor
 import { type ApprovalMode, resolveApproval } from "../../tools/approval";
 import { previewLine, TRUNCATE_LENGTHS } from "../../tools/render-utils";
 import { PROPOSE_DEVICE_NAME, writeDeviceDispatch } from "../../tools/resolve";
+import { isToolApprovedForSession } from "../../tools/session-approvals";
 import { nextActionableTask } from "../../tools/todo";
 import { SpeechEnhancer } from "../../tts/speech-enhancer";
 import { vocalizer } from "../../tts/vocalizer";
@@ -1443,13 +1444,30 @@ export class EventController {
 	 * the wrapper's `resolveApproval` inputs (approvalMode + tools.approval); uses
 	 * `resolveApproval` rather than `requiresApproval` so a `deny` policy does not
 	 * throw in the render path.
+	 *
+	 * A session approval ("… Commands for Session") downgrades the `prompt`
+	 * resolution to allow in the wrapper, so it must not flip the title here
+	 * either. Provider safety checks stay per-call: the computer tool's
+	 * synthetic `{actions, pendingSafetyChecks}` event args mark a call the
+	 * wrapper will always prompt for, session state or not. The similarity
+	 * classifier is deliberately NOT consulted — a similar-only state may still
+	 * prompt, which is the conservative correct answer for the title.
 	 */
 	#toolWillPromptForApproval(toolName: string, args: unknown): boolean {
 		const tool = this.ctx.viewSession.getToolByName(toolName);
 		if (!tool) return false;
 		const mode = (settings.get("tools.approvalMode") ?? "yolo") as ApprovalMode;
 		const userPolicies = (settings.get("tools.approval") ?? {}) as Record<string, unknown>;
-		return resolveApproval(tool, args, mode, userPolicies).policy === "prompt";
+		if (resolveApproval(tool, args, mode, userPolicies).policy !== "prompt") return false;
+		const synthetic = args as { actions?: unknown; pendingSafetyChecks?: unknown } | null;
+		if (
+			Array.isArray(synthetic?.actions) &&
+			Array.isArray(synthetic?.pendingSafetyChecks) &&
+			synthetic.pendingSafetyChecks.length > 0
+		) {
+			return true;
+		}
+		return !isToolApprovedForSession(this.ctx.sessionManager.getSessionId(), toolName);
 	}
 
 	async #handleToolExecutionUpdate(
