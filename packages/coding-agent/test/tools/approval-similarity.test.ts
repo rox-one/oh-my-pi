@@ -8,7 +8,11 @@ import {
 	isSimilarToApprovedCommand,
 	parseApprovalSimilarity,
 } from "@oh-my-pi/pi-coding-agent/tools/approval-similarity";
-import { addSimilarApproval, clearSessionApprovals } from "@oh-my-pi/pi-coding-agent/tools/session-approvals";
+import {
+	addSimilarApproval,
+	approvalIdentity,
+	clearSessionApprovals,
+} from "@oh-my-pi/pi-coding-agent/tools/session-approvals";
 
 const classifierModel = getBundledModel("anthropic", "claude-sonnet-4-6");
 if (!classifierModel) throw new Error("Expected bundled Claude Sonnet 4.6 model");
@@ -22,6 +26,14 @@ function newSessionId(): string {
 	const id = `approval-similarity-test-${++testCount}-${Date.now()}`;
 	usedSessionIds.push(id);
 	return id;
+}
+
+/**
+ * Record a grant the way the wrapper does: the bounded display subject the user
+ * read, plus the digest of the full arguments that call ran with.
+ */
+function grantSimilar(toolName: string, subject: string, args: unknown = { command: subject }, id = sessionId): void {
+	addSimilarApproval(id, toolName, subject, approvalIdentity(args));
 }
 
 function onlineSettings(backend = "online", withSmolRole = true): ApprovalSimilarityDeps["settings"] {
@@ -48,10 +60,14 @@ function onlineRegistry(available: unknown[] = [classifierModel]): ApprovalSimil
 }
 
 function makeDeps(overrides: Partial<ApprovalSimilarityDeps> = {}): ApprovalSimilarityDeps {
+	const subject = overrides.subject ?? "git diff HEAD";
 	return {
 		sessionId,
 		toolName: "bash",
-		subject: "git diff HEAD",
+		subject,
+		// Command-shaped default, matching `grantSimilar`: a candidate repeating a
+		// granted command carries that grant's identity unless a test overrides it.
+		identity: approvalIdentity({ command: subject }),
 		settings: onlineSettings(),
 		registry: onlineRegistry(),
 		...overrides,
@@ -104,8 +120,9 @@ describe("parseApprovalSimilarity", () => {
 describe("isSimilarToApprovedCommand", () => {
 	it("returns false without a model call when the session has no similar approvals", async () => {
 		const completeSimple = mockOnlineAnswer({ stopReason: "stop", text: "YES" });
-		// Another session's approvals must not leak into this session's gate.
-		addSimilarApproval(newSessionId(), "bash", "git log --oneline");
+		// Another session's approvals must not leak into this session's gate —
+		// not even a grant for the very call this one is making.
+		grantSimilar("bash", "git diff HEAD", { command: "git diff HEAD" }, newSessionId());
 
 		expect(await isSimilarToApprovedCommand(makeDeps())).toBe(false);
 		expect(completeSimple).not.toHaveBeenCalled();
@@ -115,32 +132,58 @@ describe("isSimilarToApprovedCommand", () => {
 		// Recorded approvals exist here, so only the empty candidate can stop the
 		// call: a blank subject carries nothing for a model to judge.
 		const completeSimple = mockOnlineAnswer({ stopReason: "stop", text: "YES" });
-		addSimilarApproval(sessionId, "bash", "git log --oneline");
+		grantSimilar("bash", "git log --oneline");
 
 		expect(await isSimilarToApprovedCommand(makeDeps({ subject: "" }))).toBe(false);
 		expect(await isSimilarToApprovedCommand(makeDeps({ subject: " \n\t " }))).toBe(false);
 		expect(completeSimple).not.toHaveBeenCalled();
 	});
 
-	it("approves an unchanged repeat of a recorded subject without a model call", async () => {
+	it("approves a repeat of an approved call without a model call", async () => {
 		const completeSimple = mockOnlineAnswer({ stopReason: "stop", text: "NO" });
 		const localComplete = vi.spyOn(tinyModelClient, "complete").mockResolvedValue("NO");
-		// Longer than the store's 4096-char retention bound: the recorded copy is
-		// truncated, so the repeat only matches if the candidate is bounded the
-		// same way before comparison.
-		const bulkSubject = `Path: src/generated.ts\nContent:\n${"export const x = 1;\n".repeat(400)}`;
-		addSimilarApproval(sessionId, "bash", "git log --oneline");
-		addSimilarApproval(sessionId, "write", bulkSubject);
+		// A subject past the store's 4096-char retention bound: the recorded text
+		// is truncated, so only the args digest can still recognize the repeat.
+		const writeArgs = { content: "export const x = 1;\n".repeat(400), path: "src/generated.ts" };
+		const bulkSubject = `Path: ${writeArgs.path}\nContent:\n${writeArgs.content}`;
+		grantSimilar("bash", "git log --oneline");
+		grantSimilar("write", bulkSubject, writeArgs);
 
 		expect(await isSimilarToApprovedCommand(makeDeps({ subject: "git log --oneline" }))).toBe(true);
-		expect(await isSimilarToApprovedCommand(makeDeps({ toolName: "write", subject: bulkSubject }))).toBe(true);
+		expect(
+			await isSimilarToApprovedCommand(
+				makeDeps({ identity: approvalIdentity(writeArgs), subject: bulkSubject, toolName: "write" }),
+			),
+		).toBe(true);
 		// A verdict the user already gave costs neither a request nor the wait for one.
 		expect(completeSimple).not.toHaveBeenCalled();
 		expect(localComplete).not.toHaveBeenCalled();
 	});
 
+	it("classifies two calls that share a truncated subject but ran different arguments", async () => {
+		// Approval subjects arrive already cut — every tool elides its bulk
+		// payloads for the prompt — so these two writes are recorded as the same
+		// text. Matching that text would auto-approve the second one; the digest
+		// differs, so the verdict is the classifier's (mocked NO ⇒ prompt).
+		const head = "x".repeat(2_000);
+		const subject = `Path: src/a.ts\nContent:\n${head}[…4 chars elided…]`;
+		grantSimilar("write", subject, { content: `${head}SAFE`, path: "src/a.ts" });
+		const completeSimple = mockOnlineAnswer({ stopReason: "stop", text: "NO" });
+
+		expect(
+			await isSimilarToApprovedCommand(
+				makeDeps({
+					identity: approvalIdentity({ content: `${head}PWN!`, path: "src/a.ts" }),
+					subject,
+					toolName: "write",
+				}),
+			),
+		).toBe(false);
+		expect(completeSimple).toHaveBeenCalledTimes(1);
+	});
+
 	it("auto-approves when the online classifier answers YES and carries both sides of the comparison", async () => {
-		addSimilarApproval(sessionId, "bash", "git log --oneline");
+		grantSimilar("bash", "git log --oneline");
 		const completeSimple = mockOnlineAnswer({ stopReason: "stop", text: "YES" });
 
 		expect(await isSimilarToApprovedCommand(makeDeps())).toBe(true);
@@ -163,7 +206,7 @@ describe("isSimilarToApprovedCommand", () => {
 		// it reaches the model: the target line must survive, or the classifier
 		// judges file writes by their import prologue alone.
 		const content = 'import * as fs from "node:fs/promises";\n'.repeat(20);
-		addSimilarApproval(sessionId, "write", `Path: src/deep/module/handler.ts\nContent:\n${content}`);
+		grantSimilar("write", `Path: src/deep/module/handler.ts\nContent:\n${content}`);
 		const completeSimple = mockOnlineAnswer({ stopReason: "stop", text: "NO" });
 
 		expect(
@@ -183,35 +226,35 @@ describe("isSimilarToApprovedCommand", () => {
 	});
 
 	it("prompts again when the online classifier answers NO", async () => {
-		addSimilarApproval(sessionId, "bash", "git log --oneline");
+		grantSimilar("bash", "git log --oneline");
 		mockOnlineAnswer({ stopReason: "stop", text: "NO" });
 
 		expect(await isSimilarToApprovedCommand(makeDeps())).toBe(false);
 	});
 
 	it("fails safe to false on an errored online response", async () => {
-		addSimilarApproval(sessionId, "bash", "git log --oneline");
+		grantSimilar("bash", "git log --oneline");
 		mockOnlineAnswer({ stopReason: "error", text: "" });
 
 		expect(await isSimilarToApprovedCommand(makeDeps())).toBe(false);
 	});
 
 	it("fails safe to false on unparsable online output", async () => {
-		addSimilarApproval(sessionId, "bash", "git log --oneline");
+		grantSimilar("bash", "git log --oneline");
 		mockOnlineAnswer({ stopReason: "stop", text: "maybe, they share a word" });
 
 		expect(await isSimilarToApprovedCommand(makeDeps())).toBe(false);
 	});
 
 	it("fails safe to false when the model call throws", async () => {
-		addSimilarApproval(sessionId, "bash", "git log --oneline");
+		grantSimilar("bash", "git log --oneline");
 		vi.spyOn(ai, "completeSimple").mockRejectedValue(new Error("network down"));
 
 		await expect(isSimilarToApprovedCommand(makeDeps())).resolves.toBe(false);
 	});
 
 	it("fails safe to false when no tiny/smol model is available", async () => {
-		addSimilarApproval(sessionId, "bash", "git log --oneline");
+		grantSimilar("bash", "git log --oneline");
 		const completeSimple = mockOnlineAnswer({ stopReason: "stop", text: "YES" });
 
 		expect(
@@ -226,7 +269,7 @@ describe("isSimilarToApprovedCommand", () => {
 	});
 
 	it("fails safe to false on an invalid backend setting", async () => {
-		addSimilarApproval(sessionId, "bash", "git log --oneline");
+		grantSimilar("bash", "git log --oneline");
 		const completeSimple = mockOnlineAnswer({ stopReason: "stop", text: "YES" });
 		const localComplete = vi.spyOn(tinyModelClient, "complete").mockResolvedValue("YES");
 
@@ -236,7 +279,7 @@ describe("isSimilarToApprovedCommand", () => {
 	});
 
 	it("classifies via the local memory model with the recorded subjects rendered inline", async () => {
-		addSimilarApproval(sessionId, "bash", "git log --oneline");
+		grantSimilar("bash", "git log --oneline");
 		const settings = Settings.isolated({ "providers.approvalSimilarityModel": "qwen2.5-1.5b" });
 		let classifierPrompt = "";
 		let maxTokens: number | undefined;
@@ -258,7 +301,7 @@ describe("isSimilarToApprovedCommand", () => {
 	});
 
 	it("fails safe to false when the local model returns no output", async () => {
-		addSimilarApproval(sessionId, "bash", "git log --oneline");
+		grantSimilar("bash", "git log --oneline");
 		const settings = Settings.isolated({ "providers.approvalSimilarityModel": "lfm2-1.2b" });
 		vi.spyOn(tinyModelClient, "complete").mockResolvedValue(null);
 
@@ -266,7 +309,7 @@ describe("isSimilarToApprovedCommand", () => {
 	});
 
 	it("combines the caller's abort signal with the classification timeout", async () => {
-		addSimilarApproval(sessionId, "bash", "git log --oneline");
+		grantSimilar("bash", "git log --oneline");
 		const caller = new AbortController();
 		caller.abort();
 		let receivedSignal: AbortSignal | undefined;
@@ -284,7 +327,7 @@ describe("isSimilarToApprovedCommand", () => {
 		// hung refresh would hold the approval prompt open indefinitely if the
 		// ceiling were enforced only through the abort signal.
 		vi.useFakeTimers();
-		addSimilarApproval(sessionId, "bash", "git log --oneline");
+		grantSimilar("bash", "git log --oneline");
 		mockOnlineAnswer({ stopReason: "stop", text: "YES" });
 		const registry = {
 			getAvailable: () => [classifierModel],

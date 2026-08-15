@@ -8,6 +8,7 @@ import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import {
 	addSimilarApproval,
+	approvalIdentity,
 	approveToolForSession,
 	clearSessionApprovals,
 	getSimilarApprovals,
@@ -66,7 +67,7 @@ function grantForCurrentSession(sessionManager: SessionManager): string {
 	const sessionId = sessionManager.getSessionId();
 	grantedSessionIds.push(sessionId);
 	approveToolForSession(sessionId, "bash");
-	addSimilarApproval(sessionId, "write", "Path: src/a.ts");
+	addSimilarApproval(sessionId, "write", "Path: src/a.ts", approvalIdentity({ path: "src/a.ts" }));
 	expect(isToolApprovedForSession(sessionId, "bash")).toBe(true);
 	return sessionId;
 }
@@ -132,7 +133,7 @@ it("rotating only the provider session id keeps the grants of the live session",
 
 	expect(sessionManager.getSessionId()).toBe(sessionId);
 	expect(isToolApprovedForSession(sessionId, "bash")).toBe(true);
-	expect(getSimilarApprovals(sessionId, "write")).toEqual(["Path: src/a.ts"]);
+	expect(getSimilarApprovals(sessionId, "write").map(entry => entry.subject)).toEqual(["Path: src/a.ts"]);
 });
 
 it("disposing a session releases its grants and a re-opened session id starts ungranted", async () => {

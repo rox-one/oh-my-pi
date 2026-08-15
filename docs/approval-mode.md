@@ -86,9 +86,9 @@ Tools can add approval-prompt body lines with `formatApprovalDetails(args)`. The
 An interactive approval prompt offers two extra options between `Approve` and `Deny`:
 
 - `Approve <tool> Commands for Session` — every later call of that tool skips the prompt.
-- `Approve Similar <tool> Commands for Session` — records the approved call, then compares later calls of that tool against the recorded ones with a small model. A `yes` verdict approves the call silently; anything else prompts again with the same options. An unchanged repeat of a recorded call is approved directly, without asking the model.
+- `Approve Similar <tool> Commands for Session` — records the approved call, then compares later calls of that tool against the recorded ones with a small model. A `yes` verdict approves the call silently; anything else prompts again with the same options. A repeat of a recorded call — same tool, same arguments — is approved directly, without asking the model.
 
-What is recorded is the tool's own approval-prompt detail text (`Command: …`, `Path: …`, `Action: …`), so the classifier compares what you actually saw and approved. At most 10 subjects per tool are kept, newest first, each capped at 4,096 characters. Approving the whole tool discards its recorded subjects, since it subsumes them.
+What is recorded is the tool's own approval-prompt detail text (`Command: …`, `Path: …`, `Action: …`), so the classifier compares what you actually saw and approved. At most 10 subjects per tool are kept, newest first, each capped at 4,096 characters. That text serves display and classification only; whether a later call is a repeat is decided by a digest of its full arguments, so two calls that look identical once truncated still face the classifier. Approving the whole tool discards its recorded subjects, since it subsumes them.
 
 Both grants live in memory only. Nothing is written to config or session files, and no grant is shared between processes or sessions.
 

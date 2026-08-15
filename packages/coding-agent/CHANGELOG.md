@@ -1149,6 +1149,7 @@
 ### Fixed
 
 - Fixed session-scoped tool approval grants outliving the session that made them: disposing a session now releases its grants, so re-opening the same session id in one process (lifecycle revival, `history://`, SDK re-entry) no longer resurrects an approval a fresh process would prompt for ([#4608](https://github.com/can1357/oh-my-pi/issues/4608)).
+- Fixed "Approve Similar" grants auto-approving a later call that merely looked identical: repeats were matched on the approval prompt's display text, which each tool truncates at 2000 characters, so two calls sharing that head and the same length — a `write` whose payload ends `SAFE` versus one ending `PWN!` — skipped both the classifier and the prompt. A repeat is now recognized from a digest of the full arguments that would run ([#4608](https://github.com/can1357/oh-my-pi/issues/4608)).
 
 ## [17.3.4] - 2026-08-14
 

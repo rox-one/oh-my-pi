@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import {
 	addSimilarApproval,
+	approvalIdentity,
 	approvalSubject,
 	approveToolForSession,
 	clearSessionApprovals,
@@ -38,16 +39,17 @@ describe("session approval store", () => {
 
 	it("an empty session id records nothing — the feature stays inert", () => {
 		approveToolForSession("", "bash");
-		addSimilarApproval("", "bash", "echo hi");
+		addSimilarApproval("", "bash", "echo hi", "id-1");
 		expect(isToolApprovedForSession("", "bash")).toBe(false);
 		expect(getSimilarApprovals("", "bash")).toEqual([]);
 	});
 
-	it("similar approvals are kept newest-first, deduped, and capped at 10 per tool", () => {
+	it("similar approvals are kept newest-first, deduped by identity, and capped at 10 per tool", () => {
 		const sid = newSessionId();
-		for (let i = 1; i <= 12; i++) addSimilarApproval(sid, "bash", `cmd-${i}`);
+		const subjects = () => getSimilarApprovals(sid, "bash").map(entry => entry.subject);
+		for (let i = 1; i <= 12; i++) addSimilarApproval(sid, "bash", `cmd-${i}`, `id-${i}`);
 		// The two oldest subjects fall off the back of the cap.
-		expect(getSimilarApprovals(sid, "bash")).toEqual([
+		expect(subjects()).toEqual([
 			"cmd-12",
 			"cmd-11",
 			"cmd-10",
@@ -59,9 +61,9 @@ describe("session approval store", () => {
 			"cmd-4",
 			"cmd-3",
 		]);
-		// Re-approving a recorded subject refreshes it without duplicating.
-		addSimilarApproval(sid, "bash", "cmd-5");
-		expect(getSimilarApprovals(sid, "bash")).toEqual([
+		// Re-approving the same call refreshes it without duplicating.
+		addSimilarApproval(sid, "bash", "cmd-5", "id-5");
+		expect(subjects()).toEqual([
 			"cmd-5",
 			"cmd-12",
 			"cmd-11",
@@ -73,47 +75,77 @@ describe("session approval store", () => {
 			"cmd-4",
 			"cmd-3",
 		]);
+		// Same display text, different arguments: two grants, not one — the
+		// display subject never merges distinct calls.
+		addSimilarApproval(sid, "bash", "cmd-5", "id-5-other-args");
+		expect(subjects().slice(0, 2)).toEqual(["cmd-5", "cmd-5"]);
+		expect(
+			getSimilarApprovals(sid, "bash")
+				.map(entry => entry.identity)
+				.slice(0, 2),
+		).toEqual(["id-5-other-args", "id-5"]);
 		// Subjects are recorded per tool, not per session-wide list.
 		expect(getSimilarApprovals(sid, "write")).toEqual([]);
 	});
 
-	it("truncates a bulk subject so a recorded write payload is not retained whole", () => {
+	it("truncates a bulk subject for retention without merging calls that differ past the bound", () => {
 		const sid = newSessionId();
 		const head = `Path: src/a.ts\nContent: ${"x".repeat(200)}`;
 		const bulk = `${head}${"y".repeat(64 * 1024)}`;
-		addSimilarApproval(sid, "write", bulk);
+		addSimilarApproval(sid, "write", bulk, "id-safe");
 		const [recorded, ...rest] = getSimilarApprovals(sid, "write");
 		expect(rest).toEqual([]);
-		// Bounded, but the head the classifier compares on survives intact.
-		expect(recorded?.length).toBe(4096);
-		expect(recorded?.startsWith(head)).toBe(true);
-		expect(recorded?.endsWith("…")).toBe(true);
-		// Subjects that differ only past the bound collapse into one entry, so the
-		// store bounds retained bytes and not just the entry count.
-		addSimilarApproval(sid, "write", `${bulk}-different-tail`);
-		expect(getSimilarApprovals(sid, "write")).toEqual([recorded]);
+		// Bounded, but the head the classifier reads survives intact.
+		expect(recorded?.subject.length).toBe(4096);
+		expect(recorded?.subject.startsWith(head)).toBe(true);
+		expect(recorded?.subject.endsWith("…")).toBe(true);
+		// Two calls whose subjects are identical after that bound stay two
+		// grants: the identity, not the retained text, decides what repeats.
+		addSimilarApproval(sid, "write", `${bulk}-different-tail`, "id-pwn");
+		expect(getSimilarApprovals(sid, "write").map(entry => entry.identity)).toEqual(["id-pwn", "id-safe"]);
+		expect(getSimilarApprovals(sid, "write")[0]?.subject).toBe(recorded?.subject);
 	});
 
 	it("whole-tool approval supersedes that tool's similar list but not other tools'", () => {
 		const sid = newSessionId();
-		addSimilarApproval(sid, "bash", "git status");
-		addSimilarApproval(sid, "write", "src/a.ts");
+		addSimilarApproval(sid, "bash", "git status", "id-bash");
+		addSimilarApproval(sid, "write", "src/a.ts", "id-write");
 		approveToolForSession(sid, "bash");
 		expect(getSimilarApprovals(sid, "bash")).toEqual([]);
 		expect(isToolApprovedForSession(sid, "bash")).toBe(true);
-		expect(getSimilarApprovals(sid, "write")).toEqual(["src/a.ts"]);
+		expect(getSimilarApprovals(sid, "write")).toEqual([{ identity: "id-write", subject: "src/a.ts" }]);
 	});
 
 	it("clearSessionApprovals wipes only the targeted session's state", () => {
 		const sid = newSessionId();
 		const other = newSessionId();
 		approveToolForSession(sid, "bash");
-		addSimilarApproval(sid, "write", "src/a.ts");
+		addSimilarApproval(sid, "write", "src/a.ts", "id-write");
 		approveToolForSession(other, "bash");
 		clearSessionApprovals(sid);
 		expect(isToolApprovedForSession(sid, "bash")).toBe(false);
 		expect(getSimilarApprovals(sid, "write")).toEqual([]);
 		expect(isToolApprovedForSession(other, "bash")).toBe(true);
+	});
+});
+
+describe("approvalIdentity", () => {
+	it("separates calls whose approval subjects are identical after truncation", () => {
+		// Every tool cuts bulk payloads to 2000 chars for the prompt, and the store
+		// bounds the result again at 4096, so these two writes are recorded as the
+		// same text. Only the identity keeps them apart, and it must, or approving
+		// the first auto-approves the second with no model and no prompt.
+		const head = "x".repeat(8_000);
+		expect(approvalIdentity({ content: `${head}SAFE`, path: "src/a.ts" })).not.toBe(
+			approvalIdentity({ content: `${head}PWN!`, path: "src/a.ts" }),
+		);
+	});
+
+	it("is independent of key insertion order so a true repeat matches itself", () => {
+		expect(approvalIdentity({ content: "a", path: "src/a.ts" })).toBe(
+			approvalIdentity({ path: "src/a.ts", content: "a" }),
+		);
+		expect(approvalIdentity({ nested: { b: 2, a: 1 } })).toBe(approvalIdentity({ nested: { a: 1, b: 2 } }));
 	});
 });
 

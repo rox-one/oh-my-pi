@@ -17,6 +17,7 @@ import { isSimilarToApprovedCommand } from "../../tools/approval-similarity";
 import { defaultLoadModeForToolName } from "../../tools/essential-tools";
 import {
 	addSimilarApproval,
+	approvalIdentity,
 	approvalSubject,
 	approveToolForSession,
 	getSimilarApprovals,
@@ -291,6 +292,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 					sessionId,
 					toolName: this.tool.name,
 					subject: approvalSubject(this.tool, resolvedArgs),
+					identity: approvalIdentity(resolvedArgs),
 					settings,
 					registry: context?.modelRegistry,
 					// Attribute the classification to this session's provider identity,
@@ -392,7 +394,12 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 			if (choice === approveSessionToolLabel) {
 				approveToolForSession(sessionId, this.tool.name);
 			} else if (choice === approveSimilarLabel) {
-				addSimilarApproval(sessionId, this.tool.name, approvalSubject(this.tool, resolvedArgs));
+				addSimilarApproval(
+					sessionId,
+					this.tool.name,
+					approvalSubject(this.tool, resolvedArgs),
+					approvalIdentity(resolvedArgs),
+				);
 			}
 			const approved = choice === "Approve" || choice === approveSessionToolLabel || choice === approveSimilarLabel;
 			await emitApprovalResolved(approved, approved ? undefined : "denied by user");

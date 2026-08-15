@@ -35,6 +35,7 @@ import type { ToolApprovalDecision } from "@oh-my-pi/pi-coding-agent/tools/appro
 import * as approvalSimilarity from "@oh-my-pi/pi-coding-agent/tools/approval-similarity";
 import {
 	addSimilarApproval,
+	approvalIdentity,
 	approveToolForSession,
 	clearSessionApprovals,
 } from "@oh-my-pi/pi-coding-agent/tools/session-approvals";
@@ -3027,6 +3028,9 @@ describe("ExtensionRunner", () => {
 				const deps = classify.mock.calls[0]?.[0];
 				if (!deps) throw new Error("expected a classifier call");
 				expect(deps).toMatchObject({
+					// Digest of the arguments that would run, not of the (truncated)
+					// subject text: an exact repeat is recognized losslessly.
+					identity: approvalIdentity({ command: "git status --short" }),
 					sessionId: sessionManager.getSessionId(),
 					toolName: "dangerous_tool",
 					subject: "git status --short",
@@ -3054,7 +3058,12 @@ describe("ExtensionRunner", () => {
 			});
 
 			it("classifies with a registry-less context: only the online backend needs a registry", async () => {
-				addSimilarApproval(sessionManager.getSessionId(), "dangerous_tool", "git status");
+				addSimilarApproval(
+					sessionManager.getSessionId(),
+					"dangerous_tool",
+					"git status",
+					approvalIdentity({ command: "git status" }),
+				);
 				const classify = vi.spyOn(approvalSimilarity, "isSimilarToApprovedCommand").mockResolvedValue(true);
 				const select = vi.fn(async (_title: string, _options: ExtensionUISelectItem[]) => "Deny");
 				const runner = await makeRunner(select);
@@ -3165,7 +3174,12 @@ describe("ExtensionRunner", () => {
 					execute: async () => ({ content: [{ type: "text" as const, text: "ok" }] }),
 				};
 				approveToolForSession(sessionManager.getSessionId(), "override_tool");
-				addSimilarApproval(sessionManager.getSessionId(), "override_tool", "rm -rf /tmp/scratch");
+				addSimilarApproval(
+					sessionManager.getSessionId(),
+					"override_tool",
+					"rm -rf /tmp/scratch",
+					approvalIdentity({ command: "rm -rf /tmp/scratch" }),
+				);
 				const classify = vi.spyOn(approvalSimilarity, "isSimilarToApprovedCommand");
 				const select = vi.fn(async (_title: string, _options: ExtensionUISelectItem[]) => "Approve");
 				const runner = await makeRunner(select);

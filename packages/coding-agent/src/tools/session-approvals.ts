@@ -27,22 +27,19 @@ const MAX_SIMILAR_SUBJECTS = 10;
  */
 const MAX_RETAINED_SUBJECT_CHARS = 4096;
 
-/**
- * The exact form a subject is recorded in. Callers comparing a pending call
- * against the recorded list must bound it the same way, or an unchanged repeat
- * of an over-long subject fails to match itself.
- */
-export function boundRetainedSubject(subject: string): string {
-	return subject.length > MAX_RETAINED_SUBJECT_CHARS
-		? `${subject.slice(0, MAX_RETAINED_SUBJECT_CHARS - 1)}…`
-		: subject;
+/** One recorded "approve similar" grant. */
+export interface SimilarApproval {
+	/** Bounded display text the user approved — for display and classification only. */
+	subject: string;
+	/** {@link approvalIdentity} of the call's full resolved args; the only exact-repeat key. */
+	identity: string;
 }
 
 export interface SessionApprovalState {
 	/** Tools approved for the rest of the session, by tool name. */
 	approvedTools: Set<string>;
-	/** Recorded approval subjects per tool, newest first, capped. */
-	similar: Map<string, string[]>;
+	/** Recorded approvals per tool, newest first, capped. */
+	similar: Map<string, SimilarApproval[]>;
 }
 
 const sessionApprovals = new Map<string, SessionApprovalState>();
@@ -70,16 +67,22 @@ export function approveToolForSession(sessionId: string, toolName: string): void
 	state.similar.delete(toolName);
 }
 
-export function addSimilarApproval(sessionId: string, toolName: string, subject: string): void {
+/** Record one "approve similar" grant. `identity` must come from {@link approvalIdentity}. */
+export function addSimilarApproval(sessionId: string, toolName: string, subject: string, identity: string): void {
 	const state = mutableState(sessionId);
 	if (!state || !subject) return;
-	const bounded = boundRetainedSubject(subject);
+	const bounded =
+		subject.length > MAX_RETAINED_SUBJECT_CHARS ? `${subject.slice(0, MAX_RETAINED_SUBJECT_CHARS - 1)}…` : subject;
+	const entry: SimilarApproval = { subject: bounded, identity };
 	const existing = state.similar.get(toolName) ?? [];
-	const next = [bounded, ...existing.filter(entry => entry !== bounded)];
+	// Dedup on identity, not on the bounded subject: a re-approval of the same
+	// call refreshes it to newest-first, while two calls that differ only past
+	// the display truncation stay two entries.
+	const next = [entry, ...existing.filter(recorded => recorded.identity !== identity)];
 	state.similar.set(toolName, next.slice(0, MAX_SIMILAR_SUBJECTS));
 }
 
-export function getSimilarApprovals(sessionId: string, toolName: string): readonly string[] {
+export function getSimilarApprovals(sessionId: string, toolName: string): readonly SimilarApproval[] {
 	return sessionId ? (sessionApprovals.get(sessionId)?.similar.get(toolName) ?? []) : [];
 }
 
@@ -109,6 +112,20 @@ function stableStringify(value: unknown): string {
 			return a.key < b.key ? -1 : a.key > b.key ? 1 : 0;
 		});
 	return `{${fields.map(field => `${JSON.stringify(field.key)}:${field.json}`).join(",")}}`;
+}
+
+/**
+ * Exact-repeat key of a tool call: a digest of its FULL resolved arguments,
+ * taken before any display truncation.
+ *
+ * Approval subjects are lossy twice over — every tool cuts its bulk payloads to
+ * 2000 chars for the prompt (`truncateForPrompt`) and this store bounds the
+ * result again — so two calls that differ only past the cut carry byte-identical
+ * subject text. Matching a repeat on that text would auto-approve the second
+ * one with no model and no prompt; matching on this digest cannot.
+ */
+export function approvalIdentity(args: unknown): string {
+	return Bun.hash(stableStringify(args)).toString(36);
 }
 
 function approvalDetails(tool: ApprovalSubjectTool, args: unknown): string | undefined {

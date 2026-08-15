@@ -25,7 +25,7 @@ import approvalSimilarityUserPrompt from "../prompts/system/approval-similarity-
 import { stripAnsi } from "../tiny/message-preproc";
 import { isTinyMemoryLocalModelKey, isTinyMemoryReasoningModelKey, ONLINE_MEMORY_MODEL_KEY } from "../tiny/models";
 import { tinyModelClient } from "../tiny/title-client";
-import { boundRetainedSubject, getSimilarApprovals } from "./session-approvals";
+import { getSimilarApprovals } from "./session-approvals";
 
 const SIMILARITY_SYSTEM_PROMPT = prompt.render(approvalSimilarityPrompt);
 
@@ -63,6 +63,8 @@ export interface ApprovalSimilarityDeps {
 	toolName: string;
 	/** Raw subject of the pending call — `approvalSubject(tool, args)` output. */
 	subject: string;
+	/** Exact-repeat key of the pending call — `approvalIdentity(resolvedArgs)` output. */
+	identity: string;
 	settings: Settings;
 	/** Required by the `online` backend only; the local backend classifies on-device. */
 	registry?: ModelRegistry;
@@ -74,26 +76,27 @@ export interface ApprovalSimilarityDeps {
  * True when `deps.subject` is similar to a subject the user approved for
  * `deps.toolName` this session. With no recorded subjects (or an unknown
  * session) there is nothing to compare against: returns `false` without a
- * model call. An unchanged repeat of an approved subject answers itself, also
- * without a model call.
+ * model call. A call whose arguments the user already approved answers itself,
+ * also without a model call.
  */
 export async function isSimilarToApprovedCommand(deps: ApprovalSimilarityDeps): Promise<boolean> {
-	const approvedRaw = getSimilarApprovals(deps.sessionId, deps.toolName);
+	const approvedEntries = getSimilarApprovals(deps.sessionId, deps.toolName);
 	const candidateRaw = stripAnsi(deps.subject).trim();
-	if (approvedRaw.length === 0 || candidateRaw.length === 0) return false;
+	if (approvedEntries.length === 0 || candidateRaw.length === 0) return false;
 
-	// The same subject the user read in the prompt and approved: no model can
-	// add anything, so the repeat costs neither a request nor the wait for one.
-	// Recorded subjects carry the store's retention bound, so bound the
-	// candidate identically before comparing.
-	const candidateRetained = boundRetainedSubject(candidateRaw);
-	if (approvedRaw.some(subject => stripAnsi(subject).trim() === candidateRetained)) return true;
+	// The very call the user read in the prompt and approved: no model can add
+	// anything, so the repeat costs neither a request nor the wait for one.
+	// Matched on the args digest only — subject text is truncated for display
+	// long before it is recorded, so calls differing past the cut share it.
+	if (approvedEntries.some(entry => entry.identity === deps.identity)) return true;
 
 	const backend = deps.settings.get("providers.approvalSimilarityModel");
 	// Both backends render approved subjects as `- <subject>` list items, and a
 	// subject is the tool's multi-line approval detail text ("Path: …\nContent:
 	// …"); indenting the continuation lines keeps each entry one list item.
-	const approved = approvedRaw.map(subject => boundedSubject(subject, MAX_SUBJECT_CHARS).replaceAll("\n", "\n  "));
+	const approved = approvedEntries.map(entry =>
+		boundedSubject(entry.subject, MAX_SUBJECT_CHARS).replaceAll("\n", "\n  "),
+	);
 	const candidate = boundedSubject(candidateRaw, MAX_CANDIDATE_CHARS);
 	const bounded: ApprovalSimilarityDeps = {
 		...deps,
