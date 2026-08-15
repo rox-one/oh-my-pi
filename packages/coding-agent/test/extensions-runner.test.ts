@@ -24,12 +24,16 @@ import type {
 	ExtensionError,
 	ExtensionServiceTier,
 	ExtensionUIContext,
+	ExtensionUISelectItem,
 	InputEvent,
 	InputEventResult,
 } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import { ExtensionToolWrapper } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/wrapper";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import * as approvalSimilarity from "@oh-my-pi/pi-coding-agent/tools/approval-similarity";
+import { approveToolForSession, clearSessionApprovals } from "@oh-my-pi/pi-coding-agent/tools/session-approvals";
+
 import { getProjectAgentDir, logger, TempDir } from "@oh-my-pi/pi-utils";
 
 describe("ExtensionRunner", () => {
@@ -2557,7 +2561,7 @@ describe("ExtensionRunner", () => {
 	describe("tool approval lifecycle", () => {
 		const initializeRunner = (
 			runner: ExtensionRunner,
-			select: (title: string, options: string[]) => Promise<string | undefined>,
+			select: (title: string, options: ExtensionUISelectItem[]) => Promise<string | undefined>,
 		) => {
 			runner.initialize(
 				{
@@ -2674,6 +2678,14 @@ describe("ExtensionRunner", () => {
 			]);
 			expect(select).toHaveBeenCalledWith(expect.stringContaining("Allow tool: dangerous_tool"), [
 				"Approve",
+				{
+					label: "Approve dangerous_tool Commands for Session",
+					description: "Skip approval prompts for this tool until the session ends.",
+				},
+				{
+					label: "Approve Similar dangerous_tool Commands for Session",
+					description: "Auto-approve commands the assistant judges similar; others still prompt.",
+				},
 				"Deny",
 			]);
 			delete globalState.__approvalEvents;
@@ -2889,7 +2901,228 @@ describe("ExtensionRunner", () => {
 					reason: "no interactive UI available",
 				},
 			]);
-			delete globalState.__partialContextApprovalEvents;
+		});
+
+		describe("session approval options", () => {
+			afterEach(() => {
+				vi.restoreAllMocks();
+				clearSessionApprovals(sessionManager.getSessionId());
+			});
+
+			const makeContext = (overrides: Record<string, unknown> = {}) =>
+				({
+					sessionManager,
+					modelRegistry,
+					model: undefined,
+					isIdle: () => true,
+					hasQueuedMessages: () => false,
+					abort: () => {},
+					settings: { get: (key: string) => (key === "tools.approvalMode" ? "always-ask" : {}) } as never,
+					...overrides,
+				}) as never;
+
+			const makeRunner = async (
+				select: (title: string, options: ExtensionUISelectItem[]) => Promise<string | undefined>,
+			) => {
+				const result = await loadTestExtensions();
+				const runner = new ExtensionRunner(
+					result.extensions,
+					result.runtime,
+					tempDir.path(),
+					sessionManager,
+					modelRegistry,
+				);
+				initializeRunner(runner, select);
+				return runner;
+			};
+
+			const resultText = (result: { content: readonly (TextContent | ImageContent)[] }): string => {
+				const first = result.content[0];
+				if (first && first.type === "text") return first.text;
+				throw new Error("expected text result content");
+			};
+
+			const optionLabel = (option: unknown): string => {
+				if (typeof option === "string") return option;
+				if (
+					option !== null &&
+					typeof option === "object" &&
+					"label" in option &&
+					typeof option.label === "string"
+				) {
+					return option.label;
+				}
+				throw new Error("select option without a label");
+			};
+			it("offers four options in order; the session option runs the call and suppresses later prompts", async () => {
+				const classify = vi.spyOn(approvalSimilarity, "isSimilarToApprovedCommand");
+				const select = vi.fn(async (_title: string, options: ExtensionUISelectItem[]) => {
+					const sessionOption = options.find(option => typeof option !== "string");
+					return sessionOption === undefined ? "Approve" : optionLabel(sessionOption);
+				});
+
+				const runner = await makeRunner(select);
+				const wrapper = new ExtensionToolWrapper(approvalTool, runner);
+
+				const first = await (wrapper as ExtensionToolWrapper<any>).execute(
+					"call-session-1",
+					{},
+					undefined,
+					undefined,
+					makeContext(),
+				);
+				expect(resultText(first)).toBe("ok");
+				expect(select.mock.calls[0][1].map(optionLabel)).toEqual([
+					"Approve",
+					"Approve dangerous_tool Commands for Session",
+					"Approve Similar dangerous_tool Commands for Session",
+					"Deny",
+				]);
+
+				select.mockImplementation(async () => {
+					throw new Error("a session-approved tool must not prompt again");
+				});
+				const second = await (wrapper as ExtensionToolWrapper<any>).execute(
+					"call-session-2",
+					{},
+					undefined,
+					undefined,
+					makeContext(),
+				);
+				expect(resultText(second)).toBe("ok");
+				expect(select).toHaveBeenCalledTimes(1);
+				expect(classify).not.toHaveBeenCalled();
+			});
+
+			it("records the similar subject: similar calls auto-approve, different calls prompt again", async () => {
+				const responses = ["Approve Similar dangerous_tool Commands for Session", "Deny"];
+				const select = vi.fn(async (_title: string, _options: ExtensionUISelectItem[]) => responses.shift());
+				const runner = await makeRunner(select);
+				const wrapper = new ExtensionToolWrapper(approvalTool, runner);
+				const classify = vi
+					.spyOn(approvalSimilarity, "isSimilarToApprovedCommand")
+					.mockResolvedValueOnce(true)
+					.mockResolvedValueOnce(false);
+
+				const first = await (wrapper as ExtensionToolWrapper<any>).execute(
+					"call-similar-1",
+					{ command: "git status" },
+					undefined,
+					undefined,
+					makeContext(),
+				);
+				expect(resultText(first)).toBe("ok");
+				// Nothing recorded for the tool yet ⇒ no model call on the first pick.
+				expect(classify).not.toHaveBeenCalled();
+
+				const similar = await (wrapper as ExtensionToolWrapper<any>).execute(
+					"call-similar-2",
+					{ command: "git status --short" },
+					undefined,
+					undefined,
+					makeContext(),
+				);
+				expect(resultText(similar)).toBe("ok");
+				expect(select).toHaveBeenCalledTimes(1);
+				expect(classify).toHaveBeenCalledWith(
+					expect.objectContaining({
+						sessionId: sessionManager.getSessionId(),
+						toolName: "dangerous_tool",
+						subject: "git status --short",
+					}),
+				);
+
+				await expect(
+					(wrapper as ExtensionToolWrapper<any>).execute(
+						"call-similar-3",
+						{ command: "rm -rf /" },
+						undefined,
+						undefined,
+						makeContext(),
+					),
+				).rejects.toThrow("Tool call denied by user: dangerous_tool");
+				expect(select).toHaveBeenCalledTimes(2);
+				expect(select.mock.calls[1][1].map(optionLabel)).toEqual([
+					"Approve",
+					"Approve dangerous_tool Commands for Session",
+					"Approve Similar dangerous_tool Commands for Session",
+					"Deny",
+				]);
+			});
+
+			it("dismiss never grants: an undefined choice denies and later calls prompt again", async () => {
+				const select = vi.fn(
+					async (_title: string, _options: ExtensionUISelectItem[]): Promise<string | undefined> => undefined,
+				);
+				const runner = await makeRunner(select);
+				const wrapper = new ExtensionToolWrapper(approvalTool, runner);
+
+				await expect(
+					(wrapper as ExtensionToolWrapper<any>).execute("call-dismiss", {}, undefined, undefined, makeContext()),
+				).rejects.toThrow("Tool call denied by user: dangerous_tool");
+
+				select.mockImplementation(async () => "Approve");
+				const second = await (wrapper as ExtensionToolWrapper<any>).execute(
+					"call-after-dismiss",
+					{},
+					undefined,
+					undefined,
+					makeContext(),
+				);
+				expect(resultText(second)).toBe("ok");
+				expect(select).toHaveBeenCalledTimes(2);
+			});
+
+			it("deny policies and provider safety checks still gate despite session approval", async () => {
+				approveToolForSession(sessionManager.getSessionId(), "dangerous_tool");
+				const select = vi.fn(async (_title: string, _options: ExtensionUISelectItem[]) => "Approve");
+				const runner = await makeRunner(select);
+				const wrapper = new ExtensionToolWrapper(approvalTool, runner);
+
+				await expect(
+					(wrapper as ExtensionToolWrapper<any>).execute(
+						"call-policy-deny",
+						{},
+						undefined,
+						undefined,
+						makeContext({
+							settings: {
+								get: (key: string) =>
+									key === "tools.approvalMode"
+										? "always-ask"
+										: key === "tools.approval"
+											? { dangerous_tool: "deny" }
+											: {},
+							} as never,
+						}),
+					),
+				).rejects.toThrow('Tool "dangerous_tool" is blocked by user policy.');
+				expect(select).not.toHaveBeenCalled();
+
+				const safety = await (wrapper as ExtensionToolWrapper<any>).execute(
+					"call-safety-checks",
+					{},
+					undefined,
+					undefined,
+					makeContext({
+						toolCall: {
+							batchId: "batch-safety",
+							index: 0,
+							total: 1,
+							toolCalls: [{ id: "call-safety-checks", name: "dangerous_tool" }],
+							providerMetadata: {
+								type: "computer",
+								actions: [],
+								pendingSafetyChecks: [{ id: "chk-1", message: "Dangerous provider action" }],
+							},
+						},
+					}),
+				);
+				expect(resultText(safety)).toBe("ok");
+				expect(select).toHaveBeenCalledTimes(1);
+				// Safety acknowledgement is per-call: no session-granting options offered.
+				expect(select.mock.calls[0][1]).toEqual(["Approve", "Deny"]);
+			});
 		});
 	});
 

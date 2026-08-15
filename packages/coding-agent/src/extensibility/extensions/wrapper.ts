@@ -13,12 +13,19 @@ import { sanitizeText, untilAborted } from "@oh-my-pi/pi-utils";
 import type { Settings } from "../../config/settings";
 import type { Theme } from "../../modes/theme/theme";
 import { type ApprovalMode, formatApprovalPrompt, resolveApproval, truncateForPrompt } from "../../tools/approval";
+import { isSimilarToApprovedCommand } from "../../tools/approval-similarity";
 import { defaultLoadModeForToolName } from "../../tools/essential-tools";
-import { withFileMutationSession } from "../../tools/file-write-fallback";
+import {
+	addSimilarApproval,
+	approvalSubject,
+	approveToolForSession,
+	getSimilarApprovals,
+	isToolApprovedForSession,
+} from "../../tools/session-approvals";
 import { normalizeToolEventInput, resolveToolEventInput } from "../tool-event-input";
 import { applyToolProxy } from "../tool-proxy";
 import type { ExtensionRunner } from "./runner";
-import type { RegisteredTool, ToolCallEventResult } from "./types";
+import type { ExtensionUISelectItem, RegisteredTool, ToolCallEventResult } from "./types";
 
 /**
  * Adapts a RegisteredTool into an AgentTool.
@@ -262,8 +269,33 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 		// them on the user's behalf.
 		const explicitPrompt = resolved.override || Object.hasOwn(userPolicies, resolved.policyKey ?? this.tool.name);
 		const xdevBypass = context?.xdevApproved === true && effectiveParams === params;
+		const policyPrompts = resolved.policy === "prompt" && (explicitPrompt || !xdevBypass);
+
+		// Session approvals ("… Commands for Session" prompt options) can only
+		// downgrade a `prompt` resolution to allow: they never satisfy provider
+		// safety checks (each of those must be acknowledged per call) and never
+		// override the `deny` short-circuit above. The similarity classifier runs
+		// before the prompt so a "similar" verdict skips it entirely; it is
+		// fail-safe (`false` ⇒ prompt) and time-bounded by contract.
+		const sessionId = context?.sessionManager?.getSessionId() ?? "";
+		let sessionAllowed = false;
+		if (policyPrompts && pendingSafetyChecks.length === 0 && sessionId) {
+			if (isToolApprovedForSession(sessionId, this.tool.name)) {
+				sessionAllowed = true;
+			} else if (settings && context?.modelRegistry && getSimilarApprovals(sessionId, this.tool.name).length > 0) {
+				sessionAllowed = await isSimilarToApprovedCommand({
+					sessionId,
+					toolName: this.tool.name,
+					subject: approvalSubject(resolvedArgs),
+					settings,
+					registry: context.modelRegistry,
+					signal,
+				});
+			}
+		}
+
 		const approvalCheck = {
-			required: pendingSafetyChecks.length > 0 || (resolved.policy === "prompt" && (explicitPrompt || !xdevBypass)),
+			required: (pendingSafetyChecks.length > 0 || policyPrompts) && !sessionAllowed,
 			reason: resolved.reason,
 		};
 
@@ -278,7 +310,6 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 
 			const hasApprovalHandlers =
 				this.runner.hasHandlers("tool_approval_requested") || this.runner.hasHandlers("tool_approval_resolved");
-			const sessionId = context?.sessionManager?.getSessionId() ?? "";
 			if (hasApprovalHandlers) {
 				await this.runner.emit({
 					type: "tool_approval_requested",
@@ -327,14 +358,39 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 				pendingSafetyChecks.length > 0
 					? `${basePrompt}\nProvider safety checks:\n${safetyCheckLines(pendingSafetyChecks).join("\n")}`
 					: basePrompt;
+			// Session-scoped options appear only when a session identity exists
+			// and no provider safety checks are pending — a safety acknowledgement
+			// is per-call and must not be broadened into a session-wide grant.
+			const sessionChoiceAvailable = sessionId.length > 0 && pendingSafetyChecks.length === 0;
+			const approveSessionToolLabel = `Approve ${this.tool.name} Commands for Session`;
+			const approveSimilarLabel = `Approve Similar ${this.tool.name} Commands for Session`;
+			const options: ExtensionUISelectItem[] = sessionChoiceAvailable
+				? [
+						"Approve",
+						{
+							label: approveSessionToolLabel,
+							description: "Skip approval prompts for this tool until the session ends.",
+						},
+						{
+							label: approveSimilarLabel,
+							description: "Auto-approve commands the assistant judges similar; others still prompt.",
+						},
+						"Deny",
+					]
+				: ["Approve", "Deny"];
 			let choice: string | undefined;
 			try {
-				choice = await uiContext.select(safetyPrompt, ["Approve", "Deny"]);
+				choice = await uiContext.select(safetyPrompt, options);
 			} catch (err) {
 				await emitApprovalResolved(false, err instanceof Error ? err.message : "approval aborted");
 				throw err;
 			}
-			const approved = choice === "Approve";
+			if (choice === approveSessionToolLabel) {
+				approveToolForSession(sessionId, this.tool.name);
+			} else if (choice === approveSimilarLabel) {
+				addSimilarApproval(sessionId, this.tool.name, approvalSubject(resolvedArgs));
+			}
+			const approved = choice === "Approve" || choice === approveSessionToolLabel || choice === approveSimilarLabel;
 			await emitApprovalResolved(approved, approved ? undefined : "denied by user");
 			if (!approved) {
 				throw new Error(`Tool call denied by user: ${this.tool.name}`);
