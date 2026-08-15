@@ -2689,7 +2689,7 @@ describe("ExtensionRunner", () => {
 				},
 				{
 					label: "Approve Similar dangerous_tool Commands for Session",
-					description: "Auto-approve commands the assistant judges similar; others still prompt.",
+					description: "Later calls a small model judges similar auto-approve; others prompt.",
 				},
 				"Deny",
 			]);

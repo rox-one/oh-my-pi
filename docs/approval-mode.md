@@ -86,7 +86,7 @@ Tools can add approval-prompt body lines with `formatApprovalDetails(args)`. The
 An interactive approval prompt offers two extra options between `Approve` and `Deny`:
 
 - `Approve <tool> Commands for Session` — every later call of that tool skips the prompt.
-- `Approve Similar <tool> Commands for Session` — records the approved call, then compares later calls of that tool against the recorded ones with a small model. A `yes` verdict approves the call silently; anything else prompts again with the same options.
+- `Approve Similar <tool> Commands for Session` — records the approved call, then compares later calls of that tool against the recorded ones with a small model. A `yes` verdict approves the call silently; anything else prompts again with the same options. An unchanged repeat of a recorded call is approved directly, without asking the model.
 
 What is recorded is the tool's own approval-prompt detail text (`Command: …`, `Path: …`, `Action: …`), so the classifier compares what you actually saw and approved. At most 10 subjects per tool are kept, newest first, each capped at 4,096 characters. Approving the whole tool discards its recorded subjects, since it subsumes them.
 
@@ -112,9 +112,9 @@ Those calls always prompt, and the two session options are not offered for them 
 
 ### The similarity classifier
 
-The classifier runs before the prompt is shown, so a `yes` verdict skips it. It is fail-safe in every other case: no recorded subjects, an empty subject, an unparsable answer, a request error, no available model, or a timeout all produce a normal prompt, never an approval. The wait is time-bounded and also ends with the tool call's abort signal.
+The classifier runs before the prompt is shown, so a `yes` verdict skips it. It is fail-safe in every other case: no recorded subjects, an empty subject, an unparsable answer, a request error, no available model, or a timeout all produce a normal prompt, never an approval. The wait is capped at 3 seconds — a slower verdict is worse than answering the prompt yourself — and also ends with the tool call's abort signal.
 
-Choose the backend with `providers.approvalSimilarityModel`: `online` (the default — the `TINY` role from `/models`, else `smol`) or a local on-device model. With the `online` backend, each gated call of a similar-approved tool spends one small-model request.
+Choose the backend with `providers.approvalSimilarityModel`: `online` (the default — the `TINY` role from `/models`, else `smol`) or a local on-device model. With the `online` backend, every gated call that is not an exact repeat spends one small-model request. A local backend usually loses its first classification to the 3-second cap while the model loads, and classifies normally once the worker is warm.
 
 Non-TUI surfaces receive the same options as plain labels: RPC clients and ACP form elicitation drop the descriptions the TUI shows next to each label.
 

@@ -26,6 +26,17 @@ const MAX_SIMILAR_SUBJECTS = 10;
  */
 const MAX_RETAINED_SUBJECT_CHARS = 4096;
 
+/**
+ * The exact form a subject is recorded in. Callers comparing a pending call
+ * against the recorded list must bound it the same way, or an unchanged repeat
+ * of an over-long subject fails to match itself.
+ */
+export function boundRetainedSubject(subject: string): string {
+	return subject.length > MAX_RETAINED_SUBJECT_CHARS
+		? `${subject.slice(0, MAX_RETAINED_SUBJECT_CHARS - 1)}…`
+		: subject;
+}
+
 export interface SessionApprovalState {
 	/** Tools approved for the rest of the session, by tool name. */
 	approvedTools: Set<string>;
@@ -61,8 +72,7 @@ export function approveToolForSession(sessionId: string, toolName: string): void
 export function addSimilarApproval(sessionId: string, toolName: string, subject: string): void {
 	const state = mutableState(sessionId);
 	if (!state || !subject) return;
-	const bounded =
-		subject.length > MAX_RETAINED_SUBJECT_CHARS ? `${subject.slice(0, MAX_RETAINED_SUBJECT_CHARS - 1)}…` : subject;
+	const bounded = boundRetainedSubject(subject);
 	const existing = state.similar.get(toolName) ?? [];
 	const next = [bounded, ...existing.filter(entry => entry !== bounded)];
 	state.similar.set(toolName, next.slice(0, MAX_SIMILAR_SUBJECTS));

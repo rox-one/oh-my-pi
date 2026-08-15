@@ -14,7 +14,7 @@
  * resolves to `false` (the approval gate prompts again). Never throws.
  */
 import { completeSimple } from "@oh-my-pi/pi-ai";
-import { logger, prompt } from "@oh-my-pi/pi-utils";
+import { logger, prompt, withTimeout } from "@oh-my-pi/pi-utils";
 
 import type { ModelRegistry } from "../config/model-registry";
 import { resolveRoleSelection } from "../config/model-resolver";
@@ -24,15 +24,20 @@ import approvalSimilarityLocalPrompt from "../prompts/system/approval-similarity
 import { stripAnsi } from "../tiny/message-preproc";
 import { isTinyMemoryLocalModelKey, isTinyMemoryReasoningModelKey, ONLINE_MEMORY_MODEL_KEY } from "../tiny/models";
 import { tinyModelClient } from "../tiny/title-client";
-import { getSimilarApprovals } from "./session-approvals";
+import { boundRetainedSubject, getSimilarApprovals } from "./session-approvals";
 
 const SIMILARITY_SYSTEM_PROMPT = prompt.render(approvalSimilarityPrompt);
 
 /**
- * Hard bound on the whole classification: a stalled backend must not freeze
- * the approval prompt; the caller's abort signal is combined with it.
+ * Hard bound on the whole classification: a stalled backend must not freeze the
+ * approval prompt; the caller's abort signal is combined with it. Kept under
+ * the time a user needs to answer the prompt themselves — past that the
+ * classifier is slower than the gate it replaces, and its fail-safe (a normal
+ * prompt) is the better outcome. A cold local backend loses its first
+ * classification to this bound while the worker loads the model; the retry on
+ * the next gated call finds it warm.
  */
-const CLASSIFY_TIMEOUT_MS = 10_000;
+const CLASSIFY_TIMEOUT_MS = 3_000;
 
 /** Per-approved-subject character budget (head-truncated); keeps the classifier prompt small. */
 const MAX_SUBJECT_CHARS = 160;
@@ -67,12 +72,20 @@ export interface ApprovalSimilarityDeps {
  * True when `deps.subject` is similar to a subject the user approved for
  * `deps.toolName` this session. With no recorded subjects (or an unknown
  * session) there is nothing to compare against: returns `false` without a
- * model call.
+ * model call. An unchanged repeat of an approved subject answers itself, also
+ * without a model call.
  */
 export async function isSimilarToApprovedCommand(deps: ApprovalSimilarityDeps): Promise<boolean> {
 	const approvedRaw = getSimilarApprovals(deps.sessionId, deps.toolName);
 	const candidateRaw = stripAnsi(deps.subject).trim();
 	if (approvedRaw.length === 0 || candidateRaw.length === 0) return false;
+
+	// The same subject the user read in the prompt and approved: no model can
+	// add anything, so the repeat costs neither a request nor the wait for one.
+	// Recorded subjects carry the store's retention bound, so bound the
+	// candidate identically before comparing.
+	const candidateRetained = boundRetainedSubject(candidateRaw);
+	if (approvedRaw.some(subject => stripAnsi(subject).trim() === candidateRetained)) return true;
 
 	const backend = deps.settings.get("providers.approvalSimilarityModel");
 	// Both backends render approved subjects as `- <subject>` list items, and a
@@ -87,10 +100,17 @@ export async function isSimilarToApprovedCommand(deps: ApprovalSimilarityDeps): 
 			: AbortSignal.timeout(CLASSIFY_TIMEOUT_MS),
 	};
 	try {
-		const similar =
+		// The combined abort signal cancels the backend's own work; `withTimeout`
+		// bounds the wait itself, because stages between here and the request
+		// ignore it — notably the credential resolution in `classifyOnline`, which
+		// may refresh an OAuth token over the network. It takes no signal of its
+		// own: an already-aborted one would make it reject before it adopts the
+		// classification promise, leaving that rejection unhandled.
+		const classify =
 			backend === ONLINE_MEMORY_MODEL_KEY
-				? await classifyOnline(approved, candidate, bounded)
-				: await classifyLocal(approved, candidate, backend, bounded);
+				? classifyOnline(approved, candidate, bounded)
+				: classifyLocal(approved, candidate, backend, bounded);
+		const similar = await withTimeout(classify, CLASSIFY_TIMEOUT_MS, "classification timed out");
 		return similar ?? false;
 	} catch (error) {
 		logger.debug("approval-similarity: classification failed", {

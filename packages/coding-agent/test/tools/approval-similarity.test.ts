@@ -58,12 +58,18 @@ function mockOnlineAnswer(answer: { stopReason: string; text: string }) {
 	} as never);
 }
 
+async function drainMicrotasks(): Promise<void> {
+	await Promise.resolve();
+	await Promise.resolve();
+}
+
 beforeEach(() => {
 	sessionId = `approval-similarity-test-${++testCount}-${Date.now()}`;
 });
 
 afterEach(() => {
 	clearSessionApprovals(sessionId);
+	vi.useRealTimers();
 	vi.restoreAllMocks();
 });
 
@@ -96,6 +102,23 @@ describe("isSimilarToApprovedCommand", () => {
 		expect(await isSimilarToApprovedCommand(makeDeps())).toBe(false);
 		expect(await isSimilarToApprovedCommand(makeDeps({ subject: "" }))).toBe(false);
 		expect(completeSimple).not.toHaveBeenCalled();
+	});
+
+	it("approves an unchanged repeat of a recorded subject without a model call", async () => {
+		const completeSimple = mockOnlineAnswer({ stopReason: "stop", text: "NO" });
+		const localComplete = vi.spyOn(tinyModelClient, "complete").mockResolvedValue("NO");
+		// Longer than the store's 4096-char retention bound: the recorded copy is
+		// truncated, so the repeat only matches if the candidate is bounded the
+		// same way before comparison.
+		const bulkSubject = `Path: src/generated.ts\nContent:\n${"export const x = 1;\n".repeat(400)}`;
+		addSimilarApproval(sessionId, "bash", "git log --oneline");
+		addSimilarApproval(sessionId, "write", bulkSubject);
+
+		expect(await isSimilarToApprovedCommand(makeDeps({ subject: "git log --oneline" }))).toBe(true);
+		expect(await isSimilarToApprovedCommand(makeDeps({ toolName: "write", subject: bulkSubject }))).toBe(true);
+		// A verdict the user already gave costs neither a request nor the wait for one.
+		expect(completeSimple).not.toHaveBeenCalled();
+		expect(localComplete).not.toHaveBeenCalled();
 	});
 
 	it("auto-approves when the online classifier answers YES and carries both sides of the comparison", async () => {
@@ -233,5 +256,30 @@ describe("isSimilarToApprovedCommand", () => {
 
 		expect(await isSimilarToApprovedCommand(makeDeps({ signal: caller.signal }))).toBe(false);
 		expect(receivedSignal?.aborted).toBe(true);
+	});
+
+	it("gives up at the ceiling when a backend stage never settles and never sees the signal", async () => {
+		// Credential resolution runs before the request and takes no signal, so a
+		// hung refresh would hold the approval prompt open indefinitely if the
+		// ceiling were enforced only through the abort signal.
+		vi.useFakeTimers();
+		addSimilarApproval(sessionId, "bash", "git log --oneline");
+		mockOnlineAnswer({ stopReason: "stop", text: "YES" });
+		const registry = {
+			getAvailable: () => [classifierModel],
+			getApiKey: () => Promise.withResolvers<string>().promise,
+			resolver: () => async () => "test-key",
+		} as never;
+		let verdict: boolean | undefined;
+		void isSimilarToApprovedCommand(makeDeps({ registry })).then(value => {
+			verdict = value;
+		});
+
+		await drainMicrotasks();
+		expect(verdict).toBeUndefined();
+		vi.advanceTimersByTime(3_000);
+		await drainMicrotasks();
+
+		expect(verdict).toBe(false);
 	});
 });

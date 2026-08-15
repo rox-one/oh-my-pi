@@ -383,7 +383,7 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 						},
 						{
 							label: approveSimilarLabel,
-							description: "Auto-approve commands the assistant judges similar; others still prompt.",
+							description: "Later calls a small model judges similar auto-approve; others prompt.",
 						},
 						"Deny",
 					]
