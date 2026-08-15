@@ -7,7 +7,6 @@
 
 import { APP_NAME, getAgentDir } from "@oh-my-pi/pi-utils";
 import chalk from "@oh-my-pi/pi-utils/chalk";
-import { isModelRoleValue } from "../config/model-roles";
 import {
 	getDefault,
 	getEnumValues,
@@ -231,14 +230,10 @@ function parseAndSetValue(path: SettingPath, rawValue: string): void {
 				// setter so Settings' save-time merge preserves every unrelated role.
 				const normalizedEntries: Array<[string, string]> = [];
 				for (const [role, value] of Object.entries(parsed)) {
-					if (typeof value !== "string") {
-						throw new Error(`Invalid model role value for ${role}: expected string`);
+					if (typeof value !== "string" || value.trim().length === 0) {
+						throw new Error(`Invalid model role value for ${role}: expected non-empty string`);
 					}
-					const normalized = value.trim();
-					if (!isModelRoleValue(normalized)) {
-						throw new Error(`Invalid model role value for ${role}: ${JSON.stringify(value)}`);
-					}
-					normalizedEntries.push([role, normalized]);
+					normalizedEntries.push([role, value.trim()]);
 				}
 				for (const [role, value] of normalizedEntries) {
 					settings.setModelRole(role, value);
