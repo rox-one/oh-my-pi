@@ -95,7 +95,8 @@ describe("session approval store", () => {
 		addSimilarApproval(sid, "write", bulk, "id-safe");
 		const [recorded, ...rest] = getSimilarApprovals(sid, "write");
 		expect(rest).toEqual([]);
-		// Bounded, but the head the classifier reads survives intact.
+		// The bound cuts the tail and marks it, so the head that names the
+		// target survives whatever the payload does.
 		expect(recorded?.subject.length).toBe(4096);
 		expect(recorded?.subject.startsWith(head)).toBe(true);
 		expect(recorded?.subject.endsWith("…")).toBe(true);
@@ -163,11 +164,9 @@ describe("approvalSubject", () => {
 	it("prefers the tool's approval detail lines so truncation cannot hide the target", () => {
 		const content = 'import * as fs from "node:fs/promises";\n'.repeat(20);
 		const subject = approvalSubject(writeLike, { content, path: "src/deep/module/handler.ts" });
+		// The path leads the subject: what the user approved is identified by its
+		// target, not by the payload that follows it.
 		expect(subject.startsWith("Path: src/deep/module/handler.ts\nContent:\n")).toBe(true);
-		// The classifier head-truncates each recorded subject to 160 chars; the
-		// path must survive that budget or every file sharing an import
-		// prologue classifies as "similar".
-		expect(subject.slice(0, 160)).toContain("src/deep/module/handler.ts");
 	});
 
 	it("accepts a single detail string and drops empty detail lines", () => {
@@ -193,15 +192,17 @@ describe("approvalSubject", () => {
 		const content = "x".repeat(400);
 		const subject = approvalSubject(plain, { content, path: "src/a.ts" });
 		expect(subject.startsWith('{"path":"src/a.ts","content":')).toBe(true);
-		// Key insertion order must not change the subject: recorded and
-		// candidate subjects are compared as strings.
+		// Key insertion order must not change the subject: it is the only text
+		// describing an approved call to the classifier, so one call has to read
+		// as one command however its args were assembled.
 		expect(approvalSubject(plain, { path: "src/a.ts", content })).toBe(subject);
 	});
 
 	it("falls back to sorted-key JSON that is independent of key insertion order", () => {
 		expect(approvalSubject(plain, { b: 2, a: 1 })).toBe('{"a":1,"b":2}');
-		// Equivalent nested args must produce the identical subject — the
-		// similarity classifier compares these strings for equality.
+		// Equivalent nested args must produce the identical subject, for the same
+		// reason. (Exact repeats are matched on the args digest, not on this
+		// text — see `approvalIdentity`.)
 		const first = approvalSubject(plain, { x: { b: 2, a: 1 }, c: 3 });
 		const second = approvalSubject(plain, { c: 3, x: { a: 1, b: 2 } });
 		expect(first).toBe('{"c":3,"x":{"a":1,"b":2}}');
