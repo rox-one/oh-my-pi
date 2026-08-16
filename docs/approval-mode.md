@@ -112,12 +112,13 @@ Those calls always prompt, and the two session options are not offered for them 
 
 ### The similarity classifier
 
-A verdict follows two properties of the compared calls:
+The grant is offered for whichever tool is prompting, so the compared text is a shell command for `bash` and a `Path:` / `Content:` pair for the file tools. A verdict follows three properties of the compared calls:
 
 - **Essential command** — the program doing the work. Arguments, flags, paths, and wrapper constructs (loops, pipes, `&&`, command substitution) do not change it: `ls`, `ls -la src`, and `for d in */; do ls "$d"; done` are all `ls`.
 - **Effect class** — read-only (changes nothing on disk, nor any state outside the session) or side-effecting (can change something). A call built from several parts takes the strongest class of its parts, so `ls && touch ./foo` is side-effecting.
+- **Target** — the path the call reads or writes. The approved paths set the scope: the project tree they sit in.
 
-A call is similar when its effect class matches the approved ones and either its essential command is one of theirs, or it is a different command with the same effect on the same kind of target and scope — approving `ls` covers a `find` loop over the working directory. A difference in effect class is never similar, however much text the two calls share: after approving `ls`, `ls && touch ./foo` prompts again.
+A call is similar when its effect class matches the approved ones and either its essential command is one of theirs, or it is a different command with the same effect on the same kind of target and scope — approving `ls` covers a `find` loop over the working directory. Two differences are never similar, however much text the two calls share. A difference in effect class: after approving `ls`, `ls && touch ./foo` prompts again. A target outside the approved tree — a home directory, a system path, or anything reached through `..`: after approving a `write` to `docs/notes.md`, a `write` to `~/.ssh/authorized_keys` prompts again whatever it contains.
 
 The recorded list is read as intent, not as an allow-list to match text against. Approving `ls` calls and then `find .` calls says "stop asking about read-only traversal of this project", and later read-only traversals of it are covered. The rubric is instruction to a small model, not enforcement — see the three gates above that no verdict can open.
 
