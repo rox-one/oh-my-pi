@@ -105,14 +105,32 @@ export async function isSimilarToApprovedCommand(deps: ApprovalSimilarityDeps): 
 	if (candidate.length > MAX_CANDIDATE_CHARS || isTruncatedForPrompt(candidate)) return false;
 
 	const backend = deps.settings.get("providers.approvalSimilarityModel");
-	// Both backends render approved subjects as `- <subject>` list items, and a
-	// subject is the tool's multi-line approval detail text ("Path: …\nContent:
-	// …"); indenting the continuation lines keeps each entry one list item.
+	// Everything the classifier reads is text the agent itself wrote — for `bash`
+	// the raw command — and a `YES` runs the call with no prompt, so command text
+	// that reads as instruction is an execution exploit. Two framings keep it
+	// data. Each value goes in as a JSON string, so a payload cannot start a line
+	// of its own: a forged `Approved commands:` section stays inside one quoted
+	// literal instead of posing as message structure. Around the two slots sits a
+	// marker regenerated per classification, which quoted text cannot guess and
+	// therefore cannot close. Measured on the tiny/smol role model
+	// (venice/deepseek-v4-flash): a payload appending its own approved list and
+	// "New command" won YES 3/3 with unquoted values inside the marker, and NO
+	// 3/3 once quoted, with a genuinely similar command still YES 3/3.
+	const fence = `===${crypto.randomUUID().replaceAll("-", "")}===`;
+	// JSON quoting also keeps a multi-line subject (write's "Path: …\nContent:
+	// …") on one `- ` list item, with no continuation-line indent to maintain.
 	const approved = approvedEntries
 		.map(entry => stripAnsi(entry.subject).trim())
 		.filter(subject => subject.length > 0 && subject.length <= MAX_SUBJECT_CHARS && !isTruncatedForPrompt(subject))
-		.map(subject => subject.replaceAll("\n", "\n  "));
+		.map(subject => JSON.stringify(subject));
 	if (approved.length === 0) return false;
+	// Rendered once here, not per backend: one classification asks one question,
+	// framed by one marker, whichever model answers it.
+	const userMessage = prompt.render(approvalSimilarityUserPrompt, {
+		approved,
+		candidate: JSON.stringify(candidate),
+		fence,
+	});
 	const timeBounded: ApprovalSimilarityDeps = {
 		...deps,
 		signal: deps.signal
@@ -128,8 +146,8 @@ export async function isSimilarToApprovedCommand(deps: ApprovalSimilarityDeps): 
 		// classification promise, leaving that rejection unhandled.
 		const classify =
 			backend === ONLINE_MEMORY_MODEL_KEY
-				? classifyOnline(approved, candidate, timeBounded)
-				: classifyLocal(approved, candidate, backend, timeBounded);
+				? classifyOnline(userMessage, timeBounded)
+				: classifyLocal(userMessage, backend, timeBounded);
 		const similar = await withTimeout(classify, CLASSIFY_TIMEOUT_MS, "classification timed out");
 		return similar ?? false;
 	} catch (error) {
@@ -141,11 +159,7 @@ export async function isSimilarToApprovedCommand(deps: ApprovalSimilarityDeps): 
 	}
 }
 
-async function classifyOnline(
-	approved: string[],
-	candidate: string,
-	deps: ApprovalSimilarityDeps,
-): Promise<boolean | undefined> {
+async function classifyOnline(userMessage: string, deps: ApprovalSimilarityDeps): Promise<boolean | undefined> {
 	// Only this backend needs the registry, so the requirement lives here: a
 	// context without one still reaches the local backend, and here it joins the
 	// throws below under the caller's fail-safe (a normal approval prompt).
@@ -171,7 +185,7 @@ async function classifyOnline(
 			messages: [
 				{
 					role: "user",
-					content: prompt.render(approvalSimilarityUserPrompt, { approved, candidate }),
+					content: userMessage,
 					timestamp: Date.now(),
 				},
 			],
@@ -197,8 +211,7 @@ async function classifyOnline(
 }
 
 async function classifyLocal(
-	approved: string[],
-	candidate: string,
+	userMessage: string,
 	modelKey: string,
 	deps: ApprovalSimilarityDeps,
 ): Promise<boolean | undefined> {
@@ -206,15 +219,11 @@ async function classifyLocal(
 		throw new Error(`approval-similarity: unsupported local classifier model: ${modelKey}`);
 	}
 	const maxTokens = isTinyMemoryReasoningModelKey(modelKey) ? REASONING_SAFE_MAX_TOKENS : ANSWER_MAX_TOKENS;
-	const output = await tinyModelClient.complete(
-		modelKey,
-		prompt.render(approvalSimilarityUserPrompt, { approved, candidate }),
-		{
-			maxTokens,
-			signal: deps.signal,
-			systemPrompt: SIMILARITY_SYSTEM_PROMPT,
-		},
-	);
+	const output = await tinyModelClient.complete(modelKey, userMessage, {
+		maxTokens,
+		signal: deps.signal,
+		systemPrompt: SIMILARITY_SYSTEM_PROMPT,
+	});
 	if (!output) {
 		return undefined;
 	}
