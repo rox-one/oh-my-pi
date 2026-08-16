@@ -8,7 +8,8 @@
  * - `online` (default): the TINY/smol role model classifies via
  *   {@link completeSimple}.
  * - a local key: the on-device memory model classifies via
- *   {@link tinyModelClient.complete} with an inline prompt.
+ *   {@link tinyModelClient.complete}, with the same rules/data prompt pair the
+ *   online path uses.
  *
  * Fail-safe by contract: any error, timeout, abort, unparsable output, or input
  * it cannot read whole resolves to `false` (the approval gate prompts again).
@@ -21,7 +22,6 @@ import type { ModelRegistry } from "../config/model-registry";
 import { resolveRoleSelection } from "../config/model-resolver";
 import type { Settings } from "../config/settings";
 import approvalSimilarityPrompt from "../prompts/system/approval-similarity.md" with { type: "text" };
-import approvalSimilarityLocalPrompt from "../prompts/system/approval-similarity-local.md" with { type: "text" };
 import approvalSimilarityUserPrompt from "../prompts/system/approval-similarity-user.md" with { type: "text" };
 import { stripAnsi } from "../tiny/message-preproc";
 import { isTinyMemoryLocalModelKey, isTinyMemoryReasoningModelKey, ONLINE_MEMORY_MODEL_KEY } from "../tiny/models";
@@ -206,11 +206,15 @@ async function classifyLocal(
 		throw new Error(`approval-similarity: unsupported local classifier model: ${modelKey}`);
 	}
 	const maxTokens = isTinyMemoryReasoningModelKey(modelKey) ? REASONING_SAFE_MAX_TOKENS : ANSWER_MAX_TOKENS;
-	const builtPrompt = prompt.render(approvalSimilarityLocalPrompt, { approved, candidate });
-	const output = await tinyModelClient.complete(modelKey, builtPrompt, {
-		maxTokens,
-		signal: deps.signal,
-	});
+	const output = await tinyModelClient.complete(
+		modelKey,
+		prompt.render(approvalSimilarityUserPrompt, { approved, candidate }),
+		{
+			maxTokens,
+			signal: deps.signal,
+			systemPrompt: SIMILARITY_SYSTEM_PROMPT,
+		},
+	);
 	if (!output) {
 		return undefined;
 	}

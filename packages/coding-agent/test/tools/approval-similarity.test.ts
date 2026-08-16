@@ -311,15 +311,17 @@ describe("isSimilarToApprovedCommand", () => {
 		expect(localComplete).not.toHaveBeenCalled();
 	});
 
-	it("classifies via the local memory model with the recorded subjects rendered inline", async () => {
+	it("classifies via the local memory model with the rules and the subjects on separate channels", async () => {
 		grantSimilar("bash", "git log --oneline");
 		const settings = Settings.isolated({ "providers.approvalSimilarityModel": "qwen2.5-1.5b" });
 		let classifierPrompt = "";
+		let systemPrompt: string | undefined;
 		let maxTokens: number | undefined;
 		const localComplete = vi
 			.spyOn(tinyModelClient, "complete")
 			.mockImplementation(async (_modelKey, promptText, options) => {
 				classifierPrompt = promptText;
+				systemPrompt = options?.systemPrompt;
 				maxTokens = options?.maxTokens;
 				return "YES";
 			});
@@ -327,6 +329,11 @@ describe("isSimilarToApprovedCommand", () => {
 		expect(await isSimilarToApprovedCommand(makeDeps({ settings, registry: undefined }))).toBe(true);
 		expect(classifierPrompt).toContain("- git log --oneline");
 		expect(classifierPrompt).toContain("git diff HEAD");
+		// The rules travel as the system turn, so the same file serves both
+		// backends; nothing session-specific may ride along with them.
+		expect(systemPrompt?.length ?? 0).toBeGreaterThan(0);
+		expect(systemPrompt).not.toContain("git log --oneline");
+		expect(systemPrompt).not.toContain("git diff HEAD");
 		expect(maxTokens).toBe(16);
 
 		localComplete.mockResolvedValueOnce("NO");

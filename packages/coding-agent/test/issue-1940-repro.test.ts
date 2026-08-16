@@ -121,6 +121,35 @@ describe("tiny title client prompt options", () => {
 			await client.terminate();
 		}
 	});
+
+	it("forwards a system prompt on local completions only when one is given", async () => {
+		let sent: TinyTitleWorkerInbound | undefined;
+		const worker = new FakeTinyWorker((message, worker) => {
+			sent = message;
+			if (message.type === "complete") {
+				worker.emit({ type: "completion", id: message.id, text: "YES" });
+			}
+		});
+		const client = new TinyTitleClient(() => worker);
+
+		try {
+			expect(await client.complete("lfm2-1.2b", "New command:\nls -la", { systemPrompt: "Classifier rules" })).toBe(
+				"YES",
+			);
+			expect(sent).toMatchObject({
+				type: "complete",
+				modelKey: "lfm2-1.2b",
+				prompt: "New command:\nls -la",
+				systemPrompt: "Classifier rules",
+			});
+
+			// Callers that pass no rules must stay a single user turn on the wire.
+			expect(await client.complete("lfm2-1.2b", "Extract facts")).toBe("YES");
+			expect(sent).not.toHaveProperty("systemPrompt");
+		} finally {
+			await client.terminate();
+		}
+	});
 });
 
 describe("issue #1940 — local model failures release the worker process", () => {
