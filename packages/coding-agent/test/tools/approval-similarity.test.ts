@@ -99,22 +99,33 @@ afterEach(() => {
 });
 
 describe("parseApprovalSimilarity", () => {
-	it("returns true for YES output", () => {
+	it("returns true for a bare yes, whatever decoration or reasoning preamble carries it", () => {
 		expect(parseApprovalSimilarity("YES")).toBe(true);
 		expect(parseApprovalSimilarity("yes")).toBe(true);
-		expect(parseApprovalSimilarity("  Yes, same operation  ")).toBe(true);
+		expect(parseApprovalSimilarity("  Yes\n")).toBe(true);
+		expect(parseApprovalSimilarity("YES.")).toBe(true);
+		expect(parseApprovalSimilarity("**YES**")).toBe(true);
+		expect(parseApprovalSimilarity('"yes"')).toBe(true);
+		expect(parseApprovalSimilarity("<think>same essential command</think>\nYES")).toBe(true);
 	});
 
-	it("returns false for NO output", () => {
+	it("returns false for a bare no", () => {
 		expect(parseApprovalSimilarity("NO")).toBe(false);
 		expect(parseApprovalSimilarity("no")).toBe(false);
-		expect(parseApprovalSimilarity("No, different subcommand.")).toBe(false);
+		expect(parseApprovalSimilarity("No.")).toBe(false);
 	});
 
-	it("returns undefined for unparseable output", () => {
+	it("returns undefined for anything that is not exactly yes or no", () => {
+		// A prefix parse granted every one of these.
+		expect(parseApprovalSimilarity("Yes, same operation")).toBeUndefined();
+		expect(parseApprovalSimilarity("YES, but destructive")).toBeUndefined();
+		expect(parseApprovalSimilarity("yesterday it worked")).toBeUndefined();
+		expect(parseApprovalSimilarity("No, different subcommand.")).toBeUndefined();
+		expect(parseApprovalSimilarity("nothing alike")).toBeUndefined();
+		// An unterminated reasoning block hides whatever the verdict would be.
+		expect(parseApprovalSimilarity("<think>same command\nYES")).toBeUndefined();
 		expect(parseApprovalSimilarity("maybe")).toBeUndefined();
 		expect(parseApprovalSimilarity("")).toBeUndefined();
-		expect(parseApprovalSimilarity("The commands differ")).toBeUndefined();
 	});
 });
 

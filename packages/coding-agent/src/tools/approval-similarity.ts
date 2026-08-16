@@ -217,10 +217,25 @@ async function classifyLocal(
 	return parseApprovalSimilarity(output);
 }
 
-/** Strict yes/no-prefix parse; anything else is unparsable (fail-safe). */
+/**
+ * Reasoning a local model leaked into its answer channel: the two plain tag
+ * forms every dialect in `@oh-my-pi/pi-ai` renders thinking with. An unpaired
+ * open tag is left alone — a truncated verdict must not be read as one.
+ */
+const THINK_BLOCK = /<(think|thinking)>[\s\S]*?<\/\1>/gi;
+/** Emphasis, code spans, quotes, and sentence punctuation around a one-word answer. */
+const VERDICT_DECORATION = /^[\s"'`*_]+|[\s"'`*_.,!?]+$/g;
+
+/**
+ * Exact yes/no parse; anything else is unparsable (fail-safe to a prompt).
+ *
+ * Strict on purpose: this verdict grants execution, and both prompt files
+ * demand exactly one word. A prefix match would read "yesterday it worked" and
+ * "YES, but destructive" as approvals.
+ */
 export function parseApprovalSimilarity(text: string): boolean | undefined {
-	const trimmed = text.trim().toLowerCase();
-	if (trimmed.startsWith("yes")) return true;
-	if (trimmed.startsWith("no")) return false;
+	const verdict = text.replace(THINK_BLOCK, " ").replace(VERDICT_DECORATION, "").toLowerCase();
+	if (verdict === "yes") return true;
+	if (verdict === "no") return false;
 	return undefined;
 }
