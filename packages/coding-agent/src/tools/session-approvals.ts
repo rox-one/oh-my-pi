@@ -101,9 +101,12 @@ function stableStringify(value: unknown): string {
 	if (value === null || typeof value !== "object") return JSON.stringify(value) ?? "null";
 	if (Array.isArray(value)) return `[${value.map(stableStringify).join(",")}]`;
 	// Compact fields first, bulk payloads last, each group by key name. The
-	// classifier only reads the head of a subject, so a `path`/`url`-style
-	// discriminator must not sit behind a whole file's content merely because
-	// its key sorts later in the alphabet.
+	// ordering is for `approvalSubject`'s JSON fallback: its head is what the
+	// user reads in the approval prompt and all of it the retention bound keeps,
+	// so a `path`/`url`-style discriminator must not sit behind a whole file's
+	// content merely because its key sorts later in the alphabet. The
+	// same-named helper in `../mcp/tool-cache.ts` sorts keys plainly instead —
+	// different consumer, deliberately not the same function.
 	const fields = Object.entries(value as Record<string, unknown>)
 		.filter(entry => entry[1] !== undefined)
 		.map(([key, entry]) => ({ key, json: stableStringify(entry) }))
@@ -124,9 +127,20 @@ function stableStringify(value: unknown): string {
  * result again — so two calls that differ only past the cut carry byte-identical
  * subject text. Matching a repeat on that text would auto-approve the second
  * one with no model and no prompt; matching on this digest cannot.
+ *
+ * Cryptographic on purpose. A digest hit is the strongest short-circuit in the
+ * feature — `isSimilarToApprovedCommand` answers true on it before the model,
+ * before the budget gates, and with no prompt — and both digested argument sets
+ * are written by a model that may be acting on injected content. So a
+ * constructed colliding pair (the benign call the user approves, plus a
+ * malicious twin) is a way to run a tool unprompted, which rules out
+ * `Bun.hash`: wyhash with a fixed public seed claims no collision resistance,
+ * and its 64-bit output falls to a birthday search. SHA-256 costs a few
+ * milliseconds even on a multi-megabyte `write` payload, once per gated call,
+ * on a path that already waits up to 3 s on a model.
  */
 export function approvalIdentity(args: unknown): string {
-	return Bun.hash(stableStringify(args)).toString(36);
+	return new Bun.CryptoHasher("sha256").update(stableStringify(args)).digest("base64url");
 }
 
 function approvalDetails(tool: ApprovalSubjectTool, args: unknown): string | undefined {
