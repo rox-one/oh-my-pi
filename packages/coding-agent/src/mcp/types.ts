@@ -334,7 +334,6 @@ export type MCPUrlElicitationHandler = (
 /** Transport-level URL elicitation handler without a server-name closure. */
 export type MCPUrlElicitationRequestHandler = (request: MCPUrlElicitation) => Promise<MCPUrlElicitationResponse>;
 
-
 /** tools/call response */
 export interface MCPToolCallResult {
 	content: MCPContent[];
@@ -556,19 +555,24 @@ export const MCPNotificationMethods = {
 	RESOURCES_LIST_CHANGED: "notifications/resources/list_changed",
 	RESOURCES_UPDATED: "notifications/resources/updated",
 	PROMPTS_LIST_CHANGED: "notifications/prompts/list_changed",
+	ELICITATION_COMPLETE: "notifications/elicitation/complete",
 } as const;
 
-/** Extract a JsonRpcError from a thrown value. Preserves `.code`, `.message`, and `.data`. */
+/** Extract a JSON-RPC error safe to send back to an MCP server. */
 export function toJsonRpcError(error: unknown): JsonRpcError {
+	if (error instanceof MCPRequestError) {
+		return error.data === undefined
+			? { code: error.code, message: error.message }
+			: { code: error.code, message: error.message, data: error.data };
+	}
 	if (error instanceof Error) {
 		const code = "code" in error && typeof error.code === "number" ? error.code : -32603;
-		const data = "data" in error ? error.data : undefined;
-		return data === undefined ? { code, message: error.message } : { code, message: error.message, data };
+		return { code, message: error.message };
 	}
 	if (typeof error === "object" && error !== null) {
 		const obj = error as Record<string, unknown>;
 		if (typeof obj.code === "number" && typeof obj.message === "string") {
-			return { code: obj.code, message: obj.message, data: obj.data };
+			return { code: obj.code, message: obj.message };
 		}
 	}
 	return { code: -32603, message: "Internal error" };

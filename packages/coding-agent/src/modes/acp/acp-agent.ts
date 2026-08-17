@@ -57,7 +57,7 @@ import { buildSkillPromptMessage, parseSkillInvocation } from "../../extensibili
 import { loadSlashCommands } from "../../extensibility/slash-commands";
 import { resolveLocalUrlToPath } from "../../internal-urls";
 import { MCPManager } from "../../mcp/manager";
-import type { MCPServerConfig } from "../../mcp/types";
+import type { MCPServerConfig, MCPUrlElicitation, MCPUrlElicitationResponse } from "../../mcp/types";
 import { loadAllExtensions } from "../../modes/components/extensions/state-manager";
 import { theme } from "../../modes/theme/theme";
 import { normalizePlanTitle, type PlanApprovalDetails, resolveApprovedPlan } from "../../plan-mode/approved-plan";
@@ -2695,6 +2695,43 @@ export class AcpAgent implements Agent {
 		record.extensionsConfigured = true;
 	}
 
+	async #handleMcpUrlElicitation(
+		record: ManagedSessionRecord,
+		serverName: string,
+		request: MCPUrlElicitation,
+	): Promise<MCPUrlElicitationResponse> {
+		if (this.#clientCapabilities?.elicitation?.url == null) {
+			return { action: "decline" };
+		}
+
+		let host = "unknown host";
+		try {
+			const parsed = new URL(request.url);
+			host = parsed.host || parsed.protocol.replace(/:$/, "") || host;
+		} catch {
+			// Keep malformed URLs out of the consent text; the ACP client still receives the URL field.
+		}
+
+		try {
+			const response = await this.#connection.unstable_createElicitation({
+				mode: "url",
+				sessionId: record.session.sessionId,
+				message: `MCP server "${serverName}" requests authorization at ${host}.\n${request.message}`,
+				url: request.url,
+				elicitationId: request.elicitationId,
+			});
+			if (response.action === "accept") return { action: "accept" };
+			if (response.action === "cancel") return { action: "cancel" };
+			return { action: "decline" };
+		} catch {
+			logger.warn("ACP URL elicitation failed", {
+				serverName,
+				elicitationId: request.elicitationId,
+			});
+			return { action: "decline" };
+		}
+	}
+
 	async #configureMcpServers(record: ManagedSessionRecord, servers: McpServer[]): Promise<void> {
 		if (record.mcpManager) {
 			await record.mcpManager.disconnectAll();
@@ -2711,6 +2748,9 @@ export class AcpAgent implements Agent {
 		}
 
 		const manager = new MCPManager(record.session.sessionManager.getCwd());
+		manager.setUrlElicitationHandler((serverName, request) =>
+			this.#handleMcpUrlElicitation(record, serverName, request),
+		);
 		// MCP servers connect and reconnect independently, so `onToolsChanged` can fire
 		// several times back to back. Each firing is chained onto `record.mcpRefreshChain`
 		// so refreshes apply in order, and each one re-reads `manager.getTools()` at the

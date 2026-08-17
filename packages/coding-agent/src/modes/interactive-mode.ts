@@ -4848,14 +4848,28 @@ export class InteractiveMode implements InteractiveModeContext {
 		serverName: string,
 		request: MCPUrlElicitation,
 	): Promise<{ action: "accept" | "decline" | "cancel" }> {
-		const consent = await this.showHookConfirm(
-			`Open URL requested by MCP server "${serverName}"?`,
-			`${request.message}\n${request.url}`,
+		let host = "unknown host";
+		try {
+			const parsed = new URL(request.url);
+			host = parsed.host || parsed.protocol.replace(/:$/, "") || host;
+		} catch {
+			// Keep malformed URLs out of the consent text; the MCP request is still declined or cancelled safely.
+		}
+		const choice = await this.showHookSelector(
+			`Open URL requested by MCP server "${serverName}"?\nHost: ${host}\n${request.message}`,
+			[
+				{ label: "Accept", description: `Open ${host} in your browser` },
+				{ label: "Decline", description: `Do not open ${host}` },
+				"Cancel",
+			],
 		);
-		if (!consent) return { action: "decline" };
-		this.openInBrowser(request.url);
-		this.showStatus(`Opened URL requested by MCP server "${serverName}".`);
-		return { action: "accept" };
+		if (choice === "Accept") {
+			this.openInBrowser(request.url);
+			this.showStatus(`Opened URL requested by MCP server "${serverName}" (${host}).`);
+			return { action: "accept" };
+		}
+		if (choice === "Decline") return { action: "decline" };
+		return { action: "cancel" };
 	}
 
 	showStatus(message: string, options?: { dim?: boolean }): void {

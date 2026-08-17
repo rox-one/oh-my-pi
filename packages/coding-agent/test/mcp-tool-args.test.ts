@@ -3,7 +3,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { CustomToolContext } from "@oh-my-pi/pi-coding-agent/extensibility/custom-tools";
 import { DeferredMCPTool, MCPTool, type MCPToolDefinition } from "@oh-my-pi/pi-coding-agent/mcp";
-import type { MCPServerConnection } from "@oh-my-pi/pi-coding-agent/mcp/types";
+import { MCPRequestError, type MCPServerConnection, type MCPTransport } from "@oh-my-pi/pi-coding-agent/mcp/types";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { INTENT_FIELD } from "@oh-my-pi/pi-wire";
 import { createMockConnection, createMockTransport } from "./mcp-test-utils";
@@ -14,6 +14,13 @@ type CapturedRequest = {
 };
 
 const unusedContext = {} as CustomToolContext;
+
+const URL_ELICITATION = {
+	mode: "url" as const,
+	elicitationId: "elicitation-1",
+	url: "https://gateway.example/authorize",
+	message: "Authorize the gateway",
+};
 
 function createSearchToolDefinition(): MCPToolDefinition {
 	return {
@@ -202,5 +209,89 @@ describe("MCP tool arguments", () => {
 				params: { name: "read_image_with_model", arguments: { image_path: expectedPath } },
 			},
 		]);
+	});
+
+	it("prompts once and retries after a URL elicitation-required error", async () => {
+		let calls = 0;
+		let prompts = 0;
+		const transport: MCPTransport = {
+			connected: true,
+			async request<T>(): Promise<T> {
+				calls += 1;
+				if (calls === 1) {
+					throw new MCPRequestError({
+						code: -32042,
+						message: "URL elicitation required",
+						data: { elicitations: [URL_ELICITATION] },
+					});
+				}
+				return { content: [{ type: "text", text: "ok" }] } as T;
+			},
+			async notify(): Promise<void> {},
+			async close(): Promise<void> {},
+		};
+		const connection = createMockConnection({ tools: {} }, transport);
+		connection.urlElicitationHandler = async (_server, request) => {
+			prompts += 1;
+			expect(request).toEqual(URL_ELICITATION);
+			return { action: "accept" };
+		};
+		const tool = new MCPTool(connection, createSearchToolDefinition());
+
+		const result = await tool.execute(
+			"call-1",
+			{ symbol: "Foo", language: "TypeScript" },
+			undefined,
+			unusedContext,
+			undefined,
+		);
+
+		expect(calls).toBe(2);
+		expect(prompts).toBe(1);
+		expect(result).toMatchObject({ isError: false, content: [{ type: "text", text: "ok" }] });
+	});
+
+	it("registers an optional completion waiter before prompting", async () => {
+		let calls = 0;
+		let waiterRegistered = false;
+		const completion = Promise.withResolvers<void>();
+		const transport: MCPTransport = {
+			connected: true,
+			async request<T>(): Promise<T> {
+				calls += 1;
+				if (calls === 1) {
+					throw new MCPRequestError({
+						code: -32042,
+						message: "URL elicitation required",
+						data: { elicitations: [URL_ELICITATION] },
+					});
+				}
+				return { content: [{ type: "text", text: "ok" }] } as T;
+			},
+			async notify(): Promise<void> {},
+			async close(): Promise<void> {},
+		};
+		const connection = createMockConnection({ tools: {} }, transport);
+		connection.waitForUrlElicitationCompletion = async () => {
+			waiterRegistered = true;
+			await completion.promise;
+		};
+		connection.urlElicitationHandler = async () => {
+			expect(waiterRegistered).toBe(true);
+			completion.resolve();
+			return { action: "accept" };
+		};
+		const tool = new MCPTool(connection, createSearchToolDefinition());
+
+		const result = await tool.execute(
+			"call-1",
+			{ symbol: "Foo", language: "TypeScript" },
+			undefined,
+			unusedContext,
+			undefined,
+		);
+
+		expect(calls).toBe(2);
+		expect(result).toMatchObject({ isError: false, content: [{ type: "text", text: "ok" }] });
 	});
 });

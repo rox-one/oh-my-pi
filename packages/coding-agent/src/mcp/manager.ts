@@ -55,7 +55,9 @@ import type {
 	MCPServerConnection,
 	MCPToolDefinition,
 	MCPTransport,
+	MCPUrlElicitation,
 	MCPUrlElicitationHandler,
+	MCPUrlElicitationResponse,
 } from "./types";
 import { MCPNotificationMethods } from "./types";
 
@@ -215,7 +217,10 @@ export class MCPManager {
 
 	#connections = new Map<string, MCPServerConnection>();
 	#urlElicitationHandler?: MCPUrlElicitationHandler;
+	#urlElicitationPrompts = new Map<string, Promise<MCPUrlElicitationResponse>>();
 	#urlCompletionWaiters = new Map<string, Map<string, Set<UrlCompletionWaiter>>>();
+	#completedUrlElicitations = new Map<string, Map<string, number>>();
+
 	#tools: CustomTool<TSchema, MCPToolDetails>[] = [];
 	#pendingConnections = new Map<string, Promise<MCPServerConnection>>();
 	#pendingToolLoads = new Map<string, Promise<ToolLoadResult>>();
@@ -457,9 +462,11 @@ export class MCPManager {
 	setUrlElicitationHandler(handler: MCPUrlElicitationHandler | undefined): void {
 		this.#urlElicitationHandler = handler;
 		for (const connection of this.#connections.values()) {
-			connection.urlElicitationHandler = handler;
+			connection.urlElicitationHandler = handler
+				? (serverName, request) => this.#requestUrlElicitation(serverName, request)
+				: undefined;
 			connection.transport.urlElicitationHandler = handler
-				? request => handler(connection.name, request)
+				? request => this.#requestUrlElicitation(connection.name, request)
 				: undefined;
 		}
 	}
@@ -576,7 +583,7 @@ export class MCPManager {
 						this.#handleServerNotification(name, method, params);
 					},
 					onRequest: (method, params) => this.#handleServerRequest(method, params),
-					urlElicitationHandler: this.#urlElicitationHandler,
+					urlElicitationHandler: (serverName, request) => this.#requestUrlElicitation(serverName, request),
 				});
 			})().then(
 				async connection => {
@@ -593,7 +600,9 @@ export class MCPManager {
 						throw new Error(`Server "${name}" was disconnected during initial connection`);
 					}
 
-					connection.urlElicitationHandler = this.#urlElicitationHandler;
+					connection.urlElicitationHandler = this.#urlElicitationHandler
+						? (serverName, request) => this.#requestUrlElicitation(serverName, request)
+						: undefined;
 					connection.waitForUrlElicitationCompletion = (elicitationId, signal) =>
 						this.#waitForUrlElicitationCompletion(name, elicitationId, signal);
 					this.#pendingConnections.delete(name);
@@ -768,12 +777,28 @@ export class MCPManager {
 		sortMCPToolsByName(this.#tools);
 	}
 
+	#requestUrlElicitation(serverName: string, request: MCPUrlElicitation): Promise<MCPUrlElicitationResponse> {
+		const handler = this.#urlElicitationHandler;
+		if (!handler) return Promise.resolve({ action: "decline" });
+		const key = `${serverName}\0${request.elicitationId}`;
+		const existing = this.#urlElicitationPrompts.get(key);
+		if (existing) return existing;
+		const prompt = handler(serverName, request).finally(() => this.#urlElicitationPrompts.delete(key));
+		this.#urlElicitationPrompts.set(key, prompt);
+		return prompt;
+	}
+
 	async #waitForUrlElicitationCompletion(
 		serverName: string,
 		elicitationId: string,
 		signal?: AbortSignal,
 	): Promise<void> {
 		if (signal?.aborted) throw signal.reason instanceof Error ? signal.reason : new Error("Aborted");
+		const completed = this.#completedUrlElicitations.get(serverName)?.get(elicitationId);
+		if (completed !== undefined) {
+			this.#completedUrlElicitations.get(serverName)?.delete(elicitationId);
+			return;
+		}
 		const { promise, resolve, reject } = Promise.withResolvers<void>();
 		let byId = this.#urlCompletionWaiters.get(serverName);
 		if (!byId) {
@@ -826,15 +851,27 @@ export class MCPManager {
 		const connectionKnown = this.#connections.has(serverName);
 		let refreshPromise: Promise<void> | undefined;
 		switch (method) {
-			case "notifications/elicitation/complete": {
+			case MCPNotificationMethods.ELICITATION_COMPLETE: {
 				const elicitationId =
-					params && typeof params === "object" && "elicitationId" in params && typeof params.elicitationId === "string"
+					params &&
+					typeof params === "object" &&
+					"elicitationId" in params &&
+					typeof params.elicitationId === "string"
 						? params.elicitationId
 						: undefined;
-				const waiters = elicitationId ? this.#urlCompletionWaiters.get(serverName)?.get(elicitationId) : undefined;
-				if (waiters) {
-					for (const waiter of waiters) waiter.resolve();
-					this.#urlCompletionWaiters.get(serverName)?.delete(elicitationId!);
+				if (elicitationId) {
+					const waiters = this.#urlCompletionWaiters.get(serverName)?.get(elicitationId);
+					if (waiters) {
+						for (const waiter of waiters) waiter.resolve();
+						this.#urlCompletionWaiters.get(serverName)?.delete(elicitationId);
+					} else {
+						let completed = this.#completedUrlElicitations.get(serverName);
+						if (!completed) {
+							completed = new Map();
+							this.#completedUrlElicitations.set(serverName, completed);
+						}
+						completed.set(elicitationId, Date.now());
+					}
 				}
 				break;
 			}
@@ -1259,9 +1296,11 @@ export class MCPManager {
 				this.#handleServerNotification(name, method, params);
 			},
 			onRequest: (method, params) => this.#handleServerRequest(method, params),
-			urlElicitationHandler: this.#urlElicitationHandler,
+			urlElicitationHandler: (serverName, request) => this.#requestUrlElicitation(serverName, request),
 		});
-		connection.urlElicitationHandler = this.#urlElicitationHandler;
+		connection.urlElicitationHandler = this.#urlElicitationHandler
+			? (serverName, request) => this.#requestUrlElicitation(serverName, request)
+			: undefined;
 		connection.waitForUrlElicitationCompletion = (elicitationId, signal) =>
 			this.#waitForUrlElicitationCompletion(name, elicitationId, signal);
 

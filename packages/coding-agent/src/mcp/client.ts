@@ -81,7 +81,10 @@ function parseUrlElicitation(params: unknown): MCPUrlElicitation {
 		throw Object.assign(new Error("Invalid URL elicitation request"), { code: -32602 });
 	}
 	try {
-		if (new URL(value.url).protocol !== "https:") throw new Error("URL must use HTTPS");
+		const parsed = new URL(value.url);
+		if (parsed.protocol !== "https:" || parsed.username !== "" || parsed.password !== "") {
+			throw new Error("URL must use HTTPS without embedded credentials");
+		}
 	} catch {
 		throw Object.assign(new Error("Invalid URL elicitation URL"), { code: -32602 });
 	}
@@ -91,6 +94,11 @@ function parseUrlElicitation(params: unknown): MCPUrlElicitation {
 		url: value.url,
 		message: value.message,
 	};
+}
+
+function isUrlElicitationRequest(params: unknown): boolean {
+	if (typeof params !== "object" || params === null || !("mode" in params)) return false;
+	return params.mode === "url";
 }
 
 /**
@@ -177,35 +185,35 @@ export async function connectToServer(
 	let transport: MCPTransport | undefined;
 
 	const connect = async (): Promise<MCPServerConnection> => {
-		transport = await createTransport(config);
+		const t = await createTransport(config);
+		transport = t;
 		if (options?.onNotification) {
-			transport.onNotification = options.onNotification;
+			t.onNotification = options.onNotification;
 		}
 
 		// Always handle standard MCP server-to-client requests (ping, roots/list).
 		// The initialize request declares roots capability, so we must respond to
 		// roots/list — even for short-lived test connections. URL elicitation is
-		// advertised and dispatched only when a handler was explicitly supplied.
-		if (options?.urlElicitationHandler) {
-			transport.urlElicitationHandler = async request =>
-				options.urlElicitationHandler!(name, parseUrlElicitation(request));
-		}
-		transport.onRequest = async (method, params) => {
-			if (method === "elicitation/create" && transport.urlElicitationHandler) {
-				return transport.urlElicitationHandler(parseUrlElicitation(params));
+		// advertised unconditionally; clients without a consent handler decline it.
+		const handleUrlElicitation = options?.urlElicitationHandler ?? (async () => ({ action: "decline" as const }));
+		t.urlElicitationHandler = async request => handleUrlElicitation(name, parseUrlElicitation(request));
+		t.onRequest = async (method, params) => {
+			if (method === "elicitation/create" && isUrlElicitationRequest(params)) {
+				const request = parseUrlElicitation(params);
+				return t.urlElicitationHandler ? t.urlElicitationHandler(request) : { action: "decline" as const };
 			}
 			return (options?.onRequest ?? defaultRequestHandler)(method, params);
 		};
 
 		try {
-			const initResult = await initializeConnection(transport, {
+			const initResult = await initializeConnection(t, {
 				signal: options?.signal,
-				urlElicitation: options?.urlElicitationHandler !== undefined,
+				urlElicitation: true,
 				async onInitialized() {
 					// Open the optional GET SSE stream only after the initialized
 					// notification makes the session ready for further traffic.
-					if ("startSSEListener" in transport! && typeof transport!.startSSEListener === "function") {
-						await (transport as { startSSEListener(): Promise<void> }).startSSEListener();
+					if ("startSSEListener" in t && typeof t.startSSEListener === "function") {
+						await t.startSSEListener();
 					}
 				},
 			});
@@ -213,16 +221,14 @@ export async function connectToServer(
 			return {
 				name,
 				config,
-				transport,
+				transport: t,
 				serverInfo: initResult.serverInfo,
 				capabilities: initResult.capabilities,
-				urlElicitationHandler: options?.urlElicitationHandler
-					? (request => options.urlElicitationHandler!(name, request))
-					: undefined,
+				urlElicitationHandler: options?.urlElicitationHandler,
 				instructions: initResult.instructions,
 			};
 		} catch (error) {
-			await transport.close();
+			await t.close();
 			throw error;
 		}
 	};
