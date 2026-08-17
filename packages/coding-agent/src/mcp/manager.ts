@@ -55,6 +55,7 @@ import type {
 	MCPServerConnection,
 	MCPToolDefinition,
 	MCPTransport,
+	MCPUrlElicitationHandler,
 } from "./types";
 import { MCPNotificationMethods } from "./types";
 
@@ -75,6 +76,11 @@ type TrackedPromise<T> = {
 	status: "pending" | "fulfilled" | "rejected";
 	value?: T;
 	reason?: unknown;
+};
+
+type UrlCompletionWaiter = {
+	resolve: () => void;
+	reject: (error: unknown) => void;
 };
 
 const STARTUP_TIMEOUT_MS = 250;
@@ -208,6 +214,8 @@ export class MCPManager {
 	}
 
 	#connections = new Map<string, MCPServerConnection>();
+	#urlElicitationHandler?: MCPUrlElicitationHandler;
+	#urlCompletionWaiters = new Map<string, Map<string, Set<UrlCompletionWaiter>>>();
 	#tools: CustomTool<TSchema, MCPToolDetails>[] = [];
 	#pendingConnections = new Map<string, Promise<MCPServerConnection>>();
 	#pendingToolLoads = new Map<string, Promise<ToolLoadResult>>();
@@ -445,6 +453,17 @@ export class MCPManager {
 		this.#authStorage = authStorage;
 	}
 
+	/** Set the callback used to request user consent for URL-mode elicitations. */
+	setUrlElicitationHandler(handler: MCPUrlElicitationHandler | undefined): void {
+		this.#urlElicitationHandler = handler;
+		for (const connection of this.#connections.values()) {
+			connection.urlElicitationHandler = handler;
+			connection.transport.urlElicitationHandler = handler
+				? request => handler(connection.name, request)
+				: undefined;
+		}
+	}
+
 	/** Set the callback used to complete OAuth after a tool-level auth challenge. */
 	setAuthHandler(handler: MCPAuthHandler | undefined): void {
 		this.#authHandler = handler;
@@ -556,9 +575,8 @@ export class MCPManager {
 					onNotification: (method, params) => {
 						this.#handleServerNotification(name, method, params);
 					},
-					onRequest: (method, params) => {
-						return this.#handleServerRequest(method, params);
-					},
+					onRequest: (method, params) => this.#handleServerRequest(method, params),
+					urlElicitationHandler: this.#urlElicitationHandler,
 				});
 			})().then(
 				async connection => {
@@ -575,6 +593,9 @@ export class MCPManager {
 						throw new Error(`Server "${name}" was disconnected during initial connection`);
 					}
 
+					connection.urlElicitationHandler = this.#urlElicitationHandler;
+					connection.waitForUrlElicitationCompletion = (elicitationId, signal) =>
+						this.#waitForUrlElicitationCompletion(name, elicitationId, signal);
 					this.#pendingConnections.delete(name);
 					this.#connections.set(name, connection);
 					this.#serverConfigs.set(name, config);
@@ -747,6 +768,37 @@ export class MCPManager {
 		sortMCPToolsByName(this.#tools);
 	}
 
+	async #waitForUrlElicitationCompletion(
+		serverName: string,
+		elicitationId: string,
+		signal?: AbortSignal,
+	): Promise<void> {
+		if (signal?.aborted) throw signal.reason instanceof Error ? signal.reason : new Error("Aborted");
+		const { promise, resolve, reject } = Promise.withResolvers<void>();
+		let byId = this.#urlCompletionWaiters.get(serverName);
+		if (!byId) {
+			byId = new Map();
+			this.#urlCompletionWaiters.set(serverName, byId);
+		}
+		let waiters = byId.get(elicitationId);
+		if (!waiters) {
+			waiters = new Set();
+			byId.set(elicitationId, waiters);
+		}
+		const waiter: UrlCompletionWaiter = { resolve, reject };
+		waiters.add(waiter);
+		const onAbort = () => reject(signal?.reason instanceof Error ? signal.reason : new Error("Aborted"));
+		signal?.addEventListener("abort", onAbort, { once: true });
+		try {
+			await promise;
+		} finally {
+			signal?.removeEventListener("abort", onAbort);
+			waiters.delete(waiter);
+			if (waiters.size === 0) byId.delete(elicitationId);
+			if (byId.size === 0) this.#urlCompletionWaiters.delete(serverName);
+		}
+	}
+
 	#triggerNotificationRefresh(serverName: string, kind: "tools" | "resources" | "prompts"): Promise<void> {
 		const refresh = (() => {
 			switch (kind) {
@@ -774,6 +826,18 @@ export class MCPManager {
 		const connectionKnown = this.#connections.has(serverName);
 		let refreshPromise: Promise<void> | undefined;
 		switch (method) {
+			case "notifications/elicitation/complete": {
+				const elicitationId =
+					params && typeof params === "object" && "elicitationId" in params && typeof params.elicitationId === "string"
+						? params.elicitationId
+						: undefined;
+				const waiters = elicitationId ? this.#urlCompletionWaiters.get(serverName)?.get(elicitationId) : undefined;
+				if (waiters) {
+					for (const waiter of waiters) waiter.resolve();
+					this.#urlCompletionWaiters.get(serverName)?.delete(elicitationId!);
+				}
+				break;
+			}
 			case MCPNotificationMethods.TOOLS_LIST_CHANGED:
 				if (connectionKnown) refreshPromise = this.#triggerNotificationRefresh(serverName, "tools");
 				break;
@@ -1194,10 +1258,12 @@ export class MCPManager {
 			onNotification: (method, params) => {
 				this.#handleServerNotification(name, method, params);
 			},
-			onRequest: (method, params) => {
-				return this.#handleServerRequest(method, params);
-			},
+			onRequest: (method, params) => this.#handleServerRequest(method, params),
+			urlElicitationHandler: this.#urlElicitationHandler,
 		});
+		connection.urlElicitationHandler = this.#urlElicitationHandler;
+		connection.waitForUrlElicitationCompletion = (elicitationId, signal) =>
+			this.#waitForUrlElicitationCompletion(name, elicitationId, signal);
 
 		connection.config = config;
 		if (source) connection._source = source;

@@ -83,7 +83,7 @@ import { loadSlashCommands } from "../extensibility/slash-commands";
 import type { Goal, GoalModeState } from "../goals/state";
 import { copyLocalArtifacts, resolveLocalUrlToPath } from "../internal-urls";
 import { LSP_STARTUP_EVENT_CHANNEL, type LspStartupEvent } from "../lsp/startup-events";
-import type { MCPManager } from "../mcp";
+import type { MCPManager, MCPUrlElicitation } from "../mcp";
 import {
 	formatMCPConnectionStatusMessage,
 	isMcpConnectionStatusEvent,
@@ -886,6 +886,9 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.mcpManager = mcpManager;
 		this.mcpManager?.setAuthHandler((serverName, challenge) =>
 			new MCPCommandController(this).handleMCPAuthChallenge(serverName, challenge),
+		);
+		this.mcpManager?.setUrlElicitationHandler((serverName, request) =>
+			this.#handleMcpUrlElicitation(serverName, request),
 		);
 		this.#eventBus = eventBus;
 		if (eventBus) {
@@ -4839,6 +4842,20 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.transcriptMessageComponents = new WeakMap<AgentMessage, Component>();
 		this.chatContainer.dispose();
 		this.chatContainer.clear();
+	}
+
+	async #handleMcpUrlElicitation(
+		serverName: string,
+		request: MCPUrlElicitation,
+	): Promise<{ action: "accept" | "decline" | "cancel" }> {
+		const consent = await this.showHookConfirm(
+			`Open URL requested by MCP server "${serverName}"?`,
+			`${request.message}\n${request.url}`,
+		);
+		if (!consent) return { action: "decline" };
+		this.openInBrowser(request.url);
+		this.showStatus(`Opened URL requested by MCP server "${serverName}".`);
+		return { action: "accept" };
 	}
 
 	showStatus(message: string, options?: { dim?: boolean }): void {

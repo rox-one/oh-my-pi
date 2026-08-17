@@ -102,6 +102,46 @@ describe("MCP Streamable HTTP initialization", () => {
 	});
 });
 
+describe("MCP URL elicitation capability", () => {
+	it("advertises URL elicitation when a handler is installed", async () => {
+		let initializeCapabilities: unknown;
+		server = Bun.serve({
+			port: 0,
+			async fetch(req) {
+				if (req.method === "GET") return new Response(null, { status: 405 });
+				if (req.method === "DELETE") return new Response(null, { status: 204 });
+				const body = (await req.json()) as { id?: string | number; method: string; params?: { capabilities?: unknown } };
+				if (body.method === "initialize") {
+					initializeCapabilities = body.params?.capabilities;
+					return Response.json({
+						jsonrpc: "2.0",
+						id: body.id,
+						result: {
+							protocolVersion: "2025-11-25",
+							capabilities: {},
+							serverInfo: { name: "url-elicitation", version: "1.0.0" },
+						},
+					});
+				}
+				return new Response(null, { status: 202 });
+			},
+		});
+
+		const connection = await connectToServer(
+			"url-elicitation",
+			{
+				type: "http",
+				url: `http://127.0.0.1:${server.port}/mcp`,
+				timeout: GUARD_TIMEOUT_MS,
+			},
+			{ urlElicitationHandler: async () => ({ action: "decline" }) },
+		);
+
+		expect(initializeCapabilities).toMatchObject({ elicitation: { url: {} } });
+		await connection.transport.close();
+	});
+});
+
 describe("MCP Streamable HTTP transport timeouts", () => {
 	it("keeps the request timeout active until a JSON response body is fully read", async () => {
 		server = Bun.serve({
@@ -234,6 +274,40 @@ describe("MCP Streamable HTTP transport timeouts", () => {
 		await expect(withPendingGuard(transport.request<ToolList>("tools/list"), "request")).resolves.toEqual({
 			tools: [{ name: "fast", inputSchema: { type: "object" } }],
 		});
+	});
+});
+
+it("preserves structured JSON-RPC error data", async () => {
+	server = Bun.serve({
+		port: 0,
+		fetch() {
+			return Response.json({
+				jsonrpc: "2.0",
+				id: 1,
+				error: {
+					code: -32042,
+					message: "URL elicitation required",
+					data: {
+						elicitations: [
+							{
+								mode: "url",
+								elicitationId: "test-id",
+								url: "https://gateway.example/authorize",
+								message: "Authorize the gateway",
+							},
+						],
+					},
+				},
+			});
+		},
+	});
+	const transport = await connectedTransport();
+
+	await expect(transport.request("tools/call")).rejects.toMatchObject({
+		code: -32042,
+		data: {
+			elicitations: [{ elicitationId: "test-id", url: "https://gateway.example/authorize" }],
+		},
 	});
 });
 

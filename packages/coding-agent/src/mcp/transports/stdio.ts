@@ -19,7 +19,7 @@ import type {
 	MCPStdioServerConfig,
 	MCPTransport,
 } from "../../mcp/types";
-import { toJsonRpcError } from "../../mcp/types";
+import { MCPRequestError, toJsonRpcError } from "../../mcp/types";
 import { RequestIdAllocator } from "../request-id";
 import { isMCPTimeoutEnabled, resolveMCPTimeoutMs } from "../timeout";
 
@@ -680,7 +680,7 @@ export class StdioTransport implements MCPTransport {
 			if (pending) {
 				this.#pendingRequests.delete(response.id);
 				if (response.error) {
-					pending.reject(new Error(`MCP error ${response.error.code}: ${response.error.message}`));
+					pending.reject(new MCPRequestError(response.error));
 				} else {
 					pending.resolve(response.result);
 				}

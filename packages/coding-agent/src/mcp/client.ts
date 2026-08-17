@@ -36,6 +36,8 @@ import type {
 	MCPToolDefinition,
 	MCPToolsListResult,
 	MCPTransport,
+	MCPUrlElicitation,
+	MCPUrlElicitationResponse,
 } from "./types";
 
 import { MCP_PROTOCOL_VERSION } from "./types";
@@ -67,6 +69,30 @@ async function defaultRequestHandler(method: string, _params: unknown): Promise<
 	}
 }
 
+function parseUrlElicitation(params: unknown): MCPUrlElicitation {
+	if (typeof params !== "object" || params === null) {
+		throw Object.assign(new Error("Invalid URL elicitation request"), { code: -32602 });
+	}
+	const value = params as Record<string, unknown>;
+	if (value.mode !== "url" || typeof value.elicitationId !== "string" || value.elicitationId.length === 0) {
+		throw Object.assign(new Error("Invalid URL elicitation request"), { code: -32602 });
+	}
+	if (typeof value.url !== "string" || typeof value.message !== "string") {
+		throw Object.assign(new Error("Invalid URL elicitation request"), { code: -32602 });
+	}
+	try {
+		if (new URL(value.url).protocol !== "https:") throw new Error("URL must use HTTPS");
+	} catch {
+		throw Object.assign(new Error("Invalid URL elicitation URL"), { code: -32602 });
+	}
+	return {
+		mode: "url",
+		elicitationId: value.elicitationId,
+		url: value.url,
+		message: value.message,
+	};
+}
+
 /**
  * Create a transport for the given server config.
  */
@@ -94,12 +120,15 @@ async function initializeConnection(
 		signal?: AbortSignal;
 		/** Called after notifications/initialized succeeds. */
 		onInitialized?: () => void | Promise<void>;
+		/** Whether URL-mode elicitation is supported by an installed handler. */
+		urlElicitation?: boolean;
 	},
 ): Promise<MCPInitializeResult> {
 	const params: MCPInitializeParams = {
 		protocolVersion: MCP_PROTOCOL_VERSION,
 		capabilities: {
 			roots: { listChanged: false },
+			...(options?.urlElicitation ? { elicitation: { url: {} } } : {}),
 		},
 		clientInfo: CLIENT_INFO,
 	};
@@ -141,6 +170,7 @@ export async function connectToServer(
 		signal?: AbortSignal;
 		onNotification?: (method: string, params: unknown) => void;
 		onRequest?: (method: string, params: unknown) => Promise<unknown>;
+		urlElicitationHandler?: (serverName: string, request: MCPUrlElicitation) => Promise<MCPUrlElicitationResponse>;
 	},
 ): Promise<MCPServerConnection> {
 	const timeoutMs = resolveMCPTimeoutMs(config.timeout);
@@ -154,12 +184,23 @@ export async function connectToServer(
 
 		// Always handle standard MCP server-to-client requests (ping, roots/list).
 		// The initialize request declares roots capability, so we must respond to
-		// roots/list — even for short-lived test connections.
-		transport.onRequest = options?.onRequest ?? defaultRequestHandler;
+		// roots/list — even for short-lived test connections. URL elicitation is
+		// advertised and dispatched only when a handler was explicitly supplied.
+		if (options?.urlElicitationHandler) {
+			transport.urlElicitationHandler = async request =>
+				options.urlElicitationHandler!(name, parseUrlElicitation(request));
+		}
+		transport.onRequest = async (method, params) => {
+			if (method === "elicitation/create" && transport.urlElicitationHandler) {
+				return transport.urlElicitationHandler(parseUrlElicitation(params));
+			}
+			return (options?.onRequest ?? defaultRequestHandler)(method, params);
+		};
 
 		try {
 			const initResult = await initializeConnection(transport, {
 				signal: options?.signal,
+				urlElicitation: options?.urlElicitationHandler !== undefined,
 				async onInitialized() {
 					// Open the optional GET SSE stream only after the initialized
 					// notification makes the session ready for further traffic.
@@ -175,6 +216,9 @@ export async function connectToServer(
 				transport,
 				serverInfo: initResult.serverInfo,
 				capabilities: initResult.capabilities,
+				urlElicitationHandler: options?.urlElicitationHandler
+					? (request => options.urlElicitationHandler!(name, request))
+					: undefined,
 				instructions: initResult.instructions,
 			};
 		} catch (error) {

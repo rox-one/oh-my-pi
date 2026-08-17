@@ -17,7 +17,7 @@ import type {
 	MCPSseServerConfig,
 	MCPTransport,
 } from "../../mcp/types";
-import { toJsonRpcError } from "../../mcp/types";
+import { MCPRequestError, toJsonRpcError } from "../../mcp/types";
 import { RequestIdAllocator } from "../request-id";
 import { createMCPTimeout, getNeverAbortSignal, isMCPTimeoutEnabled, resolveMCPTimeoutMs } from "../timeout";
 import { type MCPFetchInit, mcpFetch, withoutHeader } from "./header-policy";
@@ -419,7 +419,7 @@ export class HttpTransport implements MCPTransport {
 			const result = (await response.json()) as JsonRpcResponse;
 
 			if (result.error) {
-				throw new Error(`MCP error ${result.error.code}: ${result.error.message}`);
+				throw new MCPRequestError(result.error);
 			}
 
 			return result.result as T;
@@ -471,7 +471,7 @@ export class HttpTransport implements MCPTransport {
 									captured = true;
 									operation.clear();
 									if (message.error) {
-										reject(new Error(`MCP error ${message.error.code}: ${message.error.message}`));
+										reject(new MCPRequestError(message.error));
 									} else {
 										resolve(message.result as T);
 									}

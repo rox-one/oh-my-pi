@@ -6,7 +6,7 @@
 import type { AgentToolUpdateCallback } from "@oh-my-pi/pi-agent-core";
 import type { ImageContent, TextContent, TSchema } from "@oh-my-pi/pi-ai";
 import { normalizeSchemaForMCP } from "@oh-my-pi/pi-ai/utils/schema";
-import { logger, untilAborted } from "@oh-my-pi/pi-utils";
+import { logger, untilAborted, withTimeout } from "@oh-my-pi/pi-utils";
 import { INTENT_FIELD } from "@oh-my-pi/pi-wire";
 import type { SourceMeta } from "../capability/types";
 import type {
@@ -29,7 +29,9 @@ import type {
 	MCPToolCallParams,
 	MCPToolCallResult,
 	MCPToolDefinition,
+	MCPUrlElicitation,
 } from "./types";
+import { MCPRequestError } from "./types";
 
 /** Reconnect callback: tears down a stale connection, optionally authorizing first. */
 export type MCPReconnect = (options?: { authChallenge?: MCPAuthChallenge }) => Promise<MCPServerConnection | null>;
@@ -289,6 +291,37 @@ function getMcpAuthChallenge(result: MCPToolCallResult): MCPAuthChallenge | unde
 	return wwwAuthenticate.length > 0 ? { wwwAuthenticate } : undefined;
 }
 
+const URL_ELICITATION_REQUIRED_CODE = -32042;
+const URL_ELICITATION_WAIT_TIMEOUT_MS = 120_000;
+
+function getUrlElicitations(error: unknown): MCPUrlElicitation[] | undefined {
+	if (!(error instanceof MCPRequestError) || error.code !== URL_ELICITATION_REQUIRED_CODE) return undefined;
+	if (typeof error.data !== "object" || error.data === null || !("elicitations" in error.data)) return undefined;
+	const values = (error.data as { elicitations?: unknown }).elicitations;
+	if (!Array.isArray(values) || values.length === 0) return undefined;
+	const requests: MCPUrlElicitation[] = [];
+	for (const value of values) {
+		if (typeof value !== "object" || value === null) return undefined;
+		const item = value as Record<string, unknown>;
+		if (item.mode !== "url" || typeof item.elicitationId !== "string" || item.elicitationId.length === 0) {
+			return undefined;
+		}
+		if (typeof item.url !== "string" || typeof item.message !== "string") return undefined;
+		try {
+			if (new URL(item.url).protocol !== "https:") return undefined;
+		} catch {
+			return undefined;
+		}
+		requests.push({
+			mode: "url",
+			elicitationId: item.elicitationId,
+			url: item.url,
+			message: item.message,
+		});
+	}
+	return requests;
+}
+
 async function callToolWithAuthRetry(
 	connection: MCPServerConnection,
 	toolName: string,
@@ -317,6 +350,40 @@ async function callToolWithAuthRetry(
 	} catch (error) {
 		rethrowIfAborted(error, signal);
 		return { connection: newConnection, error };
+	}
+}
+
+async function callToolWithUrlElicitationRetry(
+	connection: MCPServerConnection,
+	toolName: string,
+	args: MCPToolArgs,
+	reconnect: MCPReconnect | undefined,
+	signal?: AbortSignal,
+): Promise<MCPToolCallAttempt> {
+	try {
+		return await callToolWithAuthRetry(connection, toolName, args, reconnect, signal);
+	} catch (error) {
+		rethrowIfAborted(error, signal);
+		const elicitations = getUrlElicitations(error);
+		const handler = connection.urlElicitationHandler;
+		const waitForCompletion = connection.waitForUrlElicitationCompletion;
+		if (!elicitations || !handler || !waitForCompletion) throw error;
+
+		for (const elicitation of elicitations) {
+			const response = await handler(connection.name, elicitation);
+			if (response.action !== "accept") {
+				return { connection, error: new Error("URL elicitation declined") };
+			}
+			await withTimeout(
+				waitForCompletion(elicitation.elicitationId, signal),
+				URL_ELICITATION_WAIT_TIMEOUT_MS,
+				"Timed out waiting for MCP URL elicitation completion",
+			);
+		}
+
+		// Deliberately call the non-recursive auth wrapper: a second -32042 is
+		// surfaced to the caller instead of opening an unbounded consent loop.
+		return await callToolWithAuthRetry(connection, toolName, args, reconnect, signal);
 	}
 }
 
@@ -537,7 +604,7 @@ export class MCPTool implements CustomTool<TSchema, MCPToolDetails> {
 		const providerName = this.connection._source?.providerName;
 
 		try {
-			const attempt = await callToolWithAuthRetry(this.connection, this.tool.name, args, this.reconnect, signal);
+			const attempt = await callToolWithUrlElicitationRetry(this.connection, this.tool.name, args, this.reconnect, signal);
 			if (attempt.error !== undefined) {
 				return buildErrorResult(attempt.error, this.connection.name, this.tool.name, provider, providerName);
 			}
@@ -660,7 +727,7 @@ export class DeferredMCPTool implements CustomTool<TSchema, MCPToolDetails> {
 			const connection = await untilAborted(signal, () => this.getConnection());
 			throwIfAborted(signal);
 			try {
-				const attempt = await callToolWithAuthRetry(connection, this.tool.name, args, this.reconnect, signal);
+				const attempt = await callToolWithUrlElicitationRetry(connection, this.tool.name, args, this.reconnect, signal);
 				if (attempt.error !== undefined) {
 					return buildErrorResult(
 						attempt.error,
