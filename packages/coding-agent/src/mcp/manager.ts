@@ -121,6 +121,8 @@ const RECONNECT_BURST_LIMIT = 5;
  * cleared; subsequent frames deliver directly to attached listeners.
  */
 const NOTIFICATION_BUFFER_CAP = 100;
+const COMPLETED_URL_ELICITATION_TTL_MS = 300_000;
+const COMPLETED_URL_ELICITATION_CAP = NOTIFICATION_BUFFER_CAP;
 
 function trackPromise<T>(promise: Promise<T>): TrackedPromise<T> {
 	const tracked: TrackedPromise<T> = { promise, status: "pending" };
@@ -794,10 +796,12 @@ export class MCPManager {
 		signal?: AbortSignal,
 	): Promise<void> {
 		if (signal?.aborted) throw signal.reason instanceof Error ? signal.reason : new Error("Aborted");
-		const completed = this.#completedUrlElicitations.get(serverName)?.get(elicitationId);
+		const completedById = this.#completedUrlElicitations.get(serverName);
+		const completed = completedById?.get(elicitationId);
 		if (completed !== undefined) {
-			this.#completedUrlElicitations.get(serverName)?.delete(elicitationId);
-			return;
+			completedById!.delete(elicitationId);
+			if (Date.now() - completed <= COMPLETED_URL_ELICITATION_TTL_MS) return;
+			if (completedById!.size === 0) this.#completedUrlElicitations.delete(serverName);
 		}
 		const { promise, resolve, reject } = Promise.withResolvers<void>();
 		let byId = this.#urlCompletionWaiters.get(serverName);
@@ -870,7 +874,16 @@ export class MCPManager {
 							completed = new Map();
 							this.#completedUrlElicitations.set(serverName, completed);
 						}
-						completed.set(elicitationId, Date.now());
+						const now = Date.now();
+						for (const [id, timestamp] of completed) {
+							if (now - timestamp > COMPLETED_URL_ELICITATION_TTL_MS) completed.delete(id);
+						}
+						completed.set(elicitationId, now);
+						while (completed.size > COMPLETED_URL_ELICITATION_CAP) {
+							const oldest = completed.keys().next().value;
+							if (oldest === undefined) break;
+							completed.delete(oldest);
+						}
 					}
 				}
 				break;
@@ -1040,6 +1053,16 @@ export class MCPManager {
 		);
 	}
 
+	#clearUrlElicitationState(serverName: string): void {
+		this.#completedUrlElicitations.delete(serverName);
+		const byId = this.#urlCompletionWaiters.get(serverName);
+		if (!byId) return;
+		this.#urlCompletionWaiters.delete(serverName);
+		for (const waiters of byId.values()) {
+			for (const waiter of waiters) waiter.reject(new Error(`MCP server "${serverName}" disconnected`));
+		}
+	}
+
 	/**
 	 * Drop a connection from the active map and detach its lifecycle hooks.
 	 *
@@ -1050,6 +1073,7 @@ export class MCPManager {
 	 */
 	#detachConnection(name: string, connection: MCPServerConnection): void {
 		connection.transport.onClose = undefined;
+		this.#clearUrlElicitationState(name);
 		if (this.#connections.get(name) === connection) {
 			this.#connections.delete(name);
 		}
@@ -1079,6 +1103,7 @@ export class MCPManager {
 		this.#serverConfigs.delete(name);
 		this.#pendingResourceRefresh.delete(name);
 		this.#reconnectHistory.delete(name);
+		this.#clearUrlElicitationState(name);
 
 		const connection = this.#connections.get(name);
 
@@ -1110,6 +1135,8 @@ export class MCPManager {
 		this.#epoch++;
 		const promises = Array.from(this.#connections, ([name, connection]) => this.#discardConnection(name, connection));
 		await Promise.allSettled(promises);
+		this.#completedUrlElicitations.clear();
+		this.#urlCompletionWaiters.clear();
 
 		this.#pendingConnections.clear();
 		this.#pendingToolLoads.clear();

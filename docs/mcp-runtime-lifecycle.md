@@ -153,7 +153,7 @@ The client advertises MCP URL-mode elicitation (`capabilities.elicitation.url`) 
 
 When a tool call returns the MCP URL-elicitation-required error (`-32042`), the tool bridge prompts once per unique `serverName + elicitationId`, accepts only an explicit `accept`, waits for the optional `notifications/elicitation/complete` notification when a completion waiter is available, and retries the tool once. Completion may arrive before the waiter is registered; that early completion is consumed by the subsequent wait. The wait has a bounded configurable deadline, and caller cancellation or deadline expiry aborts the retry instead of leaving the tool call pending. A second elicitation-required error is surfaced rather than recursively prompting.
 
-URL elicitation is intentionally interactive-only in this runtime. Headless/SDK sessions advertise the protocol capability for interoperability but have no consent UI and therefore decline requests. URLs and authorization payloads are not written to logs or persistence; only server identity, method, and lifecycle status are safe operational context.
+URL elicitation is intentionally interactive-only in this runtime. Headless/SDK sessions advertise the protocol capability for interoperability but have no consent UI and therefore decline requests. URL values are redacted from transport logs; elicitation payloads may be held transiently in bounded in-memory completion and listener buffers, but are not written to durable persistence.
 
 ## Refresh/reload paths (startup vs live reload)
 

@@ -40,7 +40,7 @@ import type {
 	MCPUrlElicitationResponse,
 } from "./types";
 
-import { MCP_PROTOCOL_VERSION } from "./types";
+import { MCP_PROTOCOL_VERSION, MCPRequestError } from "./types";
 
 /** Client info sent during initialization */
 const CLIENT_INFO = {
@@ -196,7 +196,7 @@ export async function connectToServer(
 		// roots/list — even for short-lived test connections. URL elicitation is
 		// advertised unconditionally; clients without a consent handler decline it.
 		const handleUrlElicitation = options?.urlElicitationHandler ?? (async () => ({ action: "decline" as const }));
-		t.urlElicitationHandler = async request => handleUrlElicitation(name, parseUrlElicitation(request));
+		t.urlElicitationHandler = async request => handleUrlElicitation(name, request);
 		t.onRequest = async (method, params) => {
 			if (method === "elicitation/create" && isUrlElicitationRequest(params)) {
 				const request = parseUrlElicitation(params);
@@ -279,7 +279,12 @@ export async function listTools(
 			params.cursor = cursor;
 		}
 
-		const result = await connection.transport.request<MCPToolsListResult>("tools/list", params, options);
+		const result = await requestWithUrlElicitationRetry<MCPToolsListResult>(
+			connection,
+			"tools/list",
+			params,
+			options,
+		);
 		allTools.push(...result.tools);
 		cursor = result.nextCursor;
 	} while (cursor);
@@ -318,6 +323,84 @@ export async function disconnectServer(connection: MCPServerConnection): Promise
 	await connection.transport.close();
 }
 
+const URL_ELICITATION_REQUIRED_CODE = -32042;
+const DEFAULT_URL_ELICITATION_WAIT_TIMEOUT_MS = 300_000;
+const URL_ELICITATION_TIMEOUT_ENV = "OMP_MCP_URL_ELICITATION_TIMEOUT_MS";
+
+function resolveUrlElicitationWaitTimeoutMs(): number {
+	const configured = Number.parseInt(process.env[URL_ELICITATION_TIMEOUT_ENV] ?? "", 10);
+	return Number.isFinite(configured) && configured > 0 ? configured : DEFAULT_URL_ELICITATION_WAIT_TIMEOUT_MS;
+}
+
+function getUrlElicitations(error: unknown): MCPUrlElicitation[] | undefined {
+	if (!(error instanceof MCPRequestError) || error.code !== URL_ELICITATION_REQUIRED_CODE) return undefined;
+	if (typeof error.data !== "object" || error.data === null || !("elicitations" in error.data)) return undefined;
+	const values = (error.data as { elicitations?: unknown }).elicitations;
+	if (!Array.isArray(values) || values.length === 0) return undefined;
+	const requests: MCPUrlElicitation[] = [];
+	for (const value of values) {
+		try {
+			requests.push(parseUrlElicitation(value));
+		} catch {
+			return undefined;
+		}
+	}
+	return requests;
+}
+
+async function requestWithUrlElicitationRetry<T>(
+	connection: MCPServerConnection,
+	method: string,
+	params: Record<string, unknown>,
+	options?: MCPRequestOptions,
+): Promise<T> {
+	try {
+		return await connection.transport.request<T>(method, params, options);
+	} catch (error) {
+		const elicitations = getUrlElicitations(error);
+		const handler = connection.urlElicitationHandler;
+		if (!elicitations || !handler) throw error;
+
+		for (const elicitation of elicitations) {
+			const completionController = connection.waitForUrlElicitationCompletion ? new AbortController() : undefined;
+			const completionSignal = completionController
+				? options?.signal
+					? AbortSignal.any([options.signal, completionController.signal])
+					: completionController.signal
+				: options?.signal;
+			const completionPromise = connection.waitForUrlElicitationCompletion?.(
+				elicitation.elicitationId,
+				completionSignal,
+			);
+			try {
+				const response = await handler(connection.name, elicitation);
+				if (response.action !== "accept") {
+					throw new Error(
+						`MCP server "${connection.name}" URL authorization was ${response.action} for ${method}.`,
+					);
+				}
+				if (completionPromise) {
+					try {
+						await withTimeout(
+							completionPromise,
+							resolveUrlElicitationWaitTimeoutMs(),
+							"MCP URL elicitation completion wait expired",
+							options?.signal,
+						);
+					} catch (waitError) {
+						if (options?.signal?.aborted) throw waitError;
+					}
+				}
+			} finally {
+				completionController?.abort();
+				await completionPromise?.catch(() => {});
+			}
+		}
+
+		return connection.transport.request<T>(method, params, options);
+	}
+}
+
 /**
  * Check if a server supports tools.
  */
@@ -349,7 +432,12 @@ export async function listResources(
 			params.cursor = cursor;
 		}
 
-		const result = await connection.transport.request<MCPResourcesListResult>("resources/list", params, options);
+		const result = await requestWithUrlElicitationRetry<MCPResourcesListResult>(
+			connection,
+			"resources/list",
+			params,
+			options,
+		);
 		allResources.push(...result.resources);
 		cursor = result.nextCursor;
 	} while (cursor);
@@ -397,7 +485,8 @@ export async function listResourceTemplates(
 				params.cursor = cursor;
 			}
 
-			const result = await connection.transport.request<MCPResourceTemplatesListResult>(
+			const result = await requestWithUrlElicitationRetry<MCPResourceTemplatesListResult>(
+				connection,
 				"resources/templates/list",
 				params,
 				options,
@@ -429,7 +518,8 @@ export async function readResource(
 	options?: MCPRequestOptions,
 ): Promise<MCPResourceReadResult> {
 	const params: MCPResourceReadParams = { uri };
-	return connection.transport.request<MCPResourceReadResult>(
+	return requestWithUrlElicitationRetry<MCPResourceReadResult>(
+		connection,
 		"resources/read",
 		params as unknown as Record<string, unknown>,
 		options,
@@ -448,7 +538,8 @@ export async function subscribeToResources(
 	const results = await Promise.allSettled(
 		uris.map(uri => {
 			const params: MCPResourceSubscribeParams = { uri };
-			return connection.transport.request(
+			return requestWithUrlElicitationRetry(
+				connection,
 				"resources/subscribe",
 				params as unknown as Record<string, unknown>,
 				options,
@@ -474,7 +565,8 @@ export async function unsubscribeFromResources(
 	const results = await Promise.allSettled(
 		uris.map(uri => {
 			const params: MCPResourceSubscribeParams = { uri };
-			return connection.transport.request(
+			return requestWithUrlElicitationRetry(
+				connection,
 				"resources/unsubscribe",
 				params as unknown as Record<string, unknown>,
 				options,
@@ -526,7 +618,12 @@ export async function listPrompts(
 			params.cursor = cursor;
 		}
 
-		const result = await connection.transport.request<MCPPromptsListResult>("prompts/list", params, options);
+		const result = await requestWithUrlElicitationRetry<MCPPromptsListResult>(
+			connection,
+			"prompts/list",
+			params,
+			options,
+		);
 		allPrompts.push(...result.prompts);
 		cursor = result.nextCursor;
 	} while (cursor);
@@ -549,7 +646,8 @@ export async function getPrompt(
 		params.arguments = args;
 	}
 
-	return connection.transport.request<MCPGetPromptResult>(
+	return requestWithUrlElicitationRetry<MCPGetPromptResult>(
+		connection,
 		"prompts/get",
 		params as unknown as Record<string, unknown>,
 		options,

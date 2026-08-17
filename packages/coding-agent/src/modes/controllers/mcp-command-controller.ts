@@ -55,6 +55,8 @@ import type {
 	MCPConfigFile,
 	MCPServerConfig,
 	MCPServerConnection,
+	MCPUrlElicitation,
+	MCPUrlElicitationResponse,
 } from "../../mcp/types";
 import { shortenPath } from "../../tools/render-utils";
 import { urlHyperlinkAlways } from "../../tui";
@@ -1924,6 +1926,32 @@ export class MCPCommandController {
 		} catch (error) {
 			this.ctx.showError(`Failed to clear auth: ${error instanceof Error ? error.message : String(error)}`);
 		}
+	}
+
+	/** Present URL-mode MCP consent in the interactive selector. */
+	async handleMCPUrlElicitation(serverName: string, request: MCPUrlElicitation): Promise<MCPUrlElicitationResponse> {
+		let host = "unknown host";
+		try {
+			const parsed = new URL(request.url);
+			host = parsed.host || parsed.protocol.replace(/:$/, "") || host;
+		} catch {
+			// Keep malformed URLs out of the consent text; the opener still receives the original request on accept.
+		}
+		const choice = await this.ctx.showHookSelector(
+			`Open URL requested by MCP server "${serverName}"?\nHost: ${host}\n${request.message}`,
+			[
+				{ label: "Accept", description: `Open ${host} in your browser` },
+				{ label: "Decline", description: `Do not open ${host}` },
+				"Cancel",
+			],
+		);
+		if (choice === "Accept") {
+			this.ctx.openInBrowser(request.url);
+			this.ctx.showStatus(`Opened URL requested by MCP server "${serverName}" (${host}).`);
+			return { action: "accept" };
+		}
+		if (choice === "Decline") return { action: "decline" };
+		return { action: "cancel" };
 	}
 
 	/** Reauthorize a server after a tool-level OAuth challenge. */

@@ -83,7 +83,7 @@ import { loadSlashCommands } from "../extensibility/slash-commands";
 import type { Goal, GoalModeState } from "../goals/state";
 import { copyLocalArtifacts, resolveLocalUrlToPath } from "../internal-urls";
 import { LSP_STARTUP_EVENT_CHANNEL, type LspStartupEvent } from "../lsp/startup-events";
-import type { MCPManager, MCPUrlElicitation } from "../mcp";
+import type { MCPManager } from "../mcp";
 import {
 	formatMCPConnectionStatusMessage,
 	isMcpConnectionStatusEvent,
@@ -888,7 +888,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			new MCPCommandController(this).handleMCPAuthChallenge(serverName, challenge),
 		);
 		this.mcpManager?.setUrlElicitationHandler((serverName, request) =>
-			this.#handleMcpUrlElicitation(serverName, request),
+			new MCPCommandController(this).handleMCPUrlElicitation(serverName, request),
 		);
 		this.#eventBus = eventBus;
 		if (eventBus) {
@@ -4842,34 +4842,6 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.transcriptMessageComponents = new WeakMap<AgentMessage, Component>();
 		this.chatContainer.dispose();
 		this.chatContainer.clear();
-	}
-
-	async #handleMcpUrlElicitation(
-		serverName: string,
-		request: MCPUrlElicitation,
-	): Promise<{ action: "accept" | "decline" | "cancel" }> {
-		let host = "unknown host";
-		try {
-			const parsed = new URL(request.url);
-			host = parsed.host || parsed.protocol.replace(/:$/, "") || host;
-		} catch {
-			// Keep malformed URLs out of the consent text; the MCP request is still declined or cancelled safely.
-		}
-		const choice = await this.showHookSelector(
-			`Open URL requested by MCP server "${serverName}"?\nHost: ${host}\n${request.message}`,
-			[
-				{ label: "Accept", description: `Open ${host} in your browser` },
-				{ label: "Decline", description: `Do not open ${host}` },
-				"Cancel",
-			],
-		);
-		if (choice === "Accept") {
-			this.openInBrowser(request.url);
-			this.showStatus(`Opened URL requested by MCP server "${serverName}" (${host}).`);
-			return { action: "accept" };
-		}
-		if (choice === "Decline") return { action: "decline" };
-		return { action: "cancel" };
 	}
 
 	showStatus(message: string, options?: { dim?: boolean }): void {

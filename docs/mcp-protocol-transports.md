@@ -110,7 +110,7 @@ Server-initiated notifications are surfaced through transport `onNotification`; 
 
 Tool calls can return the MCP URL-elicitation-required error (`-32042`) with a validated `elicitations` array in `MCPRequestError.data`. The manager deduplicates in-flight consent prompts by server name and elicitation id. After an accepted prompt, completion is optional: when the manager has a completion waiter it waits for `notifications/elicitation/complete`, including notifications that arrived before the waiter; the wait has a bounded configurable deadline and observes caller cancellation. The tool bridge performs at most one follow-up call, so repeated elicitation requirements, decline, cancel, timeout, or abort are surfaced without an unbounded retry loop.
 
-Server-request responses are JSON-RPC envelopes. Arbitrary thrown values contribute only a safe code/message; structured `data` is serialized back only for `MCPRequestError`, whose data is explicitly protocol-owned. URL values and elicitation payloads are not logged or persisted.
+Server-request responses are JSON-RPC envelopes. Arbitrary thrown values contribute only a safe code/message; structured `data` is serialized back only for `MCPRequestError`, whose data is explicitly protocol-owned. URL values are redacted from transport logs. Elicitation payloads may be held transiently in bounded in-memory completion and listener buffers; they are not written to durable persistence.
 
 ## Stdio transport internals
 

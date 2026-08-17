@@ -22,7 +22,6 @@ import { normalizeLocalScheme } from "../tools/path-utils";
 import { ToolAbortError, throwIfAborted } from "../tools/tool-errors";
 import { callTool } from "./client";
 import { renderMCPCall, renderMCPResult } from "./render";
-import { resolveMCPTimeoutMs } from "./timeout";
 import type {
 	MCPAuthChallenge,
 	MCPContent,
@@ -292,13 +291,12 @@ function getMcpAuthChallenge(result: MCPToolCallResult): MCPAuthChallenge | unde
 	return wwwAuthenticate.length > 0 ? { wwwAuthenticate } : undefined;
 }
 const URL_ELICITATION_REQUIRED_CODE = -32042;
-const DEFAULT_URL_ELICITATION_WAIT_TIMEOUT_MS = 30_000;
+const URL_ELICITATION_TIMEOUT_ENV = "OMP_MCP_URL_ELICITATION_TIMEOUT_MS";
+const DEFAULT_URL_ELICITATION_WAIT_TIMEOUT_MS = 300_000;
 
-function resolveUrlElicitationWaitTimeoutMs(connection: MCPServerConnection): number {
-	const configured = resolveMCPTimeoutMs(connection.config.timeout);
-	return configured > 0
-		? Math.min(configured, DEFAULT_URL_ELICITATION_WAIT_TIMEOUT_MS)
-		: DEFAULT_URL_ELICITATION_WAIT_TIMEOUT_MS;
+function resolveUrlElicitationWaitTimeoutMs(): number {
+	const configured = Number.parseInt(process.env[URL_ELICITATION_TIMEOUT_ENV] ?? "", 10);
+	return Number.isFinite(configured) && configured > 0 ? configured : DEFAULT_URL_ELICITATION_WAIT_TIMEOUT_MS;
 }
 
 function getUrlElicitations(error: unknown): MCPUrlElicitation[] | undefined {
@@ -375,8 +373,7 @@ async function callToolWithUrlElicitationRetry(
 		const elicitations = getUrlElicitations(error);
 		const handler = connection.urlElicitationHandler;
 		if (!elicitations || !handler) throw error;
-
-		const deadline = Date.now() + resolveUrlElicitationWaitTimeoutMs(connection);
+		const deadline = Date.now() + resolveUrlElicitationWaitTimeoutMs();
 		const waitForCompletion = connection.waitForUrlElicitationCompletion;
 		for (const elicitation of elicitations) {
 			// Register before prompting: a fast server may complete while the
@@ -393,12 +390,28 @@ async function callToolWithUrlElicitationRetry(
 			try {
 				const response = await handler(connection.name, elicitation);
 				if (response.action !== "accept") {
-					return { connection, error: new Error("URL elicitation declined") };
+					return {
+						connection,
+						error: new Error(
+							`MCP server "${connection.name}" URL authorization was ${response.action} for tool "${toolName}".`,
+						),
+					};
 				}
 				if (completionPromise) {
 					const remaining = deadline - Date.now();
-					if (remaining <= 0) throw new Error("Timed out waiting for MCP URL elicitation completion");
-					await withTimeout(completionPromise, remaining, "Timed out waiting for MCP URL elicitation completion");
+					if (remaining > 0) {
+						try {
+							await withTimeout(
+								completionPromise,
+								remaining,
+								"Timed out waiting for MCP URL elicitation completion",
+								signal,
+							);
+						} catch (waitError) {
+							rethrowIfAborted(waitError, signal);
+							// Completion is optional; retry once after the deadline.
+						}
+					}
 				}
 			} finally {
 				completionController?.abort();
