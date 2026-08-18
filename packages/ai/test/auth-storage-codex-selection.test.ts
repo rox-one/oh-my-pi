@@ -2865,7 +2865,12 @@ describe("AuthStorage claude oauth ranking", () => {
 		expectExclusivePreference(counts, "api-acct-near", "api-acct-far");
 	});
 
-	test("assumes the full duration remains when ranking clockless windows", async () => {
+	// Anthropic publishes `resetsAt` only once a weekly window is running, so a
+	// seat nobody has touched this period reports 0% used and no clock. It must
+	// be started before a running sibling is drained further: idle weekly quota
+	// strands at the period roll-over, while draining a running seat past its
+	// cap spills into paid extra usage.
+	test("starts an unstarted weekly window before draining a clocked sibling", async () => {
 		if (!authStorage) throw new Error("test setup failed");
 
 		await authStorage.set("anthropic", [
@@ -2891,7 +2896,7 @@ describe("AuthStorage claude oauth ranking", () => {
 		);
 
 		const apiKey = await authStorage.getApiKey("anthropic", "session-claude-clockless");
-		expect(apiKey).toBe("api-acct-clocked");
+		expect(apiKey).toBe("api-acct-clockless");
 	});
 
 	test("does not rank a missing weekly window as the account's 5h window", async () => {
