@@ -2049,11 +2049,17 @@ export class TurnRecovery {
 		if (!staleOpenAIResponsesReplayError && !switchedCredential && currentSelector) {
 			// A refusal chain stops at the retry budget: the exhausted-attempt
 			// last resort is for provider failures, not classifier decisions.
+			// When the provider explicitly asked for a wait (retry-after header
+			// surfaced as `retry-after-ms=` in the error message), honor it on
+			// the same model/credential instead of drilling to a cold
+			// cross-provider fallback (cache bust + billed request) mid-window.
+			// The chain still engages after the budget exhausts.
 			if (
 				allowModelFallback &&
 				retrySettings.modelFallback &&
 				!thinkingLoop &&
-				!(retryBudgetExhausted && classifierRefusal)
+				!(retryBudgetExhausted && classifierRefusal) &&
+				!(parsedRetryAfterMs !== undefined && !retryBudgetExhausted)
 			) {
 				if (!classifierRefusal) {
 					this.noteRetryFallbackCooldown(currentSelector, parsedRetryAfterMs, errorMessage);
