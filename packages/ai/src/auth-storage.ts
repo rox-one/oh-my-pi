@@ -4579,17 +4579,20 @@ export class AuthStorage {
 	}
 
 	/**
-	 * Computes the required drain rate: `headroomFraction / remainingHours` —
-	 * how fast the window's remaining quota must be consumed to fully use it
-	 * before it resets and expires. Higher = more headroom at risk of expiring
-	 * unused = ranked first, so selection chases quota that is about to be
-	 * wasted ("use it or lose it"). Without a reset clock, the full window
-	 * duration is assumed to remain so clocked and clockless scores stay comparable.
+	 * Computes the required drain rate: `headroomFraction / remainingHours`.
+	 * Higher scores rank first so quota that resets sooner is not stranded.
+	 *
+	 * A measured window with headroom but no reset clock has not started yet.
+	 * Rank it first so a fresh subscription seat is used before running siblings
+	 * spill into paid overage. A missing limit is different: its 0.5 headroom is
+	 * only an unknown-usage placeholder, so it keeps the conservative full-window
+	 * score instead of jumping the queue.
 	 */
 	#computeWindowRequiredDrain(limit: UsageLimit | undefined, nowMs: number, fallbackDurationMs: number): number {
 		const headroom = 1 - this.#normalizeUsageFraction(limit);
 		if (headroom <= 0) return 0;
 		const resetAt = this.#resolveWindowResetAt(limit?.window);
+		if (resetAt === undefined && limit !== undefined) return Number.POSITIVE_INFINITY;
 		const durationMs = limit?.window?.durationMs ?? fallbackDurationMs;
 		let remainingMs = resetAt === undefined ? durationMs : resetAt - nowMs;
 		if (Number.isFinite(durationMs) && durationMs > 0) {
