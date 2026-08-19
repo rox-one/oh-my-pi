@@ -1,11 +1,11 @@
 /**
- * Files a pending tool call will write, read straight out of its resolved
+ * What a pending tool call does to files, read straight out of its resolved
  * arguments.
  *
  * Only `write` and `edit` are covered: their arguments name their targets
  * exactly, so a session file grant can match them without asking a model. Every
- * other tool (notably `bash`, whose targets live inside a shell command) leaves
- * this empty and relies on the similarity classifier to name what it writes.
+ * other tool (notably `bash`, whose targets live inside a shell command) reports
+ * nothing and relies on the similarity classifier to name what it writes.
  *
  * Own module, not part of `session-approvals.ts`: the store is imported by the
  * TUI event controller for the approval-title heuristic, and the edit-mode
@@ -16,63 +16,95 @@ import { isRecord } from "@oh-my-pi/pi-utils";
 import { expandApplyPatchToEntries } from "../edit";
 import { normalizeApprovalPath } from "./session-approvals";
 
-/** Authored paths one `edit` call writes, in either of its two wire shapes. */
-function editTargetPaths(args: Record<string, unknown>): string[] {
-	const paths: string[] = [];
-	// `replace` and `patch` modes: one `path`, optionally renamed by an entry.
-	if (typeof args.path === "string") paths.push(args.path);
+/** File effects of one tool call, as far as its own arguments state them. */
+export interface ToolFileEffects {
+	/**
+	 * Absolute normalized files the call creates, modifies, or truncates — the
+	 * one effect a session file grant covers. Paths `normalizeApprovalPath`
+	 * refuses (URLs, globs) are dropped.
+	 */
+	writes: readonly string[];
+	/**
+	 * The call also takes a path away: a delete, or the source of a move. A
+	 * grant to write a file never answers that, so such a call is refused
+	 * outright rather than judged.
+	 */
+	removes: boolean;
+}
+
+/** Authored file effects of one `edit` call, in either of its two wire shapes. */
+function editFileEffects(args: Record<string, unknown>): { writes: string[]; removes: boolean } {
+	const writes: string[] = [];
+	let removes = false;
+	// `replace` and `patch` modes: one `path`, which a patch entry may delete or
+	// move away. `op: "create"` ignores a `rename`, so only the other ops move.
+	const filePath = typeof args.path === "string" ? args.path : undefined;
 	if (Array.isArray(args.edits)) {
 		for (const entry of args.edits) {
-			if (isRecord(entry) && typeof entry.rename === "string") paths.push(entry.rename);
+			if (!isRecord(entry)) continue;
+			if (entry.op === "delete") removes = true;
+			else if (entry.op !== "create" && typeof entry.rename === "string") {
+				removes = true;
+				writes.push(entry.rename);
+			}
 		}
 	}
+	// A path the call deletes or moves away from is not a path it writes.
+	if (filePath !== undefined && !removes) writes.push(filePath);
 	const input = typeof args.input === "string" ? args.input : undefined;
-	if (!input) return paths;
-	// `hashline` mode: every section header is a separate target, and `MV` writes
-	// its destination too. Parsing can throw on a malformed patch — an edit that
-	// never applies grants nothing.
+	if (!input) return { writes, removes };
+	// `hashline` mode: every section header is a separate target, `REM` deletes
+	// its file and `MV` writes the destination instead of the source. Parsing can
+	// throw on a malformed patch — an edit that never applies grants nothing.
 	try {
 		const sections = Patch.parse(input).sections;
 		for (const section of sections) {
-			paths.push(section.path);
-			if (section.fileOp?.kind === "move") paths.push(section.fileOp.dest);
+			const fileOp = section.fileOp;
+			if (fileOp?.kind === "rem") removes = true;
+			else if (fileOp?.kind === "move") {
+				removes = true;
+				writes.push(fileOp.dest);
+			} else writes.push(section.path);
 		}
-		if (sections.length > 0) return paths;
+		if (sections.length > 0) return { writes, removes };
 	} catch {
 		// Not a hashline patch (or not a valid one) — try the apply-patch envelope.
 	}
 	try {
 		for (const entry of expandApplyPatchToEntries({ input })) {
-			paths.push(entry.path);
-			if (entry.rename) paths.push(entry.rename);
+			if (entry.op === "delete") removes = true;
+			else if (entry.op !== "create" && entry.rename) {
+				removes = true;
+				writes.push(entry.rename);
+			} else writes.push(entry.path);
 		}
 	} catch {
 		// Neither wire shape parsed; the call names no file this gate can pin down.
 	}
-	return paths;
+	return { writes, removes };
 }
 
 /**
- * Absolute normalized files `toolName` writes with `args`, resolved against
- * `cwd`. Empty for every tool whose targets are not readable from arguments,
- * and for values `normalizeApprovalPath` refuses (URLs, globs).
+ * File effects `toolName` has with `args`, with every path resolved against
+ * `cwd`. `undefined` for every tool whose effects are not readable from
+ * arguments — those are the model's to name, and nothing structural may answer
+ * for them.
  */
-export function toolWriteTargets(toolName: string, args: unknown, cwd: string): string[] {
-	if (!isRecord(args)) return [];
+export function toolFileEffects(toolName: string, args: unknown, cwd: string): ToolFileEffects | undefined {
+	if (!isRecord(args)) return undefined;
 	const authored =
 		toolName === "write"
-			? typeof args.path === "string"
-				? [args.path]
-				: []
+			? { writes: typeof args.path === "string" ? [args.path] : [], removes: false }
 			: toolName === "edit"
-				? editTargetPaths(args)
-				: [];
-	const targets: string[] = [];
-	for (const authoredPath of authored) {
+				? editFileEffects(args)
+				: undefined;
+	if (!authored) return undefined;
+	const writes: string[] = [];
+	for (const authoredPath of authored.writes) {
 		const normalized = normalizeApprovalPath(authoredPath, cwd);
-		if (normalized && !targets.includes(normalized)) targets.push(normalized);
+		if (normalized && !writes.includes(normalized)) writes.push(normalized);
 	}
-	return targets;
+	return { writes, removes: authored.removes };
 }
 
 /**

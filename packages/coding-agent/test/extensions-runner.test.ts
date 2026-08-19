@@ -38,6 +38,7 @@ import {
 	approvalIdentity,
 	approveToolForSession,
 	clearSessionApprovals,
+	getFileApprovals,
 } from "@oh-my-pi/pi-coding-agent/tools/session-approvals";
 
 import { getProjectAgentDir, logger, TempDir } from "@oh-my-pi/pi-utils";
@@ -3256,8 +3257,53 @@ describe("ExtensionRunner", () => {
 				// The `edit` call was judged against the file it names, resolved absolute.
 				expect(classify.mock.calls[0]?.[0]).toMatchObject({
 					toolName: "edit",
-					writeTargets: ["/tmp/approval/a.ts"],
+					fileEffects: { writes: ["/tmp/approval/a.ts"], removes: false },
 				});
+			});
+
+			it("prompts for an edit that deletes a granted file, and grants nothing for a removed path", async () => {
+				// A file grant means "this session may write this file". `edit` renders
+				// a delete and an in-place edit of the same file as the same subject,
+				// so a call that takes the path away can only be refused in code — and
+				// approving it must not turn the removed path into a write grant.
+				const classify = vi.spyOn(approvalSimilarity, "classifyApprovalSimilarity");
+				const writeTargets = vi.spyOn(approvalSimilarity, "classifyWriteTargets");
+				const select = vi.fn(
+					async (_title: string, _options: ExtensionUISelectItem[]) =>
+						"Approve Similar write Commands for Session",
+				);
+				const runner = await makeRunner(select);
+				const writeWrapper = new ExtensionToolWrapper(fileTool("write"), runner);
+				const editWrapper = new ExtensionToolWrapper(fileTool("edit"), runner);
+
+				await (writeWrapper as ExtensionToolWrapper<any>).execute(
+					"call-write-grant",
+					{ path: "/tmp/approval/a.ts", content: "export {};" },
+					undefined,
+					undefined,
+					makeContext(),
+				);
+				expect(getFileApprovals(sessionManager.getSessionId())).toEqual(["/tmp/approval/a.ts"]);
+
+				select.mockImplementation(async () => "Approve Similar edit Commands for Session");
+				const deleted = await (editWrapper as ExtensionToolWrapper<any>).execute(
+					"call-edit-delete",
+					{ path: "/tmp/approval/a.ts", edits: [{ op: "delete" }] },
+					undefined,
+					undefined,
+					makeContext(),
+				);
+				expect(resultText(deleted)).toBe("ok");
+				// The grant did not answer for the delete: the user did, at a prompt.
+				expect(select).toHaveBeenCalledTimes(2);
+				expect(classify.mock.calls[0]?.[0]).toMatchObject({
+					toolName: "edit",
+					fileEffects: { writes: [], removes: true },
+				});
+				// Nothing new was granted, and no model was asked to name a target for
+				// a call whose own arguments say it writes none.
+				expect(getFileApprovals(sessionManager.getSessionId())).toEqual(["/tmp/approval/a.ts"]);
+				expect(writeTargets).not.toHaveBeenCalled();
 			});
 
 			it("records the classifier's write targets for a tool whose arguments name none", async () => {

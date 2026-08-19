@@ -18,7 +18,7 @@ import {
 	classifyApprovalSimilarity,
 	classifyWriteTargets,
 } from "../../tools/approval-similarity";
-import { toolCallCwd, toolWriteTargets } from "../../tools/approval-write-targets";
+import { toolCallCwd, toolFileEffects } from "../../tools/approval-write-targets";
 import { defaultLoadModeForToolName } from "../../tools/essential-tools";
 import {
 	addFileApprovals,
@@ -309,13 +309,13 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 		const cwd = sessionGrants
 			? toolCallCwd(this.tool.name, resolvedArgs, context?.sessionManager?.getCwd() ?? "")
 			: "";
-		const argWriteTargets = sessionGrants ? toolWriteTargets(this.tool.name, resolvedArgs, cwd) : [];
+		const fileEffects = sessionGrants ? toolFileEffects(this.tool.name, resolvedArgs, cwd) : undefined;
 		const classifyDeps = {
 			sessionId,
 			toolName: this.tool.name,
 			subject,
 			identity,
-			writeTargets: argWriteTargets,
+			fileEffects,
 			cwd,
 			registry: context?.modelRegistry,
 			// Attribute the classification to this session's provider identity,
@@ -429,16 +429,15 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 				addSimilarApproval(sessionId, this.tool.name, subject, identity);
 				// Files this call writes become session-wide grants, so approving a
 				// write here covers the same file through any other tool. Their source,
-				// in order: the arguments when the tool names its targets
-				// (`write`/`edit`), else the paths the classifier read out of the
-				// subject — reusing the verdict above when the gate already classified
-				// this call, so one gate costs at most one classification. Not awaited
-				// for its own sake: the grant only matters to later calls.
+				// in order: the call's own arguments when the tool states its file
+				// effects (`write`/`edit`, where a delete or a move away states that
+				// the path is not written), else the paths the classifier read out of
+				// the subject — reusing the verdict above when the gate already
+				// classified this call, so one gate costs at most one classification.
 				const writeTargets =
-					argWriteTargets.length > 0
-						? argWriteTargets
-						: (verdict?.writeTargets ??
-							(settings ? await classifyWriteTargets({ ...classifyDeps, settings }) : []));
+					fileEffects?.writes ??
+					verdict?.writeTargets ??
+					(settings ? await classifyWriteTargets({ ...classifyDeps, settings }) : []);
 				addFileApprovals(sessionId, writeTargets);
 			}
 			const approved = choice === "Approve" || choice === approveSessionToolLabel || choice === approveSimilarLabel;

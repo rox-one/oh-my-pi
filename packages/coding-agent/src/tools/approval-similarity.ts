@@ -29,6 +29,7 @@ import { stripAnsi } from "../tiny/message-preproc";
 import { isTinyMemoryLocalModelKey, isTinyMemoryReasoningModelKey, ONLINE_MEMORY_MODEL_KEY } from "../tiny/models";
 import { tinyModelClient } from "../tiny/title-client";
 import { isTruncatedForPrompt } from "./approval";
+import type { ToolFileEffects } from "./approval-write-targets";
 import {
 	getFileApprovals,
 	getSimilarApprovals,
@@ -83,11 +84,11 @@ export interface ApprovalSimilarityDeps {
 	/** Exact-repeat key of the pending call — `approvalIdentity(resolvedArgs)` output. */
 	identity: string;
 	/**
-	 * Files the pending call writes, read from its own arguments
-	 * (`toolWriteTargets`). Present for `write`/`edit`; empty for every tool
-	 * whose targets only a model can name.
+	 * What the pending call does to files, read from its own arguments
+	 * (`toolFileEffects`). Present for `write`/`edit`; absent for every tool
+	 * whose effects only a model can name.
 	 */
-	writeTargets?: readonly string[];
+	fileEffects?: ToolFileEffects;
 	/** Working directory of the call — the paths a model names resolve against it. */
 	cwd: string;
 	settings: Settings;
@@ -113,35 +114,44 @@ const NOT_COVERED: ApprovalSimilarityVerdict = { covered: false, writeTargets: [
 /**
  * Whether a session grant covers the pending call, plus the files it writes.
  *
- * Three answers cost no model call: nothing recorded for this tool and no file
+ * Four answers cost no model call: nothing recorded for this tool and no file
  * grant at all, a call whose arguments the user already approved (digest
- * repeat), and a `write`/`edit` whose every target already carries a file
- * grant. Anything the model could only read in part is not judged either — see
- * the budgets above.
+ * repeat), a `write`/`edit` that takes a path away (never covered), and a
+ * `write`/`edit` whose every target already carries a file grant. Anything the
+ * model could only read in part is not judged either — see the budgets above.
  */
 export async function classifyApprovalSimilarity(deps: ApprovalSimilarityDeps): Promise<ApprovalSimilarityVerdict> {
 	const approvedEntries = getSimilarApprovals(deps.sessionId, deps.toolName);
 	const approvedFiles = getFileApprovals(deps.sessionId);
 	if (approvedEntries.length === 0 && approvedFiles.length === 0) return NOT_COVERED;
-	const argTargets = deps.writeTargets ?? [];
+	const effects = deps.fileEffects;
 
 	// The very call the user read in the prompt and approved: no model can add
 	// anything, so the repeat costs neither a request nor the wait for one.
 	// Matched on the args digest only — subject text is truncated for display
 	// long before it is recorded, so calls differing past the cut share it.
 	if (approvedEntries.some(entry => entry.identity === deps.identity)) {
-		return { covered: true, writeTargets: argTargets };
+		return { covered: true, writeTargets: effects?.writes ?? [] };
 	}
 
+	// A grant means "this session may write this file". A call that takes a path
+	// away — a delete, or the source of a move — asks for a different effect, so
+	// no grant answers it and it always prompts. Refused here rather than left to
+	// the model: a file tool's subject is its path (`File: src/a.ts`) and nothing
+	// more, so a delete and an in-place edit of the same file are the same text
+	// and no classifier can tell them apart.
+	if (effects?.removes) return NOT_COVERED;
+
 	// A file grant answers structurally, and only for tools whose arguments name
-	// their targets exactly: writing a file the user approved writing this
+	// their effects exactly: writing a file the user approved writing this
 	// session is the grant, whichever of `write`/`edit` does it, and the check
 	// runs before the budget gates so a multi-kilobyte payload still matches.
 	// Deliberately not extended to tools whose targets a model has to read out of
 	// them: `rm -rf src/a.ts` writes an approved file too, so for those the
 	// verdict below — which judges the effect, not just the target — decides.
-	if (argTargets.length > 0 && argTargets.every(target => isFileApprovedForSession(deps.sessionId, target))) {
-		return { covered: true, writeTargets: argTargets };
+	const writes = effects?.writes ?? [];
+	if (writes.length > 0 && writes.every(target => isFileApprovedForSession(deps.sessionId, target))) {
+		return { covered: true, writeTargets: writes };
 	}
 
 	const approved = approvedEntries
@@ -224,12 +234,12 @@ async function classify(
 		const answer = parseApprovalSimilarity(output);
 		return {
 			covered: answer.verdict === true,
-			// Arguments beat the model: when the call names its own targets, the
-			// answer's list is redundant at best.
-			writeTargets:
-				deps.writeTargets && deps.writeTargets.length > 0
-					? deps.writeTargets
-					: citedWriteTargets(answer.writes, candidate, deps.cwd),
+			// Arguments beat the model: when the call's own arguments state its file
+			// effects, the answer's list can only be redundant or wrong — including
+			// when they state that it writes nothing.
+			writeTargets: deps.fileEffects
+				? deps.fileEffects.writes
+				: citedWriteTargets(answer.writes, candidate, deps.cwd),
 		};
 	} catch (error) {
 		logger.debug("approval-similarity: classification failed", {

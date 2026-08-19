@@ -1,50 +1,73 @@
 import { describe, expect, it } from "bun:test";
-import { toolCallCwd, toolWriteTargets } from "@oh-my-pi/pi-coding-agent/tools/approval-write-targets";
+import { toolCallCwd, toolFileEffects } from "@oh-my-pi/pi-coding-agent/tools/approval-write-targets";
 
 /** Every relative path in this file resolves against it; grant keys are absolute. */
 const REPO = "/repo";
 
-describe("toolWriteTargets", () => {
+describe("toolFileEffects", () => {
 	it("reads a write call's single target", () => {
-		expect(toolWriteTargets("write", { path: "src/a.ts", content: "export {};" }, REPO)).toEqual([
-			`${REPO}/src/a.ts`,
-		]);
-		expect(toolWriteTargets("write", { path: `${REPO}/src/a.ts`, content: "" }, "/elsewhere")).toEqual([
-			`${REPO}/src/a.ts`,
-		]);
+		expect(toolFileEffects("write", { path: "src/a.ts", content: "export {};" }, REPO)).toEqual({
+			writes: [`${REPO}/src/a.ts`],
+			removes: false,
+		});
+		expect(toolFileEffects("write", { path: `${REPO}/src/a.ts`, content: "" }, "/elsewhere")).toEqual({
+			writes: [`${REPO}/src/a.ts`],
+			removes: false,
+		});
 		// Nothing to pin down: no argument names a file.
-		expect(toolWriteTargets("write", { content: "export {};" }, REPO)).toEqual([]);
-		expect(toolWriteTargets("write", "not an object", REPO)).toEqual([]);
+		expect(toolFileEffects("write", { content: "export {};" }, REPO)).toEqual({ writes: [], removes: false });
+		expect(toolFileEffects("write", "not an object", REPO)).toBeUndefined();
 	});
 
-	it("reads an edit call's target in replace and patch shapes, including a rename destination", () => {
-		expect(toolWriteTargets("edit", { path: "src/a.ts", old_string: "a", new_string: "b" }, REPO)).toEqual([
-			`${REPO}/src/a.ts`,
-		]);
-		// A patch entry may move the file: the destination is written too, so it
-		// needs its own grant.
+	it("reads an edit call's target in replace and patch shapes", () => {
+		expect(toolFileEffects("edit", { path: "src/a.ts", old_string: "a", new_string: "b" }, REPO)).toEqual({
+			writes: [`${REPO}/src/a.ts`],
+			removes: false,
+		});
+		// The batch `replace` shape carries an `edits` array with no operation:
+		// every entry rewrites the one path in place.
 		expect(
-			toolWriteTargets(
+			toolFileEffects("edit", { path: "src/a.ts", edits: [{ old_string: "a", new_string: "b" }] }, REPO),
+		).toEqual({ writes: [`${REPO}/src/a.ts`], removes: false });
+	});
+
+	it("reports a patch delete or move as a removal, and never as a write of the path it takes away", () => {
+		// A grant says "this session may write this file"; a delete asks for a
+		// different effect, so the file must not read as a write target.
+		expect(toolFileEffects("edit", { path: "src/a.ts", edits: [{ op: "delete" }] }, REPO)).toEqual({
+			writes: [],
+			removes: true,
+		});
+		// A move writes its destination and takes the source away.
+		expect(
+			toolFileEffects(
 				"edit",
 				{ path: "src/a.ts", edits: [{ op: "update", diff: "@@" }, { rename: "src/b.ts" }] },
 				REPO,
 			),
-		).toEqual([`${REPO}/src/a.ts`, `${REPO}/src/b.ts`]);
+		).toEqual({ writes: [`${REPO}/src/b.ts`], removes: true });
+		// `op: "create"` ignores its `rename` at execute time, so it moves nothing.
+		expect(
+			toolFileEffects("edit", { path: "src/a.ts", edits: [{ op: "create", rename: "src/b.ts", diff: "x" }] }, REPO),
+		).toEqual({ writes: [`${REPO}/src/a.ts`], removes: false });
 	});
 
-	it("reads every file a hashline patch touches, including an MV destination", () => {
+	it("reads every file a hashline patch writes, and flags the ones it takes away", () => {
 		const input = ["[src/a.ts#A1B2]", "PUT 1.=1:", "+x", "[src/b.ts#C3D4]", "MV src/c.ts"].join("\n");
 
 		// One `edit` call can write several files; a grant for one of them must not
-		// stand in for the rest, so all of them are reported.
-		expect(toolWriteTargets("edit", { input }, REPO)).toEqual([
-			`${REPO}/src/a.ts`,
-			`${REPO}/src/b.ts`,
-			`${REPO}/src/c.ts`,
-		]);
+		// stand in for the rest, so all of them are reported. `src/b.ts` is moved
+		// away, so only its destination is written.
+		expect(toolFileEffects("edit", { input }, REPO)).toEqual({
+			writes: [`${REPO}/src/a.ts`, `${REPO}/src/c.ts`],
+			removes: true,
+		});
+
+		const removal = ["[src/a.ts#A1B2]", "REM"].join("\n");
+		expect(toolFileEffects("edit", { input: removal }, REPO)).toEqual({ writes: [], removes: true });
 	});
 
-	it("reads every file an apply-patch envelope touches, including a move destination", () => {
+	it("reads every file an apply-patch envelope writes, and flags the ones it takes away", () => {
 		const input = [
 			"*** Begin Patch",
 			"*** Add File: src/new.ts",
@@ -58,38 +81,44 @@ describe("toolWriteTargets", () => {
 			"*** End Patch",
 		].join("\n");
 
-		expect(toolWriteTargets("edit", { input }, REPO)).toEqual([
-			`${REPO}/src/new.ts`,
-			`${REPO}/src/old.ts`,
-			`${REPO}/src/moved.ts`,
-			`${REPO}/src/gone.ts`,
-		]);
+		expect(toolFileEffects("edit", { input }, REPO)).toEqual({
+			writes: [`${REPO}/src/new.ts`, `${REPO}/src/moved.ts`],
+			removes: true,
+		});
 	});
 
 	it("reports nothing for input neither patch dialect accepts", () => {
 		// A call that cannot apply grants nothing, and a parse failure must not
 		// escape into the approval gate.
-		expect(toolWriteTargets("edit", { input: "just prose" }, REPO)).toEqual([]);
-		expect(toolWriteTargets("edit", { input: "*** Begin Patch\n*** End Patch" }, REPO)).toEqual([]);
-		expect(toolWriteTargets("edit", { input: "" }, REPO)).toEqual([]);
+		const empty = { writes: [], removes: false };
+		expect(toolFileEffects("edit", { input: "just prose" }, REPO)).toEqual(empty);
+		expect(toolFileEffects("edit", { input: "*** Begin Patch\n*** End Patch" }, REPO)).toEqual(empty);
+		expect(toolFileEffects("edit", { input: "" }, REPO)).toEqual(empty);
 	});
 
-	it("reports nothing for a tool whose targets only a model can read out of it", () => {
+	it("reports nothing for a tool whose effects only a model can read out of it", () => {
 		// `bash` writes through a shell command, so its file grants come from the
 		// classifier's cited targets instead — structural coverage would let
 		// `rm -rf src/a.ts` ride a grant to write `src/a.ts`.
-		expect(toolWriteTargets("bash", { command: "echo hi > src/a.ts" }, REPO)).toEqual([]);
-		expect(toolWriteTargets("task", { prompt: "write src/a.ts" }, REPO)).toEqual([]);
+		expect(toolFileEffects("bash", { command: "echo hi > src/a.ts" }, REPO)).toBeUndefined();
+		expect(toolFileEffects("task", { prompt: "write src/a.ts" }, REPO)).toBeUndefined();
 	});
 
 	it("drops targets no grant key can pin down, and repeats", () => {
 		// Handler-owned schemes are not files, and a glob names a set that would
 		// widen with the filesystem.
-		expect(toolWriteTargets("write", { path: "local://notes.md", content: "" }, REPO)).toEqual([]);
-		expect(toolWriteTargets("write", { path: "src/*.ts", content: "" }, REPO)).toEqual([]);
-		expect(toolWriteTargets("edit", { path: "src/a.ts", edits: [{ rename: "./src/a.ts" }] }, REPO)).toEqual([
-			`${REPO}/src/a.ts`,
-		]);
+		expect(toolFileEffects("write", { path: "local://notes.md", content: "" }, REPO)).toEqual({
+			writes: [],
+			removes: false,
+		});
+		expect(toolFileEffects("write", { path: "src/*.ts", content: "" }, REPO)).toEqual({
+			writes: [],
+			removes: false,
+		});
+		expect(toolFileEffects("edit", { path: "src/a.ts", edits: [{ rename: "./src/a.ts" }] }, REPO)).toEqual({
+			writes: [`${REPO}/src/a.ts`],
+			removes: true,
+		});
 	});
 });
 

@@ -482,7 +482,7 @@ describe("classifyApprovalSimilarity file grants", () => {
 	it("covers a call whose every write target is already granted, without a model call", async () => {
 		const completeSimple = mockOnlineAnswer({ stopReason: "stop", text: "NO" });
 		addFileApprovals(sessionId, [`${REPO}/src/server.ts`]);
-		const deps = { writeTargets: [`${REPO}/src/server.ts`] };
+		const deps = { fileEffects: { writes: [`${REPO}/src/server.ts`], removes: false } };
 
 		// The grant is the file, not the tool that earned it: whichever tool the
 		// user first approved writing `src/server.ts` through, the others are
@@ -502,6 +502,52 @@ describe("classifyApprovalSimilarity file grants", () => {
 		expect(completeSimple).not.toHaveBeenCalled();
 	});
 
+	it("never covers a call that takes a granted file away, and asks no model about it", async () => {
+		const completeSimple = mockOnlineAnswer({ stopReason: "stop", text: "YES" });
+		addFileApprovals(sessionId, [`${REPO}/src/server.ts`, `${REPO}/src/moved.ts`]);
+		grantSimilar("edit", "File: src/server.ts", { path: "src/server.ts", old_string: "a", new_string: "b" });
+
+		// A grant means "may write this file". Deleting it is a different effect,
+		// and `edit` renders both as the same subject (`File: src/server.ts`), so
+		// the call is refused here instead of being handed to a model that cannot
+		// tell the two apart.
+		expect(
+			await covered(
+				makeDeps({
+					toolName: "edit",
+					subject: "File: src/server.ts",
+					fileEffects: { writes: [], removes: true },
+				}),
+			),
+		).toBe(false);
+		// A move writes its destination, but it still takes the source away.
+		expect(
+			await covered(
+				makeDeps({
+					toolName: "edit",
+					subject: "File: src/server.ts",
+					fileEffects: { writes: [`${REPO}/src/moved.ts`], removes: true },
+				}),
+			),
+		).toBe(false);
+		expect(completeSimple).not.toHaveBeenCalled();
+
+		// The exact call the user approved still repeats without a prompt: the
+		// digest matches the arguments they read, removal or not.
+		const args = { path: "src/server.ts", edits: [{ op: "delete" }] };
+		grantSimilar("edit", "File: src/server.ts", args);
+		expect(
+			await covered(
+				makeDeps({
+					toolName: "edit",
+					subject: "File: src/server.ts",
+					identity: approvalIdentity(args),
+					fileEffects: { writes: [], removes: true },
+				}),
+			),
+		).toBe(true);
+	});
+
 	it("classifies instead of covering when a target is ungranted or unreadable from the arguments", async () => {
 		const completeSimple = mockOnlineAnswer({ stopReason: "stop", text: "NO" });
 		addFileApprovals(sessionId, [`${REPO}/src/server.ts`]);
@@ -512,15 +558,18 @@ describe("classifyApprovalSimilarity file grants", () => {
 				makeDeps({
 					toolName: "write",
 					subject: "Path: src/client.ts",
-					writeTargets: [`${REPO}/src/server.ts`, `${REPO}/src/client.ts`],
+					fileEffects: { writes: [`${REPO}/src/server.ts`, `${REPO}/src/client.ts`], removes: false },
 				}),
 			),
 		).toBe(false);
-		// A tool whose arguments name no target gets no structural coverage at all:
-		// `rm -rf src/server.ts` writes a granted file too, so only the classifier,
-		// which judges the effect and not just the target, may cover a command.
+		// A tool whose arguments state no file effects gets no structural coverage
+		// at all: `rm -rf src/server.ts` writes a granted file too, so only the
+		// classifier, which judges the effect and not just the target, may cover a
+		// command.
 		expect(
-			await covered(makeDeps({ subject: "Command: rm -rf src/server.ts", toolName: "bash", writeTargets: [] })),
+			await covered(
+				makeDeps({ subject: "Command: rm -rf src/server.ts", toolName: "bash", fileEffects: undefined }),
+			),
 		).toBe(false);
 		expect(completeSimple).toHaveBeenCalledTimes(2);
 	});
@@ -548,7 +597,11 @@ describe("classifyApprovalSimilarity file grants", () => {
 		mockOnlineAnswer({ stopReason: "stop", text: `YES\nWRITES: ["/etc/passwd"]` });
 
 		const verdict = await classifyApprovalSimilarity(
-			makeDeps({ toolName: "write", subject: "Path: src/b.ts", writeTargets: [`${REPO}/src/b.ts`] }),
+			makeDeps({
+				toolName: "write",
+				subject: "Path: src/b.ts",
+				fileEffects: { writes: [`${REPO}/src/b.ts`], removes: false },
+			}),
 		);
 
 		expect(verdict).toEqual({ covered: true, writeTargets: [`${REPO}/src/b.ts`] });
@@ -556,7 +609,7 @@ describe("classifyApprovalSimilarity file grants", () => {
 
 	it("keeps only cited targets the subject proves, resolved against the call's own cwd", async () => {
 		grantSimilar("bash", "Command: echo hi > other.txt");
-		const subject = "Command: echo hi > out.txt && rm -rf /etc/x && rm *.log";
+		const subject = "Command: echo hi > out.txt && cat a.log > /etc/x && rm *.log";
 		// `/etc/passwd` appears nowhere in the subject: a path the model invented,
 		// or one an injected instruction asked it to add, must never become a grant.
 		// `*.log` is cited but names a set that would widen with the filesystem.
