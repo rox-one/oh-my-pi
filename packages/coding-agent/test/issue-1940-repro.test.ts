@@ -143,9 +143,17 @@ describe("tiny title client prompt options", () => {
 				systemPrompt: "Classifier rules",
 			});
 
-			// Callers that pass no rules must stay a single user turn on the wire.
+			// Callers that pass no rules carry no system content on the wire, so
+			// the worker renders the prompt as a single user turn.
 			expect(await client.complete("lfm2-1.2b", "Extract facts")).toBe("YES");
-			expect(sent).not.toHaveProperty("systemPrompt");
+			expect(sent).toEqual({
+				type: "complete",
+				id: expect.any(String),
+				modelKey: "lfm2-1.2b",
+				prompt: "Extract facts",
+				maxTokens: undefined,
+				systemPrompt: undefined,
+			});
 		} finally {
 			await client.terminate();
 		}
