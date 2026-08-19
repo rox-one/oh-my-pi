@@ -704,9 +704,10 @@ async function generateModels() {
 		const name = cleanModelName(model.name);
 		return name === model.name ? model : { ...model, name };
 	});
-	// Re-derive the first-party gpt-5.6 pro-reasoning aliases from the current
-	// base rows (stale previous-snapshot aliases are dropped inside), before the
-	// policy re-bake so the aliases get the same baked thinking metadata.
+	// Re-derive the supported gpt-5.6 pro-reasoning aliases for first-party
+	// OpenAI and Azure OpenAI Responses from the current base rows (stale
+	// previous-snapshot aliases are dropped inside), before the policy re-bake
+	// so aliases inherit the same baked thinking metadata.
 	allModels = projectOpenAIProReasoningAliases(allModels);
 	applyGeneratedModelPolicies(allModels);
 	linkOpenAIPromotionTargets(allModels);

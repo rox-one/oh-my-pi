@@ -155,6 +155,27 @@ describe("azure openai responses streaming", () => {
 		]);
 	});
 
+	it("serializes an Azure GPT-5.6 pro alias as the base deployment with pro reasoning mode", async () => {
+		const model: Model<"azure-openai-responses"> = buildModel({
+			...azureModel,
+			id: "gpt-5.6-sol-pro",
+			name: "GPT-5.6 Sol Pro",
+			reasoning: true,
+			requestModelId: "gpt-5.6-sol",
+			reasoningMode: "pro",
+			compat: azureModel.compatConfig,
+		} as ModelSpec<"azure-openai-responses">);
+
+		const payload = await captureAzurePayload(
+			{ messages: [{ role: "user", content: "Review this migration", timestamp: Date.now() }] },
+			model,
+			{ reasoning: "high", azureBaseUrl: azureModel.baseUrl },
+		);
+
+		expect(payload.model).toBe("gpt-5.6-sol");
+		expect(payload.reasoning).toMatchObject({ effort: "high", mode: "pro" });
+	});
+
 	it("keeps Azure Responses prompt_cache_key separate from Anthropic cache controls", async () => {
 		const payload = await captureAzurePayload(
 			{
