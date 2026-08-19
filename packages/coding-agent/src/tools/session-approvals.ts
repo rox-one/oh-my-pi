@@ -232,10 +232,10 @@ function stableStringify(value: unknown): string {
  * one with no model and no prompt; matching on this digest cannot.
  *
  * Cryptographic on purpose. A digest hit is the strongest short-circuit in the
- * feature — `isSimilarToApprovedCommand` answers true on it before the model,
- * before the budget gates, and with no prompt — and both digested argument sets
- * are written by a model that may be acting on injected content. So a
- * constructed colliding pair (the benign call the user approves, plus a
+ * feature — `classifyApprovalSimilarity` reports the call covered on it before
+ * the model, before the budget gates, and with no prompt — and both digested
+ * argument sets are written by a model that may be acting on injected content.
+ * So a constructed colliding pair (the benign call the user approves, plus a
  * malicious twin) is a way to run a tool unprompted, which rules out
  * `Bun.hash`: wyhash with a fixed public seed claims no collision resistance,
  * and its 64-bit output falls to a birthday search. SHA-256 costs a few
