@@ -2,16 +2,24 @@
  * In-memory per-session tool approval state.
  *
  * Backs the "Approve <tool> Commands for Session" and "Approve Similar <tool>
- * Commands for Session" approval-prompt options. State is keyed by the session
- * id the approval gate already derives from `sessionManager.getSessionId()`, is
- * never persisted to settings or session files, and dies with the logical
- * session: `AgentSession` releases the entry at every conversation boundary
+ * Commands for Session" approval-prompt options. Three grant kinds: a whole
+ * tool, a recorded subject the classifier compares later calls against, and a
+ * file the session may write — the last one is session-wide, so it covers the
+ * same file whether `write`, `edit`, or a `bash` command reaches it.
+ *
+ * State is keyed by the session id the approval gate already derives from
+ * `sessionManager.getSessionId()`, is never persisted to settings or session
+ * files, and dies with the logical session: `AgentSession` releases the entry
+ * at every conversation boundary
  * (`/new`, `/reset`, fork, rewind/branch, session switch) and on dispose via
  * `clearSessionApprovals`, so nothing survives the session that granted it —
  * not even a revival that re-opens the same session id in the same process.
  */
+import * as path from "node:path";
 import type { AgentTool } from "@oh-my-pi/pi-agent-core";
 import { logger } from "@oh-my-pi/pi-utils";
+
+import { hasGlobPathChars, resolveToCwd } from "./path-utils";
 
 /** The only part of a tool `approvalSubject` needs: its approval-prompt detail lines. */
 export type ApprovalSubjectTool = Pick<AgentTool, "formatApprovalDetails">;
@@ -28,6 +36,13 @@ const MAX_SIMILAR_SUBJECTS = 10;
  */
 const MAX_RETAINED_SUBJECT_CHARS = 4096;
 
+/**
+ * Maximum approved file paths per session. A single `edit` call can name many
+ * files, and the whole set is offered to the classifier, so it stays small
+ * enough to read in one prompt; the oldest entries fall off first.
+ */
+const MAX_FILE_APPROVALS = 64;
+
 /** One recorded "approve similar" grant. */
 export interface SimilarApproval {
 	/** Bounded display text the user approved — for display and classification only. */
@@ -41,6 +56,15 @@ export interface SessionApprovalState {
 	approvedTools: Set<string>;
 	/** Recorded approvals per tool, newest first, capped. */
 	similar: Map<string, SimilarApproval[]>;
+	/**
+	 * Absolute normalized files this session may write, newest inserted last.
+	 *
+	 * Deliberately NOT keyed by tool: the file is what the user approved, so a
+	 * grant made through `write` covers the same file reached through `edit`, and
+	 * a `bash` command's write target covers both. Per-tool keying would make
+	 * every tool re-earn the same file.
+	 */
+	files: Set<string>;
 }
 
 const sessionApprovals = new Map<string, SessionApprovalState>();
@@ -49,7 +73,7 @@ function mutableState(sessionId: string): SessionApprovalState | undefined {
 	if (!sessionId) return undefined;
 	let state = sessionApprovals.get(sessionId);
 	if (!state) {
-		state = { approvedTools: new Set(), similar: new Map() };
+		state = { approvedTools: new Set(), similar: new Map(), files: new Set() };
 		sessionApprovals.set(sessionId, state);
 	}
 	return state;
@@ -85,6 +109,85 @@ export function addSimilarApproval(sessionId: string, toolName: string, subject:
 
 export function getSimilarApprovals(sessionId: string, toolName: string): readonly SimilarApproval[] {
 	return sessionId ? (sessionApprovals.get(sessionId)?.similar.get(toolName) ?? []) : [];
+}
+
+/**
+ * Record files the user approved writing this session. Paths must already be
+ * absolute and normalized — {@link normalizeApprovalPath} is the only producer.
+ */
+export function addFileApprovals(sessionId: string, paths: Iterable<string>): void {
+	const state = mutableState(sessionId);
+	if (!state) return;
+	for (const filePath of paths) {
+		if (!filePath) continue;
+		// Re-approval moves the path to the newest end so the cap evicts by last
+		// use, not by first grant.
+		state.files.delete(filePath);
+		state.files.add(filePath);
+	}
+	for (const oldest of state.files) {
+		if (state.files.size <= MAX_FILE_APPROVALS) break;
+		state.files.delete(oldest);
+	}
+}
+
+/** Whether `filePath` (absolute, normalized) carries a file grant this session. */
+export function isFileApprovedForSession(sessionId: string, filePath: string): boolean {
+	return sessionId ? (sessionApprovals.get(sessionId)?.files.has(filePath) ?? false) : false;
+}
+
+/** Approved files, newest first — the order the classifier prompt lists them in. */
+export function getFileApprovals(sessionId: string): readonly string[] {
+	const files = sessionId ? sessionApprovals.get(sessionId)?.files : undefined;
+	return files ? [...files].reverse() : [];
+}
+
+/**
+ * Whether anything recorded this session could cover a `toolName` call, i.e.
+ * whether the gate has a reason to classify at all. File grants count for every
+ * tool; recorded subjects only for the tool that earned them.
+ */
+export function hasSessionApprovalGrants(sessionId: string, toolName: string): boolean {
+	const state = sessionId ? sessionApprovals.get(sessionId) : undefined;
+	if (!state) return false;
+	return (state.similar.get(toolName)?.length ?? 0) > 0 || state.files.size > 0;
+}
+
+/**
+ * Whether no session grant may ever cover `toolName`.
+ *
+ * `task` runs a whole subagent: its subject is a free-form prompt with no
+ * bounded operation to compare, and what it authorizes is every tool call the
+ * subagent then makes behind its own approval gate. One approved delegation
+ * says nothing about the next, so `task` is offered no session option and
+ * honors none — including a file grant, which the subagent's own `write`/`edit`
+ * calls consume on their own.
+ */
+export function isSessionGrantExcluded(toolName: string): boolean {
+	return toolName === "task";
+}
+
+/**
+ * Absolute grant key for one tool-supplied path, or `undefined` when the value
+ * is not a plain filesystem path this session can pin down.
+ *
+ * Rejected: `scheme://` targets (internal URLs, `ssh://`, http) — those are
+ * handler-owned, not files — and glob characters, which name a set that would
+ * silently widen with the filesystem. Everything else resolves against the
+ * call's own cwd, so a grant recorded from `src/a.ts` in one call matches an
+ * absolute path in the next.
+ */
+export function normalizeApprovalPath(filePath: string, cwd: string): string | undefined {
+	const trimmed = filePath.trim();
+	if (trimmed.length === 0 || /^[a-z][a-z0-9+.-]*:\/\//i.test(trimmed) || hasGlobPathChars(trimmed)) return undefined;
+	try {
+		const resolved = resolveToCwd(trimmed, cwd);
+		return path.normalize(resolved);
+	} catch {
+		// `resolveToCwd` throws on internal schemes that survived the check above
+		// (e.g. `~`-expanded ones); no grant is the fail-safe answer.
+		return undefined;
+	}
 }
 
 export function clearSessionApprovals(sessionId: string): void {

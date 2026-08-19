@@ -1,13 +1,22 @@
 import { afterEach, describe, expect, it } from "bun:test";
 import {
+	addFileApprovals,
 	addSimilarApproval,
 	approvalIdentity,
 	approvalSubject,
 	approveToolForSession,
 	clearSessionApprovals,
+	getFileApprovals,
 	getSimilarApprovals,
+	hasSessionApprovalGrants,
+	isFileApprovedForSession,
+	isSessionGrantExcluded,
 	isToolApprovedForSession,
+	normalizeApprovalPath,
 } from "@oh-my-pi/pi-coding-agent/tools/session-approvals";
+
+/** Absolute cwd every path in this file resolves against; grant keys are absolute. */
+const REPO = "/repo";
 
 // The store is module-level and shared across the suite; each test gets fresh
 // session ids and every id is released afterwards so later files see a clean map.
@@ -40,8 +49,12 @@ describe("session approval store", () => {
 	it("an empty session id records nothing — the feature stays inert", () => {
 		approveToolForSession("", "bash");
 		addSimilarApproval("", "bash", "echo hi", "id-1");
+		addFileApprovals("", ["/repo/a.ts"]);
 		expect(isToolApprovedForSession("", "bash")).toBe(false);
 		expect(getSimilarApprovals("", "bash")).toEqual([]);
+		expect(getFileApprovals("")).toEqual([]);
+		expect(isFileApprovedForSession("", "/repo/a.ts")).toBe(false);
+		expect(hasSessionApprovalGrants("", "bash")).toBe(false);
 	});
 
 	it("similar approvals are kept newest-first, deduped by identity, and capped at 10 per tool", () => {
@@ -127,6 +140,75 @@ describe("session approval store", () => {
 		expect(isToolApprovedForSession(sid, "bash")).toBe(false);
 		expect(getSimilarApprovals(sid, "write")).toEqual([]);
 		expect(isToolApprovedForSession(other, "bash")).toBe(true);
+	});
+
+	it("file grants are session-wide, newest-first, and capped at 64 by last use", () => {
+		const sid = newSessionId();
+		const other = newSessionId();
+		addFileApprovals(sid, [`${REPO}/a.ts`, `${REPO}/b.ts`]);
+		// One grant answers for every tool that reaches the file; the store keeps
+		// no tool dimension at all.
+		expect(isFileApprovedForSession(sid, `${REPO}/a.ts`)).toBe(true);
+		expect(isFileApprovedForSession(sid, `${REPO}/c.ts`)).toBe(false);
+		expect(isFileApprovedForSession(other, `${REPO}/a.ts`)).toBe(false);
+		expect(getFileApprovals(sid)).toEqual([`${REPO}/b.ts`, `${REPO}/a.ts`]);
+
+		for (let i = 0; i < 64; i++) addFileApprovals(sid, [`${REPO}/f-${i}.ts`]);
+		// `a.ts` was re-approved after `b.ts`, so it outlives it under the cap.
+		addFileApprovals(sid, [`${REPO}/a.ts`]);
+		for (let i = 64; i < 70; i++) addFileApprovals(sid, [`${REPO}/f-${i}.ts`]);
+		const files = getFileApprovals(sid);
+		expect(files).toHaveLength(64);
+		expect(files[0]).toBe(`${REPO}/f-69.ts`);
+		expect(isFileApprovedForSession(sid, `${REPO}/a.ts`)).toBe(true);
+		expect(isFileApprovedForSession(sid, `${REPO}/b.ts`)).toBe(false);
+	});
+
+	it("file grants survive a whole-tool approval and die with the session", () => {
+		const sid = newSessionId();
+		addFileApprovals(sid, [`${REPO}/a.ts`]);
+		addSimilarApproval(sid, "bash", "git status", "id-bash");
+		// Approving all of `bash` drops that tool's subjects, but a file grant is
+		// not `bash`'s to lose: `write` and `edit` still hold it.
+		approveToolForSession(sid, "bash");
+		expect(isFileApprovedForSession(sid, `${REPO}/a.ts`)).toBe(true);
+		clearSessionApprovals(sid);
+		expect(getFileApprovals(sid)).toEqual([]);
+	});
+
+	it("reports whether anything recorded could cover a call, so the gate knows to classify", () => {
+		const sid = newSessionId();
+		expect(hasSessionApprovalGrants(sid, "bash")).toBe(false);
+		addSimilarApproval(sid, "bash", "git status", "id-bash");
+		// A recorded subject covers only the tool that earned it.
+		expect(hasSessionApprovalGrants(sid, "bash")).toBe(true);
+		expect(hasSessionApprovalGrants(sid, "write")).toBe(false);
+		// A file grant is a reason to classify any tool's call.
+		addFileApprovals(sid, [`${REPO}/a.ts`]);
+		expect(hasSessionApprovalGrants(sid, "write")).toBe(true);
+	});
+
+	it("excludes task from every session grant", () => {
+		// A subagent's prompt is free-form text with no bounded operation to
+		// compare, and it runs its own tool calls behind its own gate.
+		expect(isSessionGrantExcluded("task")).toBe(true);
+		expect(isSessionGrantExcluded("bash")).toBe(false);
+		expect(isSessionGrantExcluded("write")).toBe(false);
+	});
+
+	it("normalizes a grant key to an absolute path and refuses what it cannot pin down", () => {
+		// A grant recorded from one call's relative path must match the next call's
+		// absolute one, so every key resolves against that call's own cwd.
+		expect(normalizeApprovalPath("src/a.ts", REPO)).toBe(`${REPO}/src/a.ts`);
+		expect(normalizeApprovalPath("./src/../src/a.ts", REPO)).toBe(`${REPO}/src/a.ts`);
+		expect(normalizeApprovalPath(`${REPO}/src/a.ts`, "/elsewhere")).toBe(`${REPO}/src/a.ts`);
+		expect(normalizeApprovalPath("  src/a.ts  ", REPO)).toBe(`${REPO}/src/a.ts`);
+		// A glob names a set that would silently widen with the filesystem, and a
+		// `scheme://` target is handler-owned rather than a file.
+		expect(normalizeApprovalPath("src/*.ts", REPO)).toBeUndefined();
+		expect(normalizeApprovalPath("local://notes.md", REPO)).toBeUndefined();
+		expect(normalizeApprovalPath("https://evil.example/x", REPO)).toBeUndefined();
+		expect(normalizeApprovalPath("", REPO)).toBeUndefined();
 	});
 });
 

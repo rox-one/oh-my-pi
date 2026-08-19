@@ -2956,7 +2956,7 @@ describe("ExtensionRunner", () => {
 				throw new Error("select option without a label");
 			};
 			it("offers four options in order; the session option runs the call and suppresses later prompts", async () => {
-				const classify = vi.spyOn(approvalSimilarity, "isSimilarToApprovedCommand");
+				const classify = vi.spyOn(approvalSimilarity, "classifyApprovalSimilarity");
 				const select = vi.fn(async (_title: string, options: ExtensionUISelectItem[]) => {
 					const sessionOption = options.find(option => typeof option !== "string");
 					return sessionOption === undefined ? "Approve" : optionLabel(sessionOption);
@@ -3001,9 +3001,9 @@ describe("ExtensionRunner", () => {
 				const runner = await makeRunner(select);
 				const wrapper = new ExtensionToolWrapper(approvalTool, runner);
 				const classify = vi
-					.spyOn(approvalSimilarity, "isSimilarToApprovedCommand")
-					.mockResolvedValueOnce(true)
-					.mockResolvedValueOnce(false);
+					.spyOn(approvalSimilarity, "classifyApprovalSimilarity")
+					.mockResolvedValueOnce({ covered: true, writeTargets: [] })
+					.mockResolvedValueOnce({ covered: false, writeTargets: [] });
 
 				const first = await (wrapper as ExtensionToolWrapper<any>).execute(
 					"call-similar-1",
@@ -3064,7 +3064,9 @@ describe("ExtensionRunner", () => {
 					"git status",
 					approvalIdentity({ command: "git status" }),
 				);
-				const classify = vi.spyOn(approvalSimilarity, "isSimilarToApprovedCommand").mockResolvedValue(true);
+				const classify = vi
+					.spyOn(approvalSimilarity, "classifyApprovalSimilarity")
+					.mockResolvedValue({ covered: true, writeTargets: [] });
 				const select = vi.fn(async (_title: string, _options: ExtensionUISelectItem[]) => "Deny");
 				const runner = await makeRunner(select);
 				const wrapper = new ExtensionToolWrapper(approvalTool, runner);
@@ -3180,7 +3182,7 @@ describe("ExtensionRunner", () => {
 					"rm -rf /tmp/scratch",
 					approvalIdentity({ command: "rm -rf /tmp/scratch" }),
 				);
-				const classify = vi.spyOn(approvalSimilarity, "isSimilarToApprovedCommand");
+				const classify = vi.spyOn(approvalSimilarity, "classifyApprovalSimilarity");
 				const select = vi.fn(async (_title: string, _options: ExtensionUISelectItem[]) => "Approve");
 				const runner = await makeRunner(select);
 				const wrapper = new ExtensionToolWrapper(overrideTool, runner);
@@ -3188,6 +3190,138 @@ describe("ExtensionRunner", () => {
 				const result = await (wrapper as ExtensionToolWrapper<any>).execute(
 					"call-override",
 					{ command: "rm -rf /" },
+					undefined,
+					undefined,
+					makeContext(),
+				);
+				expect(resultText(result)).toBe("ok");
+				expect(select).toHaveBeenCalledTimes(1);
+				expect(select.mock.calls[0][1]).toEqual(["Approve", "Deny"]);
+				expect(classify).not.toHaveBeenCalled();
+			});
+
+			/** A file tool whose arguments name their own write target, like the real `write`/`edit`. */
+			const fileTool = (name: string) => ({
+				name,
+				label: name,
+				description: "Test file tool",
+				parameters: {} as never,
+				formatApprovalDetails: (args: unknown) =>
+					args && typeof args === "object" && "path" in args && typeof args.path === "string"
+						? `Path: ${args.path}`
+						: "",
+				execute: async () => ({ content: [{ type: "text" as const, text: "ok" }] }),
+			});
+
+			it("approving a write's file covers a later edit of the same file, without prompting again", async () => {
+				// The grant is the file, not the tool: the user approved writing
+				// `/tmp/approval/a.ts`, and both tools' arguments name it exactly, so
+				// the wrapper hands those targets to the gate and neither call needs a
+				// model to recognize the file.
+				const classify = vi.spyOn(approvalSimilarity, "classifyApprovalSimilarity");
+				const writeTargets = vi.spyOn(approvalSimilarity, "classifyWriteTargets");
+				const select = vi.fn(
+					async (_title: string, _options: ExtensionUISelectItem[]) =>
+						"Approve Similar write Commands for Session",
+				);
+				const runner = await makeRunner(select);
+				const writeWrapper = new ExtensionToolWrapper(fileTool("write"), runner);
+				const editWrapper = new ExtensionToolWrapper(fileTool("edit"), runner);
+
+				const granted = await (writeWrapper as ExtensionToolWrapper<any>).execute(
+					"call-write-grant",
+					{ path: "/tmp/approval/a.ts", content: "export {};" },
+					undefined,
+					undefined,
+					makeContext(),
+				);
+				expect(resultText(granted)).toBe("ok");
+				// Targets read from the arguments answer the record path outright: the
+				// wrapper never asks a model what a `write`/`edit` call writes.
+				expect(writeTargets).not.toHaveBeenCalled();
+
+				select.mockImplementation(async () => {
+					throw new Error("a granted file must not prompt again");
+				});
+				const covered = await (editWrapper as ExtensionToolWrapper<any>).execute(
+					"call-edit-covered",
+					{ path: "/tmp/approval/a.ts", old_string: "a", new_string: "b" },
+					undefined,
+					undefined,
+					makeContext(),
+				);
+				expect(resultText(covered)).toBe("ok");
+				expect(select).toHaveBeenCalledTimes(1);
+				expect(writeTargets).not.toHaveBeenCalled();
+				// The `edit` call was judged against the file it names, resolved absolute.
+				expect(classify.mock.calls[0]?.[0]).toMatchObject({
+					toolName: "edit",
+					writeTargets: ["/tmp/approval/a.ts"],
+				});
+			});
+
+			it("records the classifier's write targets for a tool whose arguments name none", async () => {
+				// A command hides its targets inside shell text, so the record path asks
+				// the classifier what the approved call writes — once — and that answer
+				// becomes a file grant the file tools honor.
+				const writeTargets = vi
+					.spyOn(approvalSimilarity, "classifyWriteTargets")
+					.mockResolvedValue(["/tmp/approval/out.txt"]);
+				const classify = vi.spyOn(approvalSimilarity, "classifyApprovalSimilarity");
+				const select = vi.fn(
+					async (_title: string, _options: ExtensionUISelectItem[]) =>
+						"Approve Similar dangerous_tool Commands for Session",
+				);
+				const runner = await makeRunner(select);
+				const wrapper = new ExtensionToolWrapper(approvalTool, runner);
+				const writeWrapper = new ExtensionToolWrapper(fileTool("write"), runner);
+
+				await (wrapper as ExtensionToolWrapper<any>).execute(
+					"call-command-grant",
+					{ command: "echo hi > /tmp/approval/out.txt" },
+					undefined,
+					undefined,
+					makeContext(),
+				);
+				expect(writeTargets).toHaveBeenCalledTimes(1);
+				// Nothing was recorded for the tool yet, so the gate never classified:
+				// the record path is the only reason a request went out.
+				expect(classify).not.toHaveBeenCalled();
+
+				select.mockImplementation(async () => {
+					throw new Error("a granted file must not prompt again");
+				});
+				const covered = await (writeWrapper as ExtensionToolWrapper<any>).execute(
+					"call-write-covered",
+					{ path: "/tmp/approval/out.txt", content: "hi" },
+					undefined,
+					undefined,
+					makeContext(),
+				);
+				expect(resultText(covered)).toBe("ok");
+				expect(select).toHaveBeenCalledTimes(1);
+			});
+
+			it("never offers or honors a session grant for task", async () => {
+				// A subagent's prompt has no bounded operation to compare, and it runs
+				// its own calls behind its own gate — so a grant recorded for one
+				// delegation must not answer for the next.
+				const taskTool = {
+					name: "task",
+					label: "Task",
+					description: "Test task tool",
+					parameters: {} as never,
+					execute: async () => ({ content: [{ type: "text" as const, text: "ok" }] }),
+				};
+				approveToolForSession(sessionManager.getSessionId(), "task");
+				const classify = vi.spyOn(approvalSimilarity, "classifyApprovalSimilarity");
+				const select = vi.fn(async (_title: string, _options: ExtensionUISelectItem[]) => "Approve");
+				const runner = await makeRunner(select);
+				const wrapper = new ExtensionToolWrapper(taskTool, runner);
+
+				const result = await (wrapper as ExtensionToolWrapper<any>).execute(
+					"call-task",
+					{ prompt: "explore the repo" },
 					undefined,
 					undefined,
 					makeContext(),

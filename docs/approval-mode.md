@@ -85,6 +85,10 @@ Tools can add approval-prompt body lines with `formatApprovalDetails(args)`. The
 
 Approval prompts offer two extra options: `Approve <tool> Commands for Session` skips prompts for that tool for the rest of the session, and `Approve Similar <tool> Commands for Session` auto-approves later calls that a small classifier judges similar to the approved one; any classifier error or timeout falls back to a normal prompt. Grants live in memory only, belong to one session id (`/new`, `/reset`, fork, rewind, session switch, and process exit release them), and never bypass a `deny` policy, provider safety checks, or tool-demanded prompts such as `bash` critical patterns. The similarity backend is selected with `providers.approvalSimilarityModel`: `online` (default) or a local on-device model.
 
+`Approve Similar` also records the files that call writes, and those file grants are session-wide rather than per tool: approving a `write` to `src/a.ts` covers a later `edit` of `src/a.ts`, and a command whose write targets the classifier names covers both. For `write` and `edit` the targets come from the call's own arguments — path, patch sections, and rename destinations — and match with no model call at all. For every other tool the classifier names them, and only paths quoted verbatim in the approved subject are kept. A granted file is not a licence to do anything to it: deleting or moving it is a different effect, so it still prompts.
+
+The `task` tool is excluded from all of this. Its subject is a free-form prompt with no bounded operation to compare, and it runs its own tool calls behind its own approval gate, so `task` prompts offer only `Approve` and `Deny`.
+
 ## Defining approval on tools
 
 Built-in and custom tools share the same shape:

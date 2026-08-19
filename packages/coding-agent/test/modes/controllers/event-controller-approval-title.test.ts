@@ -5,10 +5,11 @@
  * The wrapper blocks on `uiContext.select` after `tool_execution_start`; the
  * controller mirrors that to set the `attention` title. Session approvals
  * ("… Commands for Session") downgrade `prompt` → allow in the wrapper, so the
- * title must not flip to `attention` for them — while the two prompts a session
- * grant may never answer (pending provider safety checks, carried by the
- * computer tool's synthetic event args, and a tool-demanded `override`) still
- * block per call and must keep the `attention` title.
+ * title must not flip to `attention` for them — while the three prompts a
+ * session grant may never answer (pending provider safety checks, carried by
+ * the computer tool's synthetic event args, a tool-demanded `override`, and a
+ * `task` call, which no session grant may cover) still block per call and must
+ * keep the `attention` title.
  */
 import { afterEach, beforeAll, beforeEach, describe, expect, it, type Mock, vi } from "bun:test";
 import type { AgentTool } from "@oh-my-pi/pi-agent-core";
@@ -37,6 +38,9 @@ const overrideTool = {
 	approval: { tier: "exec", override: true, reason: "Critical pattern detected" },
 } as unknown as AgentTool;
 
+/** `task` is excluded from every session grant, so its prompt always blocks. */
+const taskTool = { name: "task", approval: { tier: "exec" } } as unknown as AgentTool;
+
 function createFixture(tool: AgentTool = execTool): InteractiveModeContext {
 	const pendingTools = new Map<string, ToolExecutionComponent>();
 	const ctx = {
@@ -53,11 +57,11 @@ function createFixture(tool: AgentTool = execTool): InteractiveModeContext {
 	return ctx;
 }
 
-async function startToolCall(ctx: InteractiveModeContext, toolCallId: string, args: unknown) {
+async function startToolCall(ctx: InteractiveModeContext, toolCallId: string, args: unknown, toolName = "bash") {
 	await new EventController(ctx).handleEvent({
 		type: "tool_execution_start",
 		toolCallId,
-		toolName: "bash",
+		toolName,
 		args,
 	} as Extract<AgentSessionEvent, { type: "tool_execution_start" }>);
 }
@@ -123,6 +127,15 @@ describe("EventController approval title mirror", () => {
 		approveToolForSession(SESSION_ID, "bash");
 		ctx = createFixture(overrideTool);
 		await startToolCall(ctx, "tc-6", { command: "rm -rf /" });
+		expect(attentionCalls(titleSpy)).toBe(1);
+	});
+
+	it("stays attention for a task call, which no session grant may cover", async () => {
+		// The wrapper offers `task` no session option and honors none, so a grant
+		// recorded for the tool cannot silence the title either.
+		approveToolForSession(SESSION_ID, "task");
+		ctx = createFixture(taskTool);
+		await startToolCall(ctx, "tc-7", { prompt: "explore the repo" }, "task");
 		expect(attentionCalls(titleSpy)).toBe(1);
 	});
 });
