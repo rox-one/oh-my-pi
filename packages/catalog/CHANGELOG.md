@@ -84,6 +84,9 @@
 ### Fixed
 
 - Fixed tool-call turn failures for `opencode-go/muse-spark-1.2` and related variants by ensuring API transport pins apply to live discovery and automatically inferring response routes for gateway-first OpenCode models ([#8957](https://github.com/can1357/oh-my-pi/issues/8957)).
+### Added
+
+- Added Azure OpenAI GPT-5.6 Luna, Sol, and Terra pro-reasoning aliases, projecting each from its base catalog row with the base deployment id and `reasoning.mode: "pro"` marker.
 
 ## [17.3.8] - 2026-08-19
 

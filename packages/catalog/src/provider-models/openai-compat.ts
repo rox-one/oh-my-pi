@@ -982,12 +982,15 @@ const OPENAI_PRO_REASONING_BASE_IDS: Record<string, true> = {
 	"gpt-5.6-terra": true,
 };
 /**
- * Providers whose generated pro aliases this pass owns. `openai-codex` stays in
- * the sweep so stale aliases from earlier snapshots are dropped on regen, but
- * projection is `openai`-only — subscription (Codex) auth does not offer pro
- * reasoning.
+ * Providers whose generated pro aliases this pass owns. Azure OpenAI mirrors
+ * the GPT-5.6 Responses contract, while `openai-codex` stays in the sweep only
+ * so stale aliases from earlier snapshots are dropped on regen.
  */
-const OPENAI_PRO_REASONING_SWEEP_PROVIDERS: Record<string, true> = { openai: true, "openai-codex": true };
+const OPENAI_PRO_REASONING_PROJECTION_PROVIDERS: Record<string, true> = { openai: true, azure: true };
+const OPENAI_PRO_REASONING_SWEEP_PROVIDERS: Record<string, true> = {
+	...OPENAI_PRO_REASONING_PROJECTION_PROVIDERS,
+	"openai-codex": true,
+};
 
 /**
  * A row this generator pass owns: one of the derived `gpt-5.6-*-pro` alias ids
@@ -1005,9 +1008,9 @@ function isGeneratedOpenAIProReasoningAlias(model: ModelSpec<Api>): boolean {
 }
 
 /**
- * Re-derive the generated pro-reasoning aliases (`gpt-5.6-*-pro`) for the
- * first-party `openai` gpt-5.6 rows. Each alias inherits the base row's
- * metadata, requests the base wire id via `requestModelId`, and sets
+ * Re-derive the generated pro-reasoning aliases (`gpt-5.6-*-pro`) for
+ * first-party OpenAI and Azure OpenAI gpt-5.6 rows. Each alias inherits the
+ * base row's metadata, requests the base wire id via `requestModelId`, and sets
  * `reasoningMode: "pro"` so Responses-family request builders emit
  * `reasoning: { mode: "pro" }`. Called by the models.json generator after all
  * sources merge: stale copies of the owned aliases (previous snapshot,
@@ -1020,7 +1023,7 @@ export function projectOpenAIProReasoningAliases(models: readonly ModelSpec<Api>
 	const ids = new Set(kept.map(model => `${model.provider}/${model.id}`));
 	const out = [...kept];
 	for (const model of kept) {
-		if (model.provider !== "openai") continue;
+		if (OPENAI_PRO_REASONING_PROJECTION_PROVIDERS[model.provider] !== true) continue;
 		if (!OPENAI_PRO_REASONING_BASE_IDS[model.id]) continue;
 		const aliasId = `${model.id}-pro`;
 		const aliasKey = `${model.provider}/${aliasId}`;

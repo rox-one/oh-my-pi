@@ -7,6 +7,7 @@ import {
 	MODELS_DEV_PROVIDER_DESCRIPTORS,
 	mapModelsDevToModels,
 	PROVIDER_DESCRIPTORS,
+	projectOpenAIProReasoningAliases,
 } from "@oh-my-pi/pi-catalog/provider-models";
 import type { ModelSpec } from "@oh-my-pi/pi-catalog/types";
 
@@ -24,6 +25,31 @@ const AZURE_MODELS_DEV_FIXTURE = {
 				tool_call: true,
 				reasoning: true,
 				provider: { npm: "@ai-sdk/anthropic", api: "https://x.services.ai.azure.com/anthropic/v1" },
+			},
+		},
+	},
+};
+
+const AZURE_GPT_56_MODELS_DEV_FIXTURE = {
+	azure: {
+		models: {
+			"gpt-5.6-luna": {
+				name: "GPT-5.6 Luna",
+				tool_call: true,
+				reasoning: true,
+				limit: { context: 1_000_000, output: 128_000 },
+			},
+			"gpt-5.6-sol": {
+				name: "GPT-5.6 Sol",
+				tool_call: true,
+				reasoning: true,
+				limit: { context: 1_000_000, output: 128_000 },
+			},
+			"gpt-5.6-terra": {
+				name: "GPT-5.6 Terra",
+				tool_call: true,
+				reasoning: true,
+				limit: { context: 1_000_000, output: 128_000 },
 			},
 		},
 	},
@@ -50,6 +76,42 @@ describe("azure catalog provider", () => {
 			// Empty baseUrl: the deployment host is per-resource, resolved at runtime.
 			expect(model.baseUrl).toBe("");
 		}
+	});
+
+	test("projects a pro-mode alias for every Azure GPT-5.6 Responses model", () => {
+		const baseModels = mapModelsDevToModels(AZURE_GPT_56_MODELS_DEV_FIXTURE, MODELS_DEV_PROVIDER_DESCRIPTORS).filter(
+			model => model.provider === "azure",
+		);
+		const aliases = projectOpenAIProReasoningAliases(baseModels)
+			.filter(model => model.reasoningMode === "pro")
+			.map(model => ({
+				id: model.id,
+				requestModelId: model.requestModelId,
+				reasoningMode: model.reasoningMode,
+				api: model.api,
+			}))
+			.sort((left, right) => left.id.localeCompare(right.id));
+
+		expect(aliases).toEqual([
+			{
+				id: "gpt-5.6-luna-pro",
+				requestModelId: "gpt-5.6-luna",
+				reasoningMode: "pro",
+				api: "azure-openai-responses",
+			},
+			{
+				id: "gpt-5.6-sol-pro",
+				requestModelId: "gpt-5.6-sol",
+				reasoningMode: "pro",
+				api: "azure-openai-responses",
+			},
+			{
+				id: "gpt-5.6-terra-pro",
+				requestModelId: "gpt-5.6-terra",
+				reasoningMode: "pro",
+				api: "azure-openai-responses",
+			},
+		]);
 	});
 
 	test("bundled-shape spec (provider id, empty baseUrl) resolves the Azure Responses compat flags", () => {

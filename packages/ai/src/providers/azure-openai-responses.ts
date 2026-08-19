@@ -51,8 +51,10 @@ function resolveDeploymentName(model: Model<"azure-openai-responses">, options?:
 	if (options?.azureDeploymentName) {
 		return options.azureDeploymentName;
 	}
-	const mappedDeployment = parseAzureDeploymentNameMap($env.AZURE_OPENAI_DEPLOYMENT_NAME_MAP).get(model.id);
-	return mappedDeployment ?? model.id;
+	const deploymentMap = parseAzureDeploymentNameMap($env.AZURE_OPENAI_DEPLOYMENT_NAME_MAP);
+	const mappedDeployment =
+		deploymentMap.get(model.id) ?? (model.requestModelId ? deploymentMap.get(model.requestModelId) : undefined);
+	return mappedDeployment ?? model.requestModelId ?? model.id;
 }
 
 // Azure OpenAI Responses-specific options

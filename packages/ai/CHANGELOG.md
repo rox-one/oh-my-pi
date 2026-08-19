@@ -104,6 +104,9 @@
 - Fixed tool-argument repair applying lossy transformations (such as stringifying objects or stripping unrecognized keys) when validating union schemas (`anyOf`/`oneOf`), preventing corrupted tool call and subagent payloads
 - Fixed 400 errors when communicating with local OpenAI-compatible inference servers that reject `chat_template_kwargs.reasoning_effort` by improving reasoning effort parameter fallback and compatibility handling
 - Fixed DeepSeek-family models on hosts like Fireworks losing reasoning whenever tools were offered: a redundant `tool_choice: "auto"` is now omitted so the provider keeps thinking enabled; forced and `"none"` selectors still take priority ([#1207](https://github.com/can1357/oh-my-pi/issues/1207))
+### Fixed
+
+- Fixed Azure OpenAI Responses variants ignoring catalog `requestModelId` and `reasoningMode`, so GPT-5.6 pro aliases target the deployed base model and serialize `reasoning.mode: "pro"`.
 
 ## [17.3.8] - 2026-08-19
 
