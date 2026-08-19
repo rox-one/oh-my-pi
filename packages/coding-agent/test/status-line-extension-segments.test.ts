@@ -93,4 +93,16 @@ describe("ExtensionRunner status-line segment middleware", () => {
 		expect(result).toEqual({ content: "built-in", visible: true });
 		expect(baseCalls).toBe(1);
 	});
+
+	it("neutralizes control characters in extension content while preserving ANSI SGR styling", () => {
+		const result = renderWithExtensions("built-in", [
+			_next => ({
+				content: "line1\nline2\tindented\x1b[31mred\x1b[39m",
+				visible: true,
+			}),
+		]);
+
+		expect(result.content).toBe("line1 line2 indented\x1b[31mred\x1b[39m");
+		expect(result.visible).toBe(true);
+	});
 });

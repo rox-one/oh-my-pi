@@ -749,7 +749,7 @@ pi.registerStatusLineSegment("developer_cost", (context, _next, theme) => ({
 }));
 ```
 
-The context exposes `width`, token/cost/rate usage, context tokens and percent, the Git branch, and accumulated active milliseconds. Segment content may contain themed ANSI styling; OMP owns placement, width overflow, separators, and background rendering. Call `ctx.ui.refreshStatusLine()` after changing extension-owned renderer state so the interactive top border repaints while idle.
+The context exposes `width`, token/cost/rate usage, context tokens and percent, the Git branch, and accumulated active milliseconds. Segment content may contain themed ANSI styling; OMP owns placement, separators, and background rendering. On overflow OMP drops trailing right segments and shrinks the built-in `path` segment; a custom left segment (other than `path`) is not truncated, so keep its content bounded to avoid overflowing the bar. Call `ctx.ui.refreshStatusLine()` after changing extension-owned renderer state so the interactive top border repaints while idle.
 
 ## Tool call/result renderer
 

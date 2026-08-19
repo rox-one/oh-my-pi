@@ -529,6 +529,33 @@ function invisibleStatusLineSegment(): StatusLineSegmentResult {
 	return { content: "", visible: false };
 }
 
+/** Matches only CSI SGR sequences (`\x1b[<params>m`), the styling extensions are documented to emit. */
+const ANSI_SGR_RE = /\x1b\[[0-9;]*m/g;
+
+/**
+ * Neutralizes newlines, tabs, and other C0/C1 control characters in
+ * extension-supplied segment content, without touching CSI SGR styling
+ * escapes. Built-in segments already funnel their text through
+ * `sanitizeStatusText`, which strips ANSI entirely; extension content must
+ * keep its ANSI styling, so control characters are mapped to spaces in place
+ * instead of relying on that stricter sanitizer. This protects the
+ * single-line status bar layout (`component.ts`) from a segment whose
+ * content contains a literal newline or tab.
+ */
+function sanitizeExtensionSegmentContent(content: string): string {
+	if (!content) return content;
+	let sanitized = "";
+	let lastIndex = 0;
+	for (const match of content.matchAll(ANSI_SGR_RE)) {
+		const index = match.index ?? 0;
+		sanitized += content.slice(lastIndex, index).replace(/[\u0000-\u001f\u007f-\u009f]/g, " ");
+		sanitized += match[0];
+		lastIndex = index + match[0].length;
+	}
+	sanitized += content.slice(lastIndex).replace(/[\u0000-\u001f\u007f-\u009f]/g, " ");
+	return sanitized;
+}
+
 export class ExtensionRunner {
 	#uiContext: ExtensionUIContext;
 	#mode: ExtensionMode = "print";
@@ -1254,7 +1281,8 @@ export class ExtensionRunner {
 		}
 
 		try {
-			return render();
+			const result = render();
+			return { ...result, content: sanitizeExtensionSegmentContent(result.content) };
 		} catch (error) {
 			logger.warn("Extension status-line segment rendering failed", {
 				id,
