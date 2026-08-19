@@ -3058,7 +3058,7 @@ describe("ExtensionRunner", () => {
 				]);
 			});
 
-			it("classifies with a registry-less context: only the online backend needs a registry", async () => {
+			it("still classifies with a registry-less context: the no-model answers do not need one", async () => {
 				addSimilarApproval(
 					sessionManager.getSessionId(),
 					"dangerous_tool",
@@ -3082,6 +3082,10 @@ describe("ExtensionRunner", () => {
 
 				expect(resultText(result)).toBe("ok");
 				expect(select).not.toHaveBeenCalled();
+				// The gate is not skipped when the context carries no registry: the
+				// exact-repeat digest and the file grants answer with no model at all,
+				// and a classification that does need one fails safe inside the
+				// classifier.
 				expect(classify.mock.calls[0]?.[0].registry).toBeUndefined();
 			});
 

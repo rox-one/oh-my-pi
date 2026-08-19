@@ -5,13 +5,13 @@
  * file the session may write — and names the files the pending call writes when
  * only a model can read them out of it (a shell command's redirections).
  *
- * Two backends, selected by `providers.approvalSimilarityModel`:
- *
- * - `online` (default): the TINY/smol role model classifies via
- *   {@link completeSimple}.
- * - a local key: the on-device memory model classifies via
- *   {@link tinyModelClient.complete}, with the same rules/data prompt pair the
- *   online path uses.
+ * One backend: the TINY/smol role model classifies via {@link completeSimple}.
+ * The on-device tiny models the other small-model classifiers offer are
+ * deliberately not an option here — a `YES` from this one runs a tool with no
+ * prompt, and a 1-2B local model was measured granting a compound command whose
+ * effect class does not match the approved one (`ls && touch ./foo` against
+ * approved `ls`), which no prompt wording moved. A self-hosted classifier is
+ * still reachable by pointing the TINY role at it.
  *
  * Fail-safe by contract: any error, timeout, abort, unparsable output, or input
  * it cannot read whole resolves to "not covered" (the approval gate prompts
@@ -26,8 +26,6 @@ import type { Settings } from "../config/settings";
 import approvalSimilarityPrompt from "../prompts/system/approval-similarity.md" with { type: "text" };
 import approvalSimilarityUserPrompt from "../prompts/system/approval-similarity-user.md" with { type: "text" };
 import { stripAnsi } from "../tiny/message-preproc";
-import { isTinyMemoryLocalModelKey, isTinyMemoryReasoningModelKey, ONLINE_MEMORY_MODEL_KEY } from "../tiny/models";
-import { tinyModelClient } from "../tiny/title-client";
 import { isTruncatedForPrompt } from "./approval";
 import type { ToolFileEffects } from "./approval-write-targets";
 import {
@@ -44,9 +42,7 @@ const SIMILARITY_SYSTEM_PROMPT = prompt.render(approvalSimilarityPrompt);
  * approval prompt; the caller's abort signal is combined with it. Kept under
  * the time a user needs to answer the prompt themselves — past that the
  * classifier is slower than the gate it replaces, and its fail-safe (a normal
- * prompt) is the better outcome. A cold local backend loses its first
- * classification to this bound while the worker loads the model; the retry on
- * the next gated call finds it warm.
+ * prompt) is the better outcome.
  */
 const CLASSIFY_TIMEOUT_MS = 3_000;
 
@@ -65,14 +61,9 @@ const MAX_CANDIDATE_CHARS = 2_000;
 const MAX_ANSWER_WRITE_TARGETS = 16;
 
 /**
- * Answer budget for a non-reasoning local classifier: the verdict word plus the
- * optional `WRITES:` line of paths, with room for chat-template boilerplate.
- */
-const ANSWER_MAX_TOKENS = 128;
-/**
- * Reasoning-safe budget (online, and local reasoning models): sized to survive
- * backends that ignore `disableReasoning` — the yes/no keyword needs to land
- * after any unavoidable thinking preamble (issue #4355).
+ * Reasoning-safe budget: sized to survive a backend that ignores
+ * `disableReasoning` — the yes/no keyword needs to land after any unavoidable
+ * thinking preamble (issue #4355).
  */
 const REASONING_SAFE_MAX_TOKENS = 1024;
 
@@ -92,7 +83,10 @@ export interface ApprovalSimilarityDeps {
 	/** Working directory of the call — the paths a model names resolve against it. */
 	cwd: string;
 	settings: Settings;
-	/** Required by the `online` backend only; the local backend classifies on-device. */
+	/**
+	 * Absent when the call's context carries no registry. The no-model answers
+	 * still run; a classification that needs the model fails safe to a prompt.
+	 */
 	registry?: ModelRegistry;
 	signal?: AbortSignal;
 	metadataResolver?: (provider: string) => Record<string, unknown> | undefined;
@@ -189,7 +183,6 @@ async function classify(
 		return NOT_COVERED;
 	}
 
-	const backend = deps.settings.get("providers.approvalSimilarityModel");
 	// Everything the classifier reads is text the agent itself wrote — for `bash`
 	// the raw command — and a `YES` runs the call with no prompt, so subject text
 	// that reads as instruction is an execution exploit. Two framings keep it
@@ -202,9 +195,9 @@ async function classify(
 	// "New command" won YES 3/3 with unquoted values inside the marker, and NO
 	// 3/3 once quoted, with a genuinely similar command still YES 3/3.
 	const fence = `===${crypto.randomUUID().replaceAll("-", "")}===`;
-	// Rendered once here, not per backend: one classification asks one question,
-	// framed by one marker, whichever model answers it. JSON quoting also keeps a
-	// multi-line subject (write's "Path: …\nContent: …") on one `- ` list item.
+	// Rendered once here, not per call site: one classification asks one question,
+	// framed by one marker. JSON quoting also keeps a multi-line subject (write's
+	// "Path: …\nContent: …") on one `- ` list item.
 	const userMessage = prompt.render(approvalSimilarityUserPrompt, {
 		tool: JSON.stringify(deps.toolName),
 		approved,
@@ -219,16 +212,13 @@ async function classify(
 			: AbortSignal.timeout(CLASSIFY_TIMEOUT_MS),
 	};
 	try {
-		// The combined abort signal cancels the backend's own work; `withTimeout`
-		// bounds the wait itself, because stages between here and the request
-		// ignore it — notably the credential resolution in `completeOnline`, which
-		// may refresh an OAuth token over the network. It takes no signal of its
-		// own: an already-aborted one would make it reject before it adopts the
+		// The combined abort signal cancels the model request itself; `withTimeout`
+		// bounds the wait, because stages between here and the request ignore it —
+		// notably the credential resolution in `requestClassification`, which may
+		// refresh an OAuth token over the network. It takes no signal of its own: an
+		// already-aborted one would make it reject before it adopts the
 		// classification promise, leaving that rejection unhandled.
-		const answering =
-			backend === ONLINE_MEMORY_MODEL_KEY
-				? completeOnline(userMessage, timeBounded)
-				: completeLocal(userMessage, backend, timeBounded);
+		const answering = requestClassification(userMessage, timeBounded);
 		const output = await withTimeout(answering, CLASSIFY_TIMEOUT_MS, "classification timed out");
 		if (output === undefined) return NOT_COVERED;
 		const answer = parseApprovalSimilarity(output);
@@ -244,7 +234,6 @@ async function classify(
 	} catch (error) {
 		logger.debug("approval-similarity: classification failed", {
 			error: error instanceof Error ? error.message : String(error),
-			backend,
 		});
 		return NOT_COVERED;
 	}
@@ -272,13 +261,15 @@ function citedWriteTargets(writes: readonly string[], candidate: string, cwd: st
 	return targets;
 }
 
-async function completeOnline(userMessage: string, deps: ApprovalSimilarityDeps): Promise<string | undefined> {
-	// Only this backend needs the registry, so the requirement lives here: a
-	// context without one still reaches the local backend, and here it joins the
-	// throws below under the caller's fail-safe (a normal approval prompt).
+/** One classifier request: the rubric as the system turn, the subjects as the user turn. */
+async function requestClassification(userMessage: string, deps: ApprovalSimilarityDeps): Promise<string | undefined> {
+	// A context without a registry cannot resolve a classifier model, so the
+	// requirement lives here rather than at the gate — the no-model answers must
+	// still run — and joins the throws below under the caller's fail-safe (a
+	// normal approval prompt).
 	const registry = deps.registry;
 	if (!registry) {
-		throw new Error("approval-similarity: no model registry for online classification");
+		throw new Error("approval-similarity: no model registry for classification");
 	}
 	const resolved = resolveRoleSelection(["tiny", "smol"], deps.settings, registry.getAvailable());
 	const model = resolved?.model;
@@ -313,7 +304,7 @@ async function completeOnline(userMessage: string, deps: ApprovalSimilarityDeps)
 	);
 
 	if (response.stopReason === "error") {
-		throw new Error(`approval-similarity: online classification failed: ${response.errorMessage ?? "unknown error"}`);
+		throw new Error(`approval-similarity: classification failed: ${response.errorMessage ?? "unknown error"}`);
 	}
 
 	return response.content
@@ -322,25 +313,8 @@ async function completeOnline(userMessage: string, deps: ApprovalSimilarityDeps)
 		.join("\n");
 }
 
-async function completeLocal(
-	userMessage: string,
-	modelKey: string,
-	deps: ApprovalSimilarityDeps,
-): Promise<string | undefined> {
-	if (!isTinyMemoryLocalModelKey(modelKey)) {
-		throw new Error(`approval-similarity: unsupported local classifier model: ${modelKey}`);
-	}
-	const maxTokens = isTinyMemoryReasoningModelKey(modelKey) ? REASONING_SAFE_MAX_TOKENS : ANSWER_MAX_TOKENS;
-	const output = await tinyModelClient.complete(modelKey, userMessage, {
-		maxTokens,
-		signal: deps.signal,
-		systemPrompt: SIMILARITY_SYSTEM_PROMPT,
-	});
-	return output ?? undefined;
-}
-
 /**
- * Reasoning a local model leaked into its answer channel: the two plain tag
+ * Reasoning the model leaked into its answer channel: the two plain tag
  * forms every dialect in `@oh-my-pi/pi-ai` renders thinking with. An unpaired
  * open tag is left alone — a truncated verdict must not be read as one.
  */
@@ -349,9 +323,9 @@ const THINK_BLOCK = /<(think|thinking)>[\s\S]*?<\/\1>/gi;
 const VERDICT_DECORATION = /^[\s"'`*_]+|[\s"'`*_.,!?]+$/g;
 /**
  * Code spans and emphasis wrapped around a whole line. Stripped before any line
- * is read: the small local models fence their write line about a third of the
- * time, and a `` `WRITES: []` `` line that misses its match below counts as a
- * second verdict line, costing a good verdict its parse.
+ * is read: small models fence their write line about a third of the time, and a
+ * `` `WRITES: []` `` line that misses its match below counts as a second
+ * verdict line, costing a good verdict its parse.
  */
 const LINE_DECORATION = /^[\s`*_]+|[\s`*_]+$/g;
 /**
@@ -376,8 +350,8 @@ export interface ApprovalSimilarityAnswer {
  * prompt files demand exactly one word: a prefix match would read "yesterday it
  * worked" and "YES, but destructive" as approvals, and any extra prose line
  * leaves the verdict unparsable. The write list is optional and independent — a
- * malformed or missing one costs the answer nothing, since a local backend that
- * only ever emits a bare verdict must keep working.
+ * malformed or missing one costs the answer nothing, since a model that only
+ * ever emits a bare verdict must keep working.
  */
 export function parseApprovalSimilarity(text: string): ApprovalSimilarityAnswer {
 	const lines = text
