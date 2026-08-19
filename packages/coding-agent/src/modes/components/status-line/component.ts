@@ -28,8 +28,8 @@ import { getSeparator } from "./separators";
 import type {
 	CollabStatus,
 	EffectiveStatusLineSettings,
-	StatusLineSegmentId,
 	StatusLineSegmentOptions,
+	StatusLineSegmentRef,
 	StatusLineSettings,
 } from "./types";
 
@@ -285,22 +285,22 @@ const EMPTY_MESSAGES: readonly AgentMessage[] = [];
 const STATUS_USAGE_START_DELAY_MS = 0;
 const STATUS_USAGE_REFRESH_TIMEOUT_MS = 2_000;
 
-function isContextSegment(segment: StatusLineSegmentId): boolean {
+function isContextSegment(segment: StatusLineSegmentRef): boolean {
 	return segment === "context_pct" || segment === "context_total";
 }
 
-function hasContextSegment(segments: readonly StatusLineSegmentId[]): boolean {
+function hasContextSegment(segments: readonly StatusLineSegmentRef[]): boolean {
 	return segments.includes("context_pct") || segments.includes("context_total");
 }
 
-function hasNonContextSegment(segments: readonly StatusLineSegmentId[]): boolean {
+function hasNonContextSegment(segments: readonly StatusLineSegmentRef[]): boolean {
 	for (const segment of segments) {
 		if (!isContextSegment(segment)) return true;
 	}
 	return false;
 }
 
-function removeContextSegments(parts: string[], segments: StatusLineSegmentId[]): void {
+function removeContextSegments(parts: string[], segments: StatusLineSegmentRef[]): void {
 	let writeIndex = 0;
 	for (let readIndex = 0; readIndex < segments.length; readIndex++) {
 		const segment = segments[readIndex];
@@ -316,18 +316,18 @@ function removeContextSegments(parts: string[], segments: StatusLineSegmentId[])
 function formatEmbeddedContextPercent(percent: number): string {
 	return `${percent > 0 && percent < 1 ? percent.toFixed(1) : Math.round(percent)}%`;
 }
-function hasGitSegment(segments: readonly StatusLineSegmentId[]): boolean {
+function hasGitSegment(segments: readonly StatusLineSegmentRef[]): boolean {
 	return segments.includes("git");
 }
 
-function hasPrSegment(segments: readonly StatusLineSegmentId[]): boolean {
+function hasPrSegment(segments: readonly StatusLineSegmentRef[]): boolean {
 	return segments.includes("pr");
 }
-function hasPathSegment(segments: readonly StatusLineSegmentId[]): boolean {
+function hasPathSegment(segments: readonly StatusLineSegmentRef[]): boolean {
 	return segments.includes("path");
 }
 
-function hasGitBackedSegment(segments: readonly StatusLineSegmentId[]): boolean {
+function hasGitBackedSegment(segments: readonly StatusLineSegmentRef[]): boolean {
 	return hasGitSegment(segments) || hasPrSegment(segments);
 }
 
@@ -1864,7 +1864,7 @@ export class StatusLineComponent implements Component {
 
 		// Collect visible segment contents
 		const leftParts: string[] = [];
-		const leftSegIds: StatusLineSegmentId[] = [];
+		const leftSegIds: StatusLineSegmentRef[] = [];
 		const leftSegmentIds = layout === "plain-right" ? [] : effectiveSettings.leftSegments;
 		for (const segId of leftSegmentIds) {
 			if (subagentBadge && segId === "subagents") continue;
@@ -1876,7 +1876,7 @@ export class StatusLineComponent implements Component {
 		}
 
 		const rightParts: string[] = [];
-		const rightSegIds: StatusLineSegmentId[] = [];
+		const rightSegIds: StatusLineSegmentRef[] = [];
 		const rightSegmentIds = layout === "plain-left" ? [] : effectiveSettings.rightSegments;
 		for (const segId of rightSegmentIds) {
 			if (subagentBadge && segId === "subagents") continue;

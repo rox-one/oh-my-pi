@@ -987,6 +987,8 @@
 - Cancelled prompts during pre-stream turn setup restore the text and image attachments to the editor.
 - `top` builtin accepts single-dash macOS flags such as `-pid` and `-stats`.
 - GNU/BSD compat sweep across built-in shell utilities (`timeout`, `diff`, `find`, `date`, `tail`, `head`, `rg`, `stat`, `truncate`, `cksum`, `sleep`, `which`, `nohup`, `kill`).
+- `/settings` rows can now carry a risk note: a warning glyph on the row plus a warning-colored line above the description. `External Thinking` (`externalThinking`, `--external-thinking`) is the first user — providers have flagged the request shape it produces as abuse, up to account-level enforcement, so both the settings entry and `--help` now say so.
+- Added `ExtensionAPI.registerStatusLineSegment(id, renderer)`, allowing extensions to add configured status-line segments or synchronously wrap built-in segments through `next()`, plus `ctx.ui.refreshStatusLine()` for repainting extension-owned state while idle. OMP retains layout, overflow, separators, and safe fallback when an extension renderer fails.
 
 ## [17.3.8] - 2026-08-19
 

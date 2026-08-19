@@ -114,7 +114,7 @@ Core methods:
 
 - `on(event, handler)`
 - `registerTool`, `registerCommand`, `registerShortcut`, `registerFlag`
-- `registerMessageRenderer`, `registerAssistantThinkingRenderer`
+- `registerMessageRenderer`, `registerAssistantThinkingRenderer`, `registerStatusLineSegment`
 - `registerComposerShape`
 - `setLabel`, `getFlag`
 - `sendMessage`, `sendUserMessage`, `appendEntry`, `exec`
@@ -720,6 +720,36 @@ pi.registerAssistantThinkingRenderer((context, theme) => {
 ```
 
 Used by interactive rendering to add display-only supplemental UI below each visible assistant thinking block. The renderer receives the already-visible thinking text, content/thinking indexes, theme, and a `requestRender()` callback for async renderers. All registered renderers that return a component are appended in registration order. Renderers must not mutate messages; the original thinking block remains the provider/session source of truth.
+
+## Status-line segment renderer
+
+Register a segment id, then list it in `statusLine.leftSegments` or `statusLine.rightSegments` with `statusLine.preset: custom`. The renderer synchronously receives a stable metrics/context snapshot, a `next()` function, and the current theme. For a built-in id, `next()` renders the built-in segment; for a new id, it returns an invisible segment. Return `next()` unchanged to preserve the current behavior, or return a replacement result to hide or replace it.
+
+`next()` also executes wrappers registered by extensions loaded earlier. Later-loaded extensions are the outermost wrapper, so each wrapper must call `next()` when it wants to compose instead of replace. A wrapper exception or invalid result is ignored and the next renderer still runs.
+
+```yaml
+statusLine:
+  preset: custom
+  rightSegments: [model, mode, developer_cost]
+```
+
+```ts
+pi.registerStatusLineSegment("mode", (_context, next, theme) => {
+  const original = next();
+  if (!original.visible) return original;
+  return {
+    ...original,
+    content: [original.content, theme.fg("accent", "review")].join(" · "),
+  };
+});
+
+pi.registerStatusLineSegment("developer_cost", (context, _next, theme) => ({
+  content: theme.fg("muted", "dev $" + context.usage.cost.toFixed(2)),
+  visible: true,
+}));
+```
+
+The context exposes `width`, token/cost/rate usage, context tokens and percent, the Git branch, and accumulated active milliseconds. Segment content may contain themed ANSI styling; OMP owns placement, width overflow, separators, and background rendering. Call `ctx.ui.refreshStatusLine()` after changing extension-owned renderer state so the interactive top border repaints while idle.
 
 ## Tool call/result renderer
 

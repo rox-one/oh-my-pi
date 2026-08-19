@@ -108,6 +108,7 @@ export class ExtensionUiController {
 			notify: (message, type) => this.showHookNotify(message, type),
 			onTerminalInput: handler => this.addExtensionTerminalInputListener(handler),
 			setStatus: (key, text) => this.setHookStatus(key, text),
+			refreshStatusLine: () => this.refreshStatusLine(),
 			setWorkingMessage: message => this.ctx.setWorkingMessage(message),
 			setWidget: (key, content, options) => this.setHookWidget(key, content, options),
 			setTitle: title => setExtensionTerminalTitle(title),
@@ -574,6 +575,12 @@ export class ExtensionUiController {
 	 */
 	setHookStatus(key: string, text: string | undefined): void {
 		this.ctx.statusLine.setHookStatus(key, text);
+		this.ctx.ui.requestRender();
+	}
+
+	/** Rebuild the editor top border after an extension changes segment state. */
+	refreshStatusLine(): void {
+		this.ctx.statusLine.invalidate();
 		this.ctx.ui.requestRender();
 	}
 

@@ -289,6 +289,9 @@ export interface ExtensionUIContext {
 	/** Set status text in the footer/status bar. Pass undefined to clear. */
 	setStatus(key: string, text: string | undefined): void;
 
+	/** Re-render status-line segments after extension-owned state changes. */
+	refreshStatusLine(): void;
+
 	/** Set the working/loading message shown during streaming. Call with no argument to restore default. */
 	setWorkingMessage(message?: string): void;
 
@@ -1230,6 +1233,45 @@ export type AssistantThinkingRenderer = (
 	context: AssistantThinkingRenderContext,
 	theme: Theme,
 ) => Component | undefined;
+// ============================================================================
+// Status Line Segments
+// ============================================================================
+
+export interface StatusLineSegmentUsage {
+	inputTokens: number;
+	outputTokens: number;
+	cacheReadTokens: number;
+	cacheWriteTokens: number;
+	totalTokens: number;
+	cost: number;
+	tokensPerSecond: number | null;
+}
+
+/** Data made available to an extension-registered status-line segment renderer. */
+export interface StatusLineSegmentContext {
+	/** Terminal columns budgeted for the whole status line; segments do not need to truncate to this themselves. */
+	width: number;
+	usage: StatusLineSegmentUsage;
+	/** Context usage percent, or null when unknown (e.g. right after compaction). */
+	contextPercent: number | null;
+	contextTokens: number;
+	contextWindow: number;
+	git: { branch: string | null } | null;
+	/** Active (non-idle) processing time accumulated this session, in ms. */
+	activeMs: number;
+}
+
+export interface StatusLineSegmentResult {
+	content: string;
+	visible: boolean;
+}
+
+/** Synchronous middleware for an extension-registered status-line segment. */
+export type StatusLineSegmentRenderer = (
+	ctx: StatusLineSegmentContext,
+	next: () => StatusLineSegmentResult,
+	theme: Theme,
+) => StatusLineSegmentResult;
 
 // ============================================================================
 // Command Registration
@@ -1468,6 +1510,17 @@ export interface ExtensionAPI {
 	 * replaced; when extensions reuse an id, the later extension wins.
 	 */
 	registerComposerShape(definition: ComposerShapeDefinition): void;
+
+	/**
+	 * Register a named status-line segment usable from `statusLine.leftSegments` /
+	 * `statusLine.rightSegments` config, alongside the built-in segment ids.
+	 *
+	 * For a built-in id, `next()` renders its built-in segment. For a new id,
+	 * `next()` returns an invisible segment. When multiple extensions register
+	 * the same id, their middleware is composed in load order, with the most
+	 * recently loaded extension outermost.
+	 */
+	registerStatusLineSegment(id: string, renderer: StatusLineSegmentRenderer): void;
 
 	// =========================================================================
 	// Actions
@@ -1804,6 +1857,7 @@ export interface Extension {
 	fileDeleteFallbackHandlers: FileDeleteFallbackHandler[];
 	messageRenderers: Map<string, MessageRenderer>;
 	composerShapes: Map<string, ComposerShapeDefinition>;
+	statusLineSegments: Map<string, StatusLineSegmentRenderer>;
 	commands: Map<string, RegisteredCommand>;
 	flags: Map<string, ExtensionFlag>;
 	shortcuts: Map<KeyId, ExtensionShortcut>;

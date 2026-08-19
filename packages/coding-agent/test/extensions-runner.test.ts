@@ -874,6 +874,54 @@ describe("ExtensionRunner", () => {
 			expect(definition.style.id).toBe("extension-dock");
 		});
 	});
+
+	describe("status-line segments", () => {
+		it("registers and renders a named extension segment", async () => {
+			fs.writeFileSync(
+				path.join(extensionsDir, "status-line.ts"),
+				`export default function(pi) {
+					pi.registerStatusLineSegment("developer_cost", (_context, next) => {
+						const base = next();
+						return { content: base.content + " developer-cost", visible: true };
+					});
+				}`,
+			);
+
+			const result = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+
+			const rendered = runner.renderStatusLineSegment(
+				"developer_cost",
+				{
+					width: 80,
+					usage: {
+						inputTokens: 0,
+						outputTokens: 0,
+						cacheReadTokens: 0,
+						cacheWriteTokens: 0,
+						totalTokens: 0,
+						cost: 0,
+						tokensPerSecond: null,
+					},
+					contextPercent: null,
+					contextTokens: 0,
+					contextWindow: 0,
+					git: null,
+					activeMs: 0,
+				},
+				undefined as never,
+				() => ({ content: "built-in", visible: false }),
+			);
+
+			expect(rendered).toEqual({ content: "built-in developer-cost", visible: true });
+		});
+	});
 	describe("flags", () => {
 		it("collects flags from extensions", async () => {
 			const extCode = `
@@ -2604,6 +2652,7 @@ describe("ExtensionRunner", () => {
 					notify: () => {},
 					onTerminalInput: () => () => {},
 					setStatus: () => {},
+					refreshStatusLine: () => {},
 					setWorkingMessage: () => {},
 					setWidget: () => {},
 					setFooter: () => {},
@@ -4680,6 +4729,7 @@ describe("ExtensionRunner", () => {
 				fileDeleteFallbackHandlers: [],
 				messageRenderers: new Map(),
 				composerShapes: new Map(),
+				statusLineSegments: new Map(),
 				commands: new Map(),
 				flags: new Map(),
 				shortcuts: new Map(),
