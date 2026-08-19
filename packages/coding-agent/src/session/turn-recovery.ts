@@ -2054,12 +2054,21 @@ export class TurnRecovery {
 			// the same model/credential instead of drilling to a cold
 			// cross-provider fallback (cache bust + billed request) mid-window.
 			// The chain still engages after the budget exhausts.
+			//
+			// Capacity errors are the exception. A 429 quota window clears on its
+			// own and the same model is worth waiting for; a 503 "no capacity" or
+			// "hosted inference unavailable" is the route being down, and its
+			// retry-after is a guess at when that ends. Parking on it spends the
+			// whole budget on a model that cannot serve — a live outage burned ten
+			// attempts on `runinfra/deepseek-v4-pro` this way, with retry-after
+			// windows up to 38895ms, and never reached the OpenRouter leg.
+			const capacityUnavailable = rateLimitReason === "MODEL_CAPACITY_EXHAUSTED";
 			if (
 				allowModelFallback &&
 				retrySettings.modelFallback &&
 				!thinkingLoop &&
 				!(retryBudgetExhausted && classifierRefusal) &&
-				!(parsedRetryAfterMs !== undefined && !retryBudgetExhausted)
+				!(parsedRetryAfterMs !== undefined && !retryBudgetExhausted && !capacityUnavailable)
 			) {
 				if (!classifierRefusal) {
 					this.noteRetryFallbackCooldown(currentSelector, parsedRetryAfterMs, errorMessage);
