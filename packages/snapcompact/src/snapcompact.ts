@@ -496,8 +496,9 @@ export function frameDataBytes(frames: readonly Pick<Frame, "data">[]): number {
  * Per-request image-count budgets by provider id. These cap how many images an
  * entire request may carry (archive/system-prompt/tool-result imaging combined).
  * The values are conservative policy caps under the vendor hard limits
- * (Anthropic 100, OpenAI 500, Gemini ~2500); unknown providers fall to a safe
- * floor rather than sending unbounded attachments.
+ * (Anthropic 100, OpenAI 500, Gemini ~2500). Named ids win even when the wire
+ * API would be more permissive (umans, Groq). Unknown providers inherit the
+ * wire API's family budget; unknown APIs fall to the Groq-measured floor.
  */
 export const PROVIDER_IMAGE_BUDGETS: Record<string, number> = {
 	anthropic: 90,
@@ -509,19 +510,43 @@ export const PROVIDER_IMAGE_BUDGETS: Record<string, number> = {
 	"google-gemini-cli": 200,
 	openrouter: 90,
 	umans: 10,
+	groq: 5,
 };
 
 /** Safe floor for unknown providers (strictest mainstream measured: Groq ~5). */
 export const DEFAULT_PROVIDER_IMAGE_BUDGET = 5;
 
-/** Per-request image budget for `provider`; unknown providers get the floor. */
-export function providerImageBudget(provider: string | undefined): number {
-	return (provider !== undefined ? PROVIDER_IMAGE_BUDGETS[provider] : undefined) ?? DEFAULT_PROVIDER_IMAGE_BUDGET;
+/** Per-request image budget. Named provider ids win; otherwise inherit `api`. */
+export function providerImageBudget(provider: string | undefined, api?: string): number {
+	if (provider !== undefined) {
+		const named = PROVIDER_IMAGE_BUDGETS[provider];
+		if (named !== undefined) return named;
+	}
+	switch (api) {
+		case "anthropic-messages":
+		case "bedrock-converse-stream":
+		case "openrouter":
+			return PROVIDER_IMAGE_BUDGETS.anthropic;
+		case "openai-completions":
+		case "openai-responses":
+		case "azure-openai-responses":
+			return PROVIDER_IMAGE_BUDGETS.openai;
+		case "openai-codex-responses":
+			return PROVIDER_IMAGE_BUDGETS["openai-codex"];
+		case "google-generative-ai":
+			return PROVIDER_IMAGE_BUDGETS.google;
+		case "google-gemini-cli":
+			return PROVIDER_IMAGE_BUDGETS["google-gemini-cli"];
+		case "google-vertex":
+			return PROVIDER_IMAGE_BUDGETS["google-vertex"];
+		default:
+			return DEFAULT_PROVIDER_IMAGE_BUDGET;
+	}
 }
 
-/** Archive frame cap for `provider`: image budget, never above {@link MAX_FRAMES_DEFAULT}. */
-export function providerFrameBudget(provider: string | undefined): number {
-	return Math.min(providerImageBudget(provider), MAX_FRAMES_DEFAULT);
+/** Archive frame cap for `provider`/`api`: image budget, never above {@link MAX_FRAMES_DEFAULT}. */
+export function providerFrameBudget(provider: string | undefined, api?: string): number {
+	return Math.min(providerImageBudget(provider, api), MAX_FRAMES_DEFAULT);
 }
 
 /** Key under `CompactionEntry.preserveData` holding the frame archive. */

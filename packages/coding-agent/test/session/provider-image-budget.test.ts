@@ -16,6 +16,19 @@ const UMANS_MODEL = buildModel({
 	maxTokens: 4096,
 });
 
+const RAMP_GROK_MODEL = buildModel({
+	id: "grok-4.6",
+	name: "grok-4.6",
+	api: "anthropic-messages",
+	provider: "ramp",
+	baseUrl: "https://example.invalid",
+	reasoning: true,
+	input: ["text", "image"],
+	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+	contextWindow: 2000000,
+	maxTokens: 8192,
+});
+
 function image(data: string): ImageContent {
 	return { type: "image", data, mimeType: "image/png" };
 }
@@ -91,5 +104,23 @@ describe("provider context image budgets", () => {
 		};
 
 		expect(clampProviderContextImages(context, UMANS_MODEL)).toBe(context);
+	});
+
+	it("lets anthropic-messages gateways keep more than the unknown-provider floor", () => {
+		const context: Context = {
+			systemPrompt: [],
+			tools: [],
+			messages: [
+				{
+					role: "user",
+					content: Array.from({ length: 11 }, (_, index) => image(`image-${index}`)),
+					timestamp: 1,
+				},
+			],
+		};
+
+		const clamped = clampProviderContextImages(context, RAMP_GROK_MODEL);
+		expect(clamped).toBe(context);
+		expect(imageData(clamped)).toHaveLength(11);
 	});
 });

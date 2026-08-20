@@ -1222,6 +1222,23 @@ describe("archive helpers", () => {
 		// the send path will drop.
 		expect(snapcompact.MAX_FRAMES_DEFAULT).toBeLessThanOrEqual(snapcompact.providerImageBudget("anthropic"));
 	});
+
+	it("unknown providers inherit the wire API budget; named providers keep their cap", () => {
+		expect(snapcompact.providerImageBudget("ramp", "anthropic-messages")).toBe(
+			snapcompact.PROVIDER_IMAGE_BUDGETS.anthropic,
+		);
+		expect(snapcompact.providerImageBudget("custom-proxy", "openai-completions")).toBe(
+			snapcompact.PROVIDER_IMAGE_BUDGETS.openai,
+		);
+		expect(snapcompact.providerImageBudget("umans", "anthropic-messages")).toBe(10);
+		expect(snapcompact.providerImageBudget("groq", "openai-completions")).toBe(
+			snapcompact.DEFAULT_PROVIDER_IMAGE_BUDGET,
+		);
+		expect(snapcompact.providerImageBudget("some-new-router", "ollama-chat")).toBe(
+			snapcompact.DEFAULT_PROVIDER_IMAGE_BUDGET,
+		);
+		expect(snapcompact.providerFrameBudget("ramp", "anthropic-messages")).toBe(snapcompact.MAX_FRAMES_DEFAULT);
+	});
 });
 
 describe("dimStopwords", () => {
