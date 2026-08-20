@@ -5,7 +5,7 @@ import * as path from "node:path";
 import {
 	__isLegacyPiSelfLoopResolution,
 	__isLegacyPiShimImporter,
-} from "@oh-my-pi/pi-coding-agent/extensibility/plugins/legacy-pi-compat";
+} from "@oh-my-pi/pi-coding-agent/extensibility/plugins/legacy-pi-shim-loop-guard";
 
 // Regression for issue #8900: a custom tool that value-imports
 // `@oh-my-pi/pi-coding-agent` bricked the agent with an opaque
