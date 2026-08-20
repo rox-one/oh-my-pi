@@ -1,0 +1,49 @@
+name: omp-8800-apply
+on:
+  push:
+    branches:
+      - fix/8800-custom-model-slash-routing
+permissions:
+  contents: write
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/8800-custom-model-slash-routing
+      - name: Apply provider-lock exemption for custom providers (issue 8800)
+        run: |
+          set -euo pipefail
+          F=packages/coding-agent/src/config/model-resolver.ts
+          BLOB=$(git hash-object "$F")
+          if [ "$BLOB" != "4682ea53218b1959d32e53e9dc420e8aa058912f" ]; then
+            echo "model-resolver.ts blob SHA mismatch ($BLOB); refusing to patch a drifted file."
+            exit 1
+          fi
+          python3 - "$F" <<'PYEOF'
+          import sys
+          path = sys.argv[1]
+          src = open(path, encoding="utf-8").read()
+          anchor = "\tif (matchedModel.provider.toLowerCase() === provider) {\n\t\treturn false;\n\t}\n"
+          assert src.count(anchor) == 1, "anchor not unique"
+          insert = (
+              "\t// A cross-provider exact-id match on a provider that has no bundled\n"
+              "\t// catalog at all is a user-configured custom provider (models.json /\n"
+              "\t// models.yml): the user wrote this literal id explicitly, so resolving\n"
+              "\t// it is stated intent rather than an aggregator shadow, and the lock\n"
+              "\t// must not fire (#8800). Bundled providers (e.g. OpenRouter) keep the\n"
+              "\t// lock below unchanged.\n"
+              "\tif (getBundledModels(matchedModel.provider.toLowerCase() as GeneratedProvider).length === 0) {\n"
+              "\t\treturn false;\n"
+              "\t}\n"
+          )
+          src = src.replace(anchor, anchor + insert, 1)
+          open(path, "w", encoding="utf-8", newline="").write(src)
+          PYEOF
+          git rm -q .github/workflows/omp-8800-apply.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "$F"
+          git commit -m "fix(coding-agent): exempt custom providers from the provider lock (#8800)"
+          git push origin HEAD:fix/8800-custom-model-slash-routing
