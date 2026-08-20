@@ -42,7 +42,7 @@ function clampImageBearingMessage(
 /** Drops oldest transient image blocks so the outgoing request fits the active provider's image cap. */
 export function clampProviderContextImages(context: Context, model: Model): Context {
 	if (!model.input.includes("image")) return context;
-	const limit = providerImageBudget(model.provider, model.api);
+	const limit = providerImageBudget(model.provider, model.id);
 	const totalImages = countImages(context);
 	if (totalImages <= limit) return context;
 

@@ -32,11 +32,8 @@
  *   area-proportional, so resolution cannot improve chars/$ — 1568 stays.
  *   `detail: "high"` would downgrade (2,500-patch cap); `original` is sent.
  * - **Unknown providers** default to `8on22-bw` with Anthropic-style
- *   visual-token area billing. `providerImageBudget` still caps per-request
- *   images per provider so inline imaging cannot flood a request with
- *   attachments, but the old OpenRouter-specific 8-image cap is gone; routers
- *   now use the same permissive budget as direct Anthropic/Claude lines unless
- *   configured otherwise upstream.
+ *   visual-token area billing. Per-request image count is a separate axis:
+ *   named gateway ceiling, else model family, else a floor of 5.
  *
  * The whole pass is local and deterministic — no LLM call, no API key, no
  * latency beyond rendering. Rasterization and PNG encoding happen in native
@@ -46,7 +43,15 @@
  */
 
 import type { Api, ImageContent, Message, TextContent } from "@oh-my-pi/pi-ai";
-import { isFableOrMythos, parseAnthropicModel, semverGte } from "@oh-my-pi/pi-catalog/identity";
+import {
+	isClaudeModelId,
+	isFableOrMythos,
+	isGeminiModelId,
+	isGrokModelId,
+	isOpenAIModelId,
+	parseAnthropicModel,
+	semverGte,
+} from "@oh-my-pi/pi-catalog/identity";
 import { renderSnapcompactPng, snapcompactSupportedChars } from "@oh-my-pi/pi-natives";
 import { formatGroupedPaths, prompt } from "@oh-my-pi/pi-utils";
 import { INTENT_FIELD } from "@oh-my-pi/pi-wire";
@@ -493,12 +498,9 @@ export function frameDataBytes(frames: readonly Pick<Frame, "data">[]): number {
 }
 
 /**
- * Per-request image-count budgets by provider id. These cap how many images an
- * entire request may carry (archive/system-prompt/tool-result imaging combined).
- * The values are conservative policy caps under the vendor hard limits
- * (Anthropic 100, OpenAI 500, Gemini ~2500). Named ids win even when the wire
- * API would be more permissive (umans, Groq). Unknown providers inherit the
- * wire API's family budget; unknown APIs fall to the Groq-measured floor.
+ * Per-request image-count budgets by gateway id. Named ids are hard ceilings
+ * even when the model would allow more (umans, Groq). Unknown providers are
+ * not listed — their cap comes from the model id.
  */
 export const PROVIDER_IMAGE_BUDGETS: Record<string, number> = {
 	anthropic: 90,
@@ -513,40 +515,32 @@ export const PROVIDER_IMAGE_BUDGETS: Record<string, number> = {
 	groq: 5,
 };
 
-/** Safe floor for unknown providers (strictest mainstream measured: Groq ~5). */
+/** Safe floor when neither the gateway nor the model family has a known cap. */
 export const DEFAULT_PROVIDER_IMAGE_BUDGET = 5;
 
-/** Per-request image budget. Named provider ids win; otherwise inherit `api`. */
-export function providerImageBudget(provider: string | undefined, api?: string): number {
-	if (provider !== undefined) {
-		const named = PROVIDER_IMAGE_BUDGETS[provider];
-		if (named !== undefined) return named;
+function modelImageBudget(modelId: string): number | undefined {
+	if (isClaudeModelId(modelId) || parseAnthropicModel(modelId.toLowerCase())) {
+		return PROVIDER_IMAGE_BUDGETS.anthropic;
 	}
-	switch (api) {
-		case "anthropic-messages":
-		case "bedrock-converse-stream":
-		case "openrouter":
-			return PROVIDER_IMAGE_BUDGETS.anthropic;
-		case "openai-completions":
-		case "openai-responses":
-		case "azure-openai-responses":
-			return PROVIDER_IMAGE_BUDGETS.openai;
-		case "openai-codex-responses":
-			return PROVIDER_IMAGE_BUDGETS["openai-codex"];
-		case "google-generative-ai":
-			return PROVIDER_IMAGE_BUDGETS.google;
-		case "google-gemini-cli":
-			return PROVIDER_IMAGE_BUDGETS["google-gemini-cli"];
-		case "google-vertex":
-			return PROVIDER_IMAGE_BUDGETS["google-vertex"];
-		default:
-			return DEFAULT_PROVIDER_IMAGE_BUDGET;
-	}
+	if (isOpenAIModelId(modelId)) return PROVIDER_IMAGE_BUDGETS.openai;
+	if (isGeminiModelId(modelId)) return PROVIDER_IMAGE_BUDGETS.google;
+	if (isGrokModelId(modelId)) return MAX_FRAMES_DEFAULT;
+	return undefined;
 }
 
-/** Archive frame cap for `provider`/`api`: image budget, never above {@link MAX_FRAMES_DEFAULT}. */
-export function providerFrameBudget(provider: string | undefined, api?: string): number {
-	return Math.min(providerImageBudget(provider, api), MAX_FRAMES_DEFAULT);
+/** Named gateway ceiling, else the model-family cap, else the floor. */
+export function providerImageBudget(provider: string | undefined, modelId?: string): number {
+	const gateway = provider !== undefined ? PROVIDER_IMAGE_BUDGETS[provider] : undefined;
+	const model = modelId !== undefined ? modelImageBudget(modelId) : undefined;
+	if (gateway !== undefined && model !== undefined) return Math.min(gateway, model);
+	if (gateway !== undefined) return gateway;
+	if (model !== undefined) return model;
+	return DEFAULT_PROVIDER_IMAGE_BUDGET;
+}
+
+/** Archive frame cap: image budget, never above {@link MAX_FRAMES_DEFAULT}. */
+export function providerFrameBudget(provider: string | undefined, modelId?: string): number {
+	return Math.min(providerImageBudget(provider, modelId), MAX_FRAMES_DEFAULT);
 }
 
 /** Key under `CompactionEntry.preserveData` holding the frame archive. */

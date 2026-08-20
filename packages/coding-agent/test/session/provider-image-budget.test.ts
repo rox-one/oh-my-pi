@@ -106,7 +106,7 @@ describe("provider context image budgets", () => {
 		expect(clampProviderContextImages(context, UMANS_MODEL)).toBe(context);
 	});
 
-	it("lets anthropic-messages gateways keep more than the unknown-provider floor", () => {
+	it("lets Ramp Grok keep more than the unknown-provider floor", () => {
 		const context: Context = {
 			systemPrompt: [],
 			tools: [],
@@ -122,5 +122,26 @@ describe("provider context image budgets", () => {
 		const clamped = clampProviderContextImages(context, RAMP_GROK_MODEL);
 		expect(clamped).toBe(context);
 		expect(imageData(clamped)).toHaveLength(11);
+	});
+
+	it("clamps unknown Ramp models to the safe floor", () => {
+		const context: Context = {
+			systemPrompt: [],
+			tools: [],
+			messages: [
+				{
+					role: "user",
+					content: Array.from({ length: 11 }, (_, index) => image(`image-${index}`)),
+					timestamp: 1,
+				},
+			],
+		};
+
+		const clamped = clampProviderContextImages(context, {
+			...RAMP_GROK_MODEL,
+			id: "some-random-model",
+			name: "some-random-model",
+		});
+		expect(imageData(clamped)).toHaveLength(5);
 	});
 });

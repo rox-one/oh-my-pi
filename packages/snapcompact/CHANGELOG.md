@@ -14,7 +14,7 @@
 ### Added
 
 - Restored `providerFrameBudget()` (image budget clamped to `MAX_FRAMES_DEFAULT`) so callers can size archives to what the provider will actually send.
-- `providerImageBudget()` / `providerFrameBudget()` now take an optional wire `api`. Unknown provider ids inherit that API's family budget (`ramp` + `anthropic-messages` → 90) instead of Groq's floor of 5. Named ids still win (`umans` 10, `groq` 5).
+- `providerImageBudget()` / `providerFrameBudget()` now take an optional model id. Unknown provider ids use that model's family cap (`ramp` + `grok-4.6` → 80, `ramp` + Claude → 90) instead of Groq's floor of 5 or the wire API. Named gateways stay the ceiling (`umans` 10, `groq` 5).
 
 
 ## [17.3.8] - 2026-08-19
