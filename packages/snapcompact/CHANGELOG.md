@@ -11,6 +11,10 @@
 ### Fixed
 
 - Fixed an issue where character-based truncation could split inline base64 data URLs into corrupted payloads that were rejected by OpenAI-compatible providers. Data URLs are now replaced atomically with placeholders before truncation, and previously affected archives are healed during re-compaction.
+### Added
+
+- Restored `providerFrameBudget()` (image budget clamped to `MAX_FRAMES_DEFAULT`) so callers can size archives to what the provider will actually send.
+
 
 ## [17.3.8] - 2026-08-19
 
