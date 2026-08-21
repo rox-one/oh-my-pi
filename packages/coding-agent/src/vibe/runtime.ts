@@ -490,7 +490,7 @@ export class VibeSessionRegistry {
 		cli?: VibeCli;
 		ownerId: string;
 		state?: VibeSessionState;
-1: 		jobId?: string;
+		jobId?: string;
 		queue?: string[];
 	}): void {
 		const now = Date.now();
@@ -503,12 +503,6 @@ export class VibeSessionRegistry {
 			parentSessionFile: null,
 		};
 		this.#records.set(scopeKey(scope, record.id), {
-2: 			createdAt: now,
-			lastActivityAt: now,
-			turn: record.jobId
-				? { jobId: record.jobId, message: "test turn", startedAt: now, trace: [], toolCount: 0 }
-				: undefined,
-			queue: [...(record.queue ?? [])],
 			id: record.id,
 			cli: record.cli ?? "fast",
 			ownerId: record.ownerId,
@@ -516,20 +510,7 @@ export class VibeSessionRegistry {
 			parentSessionFile: null,
 			agent: getBundledAgent("sonic")!,
 			state: record.state ?? "running",
-1: 		jobId?: string;
-		queue?: string[];
-	}): void {
-		const now = Date.now();
-		// Key by the same scopeKey the runtime lookups use (send/#record), so a
-		// record registered here is reachable through a matching fake parent
-		// session (getSessionId "test-parent-session", sessionFile null).
-		const scope: VibeOwnerScope = {
-			ownerId: record.ownerId,
-			parentSessionId: "test-parent-session",
-			parentSessionFile: null,
-		};
-		this.#records.set(scopeKey(scope, record.id), {
-2: 			createdAt: now,
+			createdAt: now,
 			lastActivityAt: now,
 			turn: record.jobId
 				? { jobId: record.jobId, message: "test turn", startedAt: now, trace: [], toolCount: 0 }
