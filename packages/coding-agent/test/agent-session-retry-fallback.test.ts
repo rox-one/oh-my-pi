@@ -558,7 +558,7 @@ describe("AgentSession retry fallback", () => {
 			"retry.baseDelayMs": 1,
 			"retry.maxRetries": 1,
 			"retry.retryCurrentModelBeforeFallback": true,
-			"retry.retriesBeforeModelFallback": 1,
+			"retry.retriesBeforeModelFallback": 3,
 			"retry.fallbackChains": {
 				default: [
 					`${firstFallback.provider}/${firstFallback.id}`,

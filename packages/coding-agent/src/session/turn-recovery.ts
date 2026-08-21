@@ -2058,7 +2058,7 @@ export class TurnRecovery {
 		// retry budget still bounds a genuinely stuck stream.
 		const thinkingLoop = AIError.is(id, AIError.Flag.ThinkingLoop);
 		const sameModelRetriesBeforeFallback = retrySettings.retryCurrentModelBeforeFallback
-			? Math.max(0, Math.floor(retrySettings.retriesBeforeModelFallback))
+			? Math.min(maxRetries, Math.max(0, Math.floor(retrySettings.retriesBeforeModelFallback)))
 			: 0;
 		if (
 			retryBudgetExhausted &&
