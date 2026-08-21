@@ -1953,10 +1953,6 @@ export class TurnRecovery {
 		// (every rotation sets switchedCredential and skips it), so without
 		// this last resort a provider-wide usage cap never fails over to the
 		// configured chain.
-		const maxRetries = this.#isBoundedThinkingStreamClose(message)
-			? Math.min(retrySettings.maxRetries, 1)
-			: retrySettings.maxRetries;
-		let retryBudgetExhausted = this.#retryAttempt > maxRetries;
 
 		const errorMessage = message.errorMessage || "Unknown error";
 		const id = this.#classifyRetryMessage(message);
@@ -1967,6 +1963,11 @@ export class TurnRecovery {
 		const rateLimitReason = parseRateLimitReason(errorMessage);
 		const staleOpenAIResponsesReplayError = AIError.is(id, AIError.Flag.StaleResponsesItem);
 		const accountPolicyDenial = AIError.is(id, AIError.Flag.AccountPolicy);
+		const openRouterThinkingStreamClose = this.#isOpenRouterThinkingStreamClose(message);
+		const maxRetries = openRouterThinkingStreamClose
+			? Math.min(retrySettings.maxRetries, 1)
+			: retrySettings.maxRetries;
+		let retryBudgetExhausted = this.#retryAttempt > maxRetries;
 		const recordedUsageLimitOutcome = await this.#usageLimitOutcomes.get(message);
 		const parsedRetryAfterMs = this.#parseRetryAfterMsFromError(errorMessage);
 		let delayMs = staleOpenAIResponsesReplayError
@@ -2064,6 +2065,8 @@ export class TurnRecovery {
 			this.#currentModelRetryAttempt < sameModelRetriesBeforeFallback &&
 			this.#activeRetryFallback &&
 			!classifierRefusal &&
+			!accountPolicyDenial &&
+			!openRouterThinkingStreamClose &&
 			!options?.hardErrorFallback
 		) {
 			this.#retryAttempt = 1;
@@ -2074,6 +2077,7 @@ export class TurnRecovery {
 		const delayConfiguredFallback =
 			!options?.hardErrorFallback &&
 			!classifierRefusal &&
+			!accountPolicyDenial &&
 			!delayExceedsCap &&
 			this.#currentModelRetryAttempt < sameModelRetriesBeforeFallback;
 		if (!staleOpenAIResponsesReplayError && !switchedCredential && currentSelector) {
