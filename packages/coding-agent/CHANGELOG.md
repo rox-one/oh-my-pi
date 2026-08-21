@@ -289,7 +289,8 @@
 - Configured discovery providers with `authHeader` now preserve cached models across application restarts.
 - Added repeat read warning hints when identical file content is read multiple times.
 - Explicit DAP adapters can now attach without a PID or port when `attachDefaults` provide the target arguments.
-- Added `isProjectTrusted()` compatibility shim to `ExtensionContext` for extensions targeting upstream per-directory trust gates.
+- Added an `oauth.scopes` field to per-server MCP configuration that takes precedence over the scopes discovered from authorization-server or protected-resource metadata (and over a `scope` embedded in the provider's authorization URL), so an MCP server behind a general-purpose corporate IdP can request its own resource-bound scope instead of the tenant-wide `scopes_supported` list the resource rejects; `""` sends no `scope` parameter at all ([#7841](https://github.com/can1357/oh-my-pi/issues/7841))
+- Codex `[mcp_servers.<name>] scopes` and OpenCode `mcp.<name>.oauth.scope` now import into `oauth.scopes` instead of being dropped ([#7841](https://github.com/can1357/oh-my-pi/issues/7841))
 
 ### Changed
 
@@ -308,7 +309,7 @@
 - `/settings` rows can now carry a risk note: a warning glyph on the row plus a warning-colored line above the description. `External Thinking` (`externalThinking`, `--external-thinking`) is the first user — providers have flagged the request shape it produces as abuse, up to account-level enforcement, so both the settings entry and `--help` now say so.
 
 ### Fixed
-
+- Fixed OAuth scopes entered in the `/mcp add` wizard being used for that one authorization and then discarded, so `/mcp reauth` fell back to the discovered scopes the user had replaced; the wizard now records them as `oauth.scopes` ([#7841](https://github.com/can1357/oh-my-pi/issues/7841))
 - Fixed regional HTTP 401 data-residency errors during Codex chat, web search, and image generation requests by passing token residency metadata on requests.
 - Fixed macOS SSH ControlMaster socket creation failures caused by `sun_path` length limits when using named profiles.
 - Fixed an issue where Nix-packaged builds failed to load on-demand native addons (`onnxruntime-node`/`sherpa-onnx`) due to missing shared C++ runtime library paths.

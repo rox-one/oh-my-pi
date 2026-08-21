@@ -53,13 +53,14 @@ export interface MCPServer {
 		clientSecret?: string;
 		resource?: string;
 	};
-	/** OAuth configuration (clientId, clientSecret, redirectUri, callbackPort, callbackPath, prompt) for servers requiring explicit client credentials */
+	/** OAuth configuration (clientId, clientSecret, redirectUri, callbackPort, callbackPath, scopes, prompt) for servers requiring explicit client credentials */
 	oauth?: {
 		clientId?: string;
 		clientSecret?: string;
 		redirectUri?: string;
 		callbackPort?: number;
 		callbackPath?: string;
+		scopes?: string;
 		prompt?: string;
 	};
 	/** Transport type */
