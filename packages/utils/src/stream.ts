@@ -2,6 +2,7 @@ const trailingEvents = new WeakSet<ServerSentEvent>();
 
 import { abortableSource } from "./abortable";
 import { parseStreamingJson, repairJson } from "./json-parse";
+import * as logger from "./logger";
 
 const LF = 0x0a;
 type JsonlChunkResult = {
@@ -67,17 +68,17 @@ export async function* readJsonl<T>(stream: ReadableStream<Uint8Array>, signal?:
 			const tail = buffer.flush();
 			if (tail) {
 				buffer.clear();
-				const { values, error, done } = Bun.JSONL.parseChunk(tail, 0, tail.length);
+				const { values, error, read, done } = parseJsonlChunkCompat(tail, 0, tail.length);
 				if (values.length > 0) {
 					yield* values as T[];
 				}
 				if (error) {
-					yield* buffer.recoverMalformed<T>(tail, 0, tail.length);
+					yield* buffer.recoverMalformed<T>(tail, read, tail.length);
 				} else if (!done) {
 					// A partial record at EOF: attempt the same repair pass; if the
 					// frame still does not parse, drop it rather than abort the
 					// stream over a truncated final frame.
-					yield* buffer.recoverMalformed<T>(tail, 0, tail.length);
+					yield* buffer.recoverMalformed<T>(tail, read, tail.length);
 				}
 			}
 		}
@@ -242,7 +243,7 @@ class ConcatSink {
 	 * skipped, and scanning resumes at the following line — a malformed frame
 	 * no longer aborts the whole provider stream.
 	 */
-	*recoverMalformed<T>(buffer: Uint8Array, beg: number, end: number) {
+	*recoverMalformed<T>(buffer: Uint8Array, beg: number, end: number): Generator<T, void, unknown> {
 		let from = beg;
 		while (from < end) {
 			const lineEnd = nextLineEnd(buffer, from);
@@ -255,14 +256,43 @@ class ConcatSink {
 					parsed = undefined;
 				}
 				if (parsed !== undefined) {
-					if (Array.isArray(parsed)) {
-						if (parsed.length > 0) yield* parsed as T[];
-					} else {
-						yield parsed as T;
-					}
+					logger.debug("Repaired JSONL record containing raw control characters", {
+						stream: "readJsonl",
+						offset: from,
+					});
+					// Emit the repaired record as a single frame (a top-level
+					// array is one JSONL value, not one frame per element).
+					yield parsed as T;
 					this.#length = 0;
 					if (lineEnd < end) {
-						this.reset(buffer.subarray(lineEnd + 1, end));
+						// Drain any complete records that follow the repaired
+						// frame before returning, so an idle stream (RPC/MCP)
+						// does not stall them until the next chunk arrives.
+						const suffix = buffer.subarray(lineEnd + 1, end);
+						this.reset(suffix);
+						if (suffix.length > 0) {
+							// Parse the copy (byteOffset 0) — Bun.JSONL.parseChunk
+							// mis-parses nonzero-byteOffset views.
+							const copied = this.flush();
+							if (copied) {
+								const {
+									values: next,
+									error: nextError,
+									read: nextRead,
+									done: nextDone,
+								} = parseJsonlChunkCompat(copied, 0, copied.length);
+								if (next.length > 0) {
+									yield* next as T[];
+								}
+								if (nextError) {
+									yield* this.recoverMalformed<T>(copied, nextRead, copied.length);
+								} else if (nextDone) {
+									this.#length = 0;
+								} else {
+									this.reset(copied.subarray(nextRead));
+								}
+							}
+						}
 					}
 					return;
 				}
@@ -274,6 +304,10 @@ class ConcatSink {
 					this.reset(buffer.subarray(from, end));
 					return;
 				}
+				logger.debug("Skipped unparseable JSONL record", {
+					stream: "readJsonl",
+					offset: from,
+				});
 			}
 			from = lineEnd + 1;
 		}

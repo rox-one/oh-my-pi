@@ -205,6 +205,44 @@ describe("readJsonl", () => {
 		const output = await collectAsync(readJsonl(readable));
 		expect(output).toEqual([{ a: 1 }]);
 	});
+
+	it("does not re-emit records before a malformed tail at EOF", async () => {
+		// Regression: the EOF recovery path restarted at offset 0, re-parsing
+		// and re-yielding the last complete record before the malformed frame.
+		const readable = new ReadableStream<Uint8Array>({
+			start(controller) {
+				controller.enqueue(encoder.encode('bad\n{"a":1}\n{"b":2}\n{trunc'));
+				controller.close();
+			},
+		});
+
+		const output = await collectAsync(readJsonl(readable));
+		expect(output).toEqual([{ a: 1 }, { b: 2 }]);
+	});
+
+	it("emits a repaired top-level array as a single frame", async () => {
+		const readable = new ReadableStream<Uint8Array>({
+			start(controller) {
+				controller.enqueue(encoder.encode('{"a":1}\n["x\u0001y",2]\n{"c":3}\n'));
+				controller.close();
+			},
+		});
+
+		const output = await collectAsync(readJsonl(readable));
+		expect(output).toEqual([{ a: 1 }, ["x\u0001y", 2], { c: 3 }]);
+	});
+
+	it("drains complete records that follow a repaired frame in the same chunk", async () => {
+		const readable = new ReadableStream<Uint8Array>({
+			start(controller) {
+				controller.enqueue(encoder.encode('{"e":"a\u0001b"}\n{"b":2}\n{"c":3}\n'));
+				controller.close();
+			},
+		});
+
+		const output = await collectAsync(readJsonl(readable));
+		expect(output).toEqual([{ e: "a\u0001b" }, { b: 2 }, { c: 3 }]);
+	});
 });
 
 describe("createSanitizerStream", () => {
