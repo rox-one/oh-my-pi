@@ -2046,6 +2046,14 @@ export class TurnRecovery {
 		// contents, not model health (issue #8760). Keep it on the same model; the
 		// retry budget still bounds a genuinely stuck stream.
 		const thinkingLoop = AIError.is(id, AIError.Flag.ThinkingLoop);
+		const sameModelRetriesBeforeFallback = retrySettings.retryCurrentModelBeforeFallback
+			? Math.max(0, Math.floor(retrySettings.retriesBeforeModelFallback))
+			: 0;
+		const delayConfiguredFallback =
+			!options?.hardErrorFallback &&
+			!classifierRefusal &&
+			!retryBudgetExhausted &&
+			this.#retryAttempt <= sameModelRetriesBeforeFallback;
 		if (!staleOpenAIResponsesReplayError && !switchedCredential && currentSelector) {
 			// A refusal chain stops at the retry budget: the exhausted-attempt
 			// last resort is for provider failures, not classifier decisions.
@@ -2067,8 +2075,8 @@ export class TurnRecovery {
 				allowModelFallback &&
 				retrySettings.modelFallback &&
 				!thinkingLoop &&
-				!(retryBudgetExhausted && classifierRefusal) &&
-				!(parsedRetryAfterMs !== undefined && !retryBudgetExhausted && !capacityUnavailable)
+				!delayConfiguredFallback &&
+				!(retryBudgetExhausted && classifierRefusal)
 			) {
 				if (!classifierRefusal) {
 					this.noteRetryFallbackCooldown(currentSelector, parsedRetryAfterMs, errorMessage);

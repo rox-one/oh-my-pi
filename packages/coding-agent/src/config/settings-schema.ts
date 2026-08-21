@@ -1854,6 +1854,35 @@ export const SETTINGS_SCHEMA = {
 			description: "Allow retry recovery to switch to configured fallback models",
 		},
 	},
+	"retry.retryCurrentModelBeforeFallback": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "model",
+			group: "Retry & Fallback",
+			label: "Retry Before Model Fallback",
+			description: "Retry transient failures on the current model before switching to a configured fallback model",
+		},
+	},
+	"retry.retriesBeforeModelFallback": {
+		type: "number",
+		default: 3,
+		ui: {
+			tab: "model",
+			group: "Retry & Fallback",
+			label: "Retries Before Model Fallback",
+			condition: "retryCurrentModelBeforeFallbackEnabled",
+			description:
+				"Number of same-model retries before switching to a configured fallback; limited by Retry Attempts",
+			options: [
+				{ value: "1", label: "1 retry" },
+				{ value: "2", label: "2 retries" },
+				{ value: "3", label: "3 retries" },
+				{ value: "5", label: "5 retries" },
+				{ value: "10", label: "10 retries" },
+			],
+		},
+	},
 	"retry.usageAwareFallback": {
 		type: "boolean",
 		default: false,
@@ -6419,6 +6448,8 @@ export interface RetrySettings {
 	baseDelayMs: number;
 	maxDelayMs: number;
 	modelFallback: boolean;
+	retryCurrentModelBeforeFallback: boolean;
+	retriesBeforeModelFallback: number;
 	usageAwareFallback: boolean;
 	usageReservePct: number;
 	usageReservePolicy: "confirm" | "auto" | "fail-closed";

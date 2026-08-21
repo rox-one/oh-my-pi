@@ -925,6 +925,7 @@
 - Supervised process completion notices now render as compact single-line entries.
 - The todo HUD header now displays a consolidated progress bar showing task completion across all stages.
 - `/settings` rows can now carry a risk note: a warning glyph on the row plus a warning-colored line above the description. `External Thinking` (`externalThinking`, `--external-thinking`) is the first user — providers have flagged the request shape it produces as abuse, up to account-level enforcement, so both the settings entry and `--help` now say so.
+- Retry fallback chains can now wait for a configurable number of same-model retries before switching providers or models.
 
 ### Fixed
 - Fixed OAuth scopes entered in the `/mcp add` wizard being used for that one authorization and then discarded, so `/mcp reauth` fell back to the discovered scopes the user had replaced; the wizard now records them as `oauth.scopes` ([#7841](https://github.com/can1357/oh-my-pi/issues/7841))

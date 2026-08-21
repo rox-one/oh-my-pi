@@ -139,7 +139,17 @@ const CONDITIONS: Record<string, (settings?: Settings) => boolean> = {
 			return false;
 		}
 	},
-	planModeEnabled: settings => {
+	retryCurrentModelBeforeFallbackEnabled: () => {
+		try {
+			return (
+				Settings.instance.get("retry.modelFallback") === true &&
+				Settings.instance.get("retry.retryCurrentModelBeforeFallback") === true
+			);
+		} catch {
+			return false;
+		}
+	},
+	planModeEnabled: () => {
 		try {
 			return (settings ?? Settings.instance).get("plan.enabled");
 		} catch {
