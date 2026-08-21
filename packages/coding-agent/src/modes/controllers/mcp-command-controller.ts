@@ -748,7 +748,9 @@ export class MCPCommandController {
 								{
 									callbackPort: finalConfig.oauth?.callbackPort,
 									callbackPath: finalConfig.oauth?.callbackPath,
-								scopeOverride: finalConfig.oauth?.scopes,
+									redirectUri: finalConfig.oauth?.redirectUri,
+									prompt: finalConfig.oauth?.prompt,
+									scopeOverride: finalConfig.oauth?.scopes,
 									registrationUrl: oauth.registrationUrl,
 									serverUrl: finalConfig.url,
 									resource: oauthResource,
@@ -1997,6 +1999,8 @@ export class MCPCommandController {
 				{
 					callbackPort: found.config.oauth?.callbackPort,
 					callbackPath: found.config.oauth?.callbackPath,
+					redirectUri: found.config.oauth?.redirectUri,
+					prompt: found.config.oauth?.prompt,
 					scopeOverride: runtimeBaseConfig.oauth?.scopes,
 					registrationUrl: oauth.registrationUrl,
 					serverUrl,

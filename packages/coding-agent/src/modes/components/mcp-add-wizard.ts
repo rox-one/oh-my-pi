@@ -1219,7 +1219,9 @@ export class MCPAddWizard extends OverlayPanel {
 				this.#state.oauthScopes,
 				{
 					serverUrl: this.#state.url || undefined,
-				scopeOverride: this.#oauthScopeOverride(),
+					scopeOverride: this.#oauthScopeOverride(),
+					registrationUrl: this.#state.oauthRegistrationUrl || undefined,
+					resource: oauthResource || undefined,
 					abortSignal: this.#oauthAbort.signal,
 				},
 			);
