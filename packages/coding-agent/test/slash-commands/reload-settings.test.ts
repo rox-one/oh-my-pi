@@ -44,16 +44,35 @@ describe("/reload-settings slash command", () => {
 		output: Mock<(message?: string) => void>;
 		notifyConfigChanged: Mock<() => void>;
 		refreshModels: Mock<() => Promise<void>>;
+		setAdvisorEnabled: Mock<(enabled: boolean) => void>;
+		setSteeringMode: Mock<(mode: "all" | "one-at-a-time") => void>;
 	}
 
-	async function runCommand(settings: Settings): Promise<CommandCalls> {
+	async function runCommand(
+		settings: Settings,
+		sessionOverrides: Partial<Record<string, unknown>> = {},
+	): Promise<CommandCalls> {
 		const command = lookupBuiltinSlashCommand("reload-settings");
 		expect(command).toBeDefined();
 		const output = vi.fn();
 		const notifyConfigChanged = vi.fn();
 		const refreshModels = vi.fn(async () => {});
+		const setAdvisorEnabled = vi.fn();
+		const setSteeringMode = vi.fn();
+		const session = {
+			refreshModels,
+			isAdvisorEnabled: () => true,
+			setAdvisorEnabled,
+			steeringMode: "one-at-a-time",
+			followUpMode: "one-at-a-time",
+			interruptMode: "wait",
+			setSteeringMode,
+			setFollowUpMode: vi.fn(),
+			setInterruptMode: vi.fn(),
+			...sessionOverrides,
+		};
 		const runtime = {
-			session: { refreshModels },
+			session,
 			sessionManager: undefined,
 			settings,
 			cwd: projectDir,
@@ -63,7 +82,13 @@ describe("/reload-settings slash command", () => {
 			notifyConfigChanged,
 		} as unknown as SlashCommandRuntime;
 		await command!.handle?.({ name: "reload-settings", args: "", text: "/reload-settings" }, runtime);
-		return { output, notifyConfigChanged, refreshModels };
+		return {
+			output,
+			notifyConfigChanged,
+			refreshModels: session.refreshModels as unknown as Mock<() => Promise<void>>,
+			setAdvisorEnabled,
+			setSteeringMode,
+		};
 	}
 
 	it("applies an on-disk edit and reports the changed setting", async () => {
@@ -136,5 +161,54 @@ describe("/reload-settings slash command", () => {
 		const { refreshModels, output } = await runCommand(settings);
 		expect(refreshModels).toHaveBeenCalled();
 		expect(output).toHaveBeenCalledWith(expect.stringContaining("No effective values changed"));
+	});
+
+	it("refreshes the catalog before the settings reload so role signals resolve against new models", async () => {
+		await writeSettings({ advisor: { syncBacklog: "1" } });
+		const settings = await Settings.init({ cwd: projectDir, agentDir });
+		const reloadSpy = vi.spyOn(settings, "reloadFromDisk");
+
+		const { refreshModels } = await runCommand(settings);
+		expect(refreshModels.mock.invocationCallOrder[0]).toBeLessThan(reloadSpy.mock.invocationCallOrder[0]);
+	});
+
+	it("reconciles session-owned advisor and queue-mode settings from the reloaded values", async () => {
+		await writeSettings({ advisor: { enabled: false, syncBacklog: "1" }, steeringMode: "one-at-a-time" });
+		const settings = await Settings.init({ cwd: projectDir, agentDir });
+		await writeSettings({ advisor: { enabled: true, syncBacklog: "1" }, steeringMode: "all" });
+
+		const { setAdvisorEnabled, setSteeringMode, output } = await runCommand(settings, {
+			isAdvisorEnabled: () => false,
+			steeringMode: "one-at-a-time",
+		});
+		expect(setAdvisorEnabled).toHaveBeenCalledWith(true);
+		expect(setSteeringMode).toHaveBeenCalledWith("all");
+		expect(output).toHaveBeenCalledWith(expect.stringContaining("advisor.enabled"));
+	});
+
+	it("reports a malformed models.yml instead of claiming success", async () => {
+		await writeSettings({ advisor: { syncBacklog: "1" } });
+		const settings = await Settings.init({ cwd: projectDir, agentDir });
+
+		const { refreshModels, output } = await runCommand(settings, {
+			refreshModels: vi.fn(async () => {
+				throw new Error("models.yml failed to load: boom");
+			}),
+		});
+		expect(refreshModels).toHaveBeenCalled();
+		expect(output).toHaveBeenCalledWith(expect.stringContaining("failed to load: boom"));
+	});
+
+	it("never installs layers older than a mutation that lands mid-reload", async () => {
+		await writeSettings({ advisor: { syncBacklog: "1" } });
+		const settings = await Settings.init({ cwd: projectDir, agentDir });
+
+		const reload = settings.reloadFromDisk();
+		settings.set("advisor.syncBacklog", "3");
+		await reload;
+
+		expect(settings.get("advisor.syncBacklog")).toBe("3");
+		const onDisk = YAML.parse(await Bun.file(configPath()).text());
+		expect((onDisk as { advisor: { syncBacklog: string } }).advisor.syncBacklog).toBe("3");
 	});
 });

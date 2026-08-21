@@ -761,8 +761,15 @@ export class Settings {
 
 	async #reloadPersistedLayers(): Promise<void> {
 		for (;;) {
-			await this.flush();
+			// Sample the mutation generation BEFORE draining. A mutation that
+			// lands while flush() persists — or in the window between flush and
+			// the disk reads — bumps the generation since this sample and forces
+			// another pass, so the installed layers can never be older than an
+			// in-memory write whose debounced save has not fired yet. Sampling
+			// after flush() instead hides that window: the bump is counted in the
+			// sample itself and the stale read installs unchanged.
 			const mutationGeneration = this.#persistedMutationGeneration;
+			await this.flush();
 			const previousSignaledValues = {
 				modelRoles: this.get("modelRoles"),
 				sessionAccent: this.get("statusLine.sessionAccent"),
@@ -2332,7 +2339,6 @@ export class Settings {
 
 	#queueSave(): void {
 		if (!this.#persist || !this.#configPath) return;
-		this.#persistedMutationGeneration++;
 
 		// Debounce: wait 100ms for more changes
 		clearTimeout(this.#saveTimer);

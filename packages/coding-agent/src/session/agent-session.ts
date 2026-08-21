@@ -8434,6 +8434,13 @@ export class AgentSession {
 	async refreshModels(strategy: ModelRefreshStrategy = "online-if-uncached"): Promise<void> {
 		await this.#modelRegistry.refresh(strategy);
 		await this.#modelRegistry.reapplyModelPolicies();
+		// refresh() does not reject on a malformed models.yml: the custom layer
+		// comes back empty with a configError. Surface it so callers never report
+		// success while the live custom providers were dropped.
+		const configError = this.#modelRegistry.getError();
+		if (configError) {
+			throw new Error(`models.yml failed to load: ${configError.message}`);
+		}
 	}
 
 	/** Selects the session thinking level and optionally persists it as the default. */
