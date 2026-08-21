@@ -1956,7 +1956,7 @@ export class TurnRecovery {
 		const maxRetries = this.#isBoundedThinkingStreamClose(message)
 			? Math.min(retrySettings.maxRetries, 1)
 			: retrySettings.maxRetries;
-		const retryBudgetExhausted = this.#retryAttempt > maxRetries;
+		let retryBudgetExhausted = this.#retryAttempt > maxRetries;
 
 		const errorMessage = message.errorMessage || "Unknown error";
 		const id = this.#classifyRetryMessage(message);
@@ -2031,6 +2031,10 @@ export class TurnRecovery {
 			}
 		}
 
+		if (usageLimitWaitMs === undefined && parsedRetryAfterMs !== undefined && parsedRetryAfterMs > delayMs) {
+			delayMs = parsedRetryAfterMs;
+		}
+
 		const allowModelFallback = options?.allowModelFallback !== false;
 		const currentModel = this.#host.model();
 		const currentSelector = currentModel
@@ -2055,12 +2059,21 @@ export class TurnRecovery {
 		const sameModelRetriesBeforeFallback = retrySettings.retryCurrentModelBeforeFallback
 			? Math.max(0, Math.floor(retrySettings.retriesBeforeModelFallback))
 			: 0;
+		if (
+			retryBudgetExhausted &&
+			this.#currentModelRetryAttempt < sameModelRetriesBeforeFallback &&
+			this.#activeRetryFallback &&
+			!classifierRefusal &&
+			!options?.hardErrorFallback
+		) {
+			this.#retryAttempt = 1;
+			retryBudgetExhausted = false;
+		}
 		const maxDelayMs = retrySettings.maxDelayMs;
 		const delayExceedsCap = maxDelayMs > 0 && delayMs > maxDelayMs;
 		const delayConfiguredFallback =
 			!options?.hardErrorFallback &&
 			!classifierRefusal &&
-			!retryBudgetExhausted &&
 			!delayExceedsCap &&
 			this.#currentModelRetryAttempt < sameModelRetriesBeforeFallback;
 		if (!staleOpenAIResponsesReplayError && !switchedCredential && currentSelector) {
@@ -2104,8 +2117,6 @@ export class TurnRecovery {
 			if (switchedModel) {
 				delayMs = 0;
 				this.#currentModelRetryAttempt = 0;
-			} else if (usageLimitWaitMs === undefined && parsedRetryAfterMs && parsedRetryAfterMs > delayMs) {
-				delayMs = parsedRetryAfterMs;
 			}
 		}
 
@@ -2127,9 +2138,10 @@ export class TurnRecovery {
 				this.resolveRetry(); // Resolve so waitForRetry() completes
 				return false;
 			}
-			// A fallback model gets a fresh retry budget. Credential rotation
-			// instead keeps the cumulative attempt count while bypassing the
-			// same-route budget: every distinct account must be tried first.
+			// A fallback model gets a fresh retry budget. Keep attempt 1 for the
+			// switch that is about to run so retry progress remains one-based;
+			// if that request fails, its first same-model retry is governed by
+			// the per-model counter instead of the exhausted prior route.
 			if (switchedModel) this.#retryAttempt = 1;
 		}
 		if ((classifierRefusal || accountPolicyDenial) && !switchedCredential && !switchedModel) {

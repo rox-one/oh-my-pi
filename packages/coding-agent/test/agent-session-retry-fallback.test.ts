@@ -479,7 +479,7 @@ describe("AgentSession retry fallback", () => {
 				if (model.provider === fallbackModel.provider && model.id === fallbackModel.id) {
 					mock.push({ content: ["Recovered without waiting"] });
 				} else {
-					mock.push({ throw: "rate limit exceeded retry-after-ms=60000" });
+					mock.push({ throw: "overloaded_error: retry-after-ms=60000" });
 				}
 				return mock.stream(model, context, options);
 			},
@@ -514,6 +514,80 @@ describe("AgentSession retry fallback", () => {
 		expect(getLastAssistantMessage(session).content).toContainEqual({
 			type: "text",
 			text: "Recovered without waiting",
+		});
+	});
+
+	it("gives a fallback a fresh retry budget after the primary exhausts its budget", async () => {
+		const primaryModel = getBundledModel("anthropic", "claude-sonnet-4-5");
+		const firstFallback = getBundledModel("openai", "gpt-4o-mini");
+		const secondFallback = getBundledModel("openai", "gpt-4o");
+		if (!primaryModel || !firstFallback || !secondFallback) {
+			throw new Error("Expected bundled test models to exist");
+		}
+
+		const requestedModels: string[] = [];
+		const mock = createMockModel();
+		let firstFallbackAttempts = 0;
+		const agent = new Agent({
+			getApiKey: model => `${model.provider}-test-key`,
+			initialState: {
+				model: primaryModel,
+				systemPrompt: ["Test"],
+				tools: [],
+				messages: [],
+			},
+			streamFn: (model, context, options) => {
+				requestedModels.push(`${model.provider}/${model.id}`);
+				if (model.provider === firstFallback.provider && model.id === firstFallback.id) {
+					firstFallbackAttempts++;
+					mock.push(
+						firstFallbackAttempts === 1
+							? { throw: "overloaded_error: provider returned error 503" }
+							: { content: ["Recovered on first fallback retry"] },
+					);
+				} else if (model.provider === secondFallback.provider && model.id === secondFallback.id) {
+					mock.push({ content: ["Unexpected second fallback"] });
+				} else {
+					mock.push({ throw: "overloaded_error: provider returned error 503" });
+				}
+				return mock.stream(model, context, options);
+			},
+		});
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"retry.baseDelayMs": 1,
+			"retry.maxRetries": 1,
+			"retry.retryCurrentModelBeforeFallback": true,
+			"retry.retriesBeforeModelFallback": 1,
+			"retry.fallbackChains": {
+				default: [
+					`${firstFallback.provider}/${firstFallback.id}`,
+					`${secondFallback.provider}/${secondFallback.id}`,
+				],
+			},
+		});
+		settings.setModelRole("default", `${primaryModel.provider}/${primaryModel.id}`);
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings,
+			modelRegistry,
+		});
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+
+		await session.prompt("Retry the fallback after budget reset");
+		await session.waitForIdle();
+
+		expect(requestedModels).toEqual([
+			`${primaryModel.provider}/${primaryModel.id}`,
+			`${primaryModel.provider}/${primaryModel.id}`,
+			`${firstFallback.provider}/${firstFallback.id}`,
+			`${firstFallback.provider}/${firstFallback.id}`,
+		]);
+		expect(session.model?.id).toBe(firstFallback.id);
+		expect(getLastAssistantMessage(session).content).toContainEqual({
+			type: "text",
+			text: "Recovered on first fallback retry",
 		});
 	});
 
