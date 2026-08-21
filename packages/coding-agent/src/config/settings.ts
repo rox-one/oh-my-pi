@@ -2332,6 +2332,7 @@ export class Settings {
 
 	#queueSave(): void {
 		if (!this.#persist || !this.#configPath) return;
+		this.#persistedMutationGeneration++;
 
 		// Debounce: wait 100ms for more changes
 		clearTimeout(this.#saveTimer);

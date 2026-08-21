@@ -79,7 +79,7 @@ import { type Effort, streamSimple } from "@oh-my-pi/pi-ai";
 import * as AIError from "@oh-my-pi/pi-ai/error";
 import { resetOpenAICodexHistoryAfterCompaction } from "@oh-my-pi/pi-ai/providers/openai-codex-responses";
 import { toolWireSchema } from "@oh-my-pi/pi-ai/utils/schema";
-import { preferredDialect } from "@oh-my-pi/pi-catalog/identity";
+import type { ModelRefreshStrategy } from "@oh-my-pi/pi-catalog/model-manager";
 import { modelsAreEqual } from "@oh-my-pi/pi-catalog/models";
 import { MacOSPowerAssertion } from "@oh-my-pi/pi-natives";
 import {
@@ -8423,6 +8423,17 @@ export class AgentSession {
 	/** Lists available models after applying the configured enabled-model filter. */
 	getAvailableModels(): Model[] {
 		return this.#models.getAvailableModels();
+	}
+
+	/**
+	 * Rebuild the model catalog from disk after a live config reload: re-parses
+	 * models.yml (custom providers/models) and re-runs provider discovery, then
+	 * re-applies settings-driven policies. Models added mid-session become
+	 * visible to /models and /switch without a restart.
+	 */
+	async refreshModels(strategy: ModelRefreshStrategy = "online-if-uncached"): Promise<void> {
+		await this.#modelRegistry.refresh(strategy);
+		await this.#modelRegistry.reapplyModelPolicies();
 	}
 
 	/** Selects the session thinking level and optionally persists it as the default. */

@@ -909,6 +909,8 @@
 - Added `isProjectTrusted()` compatibility shim to `ExtensionContext` for extensions targeting upstream per-directory trust gates.
 - Added an `oauth.scopes` field to per-server MCP configuration that takes precedence over the scopes discovered from authorization-server or protected-resource metadata (and over a `scope` embedded in the provider's authorization URL), so an MCP server behind a general-purpose corporate IdP can request its own resource-bound scope instead of the tenant-wide `scopes_supported` list the resource rejects; `""` sends no `scope` parameter at all ([#7841](https://github.com/can1357/oh-my-pi/issues/7841))
 - Codex `[mcp_servers.<name>] scopes` and OpenCode `mcp.<name>.oauth.scope` now import into `oauth.scopes` instead of being dropped ([#7841](https://github.com/can1357/oh-my-pi/issues/7841))
+- Added `/reload-settings` slash command (`/reload-config`): re-reads the global, project, and overlay config layers from disk and applies them to the live session without a restart, reporting which effective settings changed.
+- `/reload-settings` also reloads `models.yml` (custom providers/models) and refreshes the model catalog live, so models added mid-session appear in `/models` and `/switch` without a restart.
 
 ### Changed
 
