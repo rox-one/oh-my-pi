@@ -56,7 +56,7 @@ import {
 	isHelloMessage,
 	shrinkAttachSnapshot,
 } from "./protocol";
-import { type AttachRegistry, attachKeyString, parseAttachKeyString } from "./registry";
+import { type AttachClaimPromptResult, type AttachRegistry, attachKeyString, parseAttachKeyString } from "./registry";
 
 /** Default basename of the attach socket inside the runtime dir. */
 export const ATTACH_SOCKET_FILE = "attach.sock";
@@ -793,7 +793,7 @@ export class AttachServer {
 		// Claim (or join) the worker's active prompt slot by command identity:
 		// the same cmdId while the original run is still in flight JOINS the
 		// shared outcome; a different command stays busy.
-		let claim: ReturnType<AttachRegistry["claimPrompt"]>;
+		let claim: AttachClaimPromptResult;
 		try {
 			claim = this.#registry.claimPrompt(key, prompt.cmdId, prompt.text, prompt.timeoutMs);
 		} catch (error) {

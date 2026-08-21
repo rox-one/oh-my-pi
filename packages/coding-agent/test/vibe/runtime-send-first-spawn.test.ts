@@ -1,8 +1,11 @@
-import { afterEach, describe, expect, it, mock } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import * as os from "node:os";
 import { AsyncJobManager } from "../../src/async/job-manager";
 import { Settings } from "../../src/config/settings";
+import { AgentRegistry } from "../../src/registry/agent-registry";
 import type { ExecutorOptions, FollowUpTurnOptions } from "../../src/task/executor";
+import type { SingleResult } from "../../src/task/types";
+import { VibeSessionRegistry } from "../../src/vibe/runtime";
 
 const WORKER_ID = "w1";
 const OWNER = "test-owner";
@@ -35,7 +38,7 @@ function holdNextSpawn(): void {
 }
 
 /** Minimal settled spawn/follow-up result the settle path can render. */
-function okResult() {
+function okResult(): SingleResult {
 	return {
 		index: 0,
 		id: WORKER_ID,
@@ -52,24 +55,19 @@ function okResult() {
 	};
 }
 
-// Intercept the executor module BEFORE the runtime module loads it, so the
-// runtime's `runSubprocess` / `runSubagentFollowUpTurn` imports resolve to
-// these spies. File-scoped by default in Bun — the real executor stays
-// untouched for sibling test files.
-mock.module("../../src/task/executor", () => ({
-	runSubprocess: async (options: ExecutorOptions) => {
-		spawned.push(options);
-		await spawnGate;
-		return okResult();
-	},
-	runSubagentFollowUpTurn: async (options: FollowUpTurnOptions) => {
-		followedUp.push(options);
-		return okResult();
-	},
-}));
-
-const { VibeSessionRegistry } = await import("../../src/vibe/runtime");
-const { AgentRegistry } = await import("../../src/registry/agent-registry");
+function installExecutorFakes(): void {
+	VibeSessionRegistry.global().setExecutorForTests({
+		runSubprocess: async (options: ExecutorOptions) => {
+			spawned.push(options);
+			await spawnGate;
+			return okResult();
+		},
+		runSubagentFollowUpTurn: async (options: FollowUpTurnOptions) => {
+			followedUp.push(options);
+			return okResult();
+		},
+	});
+}
 
 /** Minimal parent session the runtime's scope + spawn plumbing reads. */
 type FakeSession = Parameters<typeof VibeSessionRegistry.prototype.send>[0];
@@ -86,6 +84,10 @@ function fakeSession(): FakeSession {
 }
 
 describe("vibe send() first-spawn recovery for an idle record with a missing ref", () => {
+	beforeEach(() => {
+		installExecutorFakes();
+	});
+
 	afterEach(() => {
 		AgentRegistry.resetGlobalForTests();
 		VibeSessionRegistry.resetGlobalForTests();

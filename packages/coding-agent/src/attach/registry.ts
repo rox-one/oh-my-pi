@@ -40,6 +40,12 @@ export interface AttachPromptOutcome {
 /** Legacy name for {@link AttachPromptOutcome} (director follow-up path). */
 export type AttachFollowUpResult = AttachPromptOutcome;
 
+/** Result of claiming the serialized prompt slot for a worker (pane path). */
+export type AttachClaimPromptResult =
+	| { status: "busy" }
+	| { status: "joined"; outcome: Promise<AttachPromptOutcome> }
+	| { status: "started"; outcome: Promise<AttachPromptOutcome> };
+
 /**
  * Runs one prompt for a worker. Implementations MUST serialize per worker
  * (the registry already rejects concurrent prompts with `busy`); the harness
@@ -515,15 +521,7 @@ export class AttachRegistry {
 	 * active slot is released, so a replay landing in the settle window reads
 	 * the cache and never re-executes.
 	 */
-	claimPrompt(
-		key: AttachWorkerKey,
-		cmdId: string,
-		text: string,
-		timeoutMs?: number,
-	):
-		| { status: "busy" }
-		| { status: "joined"; outcome: Promise<AttachPromptOutcome> }
-		| { status: "started"; outcome: Promise<AttachPromptOutcome> } {
+	claimPrompt(key: AttachWorkerKey, cmdId: string, text: string, timeoutMs?: number): AttachClaimPromptResult {
 		const keyString = attachKeyString(key);
 		const entry = this.#entries.get(keyString);
 		if (!entry) {

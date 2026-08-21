@@ -216,7 +216,7 @@ export function resolveAttachBin(attachBin, execPath = process.execPath, argvEnt
     execPath.length > 0 &&
     RUNTIME_EXEC_NAMES[path.basename(execPath.replaceAll(path.win32.sep, path.posix.sep))] !== true
   ) {
-    return execPath;
+    return quoteShellArg(execPath);
   }
   return DEFAULT_ATTACH_BIN;
 }

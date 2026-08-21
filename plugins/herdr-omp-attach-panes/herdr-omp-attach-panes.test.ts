@@ -804,10 +804,15 @@ describe("resolveAttachBin", () => {
   });
 
   test("omitted, empty, null, or non-string bin resolves to the compiled executable (injectable execPath)", () => {
-    expect(resolveAttachBin(undefined, "/fork/dist/omp", null)).toBe("/fork/dist/omp");
-    expect(resolveAttachBin("", "/fork/dist/omp", null)).toBe("/fork/dist/omp");
-    expect(resolveAttachBin(null, "/fork/dist/omp", null)).toBe("/fork/dist/omp");
-    expect(resolveAttachBin(42, "/fork/dist/omp", null)).toBe("/fork/dist/omp");
+    expect(resolveAttachBin(undefined, "/fork/dist/omp", null)).toBe("'/fork/dist/omp'");
+    expect(resolveAttachBin("", "/fork/dist/omp", null)).toBe("'/fork/dist/omp'");
+    expect(resolveAttachBin(null, "/fork/dist/omp", null)).toBe("'/fork/dist/omp'");
+    expect(resolveAttachBin(42, "/fork/dist/omp", null)).toBe("'/fork/dist/omp'");
+  });
+
+  test("compiled executable with spaces or single quotes is shell-quoted", () => {
+    expect(resolveAttachBin(undefined, "/my omp/bin/omp", null)).toBe("'/my omp/bin/omp'");
+    expect(resolveAttachBin(undefined, "/path/with'quote/omp", null)).toBe("'/path/with'\\''quote/omp'");
   });
 
   test("a bare Bun/Node runtime with no CLI entry cannot route attach: DEFAULT_ATTACH_BIN applies", () => {

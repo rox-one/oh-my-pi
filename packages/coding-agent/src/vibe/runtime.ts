@@ -535,12 +535,29 @@ export class VibeSessionRegistry {
 	readonly #terminationTails = new Map<string, Promise<void>>();
 	readonly #terminatedScopes = new Set<string>();
 	#teardownGraceMs = VIBE_TEARDOWN_GRACE_MS;
+	#runSubprocess: typeof runSubprocess = runSubprocess;
+	#runSubagentFollowUpTurn: typeof runSubagentFollowUpTurn = runSubagentFollowUpTurn;
 	/** Per-scope attach substrate (registry + 0600 socket server), keyed by scopeKey(scope, ""). */
 	readonly #attachBridges = new Map<string, { bridge: AttachVibeBridge; session: ToolSession | null }>();
 
 	/** Override the teardown grace period for deterministic lifecycle tests. */
 	setTeardownGraceForTesting(timeoutMs: number): void {
 		this.#teardownGraceMs = Math.max(1, timeoutMs);
+	}
+
+	/** Test-only seam: override the executor used for vibe turns on this registry instance. */
+	setExecutorForTests(overrides: {
+		runSubprocess?: typeof runSubprocess;
+		runSubagentFollowUpTurn?: typeof runSubagentFollowUpTurn;
+	}): void {
+		if (overrides.runSubprocess) this.#runSubprocess = overrides.runSubprocess;
+		if (overrides.runSubagentFollowUpTurn) this.#runSubagentFollowUpTurn = overrides.runSubagentFollowUpTurn;
+	}
+
+	/** Reset executor overrides to the real implementations. */
+	resetExecutorForTests(): void {
+		this.#runSubprocess = runSubprocess;
+		this.#runSubagentFollowUpTurn = runSubagentFollowUpTurn;
 	}
 
 	ownerScope(session: VibeParentSession): VibeOwnerScope {
@@ -575,6 +592,12 @@ export class VibeSessionRegistry {
 		const existing = this.#attachBridges.get(key);
 		if (existing) {
 			existing.session = session;
+			for (const record of this.#records.values()) {
+				if (!matchesScope(record, scope) || record.state === "dead") continue;
+				const workerKey = attachKeyOfRecord(record);
+				if (existing.bridge.registry.has(workerKey)) continue;
+				existing.bridge.register(workerKey, record.lastActivity ?? null, true);
+			}
 			return existing;
 		}
 		const baseDir = scope.parentSessionFile
@@ -1824,8 +1847,10 @@ export class VibeSessionRegistry {
 						throw new ToolError(`Vibe session "${record.id}" changed parent scope before its turn started.`);
 					}
 					const result = options.first
-						? await runSubprocess(await this.#buildSpawnOptions(session, record, message, signal, onProgress))
-						: await runSubagentFollowUpTurn({
+						? await this.#runSubprocess(
+								await this.#buildSpawnOptions(session, record, message, signal, onProgress),
+							)
+						: await this.#runSubagentFollowUpTurn({
 								id: record.id,
 								agent: record.agent,
 								message,
