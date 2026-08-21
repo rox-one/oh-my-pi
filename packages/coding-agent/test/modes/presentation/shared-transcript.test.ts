@@ -10,6 +10,7 @@
  * - expansion, reset, and disposal behave like the builder's.
  */
 import { beforeAll, expect, test } from "bun:test";
+import { homedir } from "node:os";
 import type { AgentMessage, AgentTool } from "@oh-my-pi/pi-agent-core";
 import { resetSettingsForTest, Settings, settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
@@ -183,12 +184,13 @@ test("dispose is idempotent and clears state", () => {
 });
 
 test("sanitizeErrorLine collapses newlines, shortens paths, truncates", () => {
-	const long = `first\nsecond /Users/harriscarter/Projects/omp-herdr-worker-panes/packages/coding-agent/src/attach/server.ts boom ${"x".repeat(500)}`;
+	const home = homedir();
+	const long = `first\nsecond ${home}/Projects/omp-herdr-worker-panes/packages/coding-agent/src/attach/server.ts boom ${"x".repeat(500)}`;
 	const line = sanitizeErrorLine(long, 120);
 	expect(line).not.toContain("\n");
 	expect(line.length).toBeLessThanOrEqual(120);
 	expect(line).toContain("…");
-	expect(line).not.toContain("/Users/harriscarter/Projects/omp-herdr-worker-panes");
+	expect(line).not.toContain(`${home}/Projects/omp-herdr-worker-panes`);
 });
 
 test("tool-call bearing messages render through the builder without a live tool registry", () => {
