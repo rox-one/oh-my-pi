@@ -305,10 +305,11 @@ describe("AgentSession retry fallback", () => {
 		]);
 	});
 
-	it("retries the current model before applying a configured fallback when enabled", async () => {
+	it("retries every model before advancing through a configured fallback chain", async () => {
 		const primaryModel = getBundledModel("anthropic", "claude-sonnet-4-5");
-		const fallbackModel = getBundledModel("openai", "gpt-4o-mini");
-		if (!primaryModel || !fallbackModel) {
+		const firstFallback = getBundledModel("openai", "gpt-4o-mini");
+		const secondFallback = getBundledModel("openai", "gpt-4o");
+		if (!primaryModel || !firstFallback || !secondFallback) {
 			throw new Error("Expected bundled test models to exist");
 		}
 
@@ -325,8 +326,8 @@ describe("AgentSession retry fallback", () => {
 			},
 			streamFn: (model, context, options) => {
 				requestedModels.push(`${model.provider}/${model.id}`);
-				if (model.provider === fallbackModel.provider && model.id === fallbackModel.id) {
-					mock.push({ content: ["Recovered on fallback"] });
+				if (model.provider === secondFallback.provider && model.id === secondFallback.id) {
+					mock.push({ content: ["Recovered on second fallback"] });
 				} else {
 					mock.push({ throw: "overloaded_error: provider returned error 503" });
 				}
@@ -336,11 +337,14 @@ describe("AgentSession retry fallback", () => {
 		const settings = Settings.isolated({
 			"compaction.enabled": false,
 			"retry.baseDelayMs": 1,
-			"retry.maxRetries": 3,
+			"retry.maxRetries": 6,
 			"retry.retryCurrentModelBeforeFallback": true,
 			"retry.retriesBeforeModelFallback": 2,
 			"retry.fallbackChains": {
-				default: [`${fallbackModel.provider}/${fallbackModel.id}`],
+				default: [
+					`${firstFallback.provider}/${firstFallback.id}`,
+					`${secondFallback.provider}/${secondFallback.id}`,
+				],
 			},
 		});
 		settings.setModelRole("default", `${primaryModel.provider}/${primaryModel.id}`);
@@ -355,26 +359,95 @@ describe("AgentSession retry fallback", () => {
 		});
 		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
 
-		await session.prompt("Retry before fallback");
+		await session.prompt("Retry each model before fallback");
 		await session.waitForIdle();
 
 		expect(requestedModels).toEqual([
 			`${primaryModel.provider}/${primaryModel.id}`,
 			`${primaryModel.provider}/${primaryModel.id}`,
 			`${primaryModel.provider}/${primaryModel.id}`,
-			`${fallbackModel.provider}/${fallbackModel.id}`,
+			`${firstFallback.provider}/${firstFallback.id}`,
+			`${firstFallback.provider}/${firstFallback.id}`,
+			`${firstFallback.provider}/${firstFallback.id}`,
+			`${secondFallback.provider}/${secondFallback.id}`,
 		]);
 		expect(fallbackAppliedEvents).toEqual([
 			{
 				type: "retry_fallback_applied",
 				from: `${primaryModel.provider}/${primaryModel.id}`,
-				to: `${fallbackModel.provider}/${fallbackModel.id}`,
+				to: `${firstFallback.provider}/${firstFallback.id}`,
+				role: "default",
+			},
+			{
+				type: "retry_fallback_applied",
+				from: `${firstFallback.provider}/${firstFallback.id}`,
+				to: `${secondFallback.provider}/${secondFallback.id}`,
 				role: "default",
 			},
 		]);
 		expect(getLastAssistantMessage(session).content).toContainEqual({
 			type: "text",
-			text: "Recovered on fallback",
+			text: "Recovered on second fallback",
+		});
+	});
+
+	it("falls back immediately when the retry delay exceeds the configured cap", async () => {
+		const primaryModel = getBundledModel("anthropic", "claude-sonnet-4-5");
+		const fallbackModel = getBundledModel("openai", "gpt-4o-mini");
+		if (!primaryModel || !fallbackModel) {
+			throw new Error("Expected bundled test models to exist");
+		}
+
+		const requestedModels: string[] = [];
+		const mock = createMockModel();
+		const agent = new Agent({
+			getApiKey: model => `${model.provider}-test-key`,
+			initialState: {
+				model: primaryModel,
+				systemPrompt: ["Test"],
+				tools: [],
+				messages: [],
+			},
+			streamFn: (model, context, options) => {
+				requestedModels.push(`${model.provider}/${model.id}`);
+				if (model.provider === fallbackModel.provider && model.id === fallbackModel.id) {
+					mock.push({ content: ["Recovered without waiting"] });
+				} else {
+					mock.push({ throw: "rate limit exceeded retry-after-ms=60000" });
+				}
+				return mock.stream(model, context, options);
+			},
+		});
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"retry.maxDelayMs": 100,
+			"retry.maxRetries": 3,
+			"retry.retryCurrentModelBeforeFallback": true,
+			"retry.retriesBeforeModelFallback": 2,
+			"retry.fallbackChains": {
+				default: [`${fallbackModel.provider}/${fallbackModel.id}`],
+			},
+		});
+		settings.setModelRole("default", `${primaryModel.provider}/${primaryModel.id}`);
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings,
+			modelRegistry,
+		});
+		const waitSpy = vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+
+		await session.prompt("Fallback rather than exceed the wait cap");
+		await session.waitForIdle();
+
+		expect(requestedModels).toEqual([
+			`${primaryModel.provider}/${primaryModel.id}`,
+			`${fallbackModel.provider}/${fallbackModel.id}`,
+		]);
+		expect(waitSpy).toHaveBeenCalledWith(0, { signal: expect.any(AbortSignal) });
+		expect(getLastAssistantMessage(session).content).toContainEqual({
+			type: "text",
+			text: "Recovered without waiting",
 		});
 	});
 

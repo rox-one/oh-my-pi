@@ -197,6 +197,7 @@ export class TurnRecovery {
 	readonly #host: TurnRecoveryHost;
 	#retryAbortController: AbortController | undefined;
 	#retryAttempt = 0;
+	#currentModelRetryAttempt = 0;
 	#retryPromise: Promise<void> | undefined;
 	#retryResolve: (() => void) | undefined;
 	#activeRetryFallback: ActiveRetryFallbackState | undefined;
@@ -2049,11 +2050,14 @@ export class TurnRecovery {
 		const sameModelRetriesBeforeFallback = retrySettings.retryCurrentModelBeforeFallback
 			? Math.max(0, Math.floor(retrySettings.retriesBeforeModelFallback))
 			: 0;
+		const maxDelayMs = retrySettings.maxDelayMs;
+		const delayExceedsCap = maxDelayMs > 0 && delayMs > maxDelayMs;
 		const delayConfiguredFallback =
 			!options?.hardErrorFallback &&
 			!classifierRefusal &&
 			!retryBudgetExhausted &&
-			this.#retryAttempt <= sameModelRetriesBeforeFallback;
+			!delayExceedsCap &&
+			this.#currentModelRetryAttempt < sameModelRetriesBeforeFallback;
 		if (!staleOpenAIResponsesReplayError && !switchedCredential && currentSelector) {
 			// A refusal chain stops at the retry budget: the exhausted-attempt
 			// last resort is for provider failures, not classifier decisions.
@@ -2094,6 +2098,7 @@ export class TurnRecovery {
 			}
 			if (switchedModel) {
 				delayMs = 0;
+				this.#currentModelRetryAttempt = 0;
 			} else if (usageLimitWaitMs === undefined && parsedRetryAfterMs && parsedRetryAfterMs > delayMs) {
 				delayMs = parsedRetryAfterMs;
 			}
@@ -2177,7 +2182,6 @@ export class TurnRecovery {
 		// subagent (or interactive session) silently hung. The original
 		// assistant error message is preserved in agent state so the caller
 		// can act on it.
-		const maxDelayMs = retrySettings.maxDelayMs;
 		if (maxDelayMs > 0 && delayMs > maxDelayMs && !switchedCredential && !switchedModel) {
 			await this.persistTerminalEmptyErrorTurn(message);
 			const attempt = this.#retryAttempt;
@@ -2191,6 +2195,9 @@ export class TurnRecovery {
 			this.#clearPendingRetryErrors();
 			this.resolveRetry();
 			return false;
+		}
+		if (!switchedCredential && !switchedModel) {
+			this.#currentModelRetryAttempt++;
 		}
 
 		await this.#recordPendingRetryError(message, id, { switchedCredential, switchedModel, delayMs });
