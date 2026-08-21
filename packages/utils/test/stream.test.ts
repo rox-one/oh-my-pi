@@ -144,6 +144,67 @@ describe("readJsonl", () => {
 		const output = await collectAsync(readJsonl(readable));
 		expect(output).toEqual([{ z: 9 }]);
 	});
+
+	it("repairs a record with raw control chars instead of aborting", async () => {
+		const readable = new ReadableStream<Uint8Array>({
+			start(controller) {
+				controller.enqueue(encoder.encode('{"a":1}\n{"e":"a\u0001b"}\n{"c":3}\n'));
+				controller.close();
+			},
+		});
+
+		const output = await collectAsync(readJsonl(readable));
+		expect(output).toEqual([{ a: 1 }, { e: "a\u0001b" }, { c: 3 }]);
+	});
+
+	it("skips a malformed line and keeps parsing the rest", async () => {
+		const readable = new ReadableStream<Uint8Array>({
+			start(controller) {
+				controller.enqueue(encoder.encode('{"a":1}\n{bad json}\n{"c":3}\n'));
+				controller.close();
+			},
+		});
+
+		const output = await collectAsync(readJsonl(readable));
+		expect(output).toEqual([{ a: 1 }, { c: 3 }]);
+	});
+
+	it("recovers when the malformed line is split across chunk boundaries", async () => {
+		const readable = new ReadableStream<Uint8Array>({
+			start(controller) {
+				controller.enqueue(encoder.encode('{"a":1}\n{"e":"x\u0001'));
+				controller.enqueue(encoder.encode('y"}\n{"c":3}\n'));
+				controller.close();
+			},
+		});
+
+		const output = await collectAsync(readJsonl(readable));
+		expect(output).toEqual([{ a: 1 }, { e: "x\u0001y" }, { c: 3 }]);
+	});
+
+	it("drops a truncated final frame instead of throwing at EOF", async () => {
+		const readable = new ReadableStream<Uint8Array>({
+			start(controller) {
+				controller.enqueue(encoder.encode('{"a":1}\n{"b":'));
+				controller.close();
+			},
+		});
+
+		const output = await collectAsync(readJsonl(readable));
+		expect(output).toEqual([{ a: 1 }]);
+	});
+
+	it("drops a malformed final frame without trailing newline", async () => {
+		const readable = new ReadableStream<Uint8Array>({
+			start(controller) {
+				controller.enqueue(encoder.encode('{"a":1}\n{bad'));
+				controller.close();
+			},
+		});
+
+		const output = await collectAsync(readJsonl(readable));
+		expect(output).toEqual([{ a: 1 }]);
+	});
 });
 
 describe("createSanitizerStream", () => {

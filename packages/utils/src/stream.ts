@@ -1,9 +1,37 @@
 const trailingEvents = new WeakSet<ServerSentEvent>();
 
 import { abortableSource } from "./abortable";
-import { parseStreamingJson } from "./json-parse";
+import { parseStreamingJson, repairJson } from "./json-parse";
 
 const LF = 0x0a;
+type JsonlChunkResult = {
+	values: unknown[];
+	error: unknown;
+	read: number;
+	done: boolean;
+};
+
+/**
+ * Locate the end of the malformed JSONL record that starts at `from` — the
+ * next line feed, or `length` when the record runs to the end of the buffer.
+ */
+function nextLineEnd(buffer: Uint8Array, from: number): number {
+	const nl = buffer.indexOf(LF, from);
+	return nl === -1 ? buffer.length : nl;
+}
+
+function parseJsonlChunkCompat(input: Uint8Array, beg?: number, end?: number): JsonlChunkResult;
+function parseJsonlChunkCompat(input: string): JsonlChunkResult;
+function parseJsonlChunkCompat(input: Uint8Array | string, beg?: number, end?: number): JsonlChunkResult {
+	if (typeof input === "string") {
+		const { values, error, read, done } = Bun.JSONL.parseChunk(input);
+		return { values, error, read, done };
+	}
+	const start = beg ?? 0;
+	const stop = end ?? input.length;
+	const { values, error, read, done } = Bun.JSONL.parseChunk(input, start, stop);
+	return { values, error, read, done };
+}
 
 export async function* readLines(stream: ReadableStream<Uint8Array>, signal?: AbortSignal): AsyncGenerator<Uint8Array> {
 	const buffer = new ConcatSink();
@@ -43,9 +71,13 @@ export async function* readJsonl<T>(stream: ReadableStream<Uint8Array>, signal?:
 				if (values.length > 0) {
 					yield* values as T[];
 				}
-				if (error) throw error;
-				if (!done) {
-					throw new Error("JSONL stream ended unexpectedly");
+				if (error) {
+					yield* buffer.recoverMalformed<T>(tail, 0, tail.length);
+				} else if (!done) {
+					// A partial record at EOF: attempt the same repair pass; if the
+					// frame still does not parse, drop it rather than abort the
+					// stream over a truncated final frame.
+					yield* buffer.recoverMalformed<T>(tail, 0, tail.length);
 				}
 			}
 		}
@@ -167,7 +199,10 @@ class ConcatSink {
 			if (values.length > 0) {
 				yield* values as T[];
 			}
-			if (error) throw error;
+			if (error) {
+				yield* this.recoverMalformed<T>(chunk, read, end);
+				return;
+			}
 			if (done) return;
 			this.reset(chunk.subarray(read, end));
 			return;
@@ -184,7 +219,11 @@ class ConcatSink {
 		if (values.length > 0) {
 			yield* values as T[];
 		}
-		if (error) throw error;
+		if (error) {
+			this.#length = 0;
+			yield* this.recoverMalformed<T>(space.subarray(0, total), read, total);
+			return;
+		}
 		if (done) {
 			this.#length = 0;
 			return;
@@ -194,6 +233,51 @@ class ConcatSink {
 			space.copyWithin(0, read, total);
 		}
 		this.#length = rem;
+	}
+
+	/**
+	 * Salvage a JSONL chunk whose parse reported a malformed record. The line
+	 * containing the first parse error is repaired (raw control characters
+	 * inside strings escaped) and re-parsed; if it still does not parse it is
+	 * skipped, and scanning resumes at the following line — a malformed frame
+	 * no longer aborts the whole provider stream.
+	 */
+	*recoverMalformed<T>(buffer: Uint8Array, beg: number, end: number) {
+		let from = beg;
+		while (from < end) {
+			const lineEnd = nextLineEnd(buffer, from);
+			const segment = buffer.subarray(from, lineEnd);
+			if (segment.length > 0) {
+				let parsed: unknown | undefined;
+				try {
+					parsed = JSON.parse(repairJson(new TextDecoder().decode(segment)));
+				} catch {
+					parsed = undefined;
+				}
+				if (parsed !== undefined) {
+					if (Array.isArray(parsed)) {
+						if (parsed.length > 0) yield* parsed as T[];
+					} else {
+						yield parsed as T;
+					}
+					this.#length = 0;
+					if (lineEnd < end) {
+						this.reset(buffer.subarray(lineEnd + 1, end));
+					}
+					return;
+				}
+				if (lineEnd === end) {
+					// No line terminator after the unparseable record: it is an
+					// incomplete frame, not a malformed one — hold it so the next
+					// chunk can complete it.
+					this.#length = 0;
+					this.reset(buffer.subarray(from, end));
+					return;
+				}
+			}
+			from = lineEnd + 1;
+		}
+		this.#length = 0;
 	}
 }
 
