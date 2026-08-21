@@ -391,6 +391,72 @@ describe("AgentSession retry fallback", () => {
 		});
 	});
 
+	it("resets same-model retry allowance after a recovered turn", async () => {
+		const primaryModel = getBundledModel("anthropic", "claude-sonnet-4-5");
+		const fallbackModel = getBundledModel("openai", "gpt-4o-mini");
+		if (!primaryModel || !fallbackModel) {
+			throw new Error("Expected bundled test models to exist");
+		}
+
+		const requestedModels: string[] = [];
+		const mock = createMockModel();
+		let primaryAttempts = 0;
+		const agent = new Agent({
+			getApiKey: model => `${model.provider}-test-key`,
+			initialState: {
+				model: primaryModel,
+				systemPrompt: ["Test"],
+				tools: [],
+				messages: [],
+			},
+			streamFn: (model, context, options) => {
+				requestedModels.push(`${model.provider}/${model.id}`);
+				primaryAttempts++;
+				mock.push(
+					primaryAttempts === 1 || primaryAttempts === 3
+						? { throw: "overloaded_error: provider returned error 503" }
+						: { content: [`Recovered primary attempt ${primaryAttempts}`] },
+				);
+				return mock.stream(model, context, options);
+			},
+		});
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"retry.baseDelayMs": 1,
+			"retry.maxRetries": 3,
+			"retry.retryCurrentModelBeforeFallback": true,
+			"retry.retriesBeforeModelFallback": 1,
+			"retry.fallbackChains": {
+				default: [`${fallbackModel.provider}/${fallbackModel.id}`],
+			},
+		});
+		settings.setModelRole("default", `${primaryModel.provider}/${primaryModel.id}`);
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings,
+			modelRegistry,
+		});
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+
+		await session.prompt("Recover once");
+		await session.waitForIdle();
+		await session.prompt("Recover independently");
+		await session.waitForIdle();
+
+		expect(requestedModels).toEqual([
+			`${primaryModel.provider}/${primaryModel.id}`,
+			`${primaryModel.provider}/${primaryModel.id}`,
+			`${primaryModel.provider}/${primaryModel.id}`,
+			`${primaryModel.provider}/${primaryModel.id}`,
+		]);
+		expect(session.model?.id).toBe(primaryModel.id);
+		expect(getLastAssistantMessage(session).content).toContainEqual({
+			type: "text",
+			text: "Recovered primary attempt 4",
+		});
+	});
+
 	it("falls back immediately when the retry delay exceeds the configured cap", async () => {
 		const primaryModel = getBundledModel("anthropic", "claude-sonnet-4-5");
 		const fallbackModel = getBundledModel("openai", "gpt-4o-mini");
