@@ -436,7 +436,7 @@ export class MCPOAuthFlow extends OAuthCallbackFlow {
 		if (this.#resolvedClientId && !existingClientId) {
 			params.set("client_id", this.#resolvedClientId);
 		}
-	if (this.config.scopeOverride !== undefined) {
+		if (this.config.scopeOverride !== undefined) {
 			// An explicit override outranks a scope the provider embedded in its
 			// authorization URL: that embedded value is what the IdP advertises,
 			// not what the resource accepts.
