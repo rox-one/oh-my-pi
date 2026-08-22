@@ -2,13 +2,15 @@
 
 use std::{
 	borrow::Cow,
+	collections::HashMap,
 	fmt,
 	path::{Path, PathBuf},
-	sync::LazyLock,
+	sync::{Arc, LazyLock},
 	time::{Duration, Instant},
 };
 
 use dashmap::DashMap;
+use parking_lot::{Condvar, Mutex};
 use rayon::{ThreadPool, prelude::*};
 
 use crate::{CollectedEntries, CollectedEntry, FileType, WalkError, WalkOptions};
@@ -48,6 +50,88 @@ static WALK_POOL: LazyLock<Option<ThreadPool>> = LazyLock::new(|| {
 		.ok()
 });
 static SCAN_CACHE: LazyLock<DashMap<CacheKey, CacheEntry>> = LazyLock::new(DashMap::new);
+
+/// Per-root count of underlying walks; single-flight regression tests only.
+#[cfg(test)]
+static TEST_WALK_COUNTS: LazyLock<Mutex<HashMap<PathBuf, usize>>> =
+	LazyLock::new(|| Mutex::new(HashMap::new()));
+
+#[cfg(test)]
+fn record_test_walk(root: &Path) {
+	*TEST_WALK_COUNTS.lock().entry(root.to_path_buf()).or_default() += 1;
+}
+
+#[cfg(not(test))]
+const fn record_test_walk(_root: &Path) {}
+
+
+
+/// In-flight directory scans keyed like [`SCAN_CACHE`]; at most one walk runs
+/// per key at any time.
+static IN_FLIGHT_SCANS: LazyLock<Mutex<HashMap<CacheKey, Arc<ScanFlight>>>> =
+	LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Shared state of one in-flight directory scan.
+struct ScanFlight {
+	done:   Condvar,
+	/// `None` while the leader is walking, then the shared scan result.
+	result: Mutex<Option<Result<CollectedEntries, WalkError<String>>>>,
+}
+
+impl ScanFlight {
+	const fn new() -> Self {
+		Self { done: Condvar::new(), result: Mutex::new(None) }
+	}
+
+	/// Publish the scan result and wake every follower.
+	fn finish(&self, result: Result<CollectedEntries, WalkError<String>>) {
+		*self.result.lock() = Some(result);
+		self.done.notify_all();
+	}
+
+	/// Block until the leader publishes the result, then clone it.
+	fn wait_for_result(&self) -> Result<CollectedEntries, WalkError<String>> {
+		let mut guard = self.result.lock();
+		while guard.is_none() {
+			self.done.wait(&mut guard);
+		}
+		guard.as_ref().expect("result published before wakeup").clone()
+	}
+}
+
+/// Join the flight for `key`, starting one if no scan is running yet. Returns
+/// the shared flight plus whether this caller became its leader.
+fn join_or_start_scan(key: &CacheKey) -> (Arc<ScanFlight>, bool) {
+	let mut flights = IN_FLIGHT_SCANS.lock();
+	if let Some(flight) = flights.get(key).cloned() {
+		return (flight, false);
+	}
+	let flight = Arc::new(ScanFlight::new());
+	flights.insert(key.clone(), flight.clone());
+	(flight, true)
+}
+
+/// Deregisters a leader's flight when it finishes or unwinds. A leader that
+/// panics before publishing wakes its followers with an error instead of
+/// leaving them blocked forever.
+struct ScanLeader {
+	key:    CacheKey,
+	flight: Arc<ScanFlight>,
+}
+
+impl Drop for ScanLeader {
+	fn drop(&mut self) {
+		if IN_FLIGHT_SCANS.lock().remove(&self.key).is_some() {
+			let mut guard = self.flight.result.lock();
+			if guard.is_none() {
+				*guard = Some(Err(WalkError::Interrupted(
+					"concurrent directory scan aborted".to_string(),
+				)));
+				self.flight.done.notify_all();
+			}
+		}
+	}
+}
 
 fn env_uint<T>(name: &str, default: T, min: T, max: T) -> T
 where
@@ -273,6 +357,7 @@ where
 	E: fmt::Display,
 {
 	options.cache = false;
+	record_test_walk(root);
 	crate::collect_entries_native(root, options, || heartbeat().map_err(|err| err.to_string()))
 }
 
@@ -291,23 +376,55 @@ where
 	}
 
 	let key = cache_key(root, options);
-	let now = Instant::now();
 	if let Some(entry) = SCAN_CACHE.get(&key) {
-		let age = now.duration_since(entry.created_at);
+		let age = Instant::now().duration_since(entry.created_at);
 		if age < Duration::from_millis(ttl) {
 			return Ok(CollectedEntries {
 				entries:      entry.entries.clone(),
 				cache_age_ms: age.as_millis() as u64,
 			});
 		}
+		// The expired entry is deliberately left in place until a fresh scan
+		// replaces it: concurrent callers serve it stale-while-revalidate
+		// below, consistent with TTL semantics where data up to one TTL old
+		// is acceptable. A failed revalidation likewise keeps serving the
+		// stale snapshot instead of leaving later callers uncached.
 		drop(entry);
-		SCAN_CACHE.remove(&key);
 	}
 
-	let scan = collect_entries_uncached(root, options, heartbeat)?;
-	SCAN_CACHE.insert(key, CacheEntry { created_at: now, entries: scan.entries.clone() });
-	evict_oldest();
-	Ok(CollectedEntries { entries: scan.entries, cache_age_ms: 0 })
+	let (flight, is_leader) = join_or_start_scan(&key);
+
+	if !is_leader {
+		// Another thread owns this scan. Serve whatever the cache holds —
+		// possibly stale — rather than duplicating the walk; only callers
+		// with no cached snapshot block on the shared flight.
+		if let Some(entry) = SCAN_CACHE.get(&key) {
+			let age = Instant::now().duration_since(entry.created_at);
+			return Ok(CollectedEntries {
+				entries:      entry.entries.clone(),
+				cache_age_ms: age.as_millis() as u64,
+			});
+		}
+		return flight.wait_for_result();
+	}
+
+	// Leader: walk outside all locks, then publish to waiters and refresh
+	// the cache. Followers receive the same outcome, including errors.
+	let _leader = ScanLeader { key: key.clone(), flight: flight.clone() };
+	let scan = collect_entries_uncached(root, options, heartbeat);
+	flight.finish(scan.clone());
+
+	match scan {
+		Ok(entries) => {
+			SCAN_CACHE.insert(
+				key,
+				CacheEntry { created_at: Instant::now(), entries: entries.entries.clone() },
+			);
+			evict_oldest();
+			Ok(CollectedEntries { entries: entries.entries, cache_age_ms: 0 })
+		},
+		Err(err) => Err(err),
+	}
 }
 
 pub fn collect_entries<H, E>(
@@ -372,7 +489,10 @@ mod tests {
 	use std::{
 		fs,
 		path::{Path, PathBuf},
-		sync::atomic::{AtomicU64, Ordering},
+		sync::{
+			Arc,
+			atomic::{AtomicU64, Ordering},
+		},
 		time::{Duration, SystemTime, UNIX_EPOCH},
 	};
 
@@ -665,5 +785,39 @@ mod tests {
 			.expect("full scan includes file");
 		assert!(full_file.mtime.is_some(), "full scan should include mtime");
 		assert_eq!(full_file.size, Some(2.0));
+	}
+
+	#[test]
+	fn sixteen_threads_racing_cold_root_execute_one_walk() {
+		use std::sync::Barrier;
+
+		let dir = TempDirGuard::new();
+		for index in 0..64 {
+			fs::write(dir.path().join(format!("file-{index}.txt")), "payload").unwrap();
+		}
+		super::invalidate_all();
+
+		let mut options = scan_options(true, true, crate::WalkDetail::Full);
+		options.cache = true;
+		let barrier = Arc::new(Barrier::new(16));
+		let handles: Vec<_> = (0..16)
+			.map(|_| {
+				let barrier = barrier.clone();
+				let root = dir.path().to_path_buf();
+				std::thread::spawn(move || {
+					barrier.wait();
+					super::collect_entries(&root, options, ok_heartbeat)
+						.expect("racing scan should succeed")
+						.entries
+						.len()
+				})
+			})
+			.collect();
+		for handle in handles {
+			assert_eq!(handle.join().unwrap(), 64, "every racing caller sees the full scan");
+		}
+
+		let walks = super::TEST_WALK_COUNTS.lock().get(dir.path()).copied().unwrap_or(0);
+		assert_eq!(walks, 1, "16 racing cold-start callers must trigger exactly one walk");
 	}
 }
