@@ -1,6 +1,6 @@
 import { ProcessTerminal, type ResizeScrollbackMode, Spacer, type Terminal, Text, TUI } from "@oh-my-pi/pi-tui";
 import { CustomEditor } from "./components/custom-editor";
-import { getEditorTheme, theme } from "./theme/theme";
+import { getEditorTheme } from "./theme/theme";
 
 const DOUBLE_INTERRUPT_MS = 500;
 
@@ -18,6 +18,19 @@ export interface StartupComposerConfig {
 	readonly autocompleteMaxVisible: number;
 }
 
+/**
+ * Mirrors the canonical settings schema without importing its full runtime graph
+ * on the first-paint path. The startup composer test guards these values against drift.
+ */
+export const STARTUP_COMPOSER_DEFAULTS: StartupComposerConfig = {
+	showHardwareCursor: true,
+	maxInlineImages: 8,
+	scrollbackRebuild: false,
+	resizeScrollback: "append",
+	imeSafeCursor: false,
+	autocompleteMaxVisible: 5,
+};
+
 export interface StartupComposerOptions {
 	readonly terminal?: Terminal;
 	readonly exit?: (code: number) => void;
@@ -25,18 +38,48 @@ export interface StartupComposerOptions {
 }
 let pendingStartupComposer: StartupComposer | undefined;
 
-export function beginStartupComposer(config: StartupComposerConfig): void {
+export class StartupComposerLease {
+	readonly surface: StartupComposerSurface;
+
+	readonly #composer: StartupComposer;
+	#adopted = false;
+
+	constructor(composer: StartupComposer) {
+		this.#composer = composer;
+		this.surface = { ui: composer.ui, editor: composer.editor };
+	}
+
+	adopt(): void {
+		if (this.#adopted) return;
+		this.#composer.handoff();
+		this.#adopted = true;
+	}
+
+	dispose(): void {
+		if (!this.#adopted) this.#composer.stop();
+	}
+}
+
+export function beginStartupComposer(config: StartupComposerConfig, options: StartupComposerOptions = {}): void {
 	if (pendingStartupComposer) {
 		throw new Error("Startup composer is already active");
 	}
-	pendingStartupComposer = new StartupComposer(config);
-	pendingStartupComposer.start();
+	const composer = new StartupComposer(config, options);
+	try {
+		composer.start();
+	} catch (error) {
+		try {
+			composer.stop();
+		} catch {}
+		throw error;
+	}
+	pendingStartupComposer = composer;
 }
 
-export function takeStartupComposerSurface(): StartupComposerSurface | undefined {
+export function takeStartupComposerLease(): StartupComposerLease | undefined {
 	const composer = pendingStartupComposer;
 	pendingStartupComposer = undefined;
-	return composer?.handoff();
+	return composer ? new StartupComposerLease(composer) : undefined;
 }
 
 export function stopPendingStartupComposer(): void {
@@ -80,9 +123,8 @@ export class StartupComposer {
 		this.editor.onClear = () => this.#handleInterrupt();
 		this.editor.onExit = () => this.#requestExit(0);
 		this.editor.setShimmerRepaintHandler(() => this.ui.requestDirectWrite(this.editor));
-
+		this.ui.addChild(new Text("Starting OMP. You can type while startup finishes.", 1, 0));
 		this.ui.enableScopedInputRender(this.editor);
-		this.ui.addChild(new Text(theme.fg("muted", "Starting OMP. You can type while startup finishes."), 1, 0));
 		this.ui.addChild(new Spacer(1));
 		this.ui.addChild(this.editor);
 		this.ui.setFocus(this.editor);
@@ -92,7 +134,6 @@ export class StartupComposer {
 		if (this.#started || this.#stopped) return;
 		this.#started = true;
 		this.ui.start({ clearScrollback: true });
-		this.ui.requestRender(true);
 	}
 
 	handoff(): StartupComposerSurface {

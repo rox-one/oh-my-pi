@@ -434,20 +434,10 @@ export async function runCli(argv: string[]): Promise<void> {
 		// This conditional import is the latency boundary: loading cli-commands
 		// pulls in the full agent graph, while the provisional editor can paint
 		// independently and then transfer terminal ownership to InteractiveMode.
-		const [{ beginStartupComposer, stopPendingStartupComposer }, { getDefault }, { initTheme }] = await Promise.all([
-			import("./modes/startup-composer"),
-			import("./config/settings"),
-			import("./modes/theme/theme"),
-		]);
-		await initTheme();
-		beginStartupComposer({
-			showHardwareCursor: getDefault("showHardwareCursor"),
-			maxInlineImages: getDefault("tui.maxInlineImages"),
-			scrollbackRebuild: getDefault("tui.scrollbackRebuild"),
-			resizeScrollback: getDefault("tui.resizeScrollback"),
-			imeSafeCursor: getDefault("tui.imeSafeCursor"),
-			autocompleteMaxVisible: getDefault("autocompleteMaxVisible"),
-		});
+		const { beginStartupComposer, STARTUP_COMPOSER_DEFAULTS, stopPendingStartupComposer } = await import(
+			"./modes/startup-composer"
+		);
+		beginStartupComposer(STARTUP_COMPOSER_DEFAULTS);
 		stopStartupComposer = stopPendingStartupComposer;
 	}
 

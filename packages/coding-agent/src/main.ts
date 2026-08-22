@@ -75,9 +75,9 @@ import { CURRENT_SETUP_VERSION } from "./modes/setup-version";
 import type * as SetupWizardModule from "./modes/setup-wizard";
 import type { SetupScene } from "./modes/setup-wizard";
 import {
-	type StartupComposerSurface,
+	type StartupComposerLease,
 	stopPendingStartupComposer,
-	takeStartupComposerSurface,
+	takeStartupComposerLease,
 } from "./modes/startup-composer";
 import { initTheme, stopThemeWatcher } from "./modes/theme/theme";
 import type { SubmittedUserInput } from "./modes/types";
@@ -518,7 +518,7 @@ async function runInteractiveMode(
 	initialMessage?: string,
 	initialImages?: ImageContent[],
 	joinLink?: string,
-	startupSurface?: StartupComposerSurface,
+	startupLease?: StartupComposerLease,
 ): Promise<void> {
 	let mode: InteractiveMode;
 	try {
@@ -530,10 +530,11 @@ async function runInteractiveMode(
 			lspServers,
 			mcpManager,
 			eventBus,
-			startupSurface,
+			startupLease?.surface,
 		);
+		startupLease?.adopt();
 	} catch (error) {
-		startupSurface?.ui.stop();
+		startupLease?.dispose();
 		throw error;
 	}
 
@@ -2167,29 +2168,32 @@ export async function runRootCommand(
 						process.exit(0);
 					}
 				}
-				const startupSurface = takeStartupComposerSurface();
-
-				stopStartupWatchdog();
-				logger.endTiming();
-				await runInteractiveMode(
-					session,
-					VERSION,
-					startupChangelog,
-					notifs,
-					versionCheckPromise,
-					initialArgs.messages,
-					setToolUIContext,
-					lspServers,
-					mcpManager,
-					Boolean(parsedArgs.continue || parsedArgs.resume || parsedArgs.fork || foreignSource),
-					deps.forceSetupWizard === true,
-					showStartupSplash,
-					eventBus,
-					initialMessage,
-					initialImages,
-					parsedArgs.join,
-					startupSurface,
-				);
+				const startupLease = takeStartupComposerLease();
+				try {
+					stopStartupWatchdog();
+					logger.endTiming();
+					await runInteractiveMode(
+						session,
+						VERSION,
+						startupChangelog,
+						notifs,
+						versionCheckPromise,
+						initialArgs.messages,
+						setToolUIContext,
+						lspServers,
+						mcpManager,
+						Boolean(parsedArgs.continue || parsedArgs.resume || parsedArgs.fork || foreignSource),
+						deps.forceSetupWizard === true,
+						showStartupSplash,
+						eventBus,
+						initialMessage,
+						initialImages,
+						parsedArgs.join,
+						startupLease,
+					);
+				} finally {
+					startupLease?.dispose();
+				}
 			} else {
 				// Branch-only single-shot runner: keep print-mode code out of normal interactive startup.
 				stopStartupWatchdog();

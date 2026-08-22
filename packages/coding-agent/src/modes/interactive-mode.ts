@@ -574,6 +574,7 @@ const CTRL_L_APPEARANCE_RESPONSE_DEADLINE_MS = 2000;
 export class InteractiveMode implements InteractiveModeContext {
 	readonly #adoptedStartupSurface: boolean;
 	#ownsStartedUi: boolean;
+	#startupSubmitGated: boolean;
 	session: AgentSession;
 	sessionManager: SessionManager;
 	settings: Settings;
@@ -847,8 +848,11 @@ export class InteractiveMode implements InteractiveModeContext {
 		const editorTheme = getEditorTheme();
 		this.editor = startupSurface?.editor ?? new CustomEditor(editorTheme);
 		if (startupSurface) this.editor.setTheme(editorTheme);
+		this.editor.magicKeywordsEnabled = () => this.settings.get("magicKeywords.enabled");
+		this.editor.imageReferenceHyperlink = imageReferenceHyperlink;
 		this.#adoptedStartupSurface = startupSurface !== undefined;
 		this.#ownsStartedUi = startupSurface !== undefined;
+		this.#startupSubmitGated = startupSurface !== undefined;
 		this.keybindings = KeybindingsManager.inMemory();
 		this.agent = session.agent;
 		this.#version = version;
@@ -1189,7 +1193,6 @@ export class InteractiveMode implements InteractiveModeContext {
 
 		this.#inputController.setupKeyHandlers();
 		this.#inputController.setupEditorSubmitHandler();
-		this.editor.disableSubmit = false;
 
 		// Wire observer registry to EventBus
 		if (this.#eventBus) {
@@ -4705,12 +4708,6 @@ export class InteractiveMode implements InteractiveModeContext {
 		nextEditor.setUseTerminalCursor(this.ui.getShowHardwareCursor());
 		nextEditor.setImeSafeCursorLayout(this.settings.get("tui.imeSafeCursor"));
 		nextEditor.setAutocompleteMaxVisible(this.settings.get("autocompleteMaxVisible"));
-		nextEditor.setSpellingFeatures({
-			typoDetection: this.settings.get("spelling.typoDetection"),
-			autocomplete: this.settings.get("spelling.autocomplete"),
-			autocorrect: this.settings.get("spelling.autocorrect"),
-		});
-		nextEditor.viewportRowsProvider = () => this.ui.terminal.rows;
 		nextEditor.magicKeywordsEnabled = () => this.settings.get("magicKeywords.enabled");
 		nextEditor.imageReferenceHyperlink = imageReferenceHyperlink;
 		nextEditor.onAutocompleteCancel = () => {
