@@ -856,6 +856,9 @@
 - Fixed accurate benchmark input token counts on providers with automatic prompt caching.
 - Fixed C# files incorrectly displaying D3.js icons in edit results ([#9323](https://github.com/can1357/oh-my-pi/issues/9323)).
 - Fixed incorrect token delta reporting in expanded context compaction summaries when pre-compaction usage was omitted by the provider ([#9293](https://github.com/can1357/oh-my-pi/issues/9293)).
+### Changed
+
+- Streamed-edit guard no longer blocks the event loop while streaming: edit-target reads are async and removed-line verification is memoized per file, cutting precheck stalls on large files from tens of milliseconds (seconds cumulative) to low single-digit milliseconds.
 
 ## [17.4.4] - 2026-08-22
 
