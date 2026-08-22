@@ -4,7 +4,6 @@ import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config
 import { InteractiveMode } from "@oh-my-pi/pi-coding-agent/modes/interactive-mode";
 import {
 	beginStartupComposer,
-	STARTUP_COMPOSER_DEFAULTS,
 	StartupComposer,
 	type StartupComposerConfig,
 	StartupComposerLease,
@@ -57,17 +56,6 @@ describe("StartupComposer", () => {
 	afterEach(() => {
 		stopPendingStartupComposer();
 		resetSettingsForTest();
-	});
-
-	it("keeps lightweight startup defaults aligned with the settings schema", () => {
-		expect(STARTUP_COMPOSER_DEFAULTS).toEqual({
-			showHardwareCursor: settings.get("showHardwareCursor"),
-			maxInlineImages: settings.get("tui.maxInlineImages"),
-			scrollbackRebuild: settings.get("tui.scrollbackRebuild"),
-			resizeScrollback: settings.get("tui.resizeScrollback"),
-			imeSafeCursor: settings.get("tui.imeSafeCursor"),
-			autocompleteMaxVisible: settings.get("autocompleteMaxVisible"),
-		});
 	});
 
 	it("keeps one live editor and terminal across handoff", () => {

@@ -911,15 +911,15 @@
 ### Added
 
 - Added automatic `CMUX_SOCKET_PATH` protocol detection and typed cmux-tui browser backends for release raw-v10/`cmux.protocol/1` and current raw-v12/`cmux.protocol/2`, with stable resource targeting through `app.surface`, load-complete navigation, guarded pointer input, abort/deadline propagation, versioned viewer/stream semantics, reconnect/gap recovery, correlation-backed uncertain-creation recovery, terminal close handling, and read-reconciled ownership-safe close.
+### Added
+
+- Added an immediately editable startup composer for plain interactive launches; drafts typed while session initialization runs transfer intact into the full UI.
 
 ## [17.4.4] - 2026-08-22
 
 ### Added
 
 - Added the `tui.resizeScrollback` setting (default `append`) controlling how a settled width resize refreshes pane scrollback when the terminal repaints in place (tmux/screen/Zellij panes, in-place direct terminals). Multiplexers rewrap old output naively on width changes, leaving history hard-broken at the old width; `append` re-emits the transcript at the new width below it (one fresh copy per settled resize), `rebuild` clears pane history first so it holds exactly one current-width copy (needs a host that honors ED3, like tmux; erases pre-session scrollback), and `preserve` keeps the old-width history untouched with zero growth ([#8193](https://github.com/can1357/oh-my-pi/issues/8193)).
-### Added
-
-- Added an immediately editable startup composer for plain interactive launches; drafts typed while session initialization runs transfer intact into the full UI.
 
 ### Fixed
 

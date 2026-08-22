@@ -86,6 +86,9 @@
 ### Fixed
 
 - Fixed TUI freezing during large repaints on slow or occluded terminals by moving stdout writes to an off-thread writer.
+### Added
+
+- Added `Editor.setTheme()` so an adopted editor can switch from its lightweight startup theme to the configured interactive theme without replacing the editor or losing its draft.
 
 ## [17.4.4] - 2026-08-22
 
