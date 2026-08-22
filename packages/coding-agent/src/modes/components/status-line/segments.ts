@@ -2,9 +2,15 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import { TERMINAL } from "@oh-my-pi/pi-tui";
-import { formatDuration, formatNumber, getProjectDir, pathIsWithin, relativePathWithinRoot } from "@oh-my-pi/pi-utils";
-import type { StatusLineSegmentContext as ExtensionStatusLineSegmentContext } from "../../../extensibility/extensions/types";
-import { type Theme, type ThemeColor, theme } from "../../../modes/theme/theme";
+import {
+	formatDuration,
+	formatNumber,
+	getActiveProfile,
+	getProjectDir,
+	pathIsWithin,
+	relativePathWithinRoot,
+} from "@oh-my-pi/pi-utils";
+import { type ThemeColor, theme } from "../../../modes/theme/theme";
 import { shortenPath, TRUNCATE_LENGTHS, truncateToWidth } from "../../../tools/render-utils";
 import { fileHyperlink } from "../../../tui/hyperlink";
 import { getSessionAccentAnsi, getSessionAccentHex } from "../../../utils/session-color";
@@ -73,6 +79,14 @@ function formatAdvisorSpend(amount: number, usingSubscription: boolean, uiTheme:
 		return `${icon} ${spend}`;
 	}
 	return `${spend} (adv)`;
+}
+
+function formatCompactContextPercent(percent: number | null | undefined): string {
+	if (percent === null || percent === undefined) return "?";
+	if (percent === 0) return "0%";
+	if (percent > 0 && percent < 1) return `${percent.toFixed(1)}%`;
+	if (Number.isInteger(percent)) return `${percent}%`;
+	return `${percent.toFixed(1)}%`;
 }
 
 const SCRATCH_ROOTS: readonly string[] = (() => {
@@ -338,6 +352,17 @@ const pathSegment: StatusLineSegment = {
 	},
 };
 
+const profileSegment: StatusLineSegment = {
+	id: "profile",
+	render(_ctx) {
+		const profile = getActiveProfile();
+		if (!profile) return { content: "", visible: false };
+
+		const content = `p:${sanitizeStatusText(profile)}`;
+		return { content: theme.fg("accent", content), visible: true };
+	},
+};
+
 const gitSegment: StatusLineSegment = {
 	id: "git",
 	render(ctx) {
@@ -450,6 +475,16 @@ const tokenTotalSegment: StatusLineSegment = {
 		const total = input + output + cacheWrite + orchestrationInput + orchestrationOutput;
 		if (!total) return { content: "", visible: false };
 
+		if (ctx.options.token_total?.breakdown) {
+			const inTotal = input + cacheWrite + orchestrationInput;
+			const outTotal = output + orchestrationOutput;
+			const parts: string[] = [];
+			if (inTotal > 0) parts.push(`in:${formatNumber(inTotal)}`);
+			if (outTotal > 0) parts.push(`out:${formatNumber(outTotal)}`);
+			if (parts.length === 0) return { content: "", visible: false };
+			return { content: theme.fg("statusLineSpend", parts.join(" ")), visible: true };
+		}
+
 		const content = withIcon(theme.icon.tokens, formatNumber(total));
 		return { content: theme.fg("statusLineSpend", content), visible: true };
 	},
@@ -505,24 +540,14 @@ const contextPctSegment: StatusLineSegment = {
 		const pct = ctx.contextPercent;
 		const window = ctx.contextWindow;
 
+		const autoIcon = ctx.autoCompactEnabled && theme.icon.auto ? ` ${theme.icon.auto}` : "";
 		const color = getContextUsageThemeColor(getContextUsageLevel(pct ?? 0, window));
-		// Async-compaction indicator: pulse the auto icon while a background
-		// speculation runs, hold it in accent once a result is armed.
-		let autoIcon = "";
-		if (ctx.autoCompactEnabled && theme.icon.auto) {
-			const speculation = ctx.compactionSpeculation;
-			const iconColor =
-				speculation === "running"
-					? ctx.speculationBlinkOn
-						? "accent"
-						: "muted"
-					: speculation === "armed"
-						? "accent"
-						: color;
-			autoIcon = ` ${theme.fg(iconColor, theme.icon.auto)}`;
-		}
-		const text = theme.fg(color, formatContextUsage(pct, window, ctx.contextTokens));
-		const content = withIcon(theme.icon.context, `${text}${autoIcon}`);
+		const compact = ctx.options.context_pct?.compact === true;
+		const display = compact
+			? `ctx:${formatCompactContextPercent(pct)}`
+			: formatContextUsage(pct, window, ctx.contextTokens);
+		const text = theme.fg(color, `${display}${autoIcon}`);
+		const content = compact ? text : withIcon(theme.icon.context, text);
 
 		return { content, visible: true };
 	},
@@ -750,6 +775,7 @@ export const SEGMENTS: Record<StatusLineSegmentId, StatusLineSegment> = {
 	pi: piSegment,
 	model: modelSegment,
 	mode: modeSegment,
+	profile: profileSegment,
 	path: pathSegment,
 	git: gitSegment,
 	pr: prSegment,

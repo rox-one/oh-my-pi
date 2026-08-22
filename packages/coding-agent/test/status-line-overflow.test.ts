@@ -10,7 +10,7 @@ import { renderSegment } from "@oh-my-pi/pi-coding-agent/modes/components/status
 import { initTheme, theme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 import { getSessionAccentAnsi, getSessionAccentHex } from "@oh-my-pi/pi-coding-agent/utils/session-color";
 import { visibleWidth } from "@oh-my-pi/pi-tui";
-import { getProjectDir, setProjectDir } from "@oh-my-pi/pi-utils";
+import { getProjectDir, setProfile, setProjectDir } from "@oh-my-pi/pi-utils";
 
 const originalProjectDir = getProjectDir();
 
@@ -22,6 +22,7 @@ beforeAll(async () => {
 
 afterAll(() => {
 	resetSettingsForTest();
+	setProfile(undefined);
 	setProjectDir(originalProjectDir);
 });
 
@@ -195,33 +196,60 @@ describe("status line session accent", () => {
 	});
 });
 
-describe("session_name preview-title fallback", () => {
-	it("renders the stand-in title when the session is unnamed", () => {
-		const seg = renderSegment("session_name", createCtx({ previewTitle: "omp" }));
+describe("profile status-line segment", () => {
+	it("hides the profile segment for the default profile", () => {
+		setProfile(undefined);
+		const seg = renderSegment("profile", createCtx());
+		expect(seg.visible).toBe(false);
+		expect(seg.content).toBe("");
+	});
+
+	it("renders the active named profile", () => {
+		setProfile("work");
+		const seg = renderSegment("profile", createCtx());
 		expect(seg.visible).toBe(true);
-		expect(stripAnsi(seg.content)).toBe("omp");
+		expect(stripAnsi(seg.content)).toBe("p:work");
+		setProfile(undefined);
 	});
+});
 
-	it("prefers the real session name over the stand-in", () => {
-		const seg = renderSegment("session_name", createCtx({ sessionName: "Named session", previewTitle: "omp" }));
-		expect(stripAnsi(seg.content)).toBe("Named session");
+describe("token_total breakdown", () => {
+	it("renders labeled input and output totals when breakdown is enabled", () => {
+		const seg = renderSegment("token_total", {
+			...createCtx(),
+			options: { token_total: { breakdown: true } },
+			usageStats: {
+				input: 25000,
+				output: 5,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 25005,
+				orchestrationInput: 0,
+				orchestrationOutput: 0,
+				orchestrationCacheRead: 0,
+				premiumRequests: 0,
+				cost: 0,
+				tokensPerSecond: null,
+			},
+		} as SegmentContext);
+
+		expect(seg.visible).toBe(true);
+		expect(stripAnsi(seg.content)).toBe("in:25K out:5");
 	});
+});
 
-	it("right-aligns the stand-in title through the box border pipeline", () => {
-		const component = new StatusLineComponent(createStatusLineSession(""));
-		component.updateSettings({
-			preset: "custom",
-			leftSegments: ["pi"],
-			rightSegments: ["session_name"],
-			separator: "powerline-thin",
-			sessionAccent: false,
-		});
-		const withTitle = component.getTopBorder(80, "omp");
-		// The gauge fill pads the group gap, so the title chip lands flush right.
-		expect(withTitle.width).toBe(80);
-		expect(stripAnsi(withTitle.content).trimEnd().endsWith("omp")).toBe(true);
-		// Live render path passes no preview title: unnamed sessions show none.
-		expect(stripAnsi(component.getTopBorder(80).content)).not.toContain("omp");
+describe("context_pct compact", () => {
+	it("renders a compact ctx-prefixed percentage when enabled", () => {
+		const seg = renderSegment("context_pct", {
+			...createCtx(),
+			options: { context_pct: { compact: true } },
+			contextPercent: 9.1,
+			contextTokens: 9100,
+			contextWindow: 100000,
+		} as SegmentContext);
+
+		expect(seg.visible).toBe(true);
+		expect(stripAnsi(seg.content)).toContain("ctx:9.1%");
 	});
 });
 

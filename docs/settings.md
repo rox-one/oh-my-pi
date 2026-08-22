@@ -695,6 +695,24 @@ tui:
 
 For a custom status line, set `statusLine.preset: custom` and configure `statusLine.leftSegments`, `statusLine.rightSegments`, and `statusLine.segmentOptions`.
 
+Example:
+
+```yaml
+statusLine:
+  preset: custom
+  leftSegments: [model, profile, path, git]
+  rightSegments: [token_total, context_pct]
+  segmentOptions:
+    token_total:
+      breakdown: true
+    context_pct:
+      compact: true
+```
+
+- `profile` shows the active named profile as `p:<name>` and stays hidden for the default profile.
+- `segmentOptions.token_total.breakdown: true` renders labeled totals like `in:25K out:5`.
+- `segmentOptions.context_pct.compact: true` renders `ctx:9.1%` instead of the default `<percent>/<window>` form.
+
 ### Interaction
 
 | Key                    | Type    | Default         | Values                                                                                                  |
