@@ -844,7 +844,9 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.sessionManager = session.sessionManager;
 		this.settings = session.settings;
 		this.ui = startupSurface?.ui ?? new TUI(new ProcessTerminal(), settings.get("showHardwareCursor"));
-		this.editor = startupSurface?.editor ?? new CustomEditor(getEditorTheme());
+		const editorTheme = getEditorTheme();
+		this.editor = startupSurface?.editor ?? new CustomEditor(editorTheme);
+		if (startupSurface) this.editor.setTheme(editorTheme);
 		this.#adoptedStartupSurface = startupSurface !== undefined;
 		this.#ownsStartedUi = startupSurface !== undefined;
 		this.keybindings = KeybindingsManager.inMemory();

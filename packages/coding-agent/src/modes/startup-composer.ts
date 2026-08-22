@@ -73,6 +73,8 @@ export class StartupComposer {
 		this.editor.setUseTerminalCursor(this.ui.getShowHardwareCursor());
 		this.editor.setImeSafeCursorLayout(config.imeSafeCursor);
 		this.editor.setAutocompleteMaxVisible(config.autocompleteMaxVisible);
+		// Keep conventional emergency controls available during bootstrap. InteractiveMode
+		// replaces these with the user's configured bindings when it adopts the editor.
 		this.editor.setActionKeys("app.clear", ["ctrl+c"]);
 		this.editor.setActionKeys("app.exit", ["ctrl+d"]);
 		this.editor.onClear = () => this.#handleInterrupt();
