@@ -6,6 +6,7 @@ import { ToolAbortError, ToolError } from "../tool-errors";
 import { findFreeCdpPort, findReusableCdp, gracefulKillTreeOnce, killExistingByPath, waitForCdp } from "./attach";
 import type { CmuxKind } from "./cmux/rpc";
 import { CmuxSocketClient } from "./cmux/socket-client";
+import { CmuxTuiClient, detectCmuxSocketProtocol } from "./cmux/tui-client";
 import {
 	BROWSER_PROTOCOL_TIMEOUT_MS,
 	DEFAULT_VIEWPORT,
@@ -60,12 +61,19 @@ export interface PuppeteerBrowserHandle extends BrowserHandleCommon {
 	stealth: { browserSession: CDPSession | null; override: UserAgentOverride | null };
 }
 
-export interface CmuxBrowserHandle extends BrowserHandleCommon {
-	kind: CmuxKind;
+export interface CmuxGuiBrowserHandle extends BrowserHandleCommon {
+	backend: "gui";
+	kind: CmuxKind & { backend: "gui" };
 	client: CmuxSocketClient;
-	surface?: string;
 }
 
+export interface CmuxTuiBrowserHandle extends BrowserHandleCommon {
+	backend: "tui";
+	kind: CmuxKind & { backend: "tui" };
+	client: CmuxTuiClient;
+}
+
+export type CmuxBrowserHandle = CmuxGuiBrowserHandle | CmuxTuiBrowserHandle;
 export type BrowserHandle = PuppeteerBrowserHandle | CmuxBrowserHandle;
 
 /** Controls bounded browser-handle teardown and identifies the owning resource in timeout diagnostics. */
@@ -106,7 +114,12 @@ export async function acquireBrowser(kind: BrowserKind, opts: AcquireBrowserOpti
 	for (;;) {
 		const existing = browsers.get(key);
 		if (existing) {
-			if ("client" in existing) return existing;
+			if ("client" in existing) {
+				if (existing.backend === "gui" || (await existing.client.isAlive())) return existing;
+				browsers.delete(key);
+				await disposeBrowserHandle(existing, { kill: false });
+				continue;
+			}
 			if (existing.browser.connected) return existing;
 			browsers.delete(key);
 			await disposeBrowserHandle(existing, { kill: false });
@@ -162,13 +175,35 @@ export function normalizeConnectedCdpUrl(rawCdpUrl: string): string {
 
 async function openBrowserHandle(kind: BrowserKind, opts: AcquireBrowserOptions): Promise<BrowserHandle> {
 	if (kind.kind === "cmux") {
-		const client = new CmuxSocketClient({ socketPath: kind.socketPath, password: kind.password });
+		// Existing GUI TCP relay endpoints carry their own challenge/response
+		// handshake and never speak cmux-tui's local resource protocol.
+		const configuredBackend =
+			kind.backend === "auto" && !kind.socketPath.trim().startsWith("/") ? "gui" : kind.backend;
+		const detected =
+			configuredBackend === "gui"
+				? ({ kind: "gui", version: 2 } as const)
+				: await detectCmuxSocketProtocol({ socketPath: kind.socketPath, password: kind.password });
+		if (configuredBackend === "tui" && detected.kind !== "tui") {
+			throw new ToolError("Configured cmux-tui backend identified as GUI cmux-socket v2");
+		}
+		if (detected.kind === "gui") {
+			const client = new CmuxSocketClient({ socketPath: kind.socketPath, password: kind.password });
+			await client.connect();
+			return {
+				key: browserKey(kind),
+				backend: "gui",
+				kind: { ...kind, backend: "gui" },
+				client,
+				refCount: 0,
+			};
+		}
+		const client = new CmuxTuiClient({ socketPath: kind.socketPath, version: detected.version });
 		await client.connect();
 		return {
 			key: browserKey(kind),
-			kind,
+			backend: "tui",
+			kind: { ...kind, backend: "tui" },
 			client,
-			surface: kind.surface,
 			refCount: 0,
 		};
 	}

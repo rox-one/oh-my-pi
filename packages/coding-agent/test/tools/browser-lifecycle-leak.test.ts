@@ -29,7 +29,12 @@ import {
 import { ToolAbortError } from "@oh-my-pi/pi-coding-agent/tools/tool-errors";
 
 function makeKind(socketSuffix: string): CmuxKind {
-	return { kind: "cmux", socketPath: `/tmp/omp-test-${socketSuffix}.sock`, surface: `surface-${socketSuffix}` };
+	return {
+		kind: "cmux",
+		backend: "gui",
+		socketPath: `/tmp/omp-test-${socketSuffix}.sock`,
+		surface: `surface-${socketSuffix}`,
+	};
 }
 
 async function drainAllTabs(): Promise<void> {
@@ -192,7 +197,7 @@ describe("browser lifecycle — close deadlines", () => {
 			return {};
 		});
 
-		const kind: CmuxKind = { kind: "cmux", socketPath: "/tmp/omp-close-deadline.sock" };
+		const kind: CmuxKind = { kind: "cmux", backend: "gui", socketPath: "/tmp/omp-close-deadline.sock" };
 		const browser = await acquireBrowser(kind, { cwd: "/tmp" });
 		await acquireTab("probe", browser, { timeoutMs: 1_000 });
 

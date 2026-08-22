@@ -4674,7 +4674,7 @@ export const SETTINGS_SCHEMA = {
 			group: "Grep & Browser",
 			label: "cmux Browser",
 			description:
-				"Use cmux WKWebView surfaces for browser automation when a cmux socket is available. Set PI_BROWSER_CMUX=0 or PI_BROWSER_CMUX=1 to override.",
+				"Use GUI cmux WKWebView surfaces or typed cmux-tui browser resources when CMUX_SOCKET_PATH is available. Set PI_BROWSER_CMUX=0 or PI_BROWSER_CMUX=1 to override.",
 		},
 	},
 	"browser.screenshotDir": {

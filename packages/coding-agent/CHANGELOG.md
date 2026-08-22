@@ -908,6 +908,9 @@
 ### Changed
 
 - Streamed-edit guard no longer blocks the event loop while streaming: edit-target reads are async and removed-line verification is memoized per file, cutting precheck stalls on large files from tens of milliseconds (seconds cumulative) to low single-digit milliseconds.
+### Added
+
+- Added automatic `CMUX_SOCKET_PATH` protocol detection and typed cmux-tui browser backends for release raw-v10/`cmux.protocol/1` and current raw-v12/`cmux.protocol/2`, with stable resource targeting through `app.surface`, load-complete navigation, guarded pointer input, abort/deadline propagation, versioned viewer/stream semantics, reconnect/gap recovery, correlation-backed uncertain-creation recovery, terminal close handling, and read-reconciled ownership-safe close.
 
 ## [17.4.4] - 2026-08-22
 

@@ -12,6 +12,7 @@
 import { afterEach, beforeEach, describe, expect, it, spyOn, vi } from "bun:test";
 import { BrowserTool } from "@oh-my-pi/pi-coding-agent/tools/browser";
 import { CmuxSocketClient } from "@oh-my-pi/pi-coding-agent/tools/browser/cmux/socket-client";
+import * as tuiClient from "@oh-my-pi/pi-coding-agent/tools/browser/cmux/tui-client";
 import { getBrowsersMapForTest } from "@oh-my-pi/pi-coding-agent/tools/browser/registry";
 import { getTabsMapForTest, releaseTab } from "@oh-my-pi/pi-coding-agent/tools/browser/tab-supervisor";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools/index";
@@ -41,6 +42,7 @@ beforeEach(() => {
 	// Unique per test so the module-global browsers map (keyed by socket path)
 	// never carries a handle across tests.
 	process.env.CMUX_SOCKET_PATH = `/tmp/omp-open-lease-${process.pid}-${Math.random().toString(36).slice(2)}.sock`;
+	spyOn(tuiClient, "detectCmuxSocketProtocol").mockResolvedValue({ kind: "gui", version: 2 });
 });
 
 afterEach(async () => {
@@ -207,5 +209,48 @@ describe("browser open — concurrent different-name acquisitions each own a lea
 		expect(getTabsMapForTest().has("tab-a")).toBe(false);
 		expect(getTabsMapForTest().size).toBe(1);
 		expect(surfaceClosed).toEqual(["surface-1"]);
+	});
+});
+
+describe("browser open — explicit cmux surfaces stay per-open", () => {
+	it("opens an implicit GUI split beside a borrowed surface without inheriting its target", async () => {
+		spyOn(CmuxSocketClient.prototype, "connect").mockResolvedValue(undefined);
+		spyOn(CmuxSocketClient.prototype, "close").mockImplementation(() => undefined);
+		let splits = 0;
+		const surfaceClosed: string[] = [];
+		spyOn(CmuxSocketClient.prototype, "request").mockImplementation(
+			async (method: string, params: Record<string, unknown>): Promise<Record<string, unknown>> => {
+				if (method === "browser.open_split") {
+					splits++;
+					return { surface_id: "gui-owned-b", url: "about:blank" };
+				}
+				if (method === "surface.close") {
+					surfaceClosed.push(String(params.surface_id));
+					return {};
+				}
+				return {};
+			},
+		);
+
+		const tool = new BrowserTool(makeSession());
+		await tool.execute("borrowed-a", {
+			action: "open",
+			name: "gui-borrowed-a",
+			app: { cmux: true, surface: "gui-borrowed-a" },
+			timeout: 2,
+		});
+		await tool.execute("owned-b", { action: "open", name: "gui-owned-b", timeout: 2 });
+		await tool.execute("owned-b-reuse", { action: "open", name: "gui-owned-b", timeout: 2 });
+		await tool.execute("owned-b-explicit-reuse", {
+			action: "open",
+			name: "gui-owned-b",
+			app: { cmux: true, surface: "gui-owned-b" },
+			timeout: 2,
+		});
+		expect(splits).toBe(1);
+
+		await tool.execute("owned-b-close", { action: "close", name: "gui-owned-b", timeout: 2 });
+		await tool.execute("borrowed-a-close", { action: "close", name: "gui-borrowed-a", timeout: 2 });
+		expect(surfaceClosed).toEqual(["gui-owned-b"]);
 	});
 });

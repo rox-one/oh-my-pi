@@ -47,6 +47,7 @@ import * as logger from "@oh-my-pi/pi-utils/logger";
 function makeKind(socketSuffix: string): CmuxKind {
 	return {
 		kind: "cmux",
+		backend: "gui",
 		socketPath: `/tmp/omp-test-${socketSuffix}.sock`,
 		surface: `surface-${socketSuffix}`,
 	};

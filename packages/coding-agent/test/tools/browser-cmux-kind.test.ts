@@ -10,6 +10,7 @@ describe("resolveCmuxKind", () => {
 			}),
 		).toEqual({
 			kind: "cmux",
+			backend: "auto",
 			socketPath: "/tmp/cmux.sock",
 			password: "pw",
 			surface: undefined,
@@ -19,6 +20,7 @@ describe("resolveCmuxKind", () => {
 	it("includes the requested surface UUID", () => {
 		expect(resolveCmuxKind({ surface: "surface-uuid" }, { CMUX_SOCKET_PATH: "/tmp/cmux.sock" })).toEqual({
 			kind: "cmux",
+			backend: "auto",
 			socketPath: "/tmp/cmux.sock",
 			password: undefined,
 			surface: "surface-uuid",
@@ -38,6 +40,7 @@ describe("resolveCmuxKind", () => {
 			resolveCmuxKind({ settingEnabled: false }, { CMUX_SOCKET_PATH: "/tmp/cmux.sock", PI_BROWSER_CMUX: "1" }),
 		).toEqual({
 			kind: "cmux",
+			backend: "auto",
 			socketPath: "/tmp/cmux.sock",
 			password: undefined,
 			surface: undefined,

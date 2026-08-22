@@ -16,11 +16,15 @@ import { ToolAbortError, ToolError } from "../tool-errors";
 import { pickElectronTarget, shouldPreserveConnectedBrowserFocus } from "./attach";
 import { CmuxTab, runCmuxCode } from "./cmux/cmux-tab";
 import { mapWaitUntil } from "./cmux/rpc";
+import { type CmuxTuiClient, CmuxTuiProtocolError, isCmuxTuiUncertainMutationError } from "./cmux/tui-client";
+import { CmuxTuiTab } from "./cmux/tui-tab";
 import { DEFAULT_VIEWPORT } from "./launch";
 import {
 	type BrowserHandle,
 	type BrowserKindTag,
 	type CmuxBrowserHandle,
+	type CmuxGuiBrowserHandle,
+	type CmuxTuiBrowserHandle,
 	holdBrowser,
 	type PuppeteerBrowserHandle,
 	releaseBrowser,
@@ -92,13 +96,26 @@ export interface WorkerTabSession extends TabSessionBase<PuppeteerBrowserHandle>
 	activateForScreenshot: boolean;
 }
 
-export interface CmuxTabSession extends TabSessionBase<CmuxBrowserHandle> {
+interface CmuxTabSessionCommon {
 	backend: "cmux";
-	cmuxTab: CmuxTab;
 	cmuxOwnsSurface: boolean;
+	/** Caller-supplied borrowed target, retained for exact reuse/retarget semantics and user-visible descriptions. */
 	cmuxAttachedSurface?: string;
 }
 
+export interface CmuxGuiTabSession extends TabSessionBase<CmuxGuiBrowserHandle>, CmuxTabSessionCommon {
+	cmuxBackend: "gui";
+	cmuxTab: CmuxTab;
+}
+
+export interface CmuxTuiTabSession extends TabSessionBase<CmuxTuiBrowserHandle>, CmuxTabSessionCommon {
+	cmuxBackend: "tui";
+	cmuxTab: CmuxTuiTab;
+	/** Stable parent tab created with this owned browser; required for raw10/public-v1 topology-safe close. */
+	cmuxOwnedTabId?: string;
+}
+
+export type CmuxTabSession = CmuxGuiTabSession | CmuxTuiTabSession;
 export type TabSession = WorkerTabSession | CmuxTabSession;
 
 export interface AcquireTabOptions {
@@ -261,9 +278,18 @@ async function acquireTabImpl(
 	let tempHold = false;
 	const existing = tabs.get(name);
 	if (existing) {
+		if (
+			existing.browser === browser &&
+			existing.state === "alive" &&
+			existing.backend === "cmux" &&
+			existing.cmuxBackend === "tui"
+		) {
+			if (!(await existing.cmuxTab.resourceAlive(opts.timeoutMs, opts.signal))) {
+				existing.state = "dead";
+			}
+		}
 		if (existing.browser === browser && existing.state === "alive") {
-			const requestedCmuxSurface = "client" in browser ? (opts.cmuxSurface ?? browser.surface) : undefined;
-			if (existing.backend === "cmux" && existing.cmuxAttachedSurface !== requestedCmuxSurface) {
+			if (existing.backend === "cmux" && opts.cmuxSurface !== undefined && existing.targetId !== opts.cmuxSurface) {
 				holdBrowser(browser);
 				tempHold = true;
 				await releaseTab(name, { kill: false });
@@ -273,7 +299,10 @@ async function acquireTabImpl(
 				await releaseTab(name, { kill: false });
 			} else {
 				const reuseSteps: string[] = [];
-				if (opts.viewport && browser.kind.kind !== "cmux") {
+				if (
+					opts.viewport &&
+					(browser.kind.kind !== "cmux" || ("backend" in browser && browser.backend === "tui"))
+				) {
 					const dsf = opts.viewport.deviceScaleFactor;
 					reuseSteps.push(
 						`await page.setViewport({ width: ${opts.viewport.width}, height: ${opts.viewport.height}, deviceScaleFactor: ${dsf === undefined ? "undefined" : String(dsf)} });`,
@@ -415,7 +444,11 @@ async function acquireCmuxTab(
 	browser: CmuxBrowserHandle,
 	opts: AcquireTabOptions,
 ): Promise<AcquireTabResult> {
-	const attachedSurface = opts.cmuxSurface ?? browser.surface;
+	if (browser.backend === "tui") return await acquireCmuxTuiTab(name, browser, opts);
+	const attachedSurface = opts.cmuxSurface;
+	if (attachedSurface === "") {
+		throw new ToolError("app.surface must not be empty");
+	}
 	if (attachedSurface?.startsWith("surface:")) {
 		throw new ToolError(
 			"app.surface must be a surface UUID (e.g. CMUX_SURFACE_ID), not a 'surface:N' ref; omit it to open a new split",
@@ -426,7 +459,7 @@ async function acquireCmuxTab(
 	let initialUrl = opts.url;
 	let ownsSurface = false;
 	try {
-		if (!surfaceId) {
+		if (surfaceId === undefined) {
 			const params: Record<string, unknown> = { url: opts.url ?? "about:blank", focus: false };
 			if (process.env.CMUX_WORKSPACE_ID) params.workspace_id = process.env.CMUX_WORKSPACE_ID;
 			if (process.env.CMUX_SURFACE_ID) params.surface_id = process.env.CMUX_SURFACE_ID;
@@ -466,6 +499,7 @@ async function acquireCmuxTab(
 			browser,
 			targetId: surfaceId,
 			backend: "cmux",
+			cmuxBackend: "gui",
 			cmuxTab,
 			cmuxOwnsSurface: ownsSurface,
 			state: "alive",
@@ -481,6 +515,157 @@ async function acquireCmuxTab(
 	} catch (error) {
 		if (ownsSurface && surfaceId) {
 			await browser.client.request("surface.close", { surface_id: surfaceId }).catch(() => undefined);
+		}
+		throw error;
+	}
+}
+
+async function closeCmuxTuiOwnedResource(
+	client: CmuxTuiClient,
+	browserId: string,
+	ownedTabId: string | undefined,
+	timeoutMs?: number,
+): Promise<void> {
+	const deadline = Date.now() + (timeoutMs ?? 30_000);
+	const remaining = (): number => Math.max(1, deadline - Date.now());
+	const { machineId, sessionId } = client.route;
+	const closesParentTab = client.version === 1;
+	if (closesParentTab && !ownedTabId) {
+		throw new ToolError("Owned cmux-tui protocol/1 browser is missing its stable parent tab ID");
+	}
+	const closeOperation = closesParentTab ? "tab.close" : "browser.close";
+	const getOperation = closesParentTab ? "tab.get" : "browser.get";
+	const selector = closesParentTab ? { tab: ownedTabId! } : { browser: browserId };
+	const params = { machine: machineId, session: sessionId, ...selector };
+	const close = (): Promise<unknown> =>
+		client.request(closeOperation, params, { mutation: true, timeoutMs: remaining() });
+	const probe = (): Promise<unknown> => client.request(getOperation, params, { timeoutMs: remaining() });
+	try {
+		await close();
+	} catch (error) {
+		if (error instanceof CmuxTuiProtocolError && error.code === "selector.not_found") return;
+		if (!isCmuxTuiUncertainMutationError(error)) throw error;
+		try {
+			await probe();
+		} catch (probeError) {
+			if (probeError instanceof CmuxTuiProtocolError && probeError.code === "selector.not_found") return;
+			throw error;
+		}
+		// The read proves that the first close did not remove this stable resource ID.
+		// One new close is therefore safe; it is not a blind replay of an uncertain mutation.
+		try {
+			await close();
+		} catch (retryError) {
+			if (retryError instanceof CmuxTuiProtocolError && retryError.code === "selector.not_found") return;
+			if (!isCmuxTuiUncertainMutationError(retryError)) throw retryError;
+			try {
+				await probe();
+			} catch (probeError) {
+				if (probeError instanceof CmuxTuiProtocolError && probeError.code === "selector.not_found") return;
+			}
+			throw retryError;
+		}
+	}
+}
+
+async function acquireCmuxTuiTab(
+	name: string,
+	browser: CmuxTuiBrowserHandle,
+	opts: AcquireTabOptions,
+): Promise<AcquireTabResult> {
+	const attachedBrowser = opts.cmuxSurface;
+	if (attachedBrowser !== undefined && !/^browser_[0-9a-f]{32}$/.test(attachedBrowser)) {
+		throw new ToolError(
+			"app.surface must be a stable cmux-tui browser ID (browser_ followed by 32 lowercase hex characters)",
+		);
+	}
+	if (opts.waitUntil !== undefined && opts.waitUntil !== "load") {
+		throw new ToolError(
+			`cmux-tui browser navigation supports wait_until "load", not ${JSON.stringify(opts.waitUntil)}`,
+		);
+	}
+	const viewport = opts.viewport ?? DEFAULT_VIEWPORT;
+	let browserId = attachedBrowser;
+	let ownsBrowser = false;
+	let ownedTabId: string | undefined;
+	const initialUrl = opts.url;
+	let publishedTab: CmuxTuiTabSession | undefined;
+	let pendingCmuxTab: CmuxTuiTab | undefined;
+	try {
+		if (browserId === undefined) {
+			const result = await browser.client.createBrowserResource(
+				{
+					url: opts.url ?? "about:blank",
+					name,
+					width: viewport.width,
+					height: viewport.height,
+				},
+				{ timeoutMs: opts.timeoutMs, signal: opts.signal },
+			);
+			const created = result?.value;
+			if (
+				created?.kind !== "browser" ||
+				!/^ws_[0-9a-f]{32}$/.test(created.workspace_id) ||
+				!/^tab_[0-9a-f]{32}$/.test(created.tab_id) ||
+				!/^browser_[0-9a-f]{32}$/.test(created.browser_id)
+			) {
+				throw new ToolError("cmux-tui tab.create_browser did not return stable workspace/tab/browser IDs");
+			}
+			browserId = created.browser_id;
+			ownsBrowser = true;
+			ownedTabId = created.tab_id;
+		}
+		const cmuxTab = new CmuxTuiTab({
+			client: browser.client,
+			browserId,
+			url: initialUrl,
+			viewport,
+			onTerminal: () => {
+				if (publishedTab) publishedTab.state = "dead";
+			},
+		});
+		pendingCmuxTab = cmuxTab;
+		await cmuxTab.readyInfo(viewport, { timeoutMs: opts.timeoutMs, signal: opts.signal });
+		if (attachedBrowser && opts.url) {
+			await cmuxTab.goto(opts.url, {
+				waitUntil: opts.waitUntil ?? "load",
+				timeoutMs: opts.timeoutMs,
+				signal: opts.signal,
+			});
+		} else if (ownsBrowser && opts.url) {
+			await cmuxTab.waitForInitialLoad({
+				waitUntil: opts.waitUntil ?? "load",
+				timeoutMs: opts.timeoutMs,
+				signal: opts.signal,
+			});
+		}
+		const info = await cmuxTab.readyInfo(viewport, { timeoutMs: opts.timeoutMs, signal: opts.signal });
+		if (opts.signal?.aborted) throw new ToolAbortError("Browser tab open aborted");
+		holdBrowser(browser);
+		const tab: CmuxTuiTabSession = {
+			name,
+			browser,
+			targetId: browserId,
+			backend: "cmux",
+			cmuxBackend: "tui",
+			cmuxTab,
+			cmuxOwnsSurface: ownsBrowser,
+			cmuxOwnedTabId: ownedTabId,
+			state: "alive",
+			info,
+			pending: new Map(),
+			dialogPolicy: opts.dialogs,
+			kindTag: browser.kind.kind,
+			cmuxAttachedSurface: attachedBrowser,
+			ownerSessionId: opts.ownerSessionId,
+		};
+		publishedTab = tab;
+		tabs.set(name, tab);
+		return { tab, created: true };
+	} catch (error) {
+		await pendingCmuxTab?.closeAttachment(opts.timeoutMs).catch(() => undefined);
+		if (ownsBrowser && browserId) {
+			await closeCmuxTuiOwnedResource(browser.client, browserId, ownedTabId, opts.timeoutMs).catch(() => undefined);
 		}
 		throw error;
 	}
@@ -642,7 +827,35 @@ export async function releaseTab(name: string, opts: ReleaseTabOptions = {}): Pr
 	const timeoutMs = opts.timeoutMs ?? DEFAULT_TAB_CLOSE_TIMEOUT_MS;
 	if (tab.backend === "cmux") {
 		let closeError: unknown;
-		if (wasAlive && tab.cmuxOwnsSurface) {
+		if (tab.cmuxBackend === "tui") {
+			try {
+				await waitForTabCleanup(
+					tab,
+					timeoutMs,
+					`cmux-tui browser attachment ${JSON.stringify(tab.targetId)}`,
+					tab.cmuxTab.closeAttachment(timeoutMs),
+				);
+			} catch (error) {
+				closeError = error;
+			}
+			if (tab.cmuxOwnsSurface) {
+				try {
+					await waitForTabCleanup(
+						tab,
+						timeoutMs,
+						tab.browser.client.version === 1
+							? `cmux-tui parent tab ${JSON.stringify(tab.cmuxOwnedTabId)} (tab.close)`
+							: `cmux-tui browser ${JSON.stringify(tab.targetId)} (browser.close)`,
+						closeCmuxTuiOwnedResource(tab.browser.client, tab.targetId, tab.cmuxOwnedTabId, timeoutMs),
+					);
+					// Closing the owned resource proves the attachment is gone too, so an
+					// indeterminate viewer-release result no longer blocks successful cleanup.
+					closeError = undefined;
+				} catch (error) {
+					closeError = error;
+				}
+			}
+		} else if (wasAlive && tab.cmuxOwnsSurface) {
 			try {
 				await waitForTabCleanup(
 					tab,

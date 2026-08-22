@@ -39,6 +39,7 @@ export {
 } from "./browser/aria/aria-snapshot";
 export { cmuxSnapshotToObservation, mapWaitUntil, resolveCmuxKind, serializeEval } from "./browser/cmux/rpc";
 export { CmuxSocketClient } from "./browser/cmux/socket-client";
+export * from "./browser/cmux/tui-client";
 export { extractReadableFromHtml, type ReadableFormat, type ReadableResult } from "./browser/readable";
 export { DEFAULT_RELAY_URL, type RelayKind, resolveRelayKind } from "./browser/relay/kind";
 export type { Observation, ObservationEntry } from "./browser/tab-protocol";
@@ -49,6 +50,8 @@ const appSchema = type({
 	"path?": type("string").describe("binary path to spawn"),
 	"cdp_url?": type("string").describe("existing cdp endpoint"),
 	"relay?": type("boolean").describe("drive the user's own tabs via the omp browser relay"),
+	"cmux?": type("boolean").describe("drive a browser resource through CMUX_SOCKET_PATH"),
+	"surface?": type("string").describe("stable cmux surface or browser resource id"),
 	"args?": type("string[]").describe("extra cli args"),
 	"target?": type("string").describe("substring to pick a window"),
 });
@@ -98,6 +101,18 @@ function resolveBrowserKind(params: BrowserParams, session: ToolSession): Browse
 		const exe = resolveToCwd(app.path, session.cwd);
 		return { kind: "spawned", path: exe };
 	}
+	if (app?.surface === "") {
+		throw new ToolError("app.surface must not be empty");
+	}
+	if (app?.cmux === false && app.surface !== undefined) {
+		throw new ToolError("app.surface cannot be used when app.cmux is false");
+	}
+	const explicitCmux = app?.cmux === true || app?.surface !== undefined;
+	if (explicitCmux) {
+		const cmuxKind = resolveCmuxKind({ settingEnabled: true, surface: app?.surface });
+		if (cmuxKind) return cmuxKind;
+		throw new ToolError("cmux browser requested, but CMUX_SOCKET_PATH is unavailable or cmux is disabled");
+	}
 	const relayUrl = session.settings.get("browser.relayUrl") as string | undefined;
 	// Explicit app.relay wins over every setting; PI_BROWSER_RELAY stays the
 	// final kill switch (a relay that is down would otherwise brick the tool).
@@ -120,11 +135,11 @@ function resolveBrowserKind(params: BrowserParams, session: ToolSession): Browse
 	if (configuredCdpUrl) {
 		return { kind: "connected", cdpUrl: configuredCdpUrl.replace(/\/+$/, "") };
 	}
-	const cmuxKind = resolveCmuxKind({
-		settingEnabled: session.settings.get("browser.cmux") as boolean | undefined,
-	});
-	if (cmuxKind) {
-		return cmuxKind;
+	if (app?.cmux !== false) {
+		const cmuxKind = resolveCmuxKind({
+			settingEnabled: session.settings.get("browser.cmux") as boolean | undefined,
+		});
+		if (cmuxKind) return cmuxKind;
 	}
 	const headless = session.settings.get("browser.headless") as boolean;
 	return { kind: "headless", headless };
@@ -322,6 +337,7 @@ export class BrowserTool implements AgentTool<typeof browserSchema, BrowserToolD
 								}
 							: undefined,
 						target: params.app?.target,
+						cmuxSurface: params.app?.surface,
 						timeoutMs,
 						deadlineStartMs: deadlineStart,
 						dialogs: params.dialogs,
@@ -342,7 +358,7 @@ export class BrowserTool implements AgentTool<typeof browserSchema, BrowserToolD
 			details.viewport = tab.info.viewport;
 			const verb = result.created ? "Opened" : "Reused";
 			const lines = [
-				`${verb} tab ${JSON.stringify(name)} on ${describeBrowser(browser)}`,
+				`${verb} tab ${JSON.stringify(name)} on ${describeBrowser(browser, tab.backend === "cmux" ? tab.cmuxAttachedSurface : undefined)}`,
 				`URL: ${url}`,
 				title ? `Title: ${title}` : null,
 			].filter((l): l is string => typeof l === "string");
@@ -441,9 +457,9 @@ async function saveBrowserOutputArtifact(session: ToolSession, fullText: string)
 	}
 }
 
-function describeBrowser(handle: BrowserHandle): string {
+function describeBrowser(handle: BrowserHandle, cmuxSurface?: string): string {
 	if (!("browser" in handle)) {
-		return `cmux browser (${handle.kind.surface ?? "split"})`;
+		return `cmux browser (${cmuxSurface ?? "split"})`;
 	}
 	switch (handle.kind.kind) {
 		case "headless":
