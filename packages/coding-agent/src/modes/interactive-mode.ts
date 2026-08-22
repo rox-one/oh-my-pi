@@ -215,6 +215,7 @@ import { createSessionTeardown, type SessionTeardown } from "./session-teardown"
 import { runProviderSetupWizard } from "./setup-wizard/lazy";
 import { interruptHint } from "./shared";
 import { invokeSkillCommandFromText, isKnownSkillCommand } from "./skill-command";
+import type { StartupComposerSurface } from "./startup-composer";
 import { clearMermaidCache } from "./theme/mermaid-cache";
 import { type ShimmerPalette, shimmerEnabled, shimmerSegments, shimmerText } from "./theme/shimmer";
 import type { Theme } from "./theme/theme";
@@ -571,8 +572,8 @@ export function renderSubagentHudLines(sessions: ObservableSession[], columns: n
 const CTRL_L_APPEARANCE_RESPONSE_DEADLINE_MS = 2000;
 
 export class InteractiveMode implements InteractiveModeContext {
+	readonly #adoptedStartupSurface: boolean;
 	#ownsStartedUi: boolean;
-	#startupSubmitGated: boolean;
 	session: AgentSession;
 	sessionManager: SessionManager;
 	settings: Settings;
@@ -837,46 +838,15 @@ export class InteractiveMode implements InteractiveModeContext {
 		lspServers: LspStartupServerInfo[] | undefined = undefined,
 		mcpManager?: MCPManager,
 		eventBus?: EventBus,
-		composer?: Composer,
+		startupSurface?: StartupComposerSurface,
 	) {
 		this.session = session;
 		this.sessionManager = session.sessionManager;
 		this.settings = session.settings;
-		const preferences = {
-			quiet: settings.get("startup.quiet"),
-			composerShape: settings.get("composer.shape") ?? "box",
-			showHardwareCursor: settings.get("showHardwareCursor"),
-			maxInlineImages: settings.get("tui.maxInlineImages"),
-			resizeScrollback: settings.get("tui.resizeScrollback"),
-			imeSafeCursor: settings.get("tui.imeSafeCursor"),
-			autocompleteMaxVisible: settings.get("autocompleteMaxVisible"),
-			spellingTypoDetection: settings.get("spelling.typoDetection"),
-			spellingAutocomplete: settings.get("spelling.autocomplete"),
-			spellingAutocorrect: settings.get("spelling.autocorrect"),
-		};
-		const wasStarted = composer?.started ?? false;
-		this.composer =
-			composer ??
-			new Composer({
-				preferences,
-				welcome: {
-					version,
-					modelName: session.model?.name ?? "Unknown",
-					providerName: session.model?.provider ?? "Unknown",
-					lspServers: lspServers?.map(server => ({
-						name: server.name,
-						status: server.status,
-						fileTypes: server.fileTypes,
-					})),
-				},
-			});
-		this.composer.setPreferences(preferences);
-		this.ui = this.composer.ui;
-		this.editor = this.composer.editor;
-		this.editor.magicKeywordsEnabled = () => this.settings.get("magicKeywords.enabled");
-		this.editor.imageReferenceHyperlink = imageReferenceHyperlink;
-		this.#ownsStartedUi = wasStarted;
-		this.#startupSubmitGated = true;
+		this.ui = startupSurface?.ui ?? new TUI(new ProcessTerminal(), settings.get("showHardwareCursor"));
+		this.editor = startupSurface?.editor ?? new CustomEditor(getEditorTheme());
+		this.#adoptedStartupSurface = startupSurface !== undefined;
+		this.#ownsStartedUi = startupSurface !== undefined;
 		this.keybindings = KeybindingsManager.inMemory();
 		this.agent = session.agent;
 		this.#version = version;
@@ -914,6 +884,8 @@ export class InteractiveMode implements InteractiveModeContext {
 		// A cold-start composer already owns the terminal. Reuse it so input
 		// buffered during startup remains in the same editor instance.
 		this.ui.setMaxInlineImages(settings.get("tui.maxInlineImages"));
+		this.ui.setScrollbackRebuild(settings.get("tui.scrollbackRebuild"));
+		this.ui.setResizeScrollback(settings.get("tui.resizeScrollback"));
 		this.ui.setShowHardwareCursor(settings.get("showHardwareCursor"));
 		// OSC 66 text-sizing is Kitty-only; resolve the setting against the terminal's
 		// capability (`TERMINAL.supportsTextSizing` defaults on for Kitty) so it stays off
@@ -930,6 +902,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.errorBannerContainer = new AnchoredLiveContainer();
 		this.modelCycleContainer = new AnchoredLiveContainer();
 		this.deferredCommandContainer = new AnchoredLiveContainer();
+		this.ui.enableScopedInputRender(this.editor);
 		this.editor.setUseTerminalCursor(this.ui.getShowHardwareCursor());
 		this.editor.setImeSafeCursorLayout(settings.get("tui.imeSafeCursor"));
 		this.editor.setAutocompleteMaxVisible(settings.get("autocompleteMaxVisible"));
@@ -1136,15 +1109,21 @@ export class InteractiveMode implements InteractiveModeContext {
 		const modelName = this.session.model?.name ?? "Unknown";
 		const providerName = this.session.model?.provider ?? "Unknown";
 
-		// Prepaint started this scan before the runtime module graph loaded. Only
-		// scan here when no startup composer exists (non-TTY/embedded hosts) or
-		// its best-effort load failed.
-		const recentSessions = await logger.time("InteractiveMode.init:recentSessions", async () => {
-			const preloaded = await options.recentSessions;
-			if (preloaded) return preloaded;
-			const sessions = await getRecentSessions(this.sessionManager.getSessionDir());
-			return sessions.map(s => ({ name: s.name, timeAgo: s.timeAgo }));
-		});
+		// Get recent sessions
+		const recentSessions = await logger.time("InteractiveMode.init:recentSessions", () =>
+			getRecentSessions(this.sessionManager.getSessionDir()).then(sessions =>
+				sessions.map(s => ({
+					name: s.name,
+					timeAgo: s.timeAgo,
+				})),
+			),
+		);
+		if (this.#adoptedStartupSurface) {
+			// Replace the provisional startup frame in-place. The editor object
+			// itself survives and is reattached below with its draft intact.
+			this.ui.clear();
+		}
+
 		const startupQuiet = settings.get("startup.quiet");
 		this.composer.setPreferences({ quiet: startupQuiet });
 		this.composer.updateWelcome({
@@ -1208,6 +1187,7 @@ export class InteractiveMode implements InteractiveModeContext {
 
 		this.#inputController.setupKeyHandlers();
 		this.#inputController.setupEditorSubmitHandler();
+		this.editor.disableSubmit = false;
 
 		// Wire observer registry to EventBus
 		if (this.#eventBus) {
@@ -1229,12 +1209,10 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.#eventBusUnsubscribers.push(startMacOSAppearanceReprobeFallback(this.ui.terminal));
 		}
 
-		// A prepaint Composer may already own raw mode and the render loop.
+		// A startup composer may already own raw mode and the render loop. Do not
+		// restart the terminal or clear scrollback during that in-place handoff.
 		if (!this.#ownsStartedUi) {
-			this.composer.start({
-				clearScrollback: options.clearInitialTerminalHistory === true,
-				playWelcomeIntro: !options.suppressWelcomeIntro,
-			});
+			this.ui.start({ clearScrollback: options.clearInitialTerminalHistory === true });
 			this.#ownsStartedUi = true;
 		}
 		pushTerminalTitle();

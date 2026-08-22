@@ -75,13 +75,11 @@ import { CURRENT_SETUP_VERSION } from "./modes/setup-version";
 import type * as SetupWizardModule from "./modes/setup-wizard";
 import type { SetupScene } from "./modes/setup-wizard";
 import {
-	applyStartupComposerPreferences,
-	type ComposerLease,
-	setStartupComposerLspServers,
+	type StartupComposerSurface,
 	stopPendingStartupComposer,
-	takeStartupComposerLease,
+	takeStartupComposerSurface,
 } from "./modes/startup-composer";
-import { ensureTheme, initTheme, stopThemeWatcher } from "./modes/theme/theme";
+import { initTheme, stopThemeWatcher } from "./modes/theme/theme";
 import type { SubmittedUserInput } from "./modes/types";
 import { createWarpEventBridgeExtension } from "./modes/warp-events";
 import { AgentLifecycleManager } from "./registry/agent-lifecycle";
@@ -520,16 +518,24 @@ async function runInteractiveMode(
 	initialMessage?: string,
 	initialImages?: ImageContent[],
 	joinLink?: string,
-): Promise<InteractiveModeOutcome> {
-	const mode = new InteractiveMode(
-		session,
-		version,
-		startupChangelog,
-		setExtensionUIContext,
-		lspServers,
-		mcpManager,
-		eventBus,
-	);
+	startupSurface?: StartupComposerSurface,
+): Promise<void> {
+	let mode: InteractiveMode;
+	try {
+		mode = new InteractiveMode(
+			session,
+			version,
+			startupChangelog,
+			setExtensionUIContext,
+			lspServers,
+			mcpManager,
+			eventBus,
+			startupSurface,
+		);
+	} catch (error) {
+		startupSurface?.ui.stop();
+		throw error;
+	}
 
 	let setupWizard: typeof SetupWizardModule | undefined;
 	let setupScenes: SetupScene[] = [];
@@ -555,35 +561,13 @@ async function runInteractiveMode(
 			: [];
 		playStartupSplash = showStartupSplash && setupScenes.length === 0;
 
-		await logger.time("InteractiveMode.init", () =>
-			mode.init({
-				suppressWelcomeIntro: resuming || setupScenes.length > 0 || playStartupSplash,
-				clearInitialTerminalHistory: true,
-				recentSessions: startupLease?.recentSessions,
-			}),
-		);
-		void startBackgroundModelDiscovery?.();
+		await mode.init({
+			suppressWelcomeIntro: resuming || setupScenes.length > 0 || playStartupSplash,
+			clearInitialTerminalHistory: true,
+		});
 	} catch (error) {
 		mode.stop();
 		throw error;
-	}
-
-	let autoRestart: ExecutableUpdateMonitor | undefined;
-	if (session.sessionManager.getSessionFile()) {
-		autoRestart = new ExecutableUpdateMonitor({
-			paths: defaultAutoRestartWatchPaths({
-				argv: process.argv,
-				execPath: process.execPath,
-				env: process.env,
-			}),
-			isEnabled: () => session.settings.get("settings.autoRestartOnUpdate"),
-			onUpdate: () => {
-				mode.showStatus("OMP update detected. Restarting this session…");
-				mode.interruptIdleInputForAutoRestart();
-			},
-		});
-		await autoRestart.prime();
-		autoRestart.start();
 	}
 
 	if (setupWizard && playStartupSplash) {
@@ -1596,16 +1580,72 @@ export async function runRootCommand(
 		// warning before we reach the await site below.
 		pluginPreloadPromise.catch(() => {});
 
-	// Handle --resume (no value): show session picker
-	if (parsedArgs.resume === true && !parsedArgs.fork) {
-		const workspaceMode = settingsInstance.get("workspace.identifier");
-		const folderSessions = await logger.time(
-			"SessionManager.list",
-			SessionManager.list,
-			cwd,
-			parsedArgs.sessionDir,
-			undefined,
-			workspaceMode,
+		// Trusted files load as exact module paths, never as package roots whose
+		// sibling hooks/tools/commands/MCP content could be discovered implicitly.
+		if (!parsedArgs.trustedExtensions?.length) {
+			// Register CLI-provided extension package paths (`--extension`, `--hook`) so
+			// the `omp-plugins` discovery provider can surface their `skills/`, `hooks/`,
+			// `tools/`, `commands/`, `rules/`, `prompts/`, and `.mcp.json` sub-trees.
+			// Explicit roots remain authorized under `--no-extensions`; only ambient
+			// extension discovery is disabled.
+			const cliExtensions = [...(parsedArgs.extensions ?? []), ...(parsedArgs.hooks ?? [])];
+			injectOmpExtensionCliRoots(cliExtensions, home, getProjectDir(), {
+				mode: parsedArgs.noExtensions ? "explicit-only" : "merge",
+				replace: true,
+			});
+		}
+
+		let cwd = getProjectDir();
+		// Classify the host before opening auth or settings storage so every
+		// session-critical database connection picks the right busy timeout.
+		// See getDbBusyTimeoutMs().
+		const isProtocolMode = mode === "rpc" || mode === "rpc-ui" || mode === "acp";
+		// Protocol modes own stdin; treating it as prompt text would consume JSON-RPC frames before their transports start.
+		const pipedInput = isProtocolMode ? undefined : await logger.time("readPipedInput", readPipedInput);
+		const autoPrint = pipedInput !== undefined && !parsedArgs.print && parsedArgs.mode === undefined;
+		const isInteractive = !parsedArgs.print && !autoPrint && parsedArgs.mode === undefined;
+		// Only the interactive host renders a focusable Agent Hub / subagent session
+		// tree; declare it so headless subagent optimizations (e.g. skipping replan
+		// title refresh) can tell a focusable process from a print/RPC/eval one.
+		setInteractiveHost(isInteractive);
+		if (!isInteractive) {
+			stopPendingStartupComposer();
+		}
+		// Create AuthStorage upfront. A configured-but-unreachable auth broker throws
+		// here; convert it to an actionable stderr message + clean exit instead of a
+		// raw uncaught stack trace (issue #8096).
+		let authStorage: AuthStorage;
+		try {
+			authStorage = await logger.time("discoverAuthStorage", deps.discoverAuthStorage ?? discoverAuthStorage);
+		} catch (error) {
+			const message = await describeAuthBrokerStartupError(error);
+			if (message === null) throw error;
+			process.stderr.write(`${chalk.red(`Error: ${message}`)}\n`);
+			process.exit(1);
+		}
+
+		const settingsInstance =
+			deps.settings ?? (await logger.time("settings:init", Settings.init, { cwd, configFiles: parsedArgs.config }));
+		if (parsedArgs.approvalMode) {
+			// Runtime override (not persisted): every settings.get("tools.approvalMode") downstream
+			// sees this value. The wrapper still honours --auto-approve / --yolo on top of it.
+			settingsInstance.override("tools.approvalMode", parsedArgs.approvalMode);
+		} else if (parsedArgs.autoApprove) {
+			// --auto-approve / --yolo without an explicit --approval-mode: reflect in settings so
+			// setup-time checks (e.g. #wrapToolForAcpPermission) also see the yolo intent.
+			settingsInstance.override("tools.approvalMode", "yolo");
+		}
+		if (parsedArgs.mode === "rpc" || parsedArgs.mode === "rpc-ui") {
+			applyRpcDefaultSettingOverrides(settingsInstance);
+		} else if (parsedArgs.mode === "acp") {
+			applyAcpDefaultSettingOverrides(settingsInstance);
+		}
+
+		// The registry composes policy-dependent metadata synchronously, including
+		// extended-context window caps, so it must receive the finalized settings.
+		const modelRegistry = logger.time(
+			"modelRegistry:init",
+			() => new ModelRegistry(authStorage, undefined, { settings: settingsInstance }),
 		);
 		let preloadedAllSessions: SessionInfo[] | undefined;
 		if (folderSessions.length === 0) {
@@ -2127,33 +2167,29 @@ export async function runRootCommand(
 						process.exit(0);
 					}
 				}
-				const startupLease = takeStartupComposerLease();
-				try {
-					stopStartupWatchdog();
-					logger.endTiming();
-					await runInteractiveMode(
-						session,
-						VERSION,
-						startupChangelog,
-						notifs,
-						versionCheckPromise,
-						initialArgs.messages,
-						setToolUIContext,
-						lspServers,
-						mcpManager,
-						Boolean(parsedArgs.continue || parsedArgs.resume || parsedArgs.fork || foreignSource),
-						deps.forceSetupWizard === true,
-						showStartupSplash,
-						eventBus,
-						initialMessage,
-						initialImages,
-						parsedArgs.join,
-						startBackgroundModelDiscovery,
-						startupLease,
-					);
-				} finally {
-					startupLease?.dispose();
-				}
+				const startupSurface = takeStartupComposerSurface();
+
+				stopStartupWatchdog();
+				logger.endTiming();
+				await runInteractiveMode(
+					session,
+					VERSION,
+					startupChangelog,
+					notifs,
+					versionCheckPromise,
+					initialArgs.messages,
+					setToolUIContext,
+					lspServers,
+					mcpManager,
+					Boolean(parsedArgs.continue || parsedArgs.resume || parsedArgs.fork || foreignSource),
+					deps.forceSetupWizard === true,
+					showStartupSplash,
+					eventBus,
+					initialMessage,
+					initialImages,
+					parsedArgs.join,
+					startupSurface,
+				);
 			} else {
 				// Branch-only single-shot runner: keep print-mode code out of normal interactive startup.
 				stopStartupWatchdog();

@@ -427,16 +427,27 @@ export async function runCli(argv: string[]): Promise<void> {
 	}
 	let stopStartupComposer: (() => void) | undefined;
 	if (
-		!process.env.PI_TIMING &&
 		process.stdin.isTTY === true &&
 		process.stdout.isTTY === true &&
 		(resolvedArgv.length === 0 || (resolvedArgv.length === 1 && resolvedArgv[0] === "--no-session"))
 	) {
-		// Intentional exception to the static-import convention: this latency boundary
-		// keeps the TUI graph out of worker, subcommand, help, and version launches.
-		// Loading it statically would erase the measured cold-start improvement.
-		const { beginStartupComposer, stopPendingStartupComposer } = await import("./modes/startup-composer");
-		beginStartupComposer({ version: VERSION });
+		// This conditional import is the latency boundary: loading cli-commands
+		// pulls in the full agent graph, while the provisional editor can paint
+		// independently and then transfer terminal ownership to InteractiveMode.
+		const [{ beginStartupComposer, stopPendingStartupComposer }, { getDefault }, { initTheme }] = await Promise.all([
+			import("./modes/startup-composer"),
+			import("./config/settings"),
+			import("./modes/theme/theme"),
+		]);
+		await initTheme();
+		beginStartupComposer({
+			showHardwareCursor: getDefault("showHardwareCursor"),
+			maxInlineImages: getDefault("tui.maxInlineImages"),
+			scrollbackRebuild: getDefault("tui.scrollbackRebuild"),
+			resizeScrollback: getDefault("tui.resizeScrollback"),
+			imeSafeCursor: getDefault("tui.imeSafeCursor"),
+			autocompleteMaxVisible: getDefault("autocompleteMaxVisible"),
+		});
 		stopStartupComposer = stopPendingStartupComposer;
 	}
 
