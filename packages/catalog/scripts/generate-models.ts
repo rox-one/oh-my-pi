@@ -536,6 +536,16 @@ async function generateModels() {
 		[...bundledModelsDevModels, ...catalogProviderModels, ...gitLabDuoModels],
 		modelsDevModels,
 	);
+	const openRouterThinking = new Map(
+		catalogProviderModels
+			.filter(model => model.provider === "openrouter" && model.thinking !== undefined)
+			.map(model => [model.id, model.thinking] as const),
+	);
+	allModels = allModels.map(model => {
+		if (model.provider !== "openrouter") return model;
+		const thinking = openRouterThinking.get(model.id);
+		return thinking === undefined ? model : { ...model, thinking };
+	});
 
 	if (!allModels.some(model => model.provider === "cloudflare-ai-gateway")) {
 		allModels.push(CLOUDFLARE_FALLBACK_MODEL as ModelSpec<"anthropic-messages">);

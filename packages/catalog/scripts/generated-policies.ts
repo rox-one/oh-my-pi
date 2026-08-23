@@ -206,7 +206,9 @@ export function applyGeneratedModelPolicies(models: ModelSpec<Api>[]): void {
  * the generic deriver cannot reproduce that routing metadata.
  */
 export function rebakeModelThinking(model: ModelSpec<Api>): void {
-	if (isVariantCollapsedSpec(model)) return;
+	if (isVariantCollapsedSpec(model) || (model.provider === "openrouter" && model.thinking?.requiresEffort === true)) {
+		return;
+	}
 	if (
 		model.provider === "alibaba-token-plan" &&
 		(model.id === "qwen3.8-max-preview" || model.id === "qwen3.8-max") &&
