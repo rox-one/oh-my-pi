@@ -2181,6 +2181,7 @@ export class AuthStorage {
 					secondary,
 					nowMs,
 					strategy.windowDefaults.secondaryMs,
+					args.provider === "anthropic",
 				),
 				primaryUsed: this.#normalizeUsageFraction(primary),
 				primaryRequiredDrain: this.#computeWindowRequiredDrain(primary, nowMs, strategy.windowDefaults.primaryMs),
@@ -4582,17 +4583,27 @@ export class AuthStorage {
 	 * Computes the required drain rate: `headroomFraction / remainingHours`.
 	 * Higher scores rank first so quota that resets sooner is not stranded.
 	 *
-	 * A measured window with headroom but no reset clock has not started yet.
-	 * Rank it first so a fresh subscription seat is used before running siblings
-	 * spill into paid overage. A missing limit is different: its 0.5 headroom is
-	 * only an unknown-usage placeholder, so it keeps the conservative full-window
-	 * score instead of jumping the queue.
+	 * `prioritizeClocklessZero` opts in the one window shape where "no clock"
+	 * means "not started": Anthropic publishes `resetsAt` on a weekly window
+	 * only once that window is running, so 0% used with no clock is an untouched
+	 * subscription seat. Rank it first so it is started before running siblings
+	 * spill into paid overage. Every other clockless window keeps the
+	 * conservative full-window score — a partially consumed duration-only window
+	 * (Kimi's 5h/7d shape) and a missing limit's 0.5 unknown-usage placeholder
+	 * carry no evidence that the quota is idle, so neither may jump the queue.
 	 */
-	#computeWindowRequiredDrain(limit: UsageLimit | undefined, nowMs: number, fallbackDurationMs: number): number {
+	#computeWindowRequiredDrain(
+		limit: UsageLimit | undefined,
+		nowMs: number,
+		fallbackDurationMs: number,
+		prioritizeClocklessZero = false,
+	): number {
 		const headroom = 1 - this.#normalizeUsageFraction(limit);
 		if (headroom <= 0) return 0;
 		const resetAt = this.#resolveWindowResetAt(limit?.window);
-		if (resetAt === undefined && limit !== undefined) return Number.POSITIVE_INFINITY;
+		if (prioritizeClocklessZero && resetAt === undefined && limit?.amount.usedFraction === 0) {
+			return Number.POSITIVE_INFINITY;
+		}
 		const durationMs = limit?.window?.durationMs ?? fallbackDurationMs;
 		let remainingMs = resetAt === undefined ? durationMs : resetAt - nowMs;
 		if (Number.isFinite(durationMs) && durationMs > 0) {
@@ -4779,6 +4790,7 @@ export class AuthStorage {
 					secondary,
 					nowMs,
 					strategy.windowDefaults.secondaryMs,
+					args.provider === "anthropic",
 				),
 				primaryUsed: this.#normalizeUsageFraction(primary),
 				primaryRequiredDrain: this.#computeWindowRequiredDrain(primary, nowMs, strategy.windowDefaults.primaryMs),
