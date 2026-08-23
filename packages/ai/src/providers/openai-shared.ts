@@ -764,10 +764,16 @@ function splitReasoningDisabledExtraBody(extraBody: Record<string, unknown>): {
 	let chatTemplateKwargs: Record<string, unknown> | undefined;
 	for (const [key, value] of Object.entries(extraBody)) {
 		if (REASONING_ONLY_EXTRA_BODY_KEYS.has(key)) continue;
-		if (key === "chat_template_kwargs" && isRecord(value)) {
-			chatTemplateKwargs = Object.fromEntries(
-				Object.entries(value).filter(([kwarg]) => !REASONING_ONLY_CHAT_TEMPLATE_KWARG_KEYS.has(kwarg)),
-			);
+		if (key === "chat_template_kwargs") {
+			// Only sanitize object-shaped kwargs; a non-record value (null,
+			// array, primitive) would otherwise land in `values` and clobber
+			// the encoder's disabled `chat_template_kwargs` via `Object.assign`.
+			// Drop it so the encoder shape survives.
+			if (isRecord(value)) {
+				chatTemplateKwargs = Object.fromEntries(
+					Object.entries(value).filter(([kwarg]) => !REASONING_ONLY_CHAT_TEMPLATE_KWARG_KEYS.has(kwarg)),
+				);
+			}
 			continue;
 		}
 		values[key] = value;

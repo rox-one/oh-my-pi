@@ -72,6 +72,25 @@ describe("applyOpenAIExtraBody reasoningDisabled", () => {
 		expect(params.gateway).toBe("route-a");
 	});
 
+	it("drops a non-record chat_template_kwargs instead of clobbering the encoder disabled shape", () => {
+		// null, arrays, or primitives at extraBody.chat_template_kwargs must not
+		// survive into the merged values; otherwise Object.assign overwrites the
+		// encoder's `{ enable_thinking: false }` and the server defaults to
+		// thinking-on (or rejects the malformed payload).
+		for (const malformed of [null, ["enable_thinking", true], "false", 42]) {
+			const params: Record<string, unknown> = {
+				chat_template_kwargs: { enable_thinking: false },
+			};
+			applyOpenAIExtraBody(
+				params,
+				{ chat_template_kwargs: malformed, gateway: "route-a" },
+				{ reasoningDisabled: true },
+			);
+			expect(params.chat_template_kwargs).toEqual({ enable_thinking: false });
+			expect(params.gateway).toBe("route-a");
+		}
+	});
+
 	it("does not treat inherited Object.prototype members as reasoning keys", () => {
 		// A plain-object index (`REASONING_ONLY_EXTRA_BODY_KEYS[key]`) would read
 		// `constructor`/`toString` off the prototype chain as truthy and silently
