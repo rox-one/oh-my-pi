@@ -749,6 +749,33 @@ const REASONING_ONLY_EXTRA_BODY_KEYS = new Set([
 ]);
 
 /**
+ * `chat_template_kwargs` can carry the same Qwen reasoning controls as the
+ * top-level request body. When the encoder has disabled reasoning, remove the
+ * nested controls before merging provider config and retain the encoder's
+ * already-written kwargs over any duplicate config values.
+ */
+const REASONING_ONLY_CHAT_TEMPLATE_KWARG_KEYS = new Set(["enable_thinking", "reasoning_effort"]);
+
+function splitReasoningDisabledExtraBody(extraBody: Record<string, unknown>): {
+	values: Record<string, unknown>;
+	chatTemplateKwargs?: Record<string, unknown>;
+} {
+	const values: Record<string, unknown> = {};
+	let chatTemplateKwargs: Record<string, unknown> | undefined;
+	for (const [key, value] of Object.entries(extraBody)) {
+		if (REASONING_ONLY_EXTRA_BODY_KEYS.has(key)) continue;
+		if (key === "chat_template_kwargs" && isRecord(value)) {
+			chatTemplateKwargs = Object.fromEntries(
+				Object.entries(value).filter(([kwarg]) => !REASONING_ONLY_CHAT_TEMPLATE_KWARG_KEYS.has(kwarg)),
+			);
+			continue;
+		}
+		values[key] = value;
+	}
+	return { values, chatTemplateKwargs };
+}
+
+/**
  * Merge a compat/options `extraBody` blob into the request params. An encoded
  * Venice disable signal takes precedence over static `venice_parameters`, so
  * an explicit per-turn Thinking Off selection cannot be re-enabled by config.
@@ -765,10 +792,17 @@ export function applyOpenAIExtraBody<P extends object>(
 ): void {
 	if (!extraBody) return;
 	const encodedVeniceParameters = params.venice_parameters;
-	const mergedExtraBody = options?.reasoningDisabled
-		? Object.fromEntries(Object.entries(extraBody).filter(([key]) => !REASONING_ONLY_EXTRA_BODY_KEYS.has(key)))
-		: extraBody;
+	const { values: mergedExtraBody, chatTemplateKwargs } = options?.reasoningDisabled
+		? splitReasoningDisabledExtraBody(extraBody)
+		: { values: extraBody };
 	Object.assign(params, mergedExtraBody);
+	if (chatTemplateKwargs !== undefined) {
+		const shaped = params as P & { chat_template_kwargs?: Record<string, unknown> };
+		shaped.chat_template_kwargs = {
+			...chatTemplateKwargs,
+			...shaped.chat_template_kwargs,
+		};
+	}
 	if (encodedVeniceParameters?.disable_thinking === true) {
 		const configuredVeniceParameters = mergedExtraBody.venice_parameters;
 		params.venice_parameters = {

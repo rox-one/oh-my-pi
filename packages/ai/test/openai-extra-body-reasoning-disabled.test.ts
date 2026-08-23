@@ -4,9 +4,13 @@ import { applyOpenAIExtraBody } from "@oh-my-pi/pi-ai/providers/openai-shared";
 describe("applyOpenAIExtraBody reasoningDisabled", () => {
 	it("strips only reasoning-only keys, preserving unrelated extraBody fields", () => {
 		const params: Record<string, unknown> = {};
-		applyOpenAIExtraBody(params, { thinking: { type: "enabled" }, provider: { order: ["foo"] } }, {
-			reasoningDisabled: true,
-		});
+		applyOpenAIExtraBody(
+			params,
+			{ thinking: { type: "enabled" }, provider: { order: ["foo"] } },
+			{
+				reasoningDisabled: true,
+			},
+		);
 
 		expect(params.thinking).toBeUndefined();
 		expect(params.provider).toEqual({ order: ["foo"] });
@@ -40,18 +44,50 @@ describe("applyOpenAIExtraBody reasoningDisabled", () => {
 		expect(params.gateway).toBe("route-a");
 	});
 
+	it("preserves the encoder's disabled chat-template toggle while merging unrelated nested kwargs", () => {
+		// The extra body is merged after the dialect encoder. A nested Qwen
+		// `enable_thinking: true` must not clobber the disabled turn, but static
+		// template configuration unrelated to reasoning still belongs on the wire.
+		const params: Record<string, unknown> = {
+			chat_template_kwargs: { enable_thinking: false, preserve_thinking: true },
+		};
+		applyOpenAIExtraBody(
+			params,
+			{
+				chat_template_kwargs: {
+					enable_thinking: true,
+					reasoning_effort: "high",
+					custom_template_option: "keep-me",
+				},
+				gateway: "route-a",
+			},
+			{ reasoningDisabled: true },
+		);
+
+		expect(params.chat_template_kwargs).toEqual({
+			enable_thinking: false,
+			preserve_thinking: true,
+			custom_template_option: "keep-me",
+		});
+		expect(params.gateway).toBe("route-a");
+	});
+
 	it("does not treat inherited Object.prototype members as reasoning keys", () => {
 		// A plain-object index (`REASONING_ONLY_EXTRA_BODY_KEYS[key]`) would read
 		// `constructor`/`toString` off the prototype chain as truthy and silently
 		// drop them even though they are not reasoning controls; the Set-backed
 		// lookup must only match the explicit reasoning-control key list.
 		const params: Record<string, unknown> = {};
-		applyOpenAIExtraBody(params, { constructor: "keep-me", toString: "also-keep", thinking: { type: "enabled" } }, {
-			reasoningDisabled: true,
-		});
+		applyOpenAIExtraBody(
+			params,
+			{ constructor: "keep-me", toString: "also-keep", thinking: { type: "enabled" } },
+			{
+				reasoningDisabled: true,
+			},
+		);
 
-		expect(params["constructor"]).toBe("keep-me");
-		expect(params["toString"]).toBe("also-keep");
+		expect(Object.getOwnPropertyDescriptor(params, "constructor")?.value).toBe("keep-me");
+		expect(Object.getOwnPropertyDescriptor(params, "toString")?.value).toBe("also-keep");
 		expect(params.thinking).toBeUndefined();
 	});
 });
