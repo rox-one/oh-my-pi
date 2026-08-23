@@ -712,7 +712,29 @@ export interface OpenAIExtraBodyOptions {
 	 * `reasoning_effort`; drop `thinking` when the effort field carries the level.
 	 */
 	dropThinkingWhenReasoningEffort?: boolean;
+	/**
+	 * When true, strip reasoning-specific keys from `extraBody` before
+	 * merging instead of skipping the merge entirely. `extraBody` is an
+	 * arbitrary record that commonly carries gateway-routing hints and
+	 * controller fields with no relation to reasoning; dropping the whole
+	 * blob on a reasoning-disable would also drop those unrelated fields
+	 * and could misroute the request. Only the known reasoning-only keys
+	 * (`thinking`, `parse_reasoning`, `include_reasoning`) are removed; the
+	 * rest flows through unchanged.
+	 */
+	reasoningDisabled?: boolean;
 }
+
+/**
+ * Reasoning-specific `extraBody` keys that are no-ops once reasoning is
+ * disabled. Stripped from the blob before merging when `reasoningDisabled`
+ * is set; every other key (gateway routing, controller fields, …) survives.
+ */
+const REASONING_ONLY_EXTRA_BODY_KEYS: Record<string, true> = {
+	thinking: true,
+	parse_reasoning: true,
+	include_reasoning: true,
+};
 
 /**
  * Merge a compat/options `extraBody` blob into the request params. An encoded
@@ -720,6 +742,9 @@ export interface OpenAIExtraBodyOptions {
  * an explicit per-turn Thinking Off selection cannot be re-enabled by config.
  * When `dropThinkingWhenReasoningEffort` is set and `reasoning_effort` is
  * present, delete the conflicting `thinking` toggle (Fireworks rejects both).
+ * When `reasoningDisabled` is set, strip only the reasoning-specific keys
+ * from the blob before merging so unrelated provider-required configuration
+ * (gateway routing, controller fields, …) still reaches the request.
  */
 export function applyOpenAIExtraBody<P extends object>(
 	params: P & { venice_parameters?: Record<string, unknown> },
@@ -728,9 +753,12 @@ export function applyOpenAIExtraBody<P extends object>(
 ): void {
 	if (!extraBody) return;
 	const encodedVeniceParameters = params.venice_parameters;
-	Object.assign(params, extraBody);
+	const mergedExtraBody = options?.reasoningDisabled
+		? Object.fromEntries(Object.entries(extraBody).filter(([key]) => !REASONING_ONLY_EXTRA_BODY_KEYS[key]))
+		: extraBody;
+	Object.assign(params, mergedExtraBody);
 	if (encodedVeniceParameters?.disable_thinking === true) {
-		const configuredVeniceParameters = extraBody.venice_parameters;
+		const configuredVeniceParameters = mergedExtraBody.venice_parameters;
 		params.venice_parameters = {
 			...(isRecord(configuredVeniceParameters) ? configuredVeniceParameters : {}),
 			...encodedVeniceParameters,

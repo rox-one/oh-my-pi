@@ -1829,20 +1829,11 @@ function buildParams(
 
 	applyOpenAIGatewayRouting(params, compat, cacheRetention !== "none");
 
-	if (compat.extraBody) {
-		Object.assign(params, compat.extraBody);
-		if (reasoningDisabledForRequest) {
-			delete params.thinking;
-			delete params.enable_thinking;
-			delete params.chat_template_kwargs;
-			delete params.reasoning_effort;
-		}
-		if (model.provider === "fireworks" && params.reasoning_effort !== undefined) {
-			// Fireworks rejects simultaneous DeepSeek-style `thinking` toggles and
-			// OpenAI-style `reasoning_effort`; the effort field carries the user's level.
-			delete params.thinking;
-		}
-	}
+	applyOpenAIExtraBody(params, compat.extraBody, {
+		dropThinkingWhenReasoningEffort: compat.dropThinkingWhenReasoningEffort,
+		reasoningDisabled: finalPolicy.reasoning.disabled,
+	});
+	applyOpenAIChatCompletionsPromptCachePolicy(params, model, options);
 
 	return { params, toolStrictMode, strictToolsApplied };
 }

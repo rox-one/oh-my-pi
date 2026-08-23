@@ -149,15 +149,18 @@ export function resolveModelThinking<TApi extends Api>(
 ): ThinkingConfig | undefined {
 	if (!spec.reasoning) return undefined;
 	if (omitsWireReasoningEffort(spec.api, compat)) return undefined;
+	let thinking: ThinkingConfig;
 	if (spec.thinking && Array.isArray(spec.thinking.efforts) && spec.thinking.efforts.length > 0) {
-		return fillThinkingWireDefaults(spec, compat, spec.thinking);
+		thinking = fillThinkingWireDefaults(spec, compat, spec.thinking);
+	} else {
+		// Cascade selects effort only by routing to a sibling model id, so a
+		// Devin model with no explicit routed thinking has no controllable
+		// surface — never fabricate an effort ladder from identity.
+		if ((compat as ResolvedDevinCompat | undefined)?.trustExplicitThinkingOnly === true) return undefined;
+		// Empty/malformed explicit metadata is treated as absent — infer instead.
+		thinking = deriveThinking(spec, compat);
 	}
-	// Cascade selects effort only by routing to a sibling model id, so a Devin
-	// model with no explicit routed thinking has no controllable surface —
-	// never fabricate an effort ladder from identity.
-	if ((compat as ResolvedDevinCompat | undefined)?.trustExplicitThinkingOnly === true) return undefined;
-	// Empty/malformed explicit metadata is treated as absent — infer instead.
-	return deriveThinking(spec, compat);
+	return collapseQwenTemplateBinaryThinking(thinking, spec, compat);
 }
 
 /**
@@ -259,13 +262,58 @@ export function deriveThinking<TApi extends Api>(spec: ModelSpec<TApi>, compat: 
  * (xAI Grok off the `isGrokReasoningEffortCapable` allowlist: grok-build,
  * grok-4.20-0309-reasoning). openai-completions keeps its thinking config even
  * without effort support — binary thinking formats (zai/qwen) drive reasoning
- * through other request fields.
+ * through other request fields, and qwen-chat-template models whose compat
+ * omits `reasoning_effort` entirely collapse to a single binary toggle in
+ * `collapseQwenTemplateBinaryThinking` rather than dropping thinking here.
  */
 function omitsWireReasoningEffort(api: Api, compat: CompatOf<Api>): boolean {
 	if (api !== "openai-responses" && api !== "openai-codex-responses" && api !== "azure-openai-responses") {
 		return false;
 	}
 	return (compat as ResolvedOpenAIResponsesCompat | undefined)?.supportsReasoningEffort === false;
+}
+
+/**
+ * True for openai-completions/openrouter models whose chat template exposes
+ * reasoning only through the binary `chat_template_kwargs.enable_thinking`
+ * toggle, with no effort-tier field anywhere on the wire: `thinkingFormat`
+ * resolves to the Qwen chat-template dialect, `omitReasoningEffort` is set
+ * (the top-level field is suppressed), and the template-kwarg effort escape
+ * hatch (`qwenTemplateReasoningEffort`) is not enabled. Backends that DO
+ * route the ladder through `chat_template_kwargs.reasoning_effort` set that
+ * escape hatch and keep their genuine multi-tier surface.
+ */
+function isQwenTemplateBinaryThinking(api: Api, compat: CompatOf<Api>): boolean {
+	if (api !== "openai-completions" && api !== "openrouter") return false;
+	const resolved = compat as ResolvedOpenAICompat | undefined;
+	return (
+		resolved?.thinkingFormat === "qwen-chat-template" &&
+		resolved?.omitReasoningEffort === true &&
+		resolved?.qwenTemplateReasoningEffort !== true
+	);
+}
+
+/**
+ * Collapse a bundled multi-tier effort ladder to a single tier for
+ * qwen-chat-template models whose wire body carries only the binary
+ * `enable_thinking` toggle. Without this, every tier produces an
+ * identical request body, so the picker offered a fake multi-tier ladder
+ * with no distinguishable effect; a single tier gives it one real on/off
+ * control instead. The kept tier is the model's `defaultLevel` when set,
+ * else the highest bundled effort; the per-tier `effortMap` no longer
+ * applies to a collapsed single-tier ladder and is dropped.
+ */
+function collapseQwenTemplateBinaryThinking<TApi extends Api>(
+	thinking: ThinkingConfig,
+	spec: ModelSpec<TApi>,
+	compat: CompatOf<TApi>,
+): ThinkingConfig {
+	if (!isQwenTemplateBinaryThinking(spec.api, compat)) return thinking;
+	if (thinking.efforts.length <= 1) return thinking;
+	const tier = thinking.defaultLevel ?? thinking.efforts[thinking.efforts.length - 1];
+	const collapsed: ThinkingConfig = { ...thinking, efforts: [tier] };
+	delete collapsed.effortMap;
+	return collapsed;
 }
 
 function inferEffortMap<TApi extends Api>(

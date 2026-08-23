@@ -1259,3 +1259,72 @@ describe("Qwen 3.8 local template effort ladder", () => {
 		expect(ollama.thinking?.efforts).toEqual([Effort.Low, Effort.Medium, Effort.High, Effort.Max]);
 	});
 });
+
+describe("qwen-chat-template binary thinking toggle collapse", () => {
+	it("collapses a bundled multi-tier ladder to one tier when the wire exposes only the enable_thinking toggle", () => {
+		// omitReasoningEffort suppresses the top-level field and
+		// qwenTemplateReasoningEffort is not set, so neither the top-level
+		// nor the chat_template_kwargs effort surface reaches the wire —
+		// every tier would otherwise produce an identical request body.
+		const model = createModel({
+			id: "qwen3.8-30b",
+			api: "openai-completions",
+			provider: "custom",
+			baseUrl: "https://strict-gateway.example.com/v1",
+			compat: {
+				thinkingFormat: "qwen-chat-template",
+				omitReasoningEffort: true,
+				qwenTemplateReasoningEffort: false,
+			},
+			thinking: {
+				mode: "effort",
+				efforts: [Effort.Low, Effort.Medium, Effort.High],
+				defaultLevel: Effort.Medium,
+			},
+		});
+
+		expect(model.thinking?.efforts).toEqual([Effort.Medium]);
+		expect(model.thinking?.effortMap).toBeUndefined();
+	});
+
+	it("keeps the full ladder when a template-kwarg or top-level effort field is supported", () => {
+		// qwenTemplateReasoningEffort: true means the ladder still reaches
+		// the wire via chat_template_kwargs.reasoning_effort — must not collapse.
+		// (The wire-exact low/medium/xhigh tiers for this dialect are enforced
+		// independently of the collapse logic under test here.)
+		const templateEffort = createModel({
+			id: "qwen3.8-30b",
+			api: "openai-completions",
+			provider: "custom",
+			baseUrl: "http://localhost:8080/v1",
+			compat: {
+				thinkingFormat: "qwen-chat-template",
+				omitReasoningEffort: true,
+				qwenTemplateReasoningEffort: true,
+			},
+			thinking: {
+				mode: "effort",
+				efforts: [Effort.Low, Effort.Medium, Effort.High],
+			},
+		});
+		expect(templateEffort.thinking?.efforts).toEqual([Effort.Low, Effort.Medium, Effort.XHigh]);
+
+		// omitReasoningEffort: false means the top-level reasoning_effort
+		// field is accepted — must not collapse either.
+		const topLevelEffort = createModel({
+			id: "qwen3.8-30b",
+			api: "openai-completions",
+			provider: "custom",
+			baseUrl: "https://gateway.example.com/v1",
+			compat: {
+				thinkingFormat: "qwen-chat-template",
+				omitReasoningEffort: false,
+			},
+			thinking: {
+				mode: "effort",
+				efforts: [Effort.Low, Effort.Medium, Effort.High],
+			},
+		});
+		expect(topLevelEffort.thinking?.efforts).toEqual([Effort.Low, Effort.Medium, Effort.High]);
+	});
+});
