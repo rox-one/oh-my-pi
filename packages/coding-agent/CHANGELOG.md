@@ -658,6 +658,9 @@
 - Fixed the status-line session segment showing identical IDs for sessions created close together ([#9572](https://github.com/can1357/oh-my-pi/issues/9572)).
 - Fixed the git TUI sidebar jumping back to the top of the file list after staging or unstaging a file; selection now stays on the nearest remaining row
 - Fixed collab host UI requests raised before a writable guest joins being lost; up to 64 pending asks now replay to later writers ([#9031](https://github.com/can1357/oh-my-pi/pull/9031) by [@alphastorm](https://github.com/alphastorm)).
+### Fixed
+
+- Fixed kernel sessions failing to recover when a dead kernel reports cancellation instead of throwing.
 
 ## [18.0.4] - 2026-08-24
 
