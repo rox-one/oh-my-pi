@@ -3955,7 +3955,16 @@ export class AgentSession {
 			if (this.#maintenance.skipPostTurnMaintenanceAssistantTimestamp === msg.timestamp) {
 				this.#maintenance.skipPostTurnMaintenanceAssistantTimestamp = undefined;
 				this.#lastSuccessfulYieldToolCallId = undefined;
-				const speculationCompletion = this.#maintenance.speculationCompletion;
+				const model = this.model;
+				const requiresSpeculativeRecovery =
+					model !== undefined &&
+					msg.provider === model.provider &&
+					msg.model === model.id &&
+					(msg.stopReason === "length" ||
+						(msg.stopReason === "error" && AIError.isContextOverflow(msg, model.contextWindow ?? 0)));
+				const speculationCompletion = requiresSpeculativeRecovery
+					? this.#maintenance.speculationCompletion
+					: undefined;
 				if (!speculationCompletion) {
 					maintenanceRoute("skip-post-turn-maintenance");
 					await emitAgentEndNotification();

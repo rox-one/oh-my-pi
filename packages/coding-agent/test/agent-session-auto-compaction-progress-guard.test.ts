@@ -937,7 +937,7 @@ describe("AgentSession auto-compaction progress guard", () => {
 		);
 	});
 
-	it("resumes a thinking-only length stop after an overlapping speculative handoff", async () => {
+	it("settles an overlapping successful stop but resumes a thinking-only length stop", async () => {
 		session.settings.set("compaction.methodOrder", ["handoff"]);
 		session.settings.set("compaction.enabled", true);
 		session.settings.set("compaction.asyncEnabled", true);
@@ -977,6 +977,34 @@ describe("AgentSession auto-compaction progress guard", () => {
 		expect(session.compactionSpeculation).toBe("running");
 
 		await session.waitForIdle();
+		const ordinaryStop = {
+			role: "assistant" as const,
+			content: [{ type: "text" as const, text: "finished" }],
+			api: "anthropic-messages" as const,
+			provider: "anthropic" as const,
+			model: "claude-sonnet-4-5",
+			stopReason: "stop" as const,
+			usage: {
+				input: 143_000,
+				output: 2_000,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 145_000,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			timestamp: speculativeTrigger.timestamp + 1,
+		};
+		const ordinaryAgentEnd = Promise.withResolvers<void>();
+		session.subscribe(event => {
+			if (event.type === "agent_end") ordinaryAgentEnd.resolve();
+		});
+		sessionManager.appendMessage(ordinaryStop);
+		session.agent.emitExternalEvent({ type: "message_end", message: ordinaryStop });
+		await scheduler.yield();
+		session.agent.emitExternalEvent({ type: "agent_end", messages: [ordinaryStop] });
+		await ordinaryAgentEnd.promise;
+		expect(session.compactionSpeculation).toBe("running");
+
 		const lengthStop = {
 			role: "assistant" as const,
 			content: [{ type: "thinking" as const, thinking: "unfinished reasoning" }],
@@ -992,7 +1020,7 @@ describe("AgentSession auto-compaction progress guard", () => {
 				totalTokens: 200_000,
 				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 			},
-			timestamp: speculativeTrigger.timestamp + 1,
+			timestamp: speculativeTrigger.timestamp + 2,
 		};
 		sessionManager.appendMessage(lengthStop);
 		session.agent.emitExternalEvent({ type: "message_end", message: lengthStop });
