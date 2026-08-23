@@ -1287,7 +1287,7 @@ describe("qwen-chat-template binary thinking toggle collapse", () => {
 		expect(model.thinking?.effortMap).toBeUndefined();
 	});
 
-	it("keeps the full ladder when a template-kwarg or top-level effort field is supported", () => {
+	it("keeps the full ladder only when chat_template_kwargs.reasoning_effort actually reaches the wire", () => {
 		// qwenTemplateReasoningEffort: true means the ladder still reaches
 		// the wire via chat_template_kwargs.reasoning_effort — must not collapse.
 		// (The wire-exact low/medium/xhigh tiers for this dialect are enforced
@@ -1308,9 +1308,19 @@ describe("qwen-chat-template binary thinking toggle collapse", () => {
 			},
 		});
 		expect(templateEffort.thinking?.efforts).toEqual([Effort.Low, Effort.Medium, Effort.XHigh]);
+	});
 
-		// omitReasoningEffort: false means the top-level reasoning_effort
-		// field is accepted — must not collapse either.
+	it("collapses even when omitReasoningEffort: false, because the qwen-template-false encoder never reads that flag", () => {
+		// `omitReasoningEffort` only gates the `default` switch branch in
+		// `applyChatCompletionsCompatPolicy`; the `qwen-template-false` branch
+		// (which every qwen-chat-template model's `reasoningDisableMode`
+		// resolves to) always writes `chat_template_kwargs.enable_thinking`
+		// and only adds an effort kwarg when `qwenTemplateReasoningEffort` is
+		// true. A real NVIDIA NIM-hosted Qwen model reports
+		// `supportsReasoningEffort: true` (so `omitReasoningEffort` defaults
+		// to `false`) yet has no local `qwenTemplateReasoningEffort` escape
+		// hatch — every requested tier previously produced an identical
+		// request body despite the ladder claiming three selectable tiers.
 		const topLevelEffort = createModel({
 			id: "qwen3.8-30b",
 			api: "openai-completions",
@@ -1323,8 +1333,10 @@ describe("qwen-chat-template binary thinking toggle collapse", () => {
 			thinking: {
 				mode: "effort",
 				efforts: [Effort.Low, Effort.Medium, Effort.High],
+				defaultLevel: Effort.Medium,
 			},
 		});
-		expect(topLevelEffort.thinking?.efforts).toEqual([Effort.Low, Effort.Medium, Effort.High]);
+		expect(topLevelEffort.thinking?.efforts).toEqual([Effort.Medium]);
+		expect(topLevelEffort.thinking?.effortMap).toBeUndefined();
 	});
 });

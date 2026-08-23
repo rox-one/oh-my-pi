@@ -276,21 +276,24 @@ function omitsWireReasoningEffort(api: Api, compat: CompatOf<Api>): boolean {
 /**
  * True for openai-completions/openrouter models whose chat template exposes
  * reasoning only through the binary `chat_template_kwargs.enable_thinking`
- * toggle, with no effort-tier field anywhere on the wire: `thinkingFormat`
- * resolves to the Qwen chat-template dialect, `omitReasoningEffort` is set
- * (the top-level field is suppressed), and the template-kwarg effort escape
- * hatch (`qwenTemplateReasoningEffort`) is not enabled. Backends that DO
- * route the ladder through `chat_template_kwargs.reasoning_effort` set that
- * escape hatch and keep their genuine multi-tier surface.
+ * toggle, with no effort-tier field anywhere on the wire. Mirrors the actual
+ * dispatch key `applyChatCompletionsCompatPolicy` switches on rather than
+ * `omitReasoningEffort`: the encoder's `qwen-template-false` branch always
+ * writes `chat_template_kwargs.enable_thinking` and only adds an effort kwarg
+ * when `qwenTemplateReasoningEffort` is true — it never reads
+ * `omitReasoningEffort` (that flag only gates the unrelated `default` branch,
+ * which `reasoningDisableMode: "qwen-template-false"` never falls into).
+ * Checking `omitReasoningEffort` here left every bundled qwen-chat-template
+ * model uncollapsed in practice, since `buildOpenAICompat` defaults it to
+ * `false` for any Qwen host that reports `supportsReasoningEffort: true`.
+ * Backends that DO route the ladder through
+ * `chat_template_kwargs.reasoning_effort` set `qwenTemplateReasoningEffort`
+ * and keep their genuine multi-tier surface.
  */
 function isQwenTemplateBinaryThinking(api: Api, compat: CompatOf<Api>): boolean {
 	if (api !== "openai-completions" && api !== "openrouter") return false;
 	const resolved = compat as ResolvedOpenAICompat | undefined;
-	return (
-		resolved?.thinkingFormat === "qwen-chat-template" &&
-		resolved?.omitReasoningEffort === true &&
-		resolved?.qwenTemplateReasoningEffort !== true
-	);
+	return resolved?.reasoningDisableMode === "qwen-template-false" && resolved?.qwenTemplateReasoningEffort !== true;
 }
 
 /**
