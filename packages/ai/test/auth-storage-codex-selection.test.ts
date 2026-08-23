@@ -2934,6 +2934,43 @@ describe("AuthStorage claude oauth ranking", () => {
 		expect(apiKey).toBe("api-acct-clocked");
 	});
 
+	// A tier row is nested inside the account-wide weekly quota, so 0% on
+	// `anthropic:7d:fable` says nothing about how much of the shared week is
+	// left. When a report ships that row but no shared `anthropic:7d`,
+	// `findClaudeSecondaryLimit` hands the tier row back as `secondary` — it
+	// must not buy the seat infinite priority on that evidence.
+	test("does not boost a clockless tier-scoped weekly row standing in for the shared window", async () => {
+		if (!authStorage) throw new Error("test setup failed");
+
+		await authStorage.set("anthropic", [
+			{ type: "oauth", ...createCredential("acct-tier-only", "tier@example.com") },
+			{ type: "oauth", ...createCredential("acct-shared", "shared@example.com") },
+		]);
+
+		usageByAccount.set(
+			"acct-tier-only",
+			createClaudeUsageReport({
+				accountId: "acct-tier-only",
+				primary: { usedFraction: 0, resetInMs: FIVE_HOUR_MS },
+				// No shared 7d row at all, just an untouched clockless Fable row.
+				fableSecondary: { usedFraction: 0 },
+			}),
+		);
+		usageByAccount.set(
+			"acct-shared",
+			createClaudeUsageReport({
+				accountId: "acct-shared",
+				primary: { usedFraction: 0, resetInMs: FIVE_HOUR_MS },
+				secondary: { usedFraction: 0.5, resetInMs: 12 * HOUR_MS },
+			}),
+		);
+
+		const apiKey = await authStorage.getApiKey("anthropic", "session-claude-tier-only", {
+			modelId: "claude-fable-5",
+		});
+		expect(apiKey).toBe("api-acct-shared");
+	});
+
 	test("does not rank a missing weekly window as the account's 5h window", async () => {
 		if (!authStorage) throw new Error("test setup failed");
 
