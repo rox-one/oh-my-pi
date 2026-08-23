@@ -1,4 +1,5 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
+import { scheduler } from "node:timers/promises";
 import { Agent } from "@oh-my-pi/pi-agent-core";
 import * as compactionModule from "@oh-my-pi/pi-agent-core/compaction";
 import { type CompactionPreparation, resolveThresholdTokens, shouldCompact } from "@oh-my-pi/pi-agent-core/compaction";
@@ -924,6 +925,88 @@ describe("AgentSession auto-compaction progress guard", () => {
 		expect(sessionManager.getBranch().at(-1)).toMatchObject({
 			type: "compaction",
 			summary: "handoff document",
+		});
+		expect(sessionManager.getBranch()).not.toContainEqual(
+			expect.objectContaining({
+				type: "message",
+				message: expect.objectContaining({
+					role: "assistant",
+					stopReason: "length",
+				}),
+			}),
+		);
+	});
+
+	it("resumes a thinking-only length stop after an overlapping speculative handoff", async () => {
+		session.settings.set("compaction.methodOrder", ["handoff"]);
+		session.settings.set("compaction.enabled", true);
+		session.settings.set("compaction.asyncEnabled", true);
+		session.settings.set("compaction.thresholdTokens", 150_000);
+		session.settings.set("compaction.keepRecentTokens", 1);
+		session.settings.set("contextPromotion.enabled", false);
+		compactHookEnabled = false;
+		const continueSpy = vi.spyOn(session.agent, "continue").mockResolvedValue();
+		const handoffStarted = Promise.withResolvers<void>();
+		const handoffResult = Promise.withResolvers<string>();
+		vi.spyOn(compactionModule, "generateHandoffFromContext").mockImplementation(async () => {
+			handoffStarted.resolve();
+			return handoffResult.promise;
+		});
+
+		const speculativeTrigger = {
+			role: "assistant" as const,
+			content: [{ type: "text" as const, text: "working" }],
+			api: "anthropic-messages" as const,
+			provider: "anthropic" as const,
+			model: "claude-sonnet-4-5",
+			stopReason: "stop" as const,
+			usage: {
+				input: 143_000,
+				output: 1_000,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 144_000,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			timestamp: Date.now(),
+		};
+		sessionManager.appendMessage(speculativeTrigger);
+		session.agent.emitExternalEvent({ type: "message_end", message: speculativeTrigger });
+		session.agent.emitExternalEvent({ type: "agent_end", messages: [speculativeTrigger] });
+		await handoffStarted.promise;
+		expect(session.compactionSpeculation).toBe("running");
+
+		await session.waitForIdle();
+		const lengthStop = {
+			role: "assistant" as const,
+			content: [{ type: "thinking" as const, thinking: "unfinished reasoning" }],
+			api: "anthropic-messages" as const,
+			provider: "anthropic" as const,
+			model: "claude-sonnet-4-5",
+			stopReason: "length" as const,
+			usage: {
+				input: 150_000,
+				output: 50_000,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 200_000,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			timestamp: speculativeTrigger.timestamp + 1,
+		};
+		sessionManager.appendMessage(lengthStop);
+		session.agent.emitExternalEvent({ type: "message_end", message: lengthStop });
+		await scheduler.yield();
+		session.agent.emitExternalEvent({ type: "agent_end", messages: [lengthStop] });
+		await scheduler.yield();
+
+		handoffResult.resolve("speculative handoff");
+		await session.waitForIdle();
+
+		expect(continueSpy).toHaveBeenCalledTimes(1);
+		expect(sessionManager.getBranch().at(-1)).toMatchObject({
+			type: "compaction",
+			summary: "speculative handoff",
 		});
 		expect(sessionManager.getBranch()).not.toContainEqual(
 			expect.objectContaining({

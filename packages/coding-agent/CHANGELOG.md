@@ -740,6 +740,7 @@
 - Fixed subagent advisors abandoning reviews on the final yield turn during session teardown.
 - Fixed `/todo` expand/collapse commands and corrected `/shake thinking` reporting.
 - The exit/recovery resume hint now prints the explicit file path for a path-resumed session stored outside the managed sessions bucket (e.g. a pi transcript), instead of an `omp --resume <id>` that id-resolution can never match ([#9544](https://github.com/can1357/oh-my-pi/issues/9544)).
+- Thinking-only length stops that overlap speculative handoff now resume compaction recovery instead of leaving the autonomous run idle.
 
 ## [18.0.3] - 2026-08-23
 

@@ -1586,6 +1586,7 @@ export class AgentSession {
 	// Cursor exec, TUI listeners) is held back. Without this, a client that resumes
 	// on `agent_end` can fire its next `prompt` before #promptWithMessage's finally
 	#promptGeneration = 0;
+	#promptSequence = 0;
 	#pendingAgentEndEmit: AgentSessionEvent | undefined;
 	#inFlightSettledCallbacks: Array<() => void | Promise<void>> = [];
 	#inFlightSettledCallbacksDrain: Promise<void> | undefined;
@@ -3954,9 +3955,28 @@ export class AgentSession {
 			if (this.#maintenance.skipPostTurnMaintenanceAssistantTimestamp === msg.timestamp) {
 				this.#maintenance.skipPostTurnMaintenanceAssistantTimestamp = undefined;
 				this.#lastSuccessfulYieldToolCallId = undefined;
-				maintenanceRoute("skip-post-turn-maintenance");
-				await emitAgentEndNotification();
-				return;
+				const speculationCompletion = this.#maintenance.speculationCompletion;
+				if (!speculationCompletion) {
+					maintenanceRoute("skip-post-turn-maintenance");
+					await emitAgentEndNotification();
+					return;
+				}
+
+				const promptSequence = this.#promptSequence;
+				const promptGeneration = this.#promptGeneration;
+				maintenanceRoute("await-speculative-compaction");
+				await speculationCompletion;
+				if (
+					this.#isDisposed ||
+					this.#abortInProgress ||
+					this.#promptGeneration !== promptGeneration ||
+					this.#promptSequence !== promptSequence
+				) {
+					maintenanceRoute("skip-superseded-speculative-maintenance");
+					await emitAgentEndNotification();
+					return;
+				}
+				maintenanceRoute("resume-post-turn-maintenance");
 			}
 
 			const activeGoal = this.#goalModeState?.enabled === true && this.#goalModeState.goal.status === "active";
@@ -7055,6 +7075,7 @@ export class AgentSession {
 		if (options?.messageTag) this.#messageTags.set(message, options.messageTag);
 		this.#beginInFlight();
 		const generation = this.#promptGeneration;
+		this.#promptSequence++;
 		try {
 			await this.#recovery.maybeRestoreRetryFallbackPrimary();
 			if (!(await this.#runUsageAwarePreflightForNextModelCall())) return false;
