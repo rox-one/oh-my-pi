@@ -19,6 +19,7 @@
 ### Fixed
 
 - Fixed OpenRouter auxiliary requests (e.g. session-title generation) failing with `400 Reasoning is mandatory for this endpoint and cannot be disabled` on mandatory-reasoning models such as `stealth/ox-alpha`. Live discovery now honors the endpoint's `reasoning.mandatory` flag, clamping thinking-off to the lowest supported effort instead of sending `reasoning: { enabled: false }` ([#9415](https://github.com/can1357/oh-my-pi/issues/9415)).
+- Fixed OpenRouter auxiliary requests failing with HTTP 400 for mandatory-reasoning models such as `stealth/ox-alpha` by honoring live discovery metadata ([#9415](https://github.com/can1357/oh-my-pi/issues/9415)).
 
 ## [18.0.1] - 2026-08-23
 

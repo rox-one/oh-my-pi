@@ -808,6 +808,7 @@ describe("OpenRouter model discovery", () => {
 							name: "DeepSeek V4 Flash 0731",
 							supported_parameters: ["tools", "reasoning", "reasoning_effort"],
 							reasoning: {
+								mandatory: true,
 								supported_efforts: ["max", "high", "low"],
 								default_effort: "high",
 								mandatory: true,
