@@ -1,5 +1,7 @@
 //! Shared walker scan cache used by owned-entry collection.
 
+#[cfg(test)]
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::{
 	borrow::Cow,
 	collections::HashMap,
@@ -67,6 +69,42 @@ fn record_test_walk(root: &Path) {
 #[cfg(not(test))]
 const fn record_test_walk(_root: &Path) {}
 
+/// Test-only one-shot pause gates for deterministic concurrency regressions:
+/// a test arms `(point, root, gate)`, and the next caller reaching that
+/// point in [`get_or_scan`] for that root parks until the test opens it.
+#[cfg(test)]
+static TEST_PAUSE: LazyLock<Mutex<Option<PauseArm>>> = LazyLock::new(|| Mutex::new(None));
+
+/// Shared gate flag plus its condvar for [`TEST_PAUSE`].
+#[cfg(test)]
+type PauseGate = Arc<(Mutex<bool>, Condvar)>;
+
+/// An armed pause gate: its [`get_or_scan`] point, scoped root, and gate.
+#[cfg(test)]
+type PauseArm = (&'static str, PathBuf, PauseGate);
+
+/// How many callers have entered an armed [`TEST_PAUSE`] gate.
+#[cfg(test)]
+static TEST_PAUSE_ARRIVALS: AtomicU64 = AtomicU64::new(0);
+
+/// Park this caller if a test armed a pause gate for `point` on `root`;
+/// consumed once.
+#[cfg(test)]
+fn test_pause(point: &'static str, root: &Path) {
+	let Some((armed, expected_root, gate)) = TEST_PAUSE.lock().take() else {
+		return;
+	};
+	if armed != point || expected_root != root {
+		*TEST_PAUSE.lock() = Some((armed, expected_root, gate));
+		return;
+	}
+	TEST_PAUSE_ARRIVALS.fetch_add(1, Ordering::Relaxed);
+	let (flag, arrived) = &*gate;
+	let mut open = flag.lock();
+	while !*open {
+		arrived.wait(&mut open);
+	}
+}
 /// In-flight directory scans keyed like [`SCAN_CACHE`]; at most one walk runs
 /// per key at any time.
 static IN_FLIGHT_SCANS: LazyLock<Mutex<HashMap<CacheKey, Arc<ScanFlight>>>> =
@@ -134,6 +172,11 @@ impl ScanFlight {
 				return FollowerOutcome::Interrupted(WalkError::Interrupted(err.to_string()));
 			}
 			guard = self.outcome.lock();
+			if guard.is_some() {
+				// The leader published while we ran the heartbeat without
+				// holding the lock; don't sleep out a full poll interval.
+				continue;
+			}
 			self.done.wait_for(&mut guard, FOLLOWER_HEARTBEAT_POLL);
 		}
 	}
@@ -416,62 +459,101 @@ where
 	}
 
 	let key = cache_key(root, options);
-	if let Some(entry) = SCAN_CACHE.get(&key) {
-		let age = Instant::now().duration_since(entry.created_at);
-		if age < Duration::from_millis(ttl) {
-			return Ok(CollectedEntries {
-				entries:      entry.entries.clone(),
-				cache_age_ms: age.as_millis() as u64,
-			});
-		}
-		// The expired entry is deliberately left in place until a fresh scan
-		// replaces it: concurrent callers serve it stale-while-revalidate
-		// below, consistent with TTL semantics where data up to one TTL old
-		// is acceptable. A failed revalidation likewise keeps serving the
-		// stale snapshot instead of leaving later callers uncached.
-		drop(entry);
-	}
-
-	let (flight, is_leader) = join_or_start_scan(&key);
-
-	if !is_leader {
-		// Another thread owns this scan. Serve whatever the cache holds —
-		// possibly stale — rather than duplicating the walk; only callers
-		// with no cached snapshot block on the shared flight.
+	loop {
 		if let Some(entry) = SCAN_CACHE.get(&key) {
 			let age = Instant::now().duration_since(entry.created_at);
-			return Ok(CollectedEntries {
-				entries:      entry.entries.clone(),
-				cache_age_ms: age.as_millis() as u64,
-			});
+			if age < Duration::from_millis(ttl) {
+				return Ok(CollectedEntries {
+					entries:      entry.entries.clone(),
+					cache_age_ms: age.as_millis() as u64,
+				});
+			}
+			// The expired entry is deliberately left in place until a fresh
+			// scan replaces it: concurrent callers serve it
+			// stale-while-revalidate below, consistent with TTL semantics
+			// where data up to one TTL old is acceptable. A failed
+			// revalidation likewise keeps serving the stale snapshot instead
+			// of leaving later callers uncached.
+			drop(entry);
 		}
-		return match flight.wait_for_leader(heartbeat) {
-			FollowerOutcome::Shared(result) => result,
-			FollowerOutcome::Interrupted(err) => Err(err),
-			FollowerOutcome::Rerun => collect_entries_uncached(root, options, heartbeat),
-		};
-	}
 
-	// Leader: walk outside all locks, then refresh the cache and publish.
-	let _leader = ScanLeader { key: key.clone(), flight: flight.clone() };
-	match collect_entries_uncached(root, options, heartbeat) {
-		Ok(entries) => {
-			flight.finish(FlightOutcome::Shared(Ok(entries.clone())));
-			SCAN_CACHE.insert(key, CacheEntry {
-				created_at: Instant::now(),
-				entries:    entries.entries.clone(),
-			});
-			evict_oldest();
-			Ok(CollectedEntries { entries: entries.entries, cache_age_ms: 0 })
-		},
-		Err(err) => {
-			// Never share this failure: it may come from the leader's own
-			// heartbeat (user cancel, per-call timeout), which unrelated
-			// followers must not inherit. Wake them to rerun the walk with
-			// their own heartbeats instead.
-			flight.finish(FlightOutcome::Rerun);
-			Err(err)
-		},
+		#[cfg(test)]
+		test_pause("before-join", root);
+
+		let (flight, is_leader) = join_or_start_scan(&key);
+
+		if !is_leader {
+			// Another thread owns this scan. Serve whatever the cache holds —
+			// possibly stale — rather than duplicating the walk; only callers
+			// with no cached snapshot block on the shared flight.
+			if let Some(entry) = SCAN_CACHE.get(&key) {
+				let age = Instant::now().duration_since(entry.created_at);
+				return Ok(CollectedEntries {
+					entries:      entry.entries.clone(),
+					cache_age_ms: age.as_millis() as u64,
+				});
+			}
+			return match flight.wait_for_leader(heartbeat) {
+				FollowerOutcome::Shared(result) => result,
+				FollowerOutcome::Interrupted(err) => Err(err),
+				// The leader died on its own heartbeat. Re-enter coordinated
+				// acquisition instead of walking unguarded, so concurrent
+				// rerunners still share one flight and one cached result.
+				FollowerOutcome::Rerun => continue,
+			};
+		}
+
+		// This caller owns the scan. Register the leader guard before the
+		// recheck below so an early return still deregisters the flight via
+		// [`ScanLeader`].
+		let _leader = ScanLeader { key: key.clone(), flight: flight.clone() };
+
+		#[cfg(test)]
+		test_pause("before-walk", root);
+
+		// Close the miss-to-leadership race: another caller may have finished
+		// the whole scan between our stale check above and acquiring
+		// leadership here. Serve that fresh snapshot instead of walking over
+		// it, and hand it to any follower already blocked on this flight.
+		if let Some(entry) = SCAN_CACHE.get(&key) {
+			let age = Instant::now().duration_since(entry.created_at);
+			if age < Duration::from_millis(ttl) {
+				let cached = CollectedEntries {
+					entries:      entry.entries.clone(),
+					cache_age_ms: age.as_millis() as u64,
+				};
+				flight.finish(FlightOutcome::Shared(Ok(cached.clone())));
+				return Ok(cached);
+			}
+		}
+
+		// Leader: walk outside all locks, then refresh the cache and publish.
+		match collect_entries_uncached(root, options, heartbeat) {
+			Ok(entries) => {
+				flight.finish(FlightOutcome::Shared(Ok(entries.clone())));
+				SCAN_CACHE.insert(key, CacheEntry {
+					created_at: Instant::now(),
+					entries:    entries.entries.clone(),
+				});
+				evict_oldest();
+				return Ok(CollectedEntries { entries: entries.entries, cache_age_ms: 0 });
+			},
+			Err(err @ WalkError::InvalidData { .. }) => {
+				// Scan-wide failure independent of any caller's heartbeat;
+				// every follower would hit it too. Share it once instead of
+				// sending each of them into a duplicate walk.
+				flight.finish(FlightOutcome::Shared(Err(err.clone())));
+				return Err(err);
+			},
+			Err(err) => {
+				// Never share this failure: it comes from the leader's own
+				// heartbeat (user cancel, per-call timeout), which unrelated
+				// followers must not inherit. Wake them to rerun the walk with
+				// their own heartbeats instead.
+				flight.finish(FlightOutcome::Rerun);
+				return Err(err);
+			},
+		}
 	}
 }
 
@@ -541,12 +623,12 @@ mod tests {
 			Arc,
 			atomic::{AtomicU64, Ordering},
 		},
-		time::{Duration, SystemTime, UNIX_EPOCH},
+		time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 	};
 
 	#[cfg(unix)]
 	use super::classify_file_type;
-	use crate::{CollectedEntry, FileType};
+	use crate::{CollectedEntry, FileType, WalkError};
 
 	static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -843,7 +925,6 @@ mod tests {
 		for index in 0..64 {
 			fs::write(dir.path().join(format!("file-{index}.txt")), "payload").unwrap();
 		}
-		super::invalidate_all();
 
 		let mut options = scan_options(true, true, crate::WalkDetail::Full);
 		options.cache = true;
@@ -898,6 +979,38 @@ mod tests {
 		options
 	}
 
+	/// Opens an armed [`super::TEST_PAUSE`] gate on drop, even on panic.
+	struct PauseDisarm(Arc<(super::Mutex<bool>, super::Condvar)>);
+
+	impl Drop for PauseDisarm {
+		fn drop(&mut self) {
+			let (flag, arrived) = &*self.0;
+			*flag.lock() = true;
+			arrived.notify_all();
+		}
+	}
+
+	fn arm_pause(point: &'static str, root: &Path) -> PauseDisarm {
+		let gate = Arc::new((super::Mutex::new(false), super::Condvar::new()));
+		*super::TEST_PAUSE.lock() = Some((point, root.to_path_buf(), gate.clone()));
+		PauseDisarm(gate)
+	}
+
+	/// Blocks the first heartbeat call until `release` fires, then succeeds.
+	/// Lets a test park a leader mid-walk and let it finish cleanly after.
+	fn staged_heartbeat(
+		release: std::sync::mpsc::Receiver<()>,
+	) -> impl Fn() -> std::result::Result<(), String> + Send + 'static {
+		let armed = Arc::new(super::Mutex::new(Some(release)));
+		move || {
+			let staged = armed.lock().take();
+			if let Some(receiver) = staged {
+				let _ = receiver.recv();
+			}
+			Ok(())
+		}
+	}
+
 	fn wait_for_flight(key: &super::CacheKey) -> Arc<super::ScanFlight> {
 		for _ in 0..400 {
 			let registered = super::IN_FLIGHT_SCANS.lock().get(key).cloned();
@@ -917,11 +1030,9 @@ mod tests {
 		for index in 0..8 {
 			fs::write(dir.path().join(format!("file-{index}.txt")), "payload").unwrap();
 		}
-		super::invalidate_all();
 
 		let options = cold_scan_options();
 		let key = super::cache_key(dir.path(), options);
-
 		let (gate_tx, gate_rx) = mpsc::channel::<()>();
 		let gate = Arc::new(std::sync::Mutex::new(Some(gate_rx)));
 		let leader_root = dir.path().to_path_buf();
@@ -991,7 +1102,6 @@ mod tests {
 		for index in 0..8 {
 			fs::write(dir.path().join(format!("file-{index}.txt")), "payload").unwrap();
 		}
-		super::invalidate_all();
 
 		let options = cold_scan_options();
 		let key = super::cache_key(dir.path(), options);
@@ -1044,5 +1154,295 @@ mod tests {
 			.copied()
 			.unwrap_or(0);
 		assert_eq!(walks, 1, "the follower bailed before running any walk of its own");
+	}
+
+	/// Regression (A): after a cancelled leader, rerunning followers must
+	/// re-enter coordinated acquisition — exactly one new leader walks, the
+	/// rest share its cached result, and later callers must hit that cache.
+	#[test]
+	fn rerun_followers_reenter_coordinated_acquisition() {
+		use std::sync::mpsc;
+
+		let dir = TempDirGuard::new();
+		for index in 0..8 {
+			fs::write(dir.path().join(format!("file-{index}.txt")), "payload").unwrap();
+		}
+
+		let options = cold_scan_options();
+		let key = super::cache_key(dir.path(), options);
+
+		let (gate_tx, gate_rx) = mpsc::channel::<()>();
+		let gate = Arc::new(std::sync::Mutex::new(Some(gate_rx)));
+		let leader_root = dir.path().to_path_buf();
+		let leader_options = cold_scan_options();
+		let leader_handle = std::thread::spawn(move || {
+			super::collect_entries(
+				&leader_root,
+				leader_options,
+				gated_heartbeat(gate, "leader cancelled"),
+			)
+		});
+		wait_for_flight(&key);
+
+		// Park two followers inside wait_for_leader so both receive the
+		// cancelled leader's Rerun broadcast while it is still registered.
+		let mut follower_polls = Vec::new();
+		let mut follower_handles = Vec::new();
+		for _ in 0..2 {
+			let polls = Arc::new(AtomicU64::new(0));
+			let poll_counter = polls.clone();
+			follower_polls.push(polls);
+			let follower_root = dir.path().to_path_buf();
+			let follower_options = cold_scan_options();
+			follower_handles.push(std::thread::spawn(move || {
+				let heartbeat = move || -> std::result::Result<(), String> {
+					poll_counter.fetch_add(1, Ordering::Relaxed);
+					Ok(())
+				};
+				super::collect_entries(&follower_root, follower_options, heartbeat)
+			}));
+		}
+		for polls in &follower_polls {
+			for _ in 0..400 {
+				if polls.load(Ordering::Relaxed) > 0 {
+					break;
+				}
+				std::thread::sleep(Duration::from_millis(5));
+			}
+			assert!(polls.load(Ordering::Relaxed) > 0, "follower never joined the flight");
+		}
+
+		gate_tx.send(()).expect("release leader");
+		leader_handle
+			.join()
+			.unwrap()
+			.expect_err("leader should surface its own cancel");
+
+		for handle in follower_handles {
+			let entries = handle
+				.join()
+				.unwrap()
+				.expect("rerunning follower must complete successfully");
+			assert_eq!(entries.entries.len(), 8);
+		}
+
+		// The coordinated rerun must publish its snapshot: a later caller
+		// resolves from cache instead of scanning a third time.
+		let later =
+			super::collect_entries(dir.path(), cold_scan_options(), ok_heartbeat).expect("later scan");
+		assert_eq!(later.entries.len(), 8);
+
+		let walks = super::TEST_WALK_COUNTS
+			.lock()
+			.get(dir.path())
+			.copied()
+			.unwrap_or(0);
+		assert_eq!(walks, 2, "cancelled leader plus exactly one shared rerun must total two walks");
+	}
+
+	/// Regression (B): an unskippable scan-wide failure is shared once with
+	/// blocked followers instead of being retried once per caller.
+	#[test]
+	fn scan_wide_failure_is_shared_with_waiting_followers() {
+		let dir = TempDirGuard::new();
+		let missing = dir.path().join("never-created");
+
+		// Hold the leader between flight registration and the walk so the
+		// followers below are provably blocked on its flight before it fails.
+		let disarm = arm_pause("before-walk", &missing);
+		let arrived_before = super::TEST_PAUSE_ARRIVALS.load(Ordering::Relaxed);
+
+		let leader_root = missing.clone();
+		let leader_handle = std::thread::spawn(move || {
+			super::collect_entries(&leader_root, cold_scan_options(), ok_heartbeat)
+		});
+
+		for _ in 0..400 {
+			if super::TEST_PAUSE_ARRIVALS.load(Ordering::Relaxed) > arrived_before {
+				break;
+			}
+			std::thread::sleep(Duration::from_millis(5));
+		}
+		assert!(
+			super::TEST_PAUSE_ARRIVALS.load(Ordering::Relaxed) > arrived_before,
+			"leader never reached the pre-walk pause"
+		);
+
+		let mut followers = Vec::new();
+		for _ in 0..3 {
+			let polls = Arc::new(AtomicU64::new(0));
+			let poll_counter = polls.clone();
+			let follower_root = missing.clone();
+			followers.push((
+				polls,
+				std::thread::spawn(move || {
+					let heartbeat = move || -> std::result::Result<(), String> {
+						poll_counter.fetch_add(1, Ordering::Relaxed);
+						Ok(())
+					};
+					super::collect_entries(&follower_root, cold_scan_options(), heartbeat)
+				}),
+			));
+		}
+		for (polls, _) in &followers {
+			for _ in 0..400 {
+				if polls.load(Ordering::Relaxed) > 0 {
+					break;
+				}
+				std::thread::sleep(Duration::from_millis(5));
+			}
+			assert!(polls.load(Ordering::Relaxed) > 0, "follower never joined the flight");
+		}
+		drop(disarm);
+
+		leader_handle
+			.join()
+			.unwrap()
+			.expect_err("missing root must fail the leader with a scan-wide InvalidData error");
+		for (_, handle) in followers {
+			let result = handle.join().unwrap();
+			assert!(
+				matches!(result, Err(WalkError::InvalidData { .. })),
+				"follower must inherit the shared InvalidData failure, got {result:?}"
+			);
+		}
+
+		let walks = super::TEST_WALK_COUNTS
+			.lock()
+			.get(&missing)
+			.copied()
+			.unwrap_or(0);
+		assert_eq!(
+			walks, 1,
+			"one unskippable failure must be shared with followers, not retried per caller"
+		);
+	}
+
+	/// Regression (E): a caller suspended in the miss-to-leadership window
+	/// while another scan completes must serve the fresh snapshot as leader
+	/// instead of walking over it.
+	#[test]
+	fn late_leader_serves_snapshot_completed_during_toctou_window() {
+		let dir = TempDirGuard::new();
+		for index in 0..4 {
+			fs::write(dir.path().join(format!("file-{index}.txt")), "payload").unwrap();
+		}
+
+		let disarm = arm_pause("before-join", dir.path());
+		let arrived_before = super::TEST_PAUSE_ARRIVALS.load(Ordering::Relaxed);
+
+		let caller_root = dir.path().to_path_buf();
+		let caller_handle = std::thread::spawn(move || {
+			super::collect_entries(&caller_root, cold_scan_options(), ok_heartbeat)
+		});
+
+		for _ in 0..400 {
+			if super::TEST_PAUSE_ARRIVALS.load(Ordering::Relaxed) > arrived_before {
+				break;
+			}
+			std::thread::sleep(Duration::from_millis(5));
+		}
+		assert!(
+			super::TEST_PAUSE_ARRIVALS.load(Ordering::Relaxed) > arrived_before,
+			"caller never entered the miss-to-leadership window"
+		);
+
+		// Another caller completes the entire scan — cache insert, flight
+		// deregistration included — while the first caller is suspended.
+		let raced = super::collect_entries(dir.path(), cold_scan_options(), ok_heartbeat)
+			.expect("racing scan");
+		assert_eq!(raced.entries.len(), 4);
+
+		// Resume the suspended caller: it now acquires leadership of a fresh
+		// flight and must recheck the cache before walking.
+		drop(disarm);
+		let entries = caller_handle
+			.join()
+			.unwrap()
+			.expect("suspended caller should succeed");
+		assert_eq!(entries.entries.len(), 4);
+
+		let walks = super::TEST_WALK_COUNTS
+			.lock()
+			.get(dir.path())
+			.copied()
+			.unwrap_or(0);
+		assert_eq!(walks, 1, "caller that lost the toctou race must not walk again");
+	}
+
+	/// Regression (F): a follower whose heartbeat was running when the leader
+	/// published must return immediately, not sleep out another poll interval.
+	#[test]
+	fn follower_skips_poll_sleep_when_outcome_lands_during_heartbeat() {
+		use std::sync::mpsc;
+
+		let dir = TempDirGuard::new();
+		for index in 0..4 {
+			fs::write(dir.path().join(format!("file-{index}.txt")), "payload").unwrap();
+		}
+
+		let options = cold_scan_options();
+		let key = super::cache_key(dir.path(), options);
+
+		// Leader parks on its first heartbeat until we release it, then
+		// finishes its walk successfully and publishes the shared outcome.
+		let (gate_tx, gate_rx) = mpsc::channel::<()>();
+		let leader_root = dir.path().to_path_buf();
+		let leader_handle = std::thread::spawn(move || {
+			super::collect_entries(&leader_root, cold_scan_options(), staged_heartbeat(gate_rx))
+		});
+		wait_for_flight(&key);
+
+		// Follower parks inside its own heartbeat poll after finding no
+		// cached snapshot, exactly when the outcome lands.
+		let (parked_tx, parked_rx) = mpsc::channel::<()>();
+		let (release_tx, release_rx) = mpsc::channel::<()>();
+		let release_rx = std::sync::Mutex::new(release_rx);
+		let follower_root = dir.path().to_path_buf();
+		let follower_handle = std::thread::spawn(move || {
+			let heartbeat = move || -> std::result::Result<(), String> {
+				let _ = parked_tx.send(());
+				release_rx
+					.lock()
+					.expect("release lock")
+					.recv()
+					.map_err(|_| "release channel closed".to_string())?;
+				Ok(())
+			};
+			super::collect_entries(&follower_root, cold_scan_options(), heartbeat)
+		});
+		parked_rx
+			.recv_timeout(Duration::from_secs(5))
+			.expect("follower never parked in its heartbeat");
+
+		// Complete the leader and wait for the published outcome to be
+		// observable before releasing the still-parked follower.
+		gate_tx.send(()).expect("release leader");
+		let leader_entries = leader_handle
+			.join()
+			.unwrap()
+			.expect("leader should succeed");
+		assert_eq!(leader_entries.entries.len(), 4);
+		for _ in 0..400 {
+			if super::SCAN_CACHE.contains_key(&key) {
+				break;
+			}
+			std::thread::sleep(Duration::from_millis(5));
+		}
+		assert!(super::SCAN_CACHE.contains_key(&key), "leader never published the snapshot");
+
+		let started = Instant::now();
+		release_tx.send(()).expect("release follower");
+		let entries = follower_handle
+			.join()
+			.unwrap()
+			.expect("follower should reuse the shared result");
+		assert_eq!(entries.entries.len(), 4);
+
+		let elapsed = started.elapsed();
+		assert!(
+			elapsed < Duration::from_millis(40),
+			"follower slept out a 50ms poll interval despite a published outcome: {elapsed:?}"
+		);
 	}
 }
