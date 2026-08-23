@@ -4585,12 +4585,15 @@ export class AuthStorage {
 	 *
 	 * `prioritizeClocklessZero` opts in the one window shape where "no clock"
 	 * means "not started": Anthropic publishes `resetsAt` on a weekly window
-	 * only once that window is running, so 0% used with no clock is an untouched
-	 * subscription seat. Rank it first so it is started before running siblings
-	 * spill into paid overage. Every other clockless window keeps the
-	 * conservative full-window score — a partially consumed duration-only window
-	 * (Kimi's 5h/7d shape) and a missing limit's 0.5 unknown-usage placeholder
-	 * carry no evidence that the quota is idle, so neither may jump the queue.
+	 * only once that window is running, so an account-wide row at 0% used with
+	 * no clock is an untouched subscription seat. Rank it first so it is started
+	 * before running siblings spill into paid overage.
+	 *
+	 * Every weaker shape keeps the conservative full-window score, because none
+	 * of them prove the seat is idle: a partially consumed duration-only window
+	 * (Kimi's 5h/7d shape), a missing limit's 0.5 unknown-usage placeholder, and
+	 * a tier-scoped row (`anthropic:7d:fable`) that says nothing about the
+	 * account-wide weekly quota it is nested inside.
 	 */
 	#computeWindowRequiredDrain(
 		limit: UsageLimit | undefined,
@@ -4601,7 +4604,12 @@ export class AuthStorage {
 		const headroom = 1 - this.#normalizeUsageFraction(limit);
 		if (headroom <= 0) return 0;
 		const resetAt = this.#resolveWindowResetAt(limit?.window);
-		if (prioritizeClocklessZero && resetAt === undefined && limit?.amount.usedFraction === 0) {
+		if (
+			prioritizeClocklessZero &&
+			resetAt === undefined &&
+			limit?.amount.usedFraction === 0 &&
+			limit.scope.shared === true
+		) {
 			return Number.POSITIVE_INFINITY;
 		}
 		const durationMs = limit?.window?.durationMs ?? fallbackDurationMs;
