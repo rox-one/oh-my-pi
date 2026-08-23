@@ -2899,6 +2899,41 @@ describe("AuthStorage claude oauth ranking", () => {
 		expect(apiKey).toBe("api-acct-clockless");
 	});
 
+	// The bump above keys off "untouched", not "unclocked": a weekly window that
+	// already reports usage with no reset stamp (the duration-only shape Kimi's
+	// parser also emits) carries no evidence the quota is idle, so it still has
+	// to win on drain pressure like any other measured window.
+	test("keeps a partially used clockless weekly window behind an urgent clocked sibling", async () => {
+		if (!authStorage) throw new Error("test setup failed");
+
+		await authStorage.set("anthropic", [
+			{ type: "oauth", ...createCredential("acct-part-clockless", "part@example.com") },
+			{ type: "oauth", ...createCredential("acct-clocked", "clocked@example.com") },
+		]);
+
+		usageByAccount.set(
+			"acct-part-clockless",
+			createClaudeUsageReport({
+				accountId: "acct-part-clockless",
+				primary: { usedFraction: 0, resetInMs: FIVE_HOUR_MS },
+				// 0.5 headroom assumed to span a full week: ~0.003/h.
+				secondary: { usedFraction: 0.5 },
+			}),
+		);
+		usageByAccount.set(
+			"acct-clocked",
+			createClaudeUsageReport({
+				accountId: "acct-clocked",
+				primary: { usedFraction: 0, resetInMs: FIVE_HOUR_MS },
+				// Same headroom, 12h to burn it: ~0.042/h, so this seat is first.
+				secondary: { usedFraction: 0.5, resetInMs: 12 * HOUR_MS },
+			}),
+		);
+
+		const apiKey = await authStorage.getApiKey("anthropic", "session-claude-part-clockless");
+		expect(apiKey).toBe("api-acct-clocked");
+	});
+
 	test("does not rank a missing weekly window as the account's 5h window", async () => {
 		if (!authStorage) throw new Error("test setup failed");
 
