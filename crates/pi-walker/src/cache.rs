@@ -528,14 +528,18 @@ where
 		}
 
 		// Leader: walk outside all locks, then refresh the cache and publish.
+		// Order matters: the cache entry MUST be inserted before `finish` wakes
+		// followers. A woken follower can mutate the filesystem and call
+		// `invalidate_path` before we insert, and an insert after that would
+		// resurrect entries the invalidation just removed.
 		match collect_entries_uncached(root, options, heartbeat) {
 			Ok(entries) => {
-				flight.finish(FlightOutcome::Shared(Ok(entries.clone())));
 				SCAN_CACHE.insert(key, CacheEntry {
 					created_at: Instant::now(),
 					entries:    entries.entries.clone(),
 				});
 				evict_oldest();
+				flight.finish(FlightOutcome::Shared(Ok(entries.clone())));
 				return Ok(CollectedEntries { entries: entries.entries, cache_age_ms: 0 });
 			},
 			Err(err @ WalkError::InvalidData { .. }) => {
