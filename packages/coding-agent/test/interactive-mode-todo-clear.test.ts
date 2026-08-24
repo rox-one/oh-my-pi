@@ -5,6 +5,7 @@ import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { InteractiveMode } from "@oh-my-pi/pi-coding-agent/modes/interactive-mode";
 import { initTheme, theme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
+import { AgentRegistry, MAIN_AGENT_ID } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
@@ -226,6 +227,78 @@ describe("InteractiveMode todo HUD persistence", () => {
 		vi.advanceTimersByTime(100);
 
 		expect(session.getTodoPhases()[0]?.tasks[0]?.status).toBe("completed");
+	});
+
+	it("reconciles focused worker todos without overwriting the main session", async () => {
+		await replaceMode();
+		setTodoClearDelay(-1);
+		vi.spyOn(mode.statusLine, "watchBranch").mockImplementation(() => {});
+		const mainPhases: TodoPhase[] = [
+			{ name: "Main plan", tasks: [{ content: "orchestrate the main work", status: "in_progress" }] },
+		];
+		session.setTodoPhases(mainPhases);
+		mode.setTodos(session.getTodoPhases());
+		await mode.init();
+
+		const focusedDir = TempDir.createSync("@pi-focused-reconcile-");
+		const model = modelRegistry.find("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected claude-sonnet-4-5 to exist in registry");
+		const focusedSession = new AgentSession({
+			agent: new Agent({
+				initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+			}),
+			sessionManager: SessionManager.create(focusedDir.path(), focusedDir.path()),
+			settings: Settings.isolated(),
+			modelRegistry,
+		});
+		focusedSession.setTodoPhases([
+			{
+				name: "Worker plan",
+				tasks: [
+					{ content: "apply nested review fixes", status: "pending" },
+					{ content: "verify worker changes", status: "in_progress" },
+				],
+			},
+		]);
+		const registry = AgentRegistry.global();
+		const agentId = "FocusedTodoParent";
+		const ref = registry.register({
+			id: agentId,
+			displayName: agentId,
+			kind: "sub",
+			parentId: MAIN_AGENT_ID,
+			session: focusedSession,
+			status: "running",
+		});
+		try {
+			await mode.focusAgentSession(agentId);
+			expect(renderTodos(mode)).toContain("apply nested review fixes");
+
+			vi.useFakeTimers();
+			eventBus.emit(TASK_SUBAGENT_LIFECYCLE_CHANNEL, {
+				id: `${agentId}/NestedFixer`,
+				index: 0,
+				agent: "task",
+				description: "apply nested review fixes",
+				status: "completed",
+				detached: true,
+			});
+			vi.advanceTimersByTime(100);
+
+			expect(focusedSession.getTodoPhases()[0]?.tasks[0]?.status).toBe("completed");
+			expect(session.getTodoPhases()).toEqual(mainPhases);
+			expect(renderTodos(mode)).toContain("1/2");
+
+			await mode.unfocusSession();
+			expect(renderTodos(mode)).toContain("orchestrate the main work");
+			expect(renderTodos(mode)).not.toContain("apply nested review fixes");
+		} finally {
+			vi.useRealTimers();
+			if (mode.focusedAgentId) await mode.unfocusSession();
+			registry.unregister(agentId, ref);
+			await focusedSession.dispose();
+			focusedDir.removeSync();
+		}
 	});
 
 	it("completes a blocked todo when the detached subagent it waits on finishes", async () => {
