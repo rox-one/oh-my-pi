@@ -4,7 +4,7 @@ Mode: custom instructions.
 
 ## Distribution
 
-Use `task`: `agent: "reviewer"`, `tasks` array. Create exactly **1 reviewer task**; assignment MUST include custom instructions.
+Use `{{toolRefs.task}}`: `agent: "reviewer"`, `tasks` array. Create exactly **1 reviewer task**; assignment MUST include custom instructions.
 
 ## Reviewer Instructions
 

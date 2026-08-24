@@ -5625,6 +5625,16 @@ export class AgentSession {
 		return this.#tools.getActiveToolNames();
 	}
 
+	/** Formats a model-facing reference for a registered session tool. */
+	getToolReference(name: string): string {
+		const tool = this.#tools.registry.get(name);
+		return formatCodeModeToolReference({
+			name,
+			wireName: tool?.customWireName,
+			direct: this.getActiveToolNames().includes(name),
+		});
+	}
+
 	/** Enabled top-level and discoverable tool names. */
 	getEnabledToolNames(): string[] {
 		return this.#tools.getEnabledToolNames();
@@ -7378,6 +7388,7 @@ export class AgentSession {
 		const ctx = {
 			...baseCtx,
 			hasQueuedMessages: baseCtx.hasPendingMessages,
+			getToolReference: (name: string) => this.getToolReference(name),
 		} as unknown as HookCommandContext;
 
 		try {

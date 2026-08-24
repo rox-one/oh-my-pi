@@ -38,6 +38,11 @@ interface DiffStats {
 	totalRemoved: number;
 	excluded: { path: string; reason: string; linesAdded: number; linesRemoved: number }[];
 }
+type ReviewToolRefs = { task: string };
+
+function getReviewToolRefs(ctx: HookCommandContext): ReviewToolRefs {
+	return { task: ctx.getToolReference?.("task") ?? "task" };
+}
 
 interface CurrentReviewDiff {
 	diffInstruction: string;
@@ -236,7 +241,12 @@ function buildReviewPrompt(
 	mode: string,
 	stats: DiffStats,
 	rawDiff: string,
-	options: { additionalInstructions?: string; diffInstruction?: string; contextInstruction?: string } = {},
+	options: {
+		additionalInstructions?: string;
+		diffInstruction?: string;
+		contextInstruction?: string;
+		toolRefs?: ReviewToolRefs;
+	} = {},
 ): string {
 	const agentCount = getRecommendedAgentCount(stats);
 	const skipDiff = rawDiff.length > MAX_DIFF_CHARS || stats.files.length > MAX_FILES_FOR_INLINE_DIFF;
@@ -264,15 +274,16 @@ function buildReviewPrompt(
 		additionalInstructions: options.additionalInstructions,
 		diffInstruction: options.diffInstruction ?? DEFAULT_LARGE_DIFF_INSTRUCTION,
 		contextInstruction: options.contextInstruction ?? DEFAULT_CONTEXT_INSTRUCTION,
+		toolRefs: options.toolRefs ?? { task: "task" },
 	});
 }
 
-function buildCustomReviewPrompt(instructions: string): string {
-	return prompt.render(reviewCustomRequestTemplate, { instructions });
+function buildCustomReviewPrompt(instructions: string, toolRefs: ReviewToolRefs): string {
+	return prompt.render(reviewCustomRequestTemplate, { instructions, toolRefs });
 }
 
-function buildHeadlessReviewPrompt(focus?: string): string {
-	return prompt.render(reviewHeadlessRequestTemplate, { focus });
+function buildHeadlessReviewPrompt(focus: string | undefined, toolRefs: ReviewToolRefs): string {
+	return prompt.render(reviewHeadlessRequestTemplate, { focus, toolRefs });
 }
 
 const REVIEW_CONTEXT_PR_LIMIT = 3;
@@ -390,6 +401,7 @@ function buildReviewPromptFromDiff(
 		additionalInstructions: extraInstructions,
 		diffInstruction: options.diffInstruction,
 		contextInstruction: options.contextInstruction,
+		toolRefs: getReviewToolRefs(ctx),
 	});
 }
 
@@ -486,7 +498,7 @@ export class ReviewCommand implements CustomCommand {
 
 		const extraInstructions = parsedArgs.extraInstructions || undefined;
 		if (!ctx.hasUI) {
-			return buildHeadlessReviewPrompt(extraInstructions);
+			return buildHeadlessReviewPrompt(extraInstructions, getReviewToolRefs(ctx));
 		}
 
 		const choices: Array<{ label: string; value: ReviewMenuChoice }> = [
@@ -623,11 +635,12 @@ export class ReviewCommand implements CustomCommand {
 						{
 							additionalInstructions: instructions,
 							diffInstruction: reviewDiff.diffInstruction,
+							toolRefs: getReviewToolRefs(ctx),
 						},
 					);
 				}
 
-				return buildCustomReviewPrompt(instructions);
+				return buildCustomReviewPrompt(instructions, getReviewToolRefs(ctx));
 			}
 		}
 	}

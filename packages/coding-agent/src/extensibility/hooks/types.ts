@@ -186,6 +186,8 @@ export interface HookContext {
 	sessionManager: ReadonlySessionManager;
 	/** Model registry - use for API key resolution and model retrieval */
 	modelRegistry: ModelRegistry;
+	/** Formats a model-facing tool reference for the active direct/bridge transport. */
+	getToolReference?: (name: string) => string;
 	/** Current model (may be undefined if no model is selected yet) */
 	model: Model | undefined;
 	/** Whether the agent is idle (not streaming) */
