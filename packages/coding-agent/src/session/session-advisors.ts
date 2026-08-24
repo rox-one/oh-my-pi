@@ -472,17 +472,24 @@ export class SessionAdvisors {
 		this.#advisorCosts = new Map(costs);
 	}
 
+	/** Capture the per-advisor ledger at a transcript byte-snapshot boundary. */
+	costSnapshot(): ReadonlyMap<string, number> {
+		return new Map(this.#advisorCosts);
+	}
+
 	/**
-	 * Seed the persisted spend recorded before this session was resumed. Applied
-	 * off the critical path (see {@link AgentSession.restoreInitialAdvisorCosts}),
-	 * so a slug already billed this process — a turn that finished before the
-	 * transcript scan did — keeps its accumulated value instead of being
-	 * clobbered or double-counted.
+	 * Restore spend persisted at `costsAtSnapshot`, then add only the process-local
+	 * delta billed after that fixed transcript snapshot. This preserves turns
+	 * completed while the background scan runs without double-counting entries
+	 * the scan already includes.
 	 */
-	restoreInitialCost(costs: ReadonlyMap<string, number>): void {
-		for (const [slug, total] of costs) {
-			if (!this.#advisorCosts.has(slug)) this.#advisorCosts.set(slug, total);
+	restoreInitialCost(costs: ReadonlyMap<string, number>, costsAtSnapshot: ReadonlyMap<string, number>): void {
+		const restored = new Map(costs);
+		for (const [slug, current] of this.#advisorCosts) {
+			const accrued = current - (costsAtSnapshot.get(slug) ?? 0);
+			if (accrued > 0) restored.set(slug, (restored.get(slug) ?? 0) + accrued);
 		}
+		this.#advisorCosts = restored;
 	}
 
 	/**

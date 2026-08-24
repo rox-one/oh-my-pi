@@ -571,17 +571,30 @@ describe("AgentSession advisor toggle", () => {
 		session.restoreInitialAdvisorCosts(new Map([["", 0.5]]));
 		expect(session.getAdvisorCost()).toBeCloseTo(0.5, 8);
 	});
-	it("keeps a turn billed before the resume scan finishes instead of clobbering it", () => {
-		const advisor = enableAdvisor();
-		appendAdvisorCost(advisor, 0.25, 1);
-		// A late-settling scan must not overwrite or double-count the turn already
-		// billed this process (issue #9553).
-		session.restoreInitialAdvisorCosts(new Map([["", 0.5]]));
-		expect(session.getAdvisorCost()).toBeCloseTo(0.25, 8);
+	it("adds a turn billed while the resume scan is running to persisted spend", async () => {
+		const restore = Promise.withResolvers<Map<string, number>>();
+		const load = vi.spyOn(advisorModule, "loadAdvisorTranscriptCosts").mockImplementation((_file, options) => {
+			options?.onSnapshot?.();
+			return restore.promise;
+		});
+		try {
+			session.beginInitialAdvisorCostRestore();
+			const advisor = enableAdvisor();
+			appendAdvisorCost(advisor, 0.25, 1);
+			restore.resolve(new Map([["", 0.5]]));
+			await session.advisorCostRestore;
+
+			expect(session.getAdvisorCost()).toBeCloseTo(0.75, 8);
+		} finally {
+			load.mockRestore();
+		}
 	});
 	it("ignores an initial cost restore after the active session changes", async () => {
 		const restore = Promise.withResolvers<Map<string, number>>();
-		const load = vi.spyOn(advisorModule, "loadAdvisorTranscriptCosts").mockReturnValue(restore.promise);
+		const load = vi.spyOn(advisorModule, "loadAdvisorTranscriptCosts").mockImplementation((_file, options) => {
+			options?.onSnapshot?.();
+			return restore.promise;
+		});
 		try {
 			session.beginInitialAdvisorCostRestore();
 			await session.newSession();

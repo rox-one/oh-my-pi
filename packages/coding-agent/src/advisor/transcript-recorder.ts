@@ -1,4 +1,4 @@
-import * as fs from "node:fs/promises";
+import * as fs from "node:fs";
 import * as path from "node:path";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { Message, UserMessage } from "@oh-my-pi/pi-ai";
@@ -34,56 +34,94 @@ export function isAdvisorTranscriptName(name: string): boolean {
 	);
 }
 
+/** Controls resume-time advisor transcript cost restoration. */
+export interface LoadAdvisorTranscriptCostsOptions {
+	/**
+	 * Runs synchronously after every transcript's byte length has been captured
+	 * and before parsing begins. Callers use this boundary to snapshot in-memory
+	 * costs; later appends are excluded from the disk totals.
+	 */
+	onSnapshot?: () => void;
+}
+
+interface AdvisorTranscriptCostFileSnapshot {
+	file: string;
+	slug: string;
+	maxBytes: number;
+}
+
 /**
- * Sum the advisor spend already persisted next to a primary session transcript,
+ * Sum advisor spend already persisted next to a primary session transcript,
  * keyed by advisor slug.
  *
- * The ledger a session keeps in memory only covers the current process, so a
- * resumed session would report zero until the next advisor turn. The recorded
- * transcripts are the durable copy of exactly the same finalized messages, so
- * they are read back through the shared loader - no lock, no writer, and no
- * second parser to keep in step with the session format.
+ * Each transcript is read only through the byte length captured before
+ * `onSnapshot` runs. This fixed prefix lets resume reconcile the persisted
+ * total with advisor turns billed while the asynchronous scan is running,
+ * without either dropping or double-counting those concurrent turns.
  *
  * Only the session's own advisors count: subagent advisors write to
  * `<session>/<SubId>/__advisor.jsonl`, and their spend belongs to the subagent,
  * not to this roster. Hence the scan stays at the top level of the directory.
  */
-export async function loadAdvisorTranscriptCosts(sessionFile: string | undefined): Promise<Map<string, number>> {
+export async function loadAdvisorTranscriptCosts(
+	sessionFile: string | undefined,
+	options: LoadAdvisorTranscriptCostsOptions = {},
+): Promise<Map<string, number>> {
+	const snapshots: AdvisorTranscriptCostFileSnapshot[] = [];
+	if (sessionFile?.endsWith(JSONL_SUFFIX)) {
+		const directory = sessionFile.slice(0, -JSONL_SUFFIX.length);
+		let dirents: fs.Dirent[] = [];
+		try {
+			dirents = fs.readdirSync(directory, { withFileTypes: true });
+		} catch {}
+		for (const dirent of dirents) {
+			if (!dirent.isFile() || !isAdvisorTranscriptName(dirent.name)) continue;
+			const file = path.join(directory, dirent.name);
+			try {
+				snapshots.push({
+					file,
+					slug:
+						dirent.name === ADVISOR_TRANSCRIPT_FILENAME
+							? ""
+							: dirent.name.slice(`${ADVISOR_TRANSCRIPT_STEM}.`.length, -JSONL_SUFFIX.length),
+					maxBytes: fs.statSync(file).size,
+				});
+			} catch {}
+		}
+	}
+	options.onSnapshot?.();
+
 	const costs = new Map<string, number>();
-	if (!sessionFile?.endsWith(JSONL_SUFFIX)) return costs;
-	const directory = sessionFile.slice(0, -JSONL_SUFFIX.length);
-	const dirents = await fs.readdir(directory, { withFileTypes: true }).catch(() => []);
-	for (const dirent of dirents) {
-		if (!dirent.isFile() || !isAdvisorTranscriptName(dirent.name)) continue;
-		const slug =
-			dirent.name === ADVISOR_TRANSCRIPT_FILENAME
-				? ""
-				: dirent.name.slice(`${ADVISOR_TRANSCRIPT_STEM}.`.length, -JSONL_SUFFIX.length);
+	for (const snapshot of snapshots) {
 		let total = 0;
 		let validHeader: boolean | undefined;
 		try {
-			await visitEntriesFromFileStream(path.join(directory, dirent.name), entry => {
-				const isObject = typeof entry === "object" && entry !== null;
-				if (validHeader === undefined) {
-					validHeader = isObject && entry.type === "session" && typeof entry.id === "string";
-					return;
-				}
-				// A syntactically valid but non-object entry (e.g. a bare `null`
-				// line) must cost only itself, not crash entry.type access and
-				// discard everything accumulated for this transcript.
-				if (!validHeader || !isObject || entry.type !== "message") return;
-				const message = entry.message;
-				if (!message || typeof message !== "object" || message.role !== "assistant") return;
-				// One malformed usage block must cost that entry only, not the
-				// whole transcript's total.
-				const total_ = message.usage?.cost?.total;
-				if (typeof total_ === "number" && Number.isFinite(total_)) total += total_;
-			});
+			await visitEntriesFromFileStream(
+				snapshot.file,
+				entry => {
+					const isObject = typeof entry === "object" && entry !== null;
+					if (validHeader === undefined) {
+						validHeader = isObject && entry.type === "session" && typeof entry.id === "string";
+						return;
+					}
+					// A syntactically valid but non-object entry (e.g. a bare
+					// `null` line) must cost only itself, not crash entry.type
+					// access and discard everything accumulated for this transcript.
+					if (!validHeader || !isObject || entry.type !== "message") return;
+					const message = entry.message;
+					if (!message || typeof message !== "object" || message.role !== "assistant") return;
+					// One malformed usage block must cost that entry only, not the
+					// whole transcript's total.
+					const total_ = message.usage?.cost?.total;
+					if (typeof total_ === "number" && Number.isFinite(total_)) total += total_;
+				},
+				{ maxBytes: snapshot.maxBytes },
+			);
 		} catch (err) {
-			logger.debug("advisor transcript cost read failed", { file: dirent.name, err: String(err) });
+			logger.debug("advisor transcript cost read failed", { file: path.basename(snapshot.file), err: String(err) });
 			continue;
 		}
-		if (total > 0) costs.set(slug, total);
+		if (total > 0) costs.set(snapshot.slug, total);
 	}
 	return costs;
 }

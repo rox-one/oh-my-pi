@@ -231,6 +231,34 @@ describe("AdvisorTranscriptRecorder", () => {
 		});
 	});
 
+	it("excludes transcript entries appended after the cost snapshot", async () => {
+		await withTempDir(async dir => {
+			const sessionFile = path.join(dir, "sess.jsonl");
+			const recorder = new AdvisorTranscriptRecorder(
+				() => sessionFile,
+				() => dir,
+			);
+			recorder.record(assistantMessage("persisted before snapshot", 1, 0.25));
+			await recorder.close();
+
+			const transcript = path.join(dir, "sess", ADVISOR_TRANSCRIPT_FILENAME);
+			const appended = Promise.withResolvers<void>();
+			const costs = loadAdvisorTranscriptCosts(sessionFile, {
+				onSnapshot: () => {
+					const entry = JSON.stringify({
+						type: "message",
+						message: assistantMessage("billed after snapshot", 1, 0.5),
+					});
+					void fs.appendFile(transcript, `${entry}\n`).then(appended.resolve, appended.reject);
+				},
+			});
+			await appended.promise;
+
+			expect((await costs).get("")).toBeCloseTo(0.25, 8);
+			expect((await loadAdvisorTranscriptCosts(sessionFile)).get("")).toBeCloseTo(0.75, 8);
+		});
+	});
+
 	it("keeps valid costs when persisted entries are malformed", async () => {
 		await withTempDir(async dir => {
 			const sessionFile = path.join(dir, "sess.jsonl");
