@@ -301,6 +301,61 @@ describe("InteractiveMode todo HUD persistence", () => {
 		}
 	});
 
+	it("reconciles into the snapshot's owning session even when viewSession has moved on", async () => {
+		// Reproduces the focus-attach window deterministically: the HUD snapshot is
+		// reloaded from the worker (making it the owner) while viewSession is still
+		// the main session. A subagent completing here must land in the worker, not
+		// be written over the main session's canonical plan (#9575 review).
+		await replaceMode();
+		setTodoClearDelay(-1);
+		vi.spyOn(mode.statusLine, "watchBranch").mockImplementation(() => {});
+		const mainPhases: TodoPhase[] = [
+			{ name: "Main plan", tasks: [{ content: "orchestrate the main work", status: "in_progress" }] },
+		];
+		session.setTodoPhases(mainPhases);
+		mode.setTodos(session.getTodoPhases());
+		await mode.init();
+
+		const workerDir = TempDir.createSync("@pi-owner-reconcile-");
+		const model = modelRegistry.find("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected claude-sonnet-4-5 to exist in registry");
+		const workerSession = new AgentSession({
+			agent: new Agent({
+				initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+			}),
+			sessionManager: SessionManager.create(workerDir.path(), workerDir.path()),
+			settings: Settings.isolated(),
+			modelRegistry,
+		});
+		workerSession.setTodoPhases([
+			{ name: "Worker plan", tasks: [{ content: "run the delegated fix", status: "in_progress" }] },
+		]);
+		try {
+			// Owner := worker, viewSession still := main.
+			await mode.reloadTodos(workerSession);
+			expect(renderTodos(mode)).toContain("run the delegated fix");
+
+			vi.useFakeTimers();
+			eventBus.emit(TASK_SUBAGENT_LIFECYCLE_CHANNEL, {
+				id: "DelegatedFixer",
+				index: 0,
+				agent: "task",
+				description: "run the delegated fix",
+				status: "completed",
+				detached: true,
+			});
+			vi.advanceTimersByTime(100);
+
+			expect(workerSession.getTodoPhases()[0]?.tasks[0]?.status).toBe("completed");
+			expect(session.getTodoPhases()).toEqual(mainPhases);
+			expect(renderTodos(mode)).toContain("1/1");
+		} finally {
+			vi.useRealTimers();
+			await workerSession.dispose();
+			workerDir.removeSync();
+		}
+	});
+
 	it("completes a blocked todo when the detached subagent it waits on finishes", async () => {
 		await replaceMode();
 		setTodoClearDelay(-1);
