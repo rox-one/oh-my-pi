@@ -8094,6 +8094,7 @@ export class AgentSession {
 		this.#usagePreflightReadyForNextModelCall = false;
 		this.#usagePreflightReadyModel = undefined;
 
+		let cwdChangeTarget: string | undefined;
 		try {
 			if (switchingToDifferentSession) {
 				// Stop and settle in-flight advisors while the old-session feeds can
@@ -8235,12 +8236,13 @@ export class AgentSession {
 					error: String(refreshErr),
 				});
 			}
-			if (
-				options?.onCwdChange &&
-				path.resolve(this.sessionManager.getCwd()) !== path.resolve(previousSessionState.cwd)
-			) {
-				if (!(await options.onCwdChange(this.sessionManager.getCwd(), previousSessionState.cwd))) {
-					throw SESSION_CWD_CHANGE_REJECTED;
+			if (options?.onCwdChange) {
+				const newCwd = this.sessionManager.getCwd();
+				if (path.resolve(newCwd) !== path.resolve(previousSessionState.cwd)) {
+					cwdChangeTarget = newCwd;
+					if (!(await options.onCwdChange(newCwd, previousSessionState.cwd))) {
+						throw SESSION_CWD_CHANGE_REJECTED;
+					}
 				}
 			}
 			// Hand the ledger over to the session that just took over, and only once the
@@ -8311,6 +8313,20 @@ export class AgentSession {
 					targetSessionFile: sessionPath,
 					error: String(reconcileError),
 				});
+			}
+			if (cwdChangeTarget && error !== SESSION_CWD_CHANGE_REJECTED && options?.onCwdChange) {
+				try {
+					if (!(await options.onCwdChange(previousSessionState.cwd, cwdChangeTarget))) {
+						logger.warn("Cwd rollback was rejected after session switch", {
+							cwd: previousSessionState.cwd,
+						});
+					}
+				} catch (rollbackError) {
+					logger.warn("Cwd rollback failed after session switch", {
+						cwd: previousSessionState.cwd,
+						error: String(rollbackError),
+					});
+				}
 			}
 			this.#bash.finishSessionTransition(bashTransition, false);
 			if (error === SESSION_CWD_CHANGE_REJECTED) return false;
