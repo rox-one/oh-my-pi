@@ -355,27 +355,46 @@ describe("structured subagent primitive", () => {
 		await fs.rm(settled.artifactsDir, { recursive: true, force: true });
 	});
 
-	it("keeps a nonpersistent task artifact lease while its verified URI is published", async () => {
+	it("resolves same agent IDs to their own nonpersistent artifact bytes", async () => {
 		mockDiscovery();
+		const outputs = ["first session output", "second session output"];
 		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => {
 			if (!options.artifactsDir) throw new Error("artifactsDir missing");
-			const written = await writeVerifiedAgentOutput(options.artifactsDir, options.id, "published output");
+			const output = outputs.shift();
+			if (output === undefined) throw new Error("unexpected extra subagent run");
+			const written = await writeVerifiedAgentOutput(options.artifactsDir, options.id, output);
 			if (!written.ok) throw new Error(written.error);
 			return {
 				...result(),
 				id: options.id,
-				output: "published output",
+				output,
 				outputMeta: written.artifact,
 				outputPath: written.artifact.path,
 			};
 		});
 
-		const settled = await runStructuredSubagent(request());
-		const resource = await new AgentProtocolHandler().resolve(parseInternalUrl(`agent://${settled.result.id}`));
+		const first = await runStructuredSubagent(request({ session: session(), identity: { id: "Worker" } }));
+		const second = await runStructuredSubagent(request({ session: session(), identity: { id: "Worker" } }));
+		const firstUri = first.result.outputMeta?.uri;
+		const secondUri = second.result.outputMeta?.uri;
+		if (!firstUri || !secondUri) throw new Error("expected published artifact URIs");
 
-		expect(settled.temporaryArtifacts).toBe(true);
-		expect(resource.content).toBe("published output");
-		await fs.rm(settled.artifactsDir, { recursive: true, force: true });
+		try {
+			const handler = new AgentProtocolHandler();
+			const firstResource = await handler.resolve(parseInternalUrl(firstUri));
+			const secondResource = await handler.resolve(parseInternalUrl(secondUri));
+
+			expect(firstUri).toContain("?lease=");
+			expect(secondUri).toContain("?lease=");
+			expect(secondUri).not.toBe(firstUri);
+			expect(firstResource.content).toBe("first session output");
+			expect(secondResource.content).toBe("second session output");
+		} finally {
+			await Promise.all([
+				fs.rm(first.artifactsDir, { recursive: true, force: true }),
+				fs.rm(second.artifactsDir, { recursive: true, force: true }),
+			]);
+		}
 	});
 	it("uses identical non-plan LSP and IRC policy for task and eval invocations", async () => {
 		mockDiscovery();

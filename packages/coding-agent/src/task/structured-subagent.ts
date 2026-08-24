@@ -342,6 +342,8 @@ interface ArtifactLease {
 	sessionFile: string | null;
 	artifactsDir: string;
 	temporary: boolean;
+	/** Scope encoded in a temporary artifact URI so identical agent IDs stay unambiguous. */
+	uriScope?: string;
 	unregister: (() => void) | undefined;
 }
 
@@ -355,12 +357,19 @@ async function leaseArtifacts(
 		await fs.mkdir(artifactsDir, { recursive: true });
 		return { sessionFile, artifactsDir, temporary: false, unregister: undefined };
 	}
+	const uriScope = Snowflake.next();
 	const artifactsDir = path.join(
 		os.tmpdir(),
-		`${invocationKind === "eval" ? "omp-eval-agent" : "omp-task"}-${Snowflake.next()}`,
+		`${invocationKind === "eval" ? "omp-eval-agent" : "omp-task"}-${uriScope}`,
 	);
 	await fs.mkdir(artifactsDir, { recursive: true });
-	return { sessionFile: null, artifactsDir, temporary: true, unregister: registerArtifactsDir(artifactsDir) };
+	return {
+		sessionFile: null,
+		artifactsDir,
+		temporary: true,
+		uriScope,
+		unregister: registerArtifactsDir(artifactsDir, uriScope),
+	};
 }
 
 function resolveAutoloadSkills(session: ToolSession, agent: AgentDefinition) {
@@ -603,6 +612,12 @@ export async function runStructuredSubagent(request: StructuredSubagentRequest):
 			});
 		}
 		attachStructuredOutputMetadata(result, policy.schema);
+		if (lease.uriScope && result.outputMeta) {
+			result.outputMeta = {
+				...result.outputMeta,
+				uri: `agent://${result.id}?lease=${encodeURIComponent(lease.uriScope)}`,
+			};
+		}
 		publishedArtifact = result.outputMeta !== undefined;
 		requiresRecoveryArtifacts =
 			policy.isIsolated &&

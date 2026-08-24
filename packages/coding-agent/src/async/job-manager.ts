@@ -321,7 +321,13 @@ export class AsyncJobManager {
 
 		const receipt = outcome.outputMeta;
 		const agentId = job.agentId ?? job.id;
-		if (receipt && receipt.uri !== `agent://${agentId}`) {
+		const expectedUri = `agent://${agentId}`;
+		const scopedPrefix = `${expectedUri}?lease=`;
+		const receiptMatchesAgent =
+			!receipt ||
+			receipt.uri === expectedUri ||
+			(receipt.uri.startsWith(scopedPrefix) && receipt.uri.length > scopedPrefix.length);
+		if (!receiptMatchesAgent) {
 			job.outputMeta = undefined;
 			job.artifactError = outcome.artifactError ?? `artifact receipt does not match ${agentId}`;
 			return;

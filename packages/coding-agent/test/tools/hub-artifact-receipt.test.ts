@@ -51,6 +51,10 @@ describe("hub task artifact receipts", () => {
 			"artifact 20 B at `agent://Auditor`",
 		);
 
+		const scopedReceipt = { ...receipt, uri: "agent://Auditor?lease=session-a" };
+		manager.setTaskArtifactOutcome(id, { outputMeta: scopedReceipt });
+		expect(snapshotJobs(session, manager.getAllJobs())[0]?.outputMeta).toEqual(scopedReceipt);
+
 		manager.setTaskArtifactOutcome(id, { outputMeta: { ...receipt, uri: "agent://Other" } });
 		const status = resultText(buildJobResult(session, manager, "jobs", manager.getAllJobs(), []));
 		expect(status).toContain("read it with `wait` on this id");

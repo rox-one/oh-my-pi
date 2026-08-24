@@ -10,16 +10,25 @@ import { isEnoent } from "@oh-my-pi/pi-utils";
 import { AgentRegistry } from "../registry/agent-registry";
 
 const extraArtifactsDirs = new Set<string>();
+const scopedArtifactsDirs = new Map<string, string>();
 
-export function registerArtifactsDir(dir: string): () => void {
+export function registerArtifactsDir(dir: string, scope?: string): () => void {
 	extraArtifactsDirs.add(dir);
+	if (scope) scopedArtifactsDirs.set(scope, dir);
 	return () => {
 		extraArtifactsDirs.delete(dir);
+		if (scope && scopedArtifactsDirs.get(scope) === dir) scopedArtifactsDirs.delete(scope);
 	};
+}
+
+/** Resolve a temporary artifact directory by the scope encoded in a published agent URI. */
+export function artifactsDirForScope(scope: string): string | undefined {
+	return scopedArtifactsDirs.get(scope);
 }
 
 export function resetRegisteredArtifactDirsForTests(): void {
 	extraArtifactsDirs.clear();
+	scopedArtifactsDirs.clear();
 }
 
 /**

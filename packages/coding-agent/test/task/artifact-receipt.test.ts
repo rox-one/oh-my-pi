@@ -11,6 +11,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { writeVerifiedAgentOutput } from "@oh-my-pi/pi-coding-agent/task/output-manager";
 import { prompt, TempDir } from "@oh-my-pi/pi-utils";
+import taskDescriptionTemplate from "../../src/prompts/tools/task.md" with { type: "text" };
 import taskSummaryTemplate from "../../src/prompts/tools/task-summary.md" with { type: "text" };
 
 describe("writeVerifiedAgentOutput", () => {
@@ -118,5 +119,27 @@ describe("task-result envelope", () => {
 		expect(rendered).not.toContain("agent://");
 		expect(rendered).toContain("<artifact-unavailable>");
 		expect(rendered).toContain("ENOSPC: no space left on device");
+	});
+});
+
+describe("task retrieval prompt", () => {
+	it("follows the retrieval pointer in each async job row", () => {
+		const rendered = prompt.render(taskDescriptionTemplate, {
+			agents: [],
+			scoutAvailable: false,
+			spawningDisabled: false,
+			defaultAgent: "task",
+			isolationEnabled: false,
+			applyIsolatedChanges: false,
+			batchEnabled: false,
+			effortEnabled: false,
+			asyncEnabled: true,
+			hasBlockingAgents: false,
+			ircEnabled: false,
+		});
+
+		expect(rendered).toContain("Follow each settled row's retrieval pointer");
+		expect(rendered).toContain("otherwise use `hub wait` on that job ID");
+		expect(rendered).not.toContain("full output at `agent://<id>`");
 	});
 });
