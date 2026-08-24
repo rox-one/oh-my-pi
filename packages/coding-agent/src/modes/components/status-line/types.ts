@@ -20,6 +20,7 @@ export interface CollabStatus {
 }
 
 export interface StatusLineSegmentOptions {
+	session?: { length?: number };
 	model?: { showThinkingLevel?: boolean };
 	path?: { abbreviate?: boolean; maxLength?: number; stripWorkPrefix?: boolean };
 	git?: { showBranch?: boolean; showStaged?: boolean; showUnstaged?: boolean; showUntracked?: boolean };

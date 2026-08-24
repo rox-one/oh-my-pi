@@ -96,6 +96,7 @@
 - Fixed completed assistant replies disappearing from the live transcript under viewport pressure.
 - Accelerated SHA-2 and SHA-3 checksums on supported ARM64 hardware.
 - Fixed large MCP tool payloads being stored redundantly on disk.
+- Fixed the status-line session segment showing identical IDs for sessions created close together ([#9572](https://github.com/can1357/oh-my-pi/issues/9572)).
 
 ## [18.0.4] - 2026-08-24
 
