@@ -56,6 +56,7 @@ export function resolveCodeMode(args: {
 	return { active: true, directToolNames: direct };
 }
 
+/** Formats a tool reference as its direct wire alias or an eval bridge expression (`tool.*`/bracket syntax). */
 export function formatCodeModeToolReference(args: { name: string; wireName?: string; direct: boolean }): string {
 	if (args.direct) return args.wireName ?? args.name;
 	return /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(args.name) ? `tool.${args.name}` : `tool[${JSON.stringify(args.name)}]`;
