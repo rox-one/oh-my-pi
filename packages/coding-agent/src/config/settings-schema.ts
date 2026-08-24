@@ -626,13 +626,13 @@ export const SETTINGS_SCHEMA = {
 	"providers.openai-codex.codeMode": {
 		type: "enum",
 		values: ["off", "on", "auto"] as const,
-		default: "off",
+		default: "auto",
 		ui: {
 			tab: "providers",
 			group: "Services",
 			label: "Codex Code Mode",
 			description:
-				"Route Codex code_mode_only models (GPT-5.6) through the eval tool as a programmatic execution surface: the direct tool surface collapses to eval/ask/todo and every other session tool is invoked from eval cells. Mirrors codex-rs Code Mode. 'auto' follows the model catalog flag.",
+				"Route Codex code_mode_only models (GPT-5.6) through the eval tool as a programmatic execution surface: the direct tool surface collapses to eval/ask/todo and every other session tool is invoked from eval cells. Mirrors codex-rs Code Mode. 'auto' follows the model catalog flag by default; 'on' forces it for any Codex model; 'off' opts out and leaves the full direct surface.",
 		},
 	},
 
