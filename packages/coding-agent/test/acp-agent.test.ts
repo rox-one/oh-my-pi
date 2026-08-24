@@ -132,6 +132,8 @@ class FakeAgentSession {
 	disposed = false;
 	fastMode = false;
 	forcedToolChoice: string | undefined;
+	activeToolNames: string[] = [];
+	enabledToolNames: string[] = [];
 	get settings(): Settings {
 		return Settings.instance;
 	}
@@ -337,14 +339,24 @@ class FakeAgentSession {
 	}
 
 	getActiveToolNames(): string[] {
-		return [];
+		return [...this.activeToolNames];
+	}
+
+	getEnabledToolNames(): string[] {
+		return [...this.enabledToolNames];
 	}
 
 	getAllToolNames(): string[] {
 		return [];
 	}
 
-	setActiveToolsByName(_toolNames: string[]): void {}
+	hasBuiltInTool(name: string): boolean {
+		return name === "write";
+	}
+
+	setActiveToolsByName(toolNames: string[]): void {
+		this.activeToolNames = [...toolNames];
+	}
 
 	setClientBridge(_bridge: unknown): void {}
 
@@ -711,9 +723,11 @@ describe("ACP agent", () => {
 		expect(initialModeConfig?.currentValue).toBe("default");
 		expect(initialModeConfig?.options?.map(option => option.value)).toEqual(["default", "plan"]);
 
-		await harness.agent.setSessionMode({ sessionId: created.sessionId, modeId: "plan" });
-
 		const session = harness.findSession(created.sessionId)!;
+		session.enabledToolNames = ["eval", "write"];
+		session.activeToolNames = ["eval"];
+		await harness.agent.setSessionMode({ sessionId: created.sessionId, modeId: "plan" });
+		expect(session.activeToolNames).toContain("write");
 		expect(session.planModeState).toEqual(
 			expect.objectContaining({ enabled: true, planFilePath: "local://PLAN.md", workflow: "parallel" }),
 		);
@@ -750,6 +764,7 @@ describe("ACP agent", () => {
 		await harness.agent.setSessionMode({ sessionId: created.sessionId, modeId: "default" });
 		expect(session.planModeState).toBeUndefined();
 		expect(session.planProposalHandler).toBeUndefined();
+		expect(session.activeToolNames).toEqual(["eval", "write"]);
 
 		harness.abortController.abort();
 		await Bun.sleep(0);

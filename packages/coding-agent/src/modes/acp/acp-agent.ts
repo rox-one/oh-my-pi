@@ -782,7 +782,7 @@ export class AcpAgent implements Agent {
 
 	async setSessionMode(params: SetSessionModeRequest): Promise<SetSessionModeResponse> {
 		const record = this.#getSessionRecord(params.sessionId);
-		this.#applyModeChange(record.session, params.modeId);
+		await this.#applyModeChange(record.session, params.modeId);
 		await this.#connection.sessionUpdate({
 			sessionId: record.session.sessionId,
 			update: this.#buildCurrentModeUpdate(record.session),
@@ -799,7 +799,7 @@ export class AcpAgent implements Agent {
 
 		switch (params.configId) {
 			case MODE_CONFIG_ID:
-				this.#applyModeChange(record.session, params.value);
+				await this.#applyModeChange(record.session, params.value);
 				break;
 			case MODEL_CONFIG_ID:
 				await this.#setModelById(record.session, params.value);
@@ -1912,28 +1912,47 @@ export class AcpAgent implements Agent {
 		return session.getPlanModeState()?.enabled ? ACP_PLAN_MODE_ID : ACP_DEFAULT_MODE_ID;
 	}
 
-	#applyModeChange(session: AgentSession, modeId: string): void {
+	async #applyModeChange(session: AgentSession, modeId: string): Promise<void> {
 		const availableModes = this.#getAvailableModes(session);
 		if (!availableModes.some(mode => mode.id === modeId)) {
 			throw new Error(`Unsupported ACP mode: ${modeId}`);
 		}
+		const previous = session.getPlanModeState();
+		const previousPlanProposalHandler = session.peekPlanProposalHandler?.();
 		if (modeId === ACP_PLAN_MODE_ID) {
-			const previous = session.getPlanModeState();
+			const enabledToolNames = session.getEnabledToolNames();
+			const planToolNames =
+				session.hasBuiltInTool("write") && !enabledToolNames.includes("write")
+					? [...enabledToolNames, "write"]
+					: enabledToolNames;
 			session.setPlanModeState({
 				enabled: true,
 				planFilePath: previous?.planFilePath ?? DEFAULT_PLAN_FILE_URL,
 				workflow: previous?.workflow ?? "parallel",
 				reentry: previous !== undefined,
 			});
+			try {
+				await session.setActiveToolsByName(planToolNames);
+			} catch (error) {
+				session.setPlanModeState(previous);
+				throw error;
+			}
 			// Mirror `InteractiveMode.#enterPlanMode`: register the plan-proposal
 			// handler that consumes `xd://propose` writes from plan mode. Without
 			// this, proposal dispatch falls through and plan mode has no approval
 			// path (issue #1869).
 			session.setPlanProposalHandler?.(title => this.#handleAcpPlanProposal(session, title));
-		} else {
-			session.setPlanProposalHandler?.(null);
-			session.setPlanModeState(undefined);
+			return;
 		}
+		session.setPlanModeState(undefined);
+		try {
+			await session.setActiveToolsByName(session.getEnabledToolNames());
+		} catch (error) {
+			session.setPlanModeState(previous);
+			session.setPlanProposalHandler?.(previousPlanProposalHandler ?? null);
+			throw error;
+		}
+		session.setPlanProposalHandler?.(null);
 	}
 
 	/**
