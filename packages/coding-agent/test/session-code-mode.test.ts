@@ -589,7 +589,7 @@ describe("Code Mode session startup", () => {
 			agentDir: registryDir,
 			modelRegistry,
 			sessionManager: SessionManager.inMemory(),
-			settings: Settings.isolated({ "providers.openai-codex.codeMode": "auto" }),
+			settings: Settings.isolated(),
 			model: codeModel,
 			disableExtensionDiscovery: true,
 			skills: [],
