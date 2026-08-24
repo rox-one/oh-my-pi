@@ -1423,6 +1423,8 @@ export class AgentSession {
 	#goalModeState: GoalModeState | undefined;
 	#goalRuntime: GoalRuntime;
 	readonly #advisors: SessionAdvisors;
+	/** Resolves once the resume-time advisor spend backfill settles (issue #9553). */
+	#advisorCostRestore: Promise<void> = Promise.resolve();
 	#goalTurnCounter = 0;
 	#planReferenceSent = false;
 	#planReferencePath = "local://PLAN.md";
@@ -2535,7 +2537,6 @@ export class AgentSession {
 			configs: config.advisorConfigs,
 			streamFn: config.advisorStreamFn,
 			transformProviderContext: config.transformProviderContext,
-			initialCosts: config.initialAdvisorCosts,
 		});
 
 		const maintenanceHost: SessionMaintenanceHost = {
@@ -12043,6 +12044,35 @@ export class AgentSession {
 	/** Return cumulative cost recorded for the current session's advisor activity. */
 	getAdvisorCost(): number {
 		return this.#advisors.getAdvisorCost();
+	}
+
+	/**
+	 * Begin backfilling advisor spend recorded before this resume, off the
+	 * critical path (issue #9553). A large advisor transcript would otherwise
+	 * block session startup for tens of seconds while the whole file is streamed
+	 * and parsed; instead the status-line total hydrates once the scan settles.
+	 * The resulting promise is exposed via {@link advisorCostRestore} for tests
+	 * and headless callers that must observe the hydrated total.
+	 */
+	beginInitialAdvisorCostRestore(): void {
+		this.#advisorCostRestore = loadAdvisorTranscriptCosts(this.sessionFile)
+			.then(costs => this.restoreInitialAdvisorCosts(costs))
+			.catch(err => logger.debug("advisor cost restore failed", { err: String(err) }));
+	}
+
+	/** Resolves once {@link beginInitialAdvisorCostRestore}'s scan has settled. */
+	get advisorCostRestore(): Promise<void> {
+		return this.#advisorCostRestore;
+	}
+
+	/**
+	 * Seed persisted advisor spend into the status-line ledger. A slug already
+	 * billed this process keeps its accumulated value, so a late-settling scan
+	 * (see {@link beginInitialAdvisorCostRestore}) never clobbers or
+	 * double-counts a turn that finished first.
+	 */
+	restoreInitialAdvisorCosts(costs: ReadonlyMap<string, number>): void {
+		this.#advisors.restoreInitialCost(costs);
 	}
 	/** Return whether any active or configured advisor is running on an OAuth/subscription model. */
 	isAdvisorUsingSubscription(): boolean {

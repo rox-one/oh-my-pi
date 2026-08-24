@@ -5,6 +5,7 @@ import type { Message, UserMessage } from "@oh-my-pi/pi-ai";
 import { logger } from "@oh-my-pi/pi-utils";
 import { visitEntriesFromFileStream } from "../session/session-loader";
 import { SessionManager } from "../session/session-manager";
+import { fingerprintMessage } from "./message-fingerprint";
 
 /**
  * Reserved transcript stem for advisor session files. Chosen so it cannot
@@ -114,6 +115,18 @@ export class AdvisorTranscriptRecorder {
 	#filename: string;
 	/** Serializes the async open/close against synchronous appends so records land in order. */
 	#queue: Promise<void>;
+	/**
+	 * Fingerprints of user "session update" deltas already persisted to
+	 * {@link #dedupFile}. The advisor re-primes on every history rewrite
+	 * (compaction, resume, retry) and re-emits the SAME replay batch with fresh
+	 * ids/timestamps; those carry no usage, so skipping exact repeats keeps the
+	 * transcript O(new content) without dropping a billed assistant turn
+	 * (issue #9553). Reset when the target file changes so a session switch
+	 * starts a fresh dedup window.
+	 */
+	#seenUserFingerprints = new Set<bigint>();
+	/** Target file the {@link #seenUserFingerprints} window belongs to. */
+	#dedupFile: string | undefined;
 
 	/**
 	 * @param filename Transcript filename within the session dir. Defaults to
@@ -163,6 +176,22 @@ export class AdvisorTranscriptRecorder {
 		const sessionFile = this.resolveSessionFile();
 		if (!sessionFile?.endsWith(JSONL_SUFFIX)) return;
 		const file = path.join(sessionFile.slice(0, -JSONL_SUFFIX.length), this.#filename);
+		// A new target file starts a fresh dedup window: fingerprints from the
+		// prior session's replays must never suppress the new file's first update.
+		if (file !== this.#dedupFile) {
+			this.#dedupFile = file;
+			this.#seenUserFingerprints.clear();
+		}
+		// Drop a re-delivered replay batch: user deltas carry no usage, so an
+		// exact repeat adds nothing but bytes. Assistant/toolResult turns are the
+		// advisor's real (billed) work and are always persisted, even on retry.
+		if (message.role === "user") {
+			const fingerprint = fingerprintMessage(message);
+			if (fingerprint !== undefined) {
+				if (this.#seenUserFingerprints.has(fingerprint)) return;
+				this.#seenUserFingerprints.add(fingerprint);
+			}
+		}
 		const cwd = this.resolveCwd();
 		this.#enqueue(async () => {
 			if (file !== this.#file) {

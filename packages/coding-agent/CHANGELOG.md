@@ -743,6 +743,7 @@
 - Fixed `/todo` expand/collapse commands and corrected `/shake thinking` reporting.
 - The exit/recovery resume hint now prints the explicit file path for a path-resumed session stored outside the managed sessions bucket (e.g. a pi transcript), instead of an `omp --resume <id>` that id-resolution can never match ([#9544](https://github.com/can1357/oh-my-pi/issues/9544)).
 - Thinking-only length stops that overlap speculative handoff now resume compaction recovery instead of leaving the autonomous run idle.
+- Advisor transcripts no longer re-persist replayed "Session update" batches on every re-prime/retry, so `__advisor.jsonl` grows with new content instead of ballooning to multiple GB; resumed sessions load the advisor cost total off the critical path (no more minute-long `createAgentSession` hang), and the Agent Hub caps pathological advisor-transcript scans so one huge file can't stall `hub list` ([#9553](https://github.com/can1357/oh-my-pi/issues/9553)).
 
 ## [18.0.3] - 2026-08-23
 

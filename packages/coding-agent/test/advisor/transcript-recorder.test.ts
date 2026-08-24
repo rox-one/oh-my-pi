@@ -164,6 +164,49 @@ describe("AdvisorTranscriptRecorder", () => {
 		});
 	});
 
+	it("drops re-delivered replay batches but keeps every billed assistant turn", async () => {
+		await withTempDir(async dir => {
+			const sessionFile = path.join(dir, "sess.jsonl");
+			const recorder = new AdvisorTranscriptRecorder(
+				() => sessionFile,
+				() => dir,
+			);
+			// The advisor re-primes on every history rewrite and re-emits the SAME
+			// "session update" with fresh timestamps; each cycle still bills a
+			// distinct assistant turn.
+			for (let cycle = 0; cycle < 5; cycle++) {
+				recorder.record({ ...userMessage("### Session update"), timestamp: cycle + 1 } as AgentMessage);
+				recorder.record(assistantMessage(`advice ${cycle}`, 1, 0.1));
+			}
+			await recorder.close();
+
+			const messages = await readMessageEntries(path.join(dir, "sess", ADVISOR_TRANSCRIPT_FILENAME));
+			expect(messages.filter(m => m.message?.role === "user")).toHaveLength(1);
+			expect(messages.filter(m => m.message?.role === "assistant")).toHaveLength(5);
+			expect((await loadAdvisorTranscriptCosts(sessionFile)).get("")).toBeCloseTo(0.5, 8);
+		});
+	});
+
+	it("re-persists an identical replay after a session switch resets the dedup window", async () => {
+		await withTempDir(async dir => {
+			let sessionFile = path.join(dir, "first.jsonl");
+			const recorder = new AdvisorTranscriptRecorder(
+				() => sessionFile,
+				() => dir,
+			);
+			recorder.record(userMessage("### Session update"));
+			recorder.record(userMessage("### Session update")); // deduped within the first file
+			sessionFile = path.join(dir, "second.jsonl");
+			recorder.record(userMessage("### Session update")); // new file → fresh window
+			await recorder.close();
+
+			const first = await readMessageEntries(path.join(dir, "first", ADVISOR_TRANSCRIPT_FILENAME));
+			const second = await readMessageEntries(path.join(dir, "second", ADVISOR_TRANSCRIPT_FILENAME));
+			expect(first.filter(m => m.message?.role === "user")).toHaveLength(1);
+			expect(second.filter(m => m.message?.role === "user")).toHaveLength(1);
+		});
+	});
+
 	it("loads cumulative costs by advisor slug", async () => {
 		await withTempDir(async dir => {
 			const sessionFile = path.join(dir, "sess.jsonl");

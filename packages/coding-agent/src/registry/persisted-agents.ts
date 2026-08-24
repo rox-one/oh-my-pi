@@ -19,6 +19,13 @@ import {
 
 /** Maximum prefix entries inspected for task metadata. */
 const MAX_METADATA_LINES = 64;
+/**
+ * Upper bound on records scanned to compute an advisor transcript's Hub metrics.
+ * Well above any healthy advisor file (post issue #9553 the file grows O(new
+ * content)); it exists only so a legacy multi-GB transcript can't stall the
+ * render thread when the Hub roster is built.
+ */
+const MAX_ADVISOR_HISTORY_LINES = 200_000;
 
 interface PersistedAgentMetadata {
 	activity?: string;
@@ -155,7 +162,17 @@ async function readPersistedAgentHistory(
 				const message = recordOf(record.message);
 				if (message?.role === "assistant") assistantById.set(id, assistantMetrics(message));
 			},
-			{ shouldContinue },
+			// Advisor transcripts are the one file that can grow pathologically large
+			// (issue #9553); cap their scan so one bad transcript can't stall the Hub
+			// on the render thread. Healthy advisor files sit far below this bound,
+			// so their metrics stay exact; a capped legacy file reports approximate
+			// (lower-bound) cost/tokens rather than freezing `hub list`.
+			{
+				shouldContinue,
+				maxRecords: isAdvisorTranscriptName(path.basename(transcript.sessionFile))
+					? MAX_ADVISOR_HISTORY_LINES
+					: undefined,
+			},
 		);
 	} catch {
 		return {};

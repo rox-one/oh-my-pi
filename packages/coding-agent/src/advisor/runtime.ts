@@ -14,6 +14,7 @@ import {
 } from "../session/session-history-format";
 import type { AdvisorPolicyAttribution } from "./advise-tool";
 import { ADVISOR_RENDER_OPTIONS, renderAdvisorDeltaChunks } from "./delta-split";
+import { fingerprintMessage } from "./message-fingerprint";
 
 export interface AdvisorExtensionContext {
 	text: string;
@@ -261,45 +262,6 @@ interface CatchupWaiter {
 interface DeliveredMessage {
 	message: AgentMessage;
 	fingerprint: bigint | undefined;
-}
-
-function fingerprintMessage(message: AgentMessage): bigint | undefined {
-	try {
-		// Field-selective fingerprint: hash every top-level field the advisor
-		// renderer actually reads (mirrors AppendOnlyContextManager.#messageDigest,
-		// issue #3406). Unrendered metadata (timestamp, usage, provider internals)
-		// churns on provider round-trips and would otherwise trigger a full
-		// transcript replay for a no-op change. Rendered fields (from
-		// session-history-format.ts): role, content, customType, display, isError,
-		// toolResult: cancelled/exitCode/output, custom: details, plus the
-		// execution/branch/compaction/file-mention fields the formatter reads:
-		// excludeFromContext, command (bashExecution), code (pythonExecution),
-		// summary + fromId (branch/compaction), files (fileMention).
-		const m = message as unknown as Record<string, unknown>;
-		const payload = JSON.stringify({
-			r: m.role ?? null,
-			c: m.content ?? null,
-			toolCallId: m.toolCallId ?? null,
-			toolName: m.toolName ?? null,
-			err: m.isError ?? null,
-			ct: m.customType ?? null,
-			disp: m.display ?? null,
-			cancel: m.cancelled ?? null,
-			exit: m.exitCode ?? null,
-			out: m.output ?? null,
-			det: m.details ?? null,
-			xfc: m.excludeFromContext ?? null,
-			cmd: m.command ?? null,
-			code: m.code ?? null,
-			sum: m.summary ?? null,
-			from: m.fromId ?? null,
-			files: m.files ?? null,
-		});
-		if (payload === undefined) return undefined;
-		return Bun.hash.wyhash(payload);
-	} catch {
-		return undefined;
-	}
 }
 
 export class AdvisorRuntime {

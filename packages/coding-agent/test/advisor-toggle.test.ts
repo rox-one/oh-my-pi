@@ -557,10 +557,26 @@ describe("AgentSession advisor toggle", () => {
 			enableLsp: false,
 		});
 		try {
+			// The scan runs off the critical path now (issue #9553), so await the
+			// backfill signal the session exposes rather than a wall-clock guess.
+			await result.session.advisorCostRestore;
 			expect(result.session.getAdvisorCost()).toBeCloseTo(0.5, 8);
 		} finally {
 			await result.session.dispose();
 		}
+	});
+	it("seeds persisted advisor spend when no turn has been billed yet", () => {
+		enableAdvisor();
+		session.restoreInitialAdvisorCosts(new Map([["", 0.5]]));
+		expect(session.getAdvisorCost()).toBeCloseTo(0.5, 8);
+	});
+	it("keeps a turn billed before the resume scan finishes instead of clobbering it", () => {
+		const advisor = enableAdvisor();
+		appendAdvisorCost(advisor, 0.25, 1);
+		// A late-settling scan must not overwrite or double-count the turn already
+		// billed this process (issue #9553).
+		session.restoreInitialAdvisorCosts(new Map([["", 0.5]]));
+		expect(session.getAdvisorCost()).toBeCloseTo(0.25, 8);
 	});
 	it("starts a new session with only post-transition advisor cost", async () => {
 		const advisor = enableAdvisor();
