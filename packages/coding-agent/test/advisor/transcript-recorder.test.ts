@@ -164,20 +164,21 @@ describe("AdvisorTranscriptRecorder", () => {
 		});
 	});
 
-	it("drops re-delivered replay batches but keeps every billed assistant turn", async () => {
+	it("skips a retried batch but keeps every billed assistant turn", async () => {
 		await withTempDir(async dir => {
 			const sessionFile = path.join(dir, "sess.jsonl");
 			const recorder = new AdvisorTranscriptRecorder(
 				() => sessionFile,
 				() => dir,
 			);
-			// The advisor re-primes on every history rewrite and re-emits the SAME
-			// "session update" with fresh timestamps; each cycle still bills a
-			// distinct assistant turn.
-			for (let cycle = 0; cycle < 5; cycle++) {
-				recorder.record({ ...userMessage("### Session update"), timestamp: cycle + 1 } as AgentMessage);
-				recorder.record(assistantMessage(`advice ${cycle}`, 1, 0.1));
+			// A failing advisor re-sends the identical batch each attempt; the turn
+			// only commits once it finally succeeds (issue #9553).
+			for (let attempt = 0; attempt < 5; attempt++) {
+				recorder.beginTurn();
+				recorder.record({ ...userMessage("### Session update"), timestamp: attempt + 1 } as AgentMessage);
+				recorder.record(assistantMessage(`attempt ${attempt}`, 1, 0.1));
 			}
+			recorder.commitTurn();
 			await recorder.close();
 
 			const messages = await readMessageEntries(path.join(dir, "sess", ADVISOR_TRANSCRIPT_FILENAME));
@@ -187,23 +188,46 @@ describe("AdvisorTranscriptRecorder", () => {
 		});
 	});
 
-	it("re-persists an identical replay after a session switch resets the dedup window", async () => {
+	it("keeps identical deltas that belong to distinct committed turns", async () => {
 		await withTempDir(async dir => {
-			let sessionFile = path.join(dir, "first.jsonl");
+			const sessionFile = path.join(dir, "sess.jsonl");
 			const recorder = new AdvisorTranscriptRecorder(
 				() => sessionFile,
 				() => dir,
 			);
-			recorder.record(userMessage("### Session update"));
-			recorder.record(userMessage("### Session update")); // deduped within the first file
-			sessionFile = path.join(dir, "second.jsonl");
-			recorder.record(userMessage("### Session update")); // new file → fresh window
+			// The user re-submits the same prompt across three separate turns: each
+			// renders an identical "Session update" yet is genuinely new content.
+			for (let turn = 0; turn < 3; turn++) {
+				recorder.beginTurn();
+				recorder.record(userMessage("### Session update"));
+				recorder.record(assistantMessage(`review ${turn}`, 1, 0.1));
+				recorder.commitTurn();
+			}
 			await recorder.close();
 
-			const first = await readMessageEntries(path.join(dir, "first", ADVISOR_TRANSCRIPT_FILENAME));
-			const second = await readMessageEntries(path.join(dir, "second", ADVISOR_TRANSCRIPT_FILENAME));
-			expect(first.filter(m => m.message?.role === "user")).toHaveLength(1);
-			expect(second.filter(m => m.message?.role === "user")).toHaveLength(1);
+			const messages = await readMessageEntries(path.join(dir, "sess", ADVISOR_TRANSCRIPT_FILENAME));
+			expect(messages.filter(m => m.message?.role === "user")).toHaveLength(3);
+		});
+	});
+
+	it("keeps identical deltas delivered within one turn", async () => {
+		await withTempDir(async dir => {
+			const sessionFile = path.join(dir, "sess.jsonl");
+			const recorder = new AdvisorTranscriptRecorder(
+				() => sessionFile,
+				() => dir,
+			);
+			// Two tool runs with byte-identical output render two identical chunks in
+			// one delivery; both must persist (they are distinct positions, not a replay).
+			recorder.beginTurn();
+			recorder.record(userMessage("### Session update"));
+			recorder.record(userMessage("### Session update"));
+			recorder.record(assistantMessage("review", 1, 0.1));
+			recorder.commitTurn();
+			await recorder.close();
+
+			const messages = await readMessageEntries(path.join(dir, "sess", ADVISOR_TRANSCRIPT_FILENAME));
+			expect(messages.filter(m => m.message?.role === "user")).toHaveLength(2);
 		});
 	});
 

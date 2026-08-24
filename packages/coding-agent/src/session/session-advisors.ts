@@ -980,7 +980,8 @@ export class SessionAdvisors {
 				maintainContext: (incoming, signal) => this.#maintainAdvisorContext(advisorRef, incoming, signal),
 				obfuscator: this.#host.obfuscator,
 				getModelIdentity: () => formatModelString(advisorRef.agent.state.model),
-				beginAdvisorUpdate: (inProgress, policyAttributions = []) => {
+				beginAdvisorUpdate: inProgress => {
+					advisorRef.recorder.beginTurn();
 					advisorRef.adviseTool.beginUpdate(inProgress);
 					advisorRef.emissionGuard.beginUpdate();
 					advisorRef.policyAttributions.clear();
@@ -999,6 +1000,9 @@ export class SessionAdvisors {
 				onTurnError: (error, failedMessages, signal) =>
 					this.#recoverAdvisorTurn(advisorRef, error, failedMessages, signal),
 				onTurnSuccess: async () => {
+					// Commit the delivered batch so retries of a failed turn stay deduped
+					// while this successful turn's context is persisted once (issue #9553).
+					advisorRef.recorder.commitTurn();
 					const fallback = advisorRef.retryFallback;
 					if (!advisorRef.retryFallbackPendingSuccess || !fallback) return;
 					advisorRef.retryFallbackPendingSuccess = false;

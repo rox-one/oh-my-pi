@@ -154,17 +154,20 @@ export class AdvisorTranscriptRecorder {
 	/** Serializes the async open/close against synchronous appends so records land in order. */
 	#queue: Promise<void>;
 	/**
-	 * Fingerprints of user "session update" deltas already persisted to
-	 * {@link #dedupFile}. The advisor re-primes on every history rewrite
-	 * (compaction, resume, retry) and re-emits the SAME replay batch with fresh
-	 * ids/timestamps; those carry no usage, so skipping exact repeats keeps the
-	 * transcript O(new content) without dropping a billed assistant turn
-	 * (issue #9553). Reset when the target file changes so a session switch
-	 * starts a fresh dedup window.
+	 * Ordered fingerprints of user "session update" deltas persisted since the
+	 * last committed advisor turn. The advisor re-delivers the identical batch on
+	 * every retry/overflow/refusal loop (issue #9553), and {@link #rollbackFailedTurn}
+	 * only cleans the agent's in-memory state — the recorder already wrote the
+	 * attempt. Matching a re-delivery positionally against this window skips the
+	 * duplicate while still persisting genuinely new content, including two
+	 * distinct deltas that happen to render identically (a repeated prompt, or two
+	 * tool runs with the same output).
 	 */
-	#seenUserFingerprints = new Set<bigint>();
-	/** Target file the {@link #seenUserFingerprints} window belongs to. */
-	#dedupFile: string | undefined;
+	#replayWindow: bigint[] = [];
+	/** Cursor into {@link #replayWindow}; reset at each delivery attempt via {@link beginTurn}. */
+	#replayCursor = 0;
+	/** Target file {@link #replayWindow} belongs to; a switch starts a fresh window. */
+	#windowFile: string | undefined;
 
 	/**
 	 * @param filename Transcript filename within the session dir. Defaults to
@@ -214,20 +217,33 @@ export class AdvisorTranscriptRecorder {
 		const sessionFile = this.resolveSessionFile();
 		if (!sessionFile?.endsWith(JSONL_SUFFIX)) return;
 		const file = path.join(sessionFile.slice(0, -JSONL_SUFFIX.length), this.#filename);
-		// A new target file starts a fresh dedup window: fingerprints from the
-		// prior session's replays must never suppress the new file's first update.
-		if (file !== this.#dedupFile) {
-			this.#dedupFile = file;
-			this.#seenUserFingerprints.clear();
+		// A new target file starts a fresh replay window: positions from the prior
+		// session's turns must never suppress the new file's first delta.
+		if (file !== this.#windowFile) {
+			this.#windowFile = file;
+			this.#replayWindow = [];
+			this.#replayCursor = 0;
 		}
-		// Drop a re-delivered replay batch: user deltas carry no usage, so an
-		// exact repeat adds nothing but bytes. Assistant/toolResult turns are the
-		// advisor's real (billed) work and are always persisted, even on retry.
+		// Skip a re-delivered user delta: on retry/overflow/refusal the advisor
+		// re-sends the identical batch in the same order, so a positional match
+		// against this turn's window is a replay that adds only bytes. New content
+		// — including a delta that renders like an earlier one — diverges from the
+		// window and is persisted. Assistant/tool turns are billed work: always
+		// written, so cost attribution and the Hub transcript stay intact.
 		if (message.role === "user") {
 			const fingerprint = fingerprintMessage(message);
 			if (fingerprint !== undefined) {
-				if (this.#seenUserFingerprints.has(fingerprint)) return;
-				this.#seenUserFingerprints.add(fingerprint);
+				if (this.#replayCursor < this.#replayWindow.length) {
+					if (this.#replayWindow[this.#replayCursor] === fingerprint) {
+						this.#replayCursor++;
+						return;
+					}
+					// Divergent retry (e.g. reasoning stripped after a refusal): the
+					// window no longer matches, so drop its stale tail and record anew.
+					this.#replayWindow.length = this.#replayCursor;
+				}
+				this.#replayWindow.push(fingerprint);
+				this.#replayCursor = this.#replayWindow.length;
 			}
 		}
 		const cwd = this.resolveCwd();
@@ -242,6 +258,25 @@ export class AdvisorTranscriptRecorder {
 			}
 			this.#manager?.appendMessage(persisted);
 		});
+	}
+
+	/**
+	 * Mark the start of one advisor delivery attempt. Rewinds the replay cursor so
+	 * a retry that re-sends the same batch matches this turn's window positionally
+	 * and is skipped, while the window itself (persisted-since-commit) is retained.
+	 */
+	beginTurn(): void {
+		this.#replayCursor = 0;
+	}
+
+	/**
+	 * Mark an advisor turn as committed (its output landed). Clears the replay
+	 * window so the next turn's deltas are recorded even when they render like a
+	 * committed one — only re-deliveries of an *uncommitted* turn are replays.
+	 */
+	commitTurn(): void {
+		this.#replayWindow = [];
+		this.#replayCursor = 0;
 	}
 
 	/** Flush pending writes (best-effort). */
