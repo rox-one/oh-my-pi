@@ -467,6 +467,7 @@ function cloneMessageEndNotification(message: AgentMessage): AgentMessage {
 }
 
 const INTERRUPTED_THINKING_MIN_CHARS = 60;
+const SESSION_CWD_CHANGE_REJECTED = Symbol("sessionCwdChangeRejected");
 
 export class AgentSession {
 	readonly agent: Agent;
@@ -8009,14 +8010,16 @@ export class AgentSession {
 		if (!sessionFile) return;
 		await this.switchSession(sessionFile);
 	}
-
 	/**
 	 * Switch to a different session file.
 	 * Aborts current operation, loads messages, restores model/thinking.
 	 * Listeners are preserved and will continue receiving events.
-	 * @returns true if switch completed, false if cancelled by hook
+	 * @returns true if switch completed, false if cancelled by hook or cwd change
 	 */
-	async switchSession(sessionPath: string): Promise<boolean> {
+	async switchSession(
+		sessionPath: string,
+		options?: { onCwdChange?: (newCwd: string, previousCwd: string) => Promise<boolean> },
+	): Promise<boolean> {
 		const previousSessionFile = this.sessionManager.getSessionFile();
 		const switchingToDifferentSession = previousSessionFile
 			? path.resolve(previousSessionFile) !== path.resolve(sessionPath)
@@ -8232,6 +8235,14 @@ export class AgentSession {
 					error: String(refreshErr),
 				});
 			}
+			if (
+				options?.onCwdChange &&
+				path.resolve(this.sessionManager.getCwd()) !== path.resolve(previousSessionState.cwd)
+			) {
+				if (!(await options.onCwdChange(this.sessionManager.getCwd(), previousSessionState.cwd))) {
+					throw SESSION_CWD_CHANGE_REJECTED;
+				}
+			}
 			// Hand the ledger over to the session that just took over, and only once the
 			// switch has committed: an earlier swap would be lost work if any step above
 			// rolled it back. The target's own advisor transcripts are the record of what
@@ -8302,6 +8313,7 @@ export class AgentSession {
 				});
 			}
 			this.#bash.finishSessionTransition(bashTransition, false);
+			if (error === SESSION_CWD_CHANGE_REJECTED) return false;
 			throw error;
 		}
 	}

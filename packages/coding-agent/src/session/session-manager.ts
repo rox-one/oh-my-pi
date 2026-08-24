@@ -9,7 +9,7 @@ import type {
 	Usage,
 } from "@oh-my-pi/pi-ai";
 import {
-	directoryExists,
+	directoryIsMissing,
 	getBlobsDir,
 	getProjectDir,
 	getSessionsDir,
@@ -1384,7 +1384,7 @@ export class SessionManager {
 		// chdir interactive mode then performs) would fail with ENOENT. Keep the
 		// current cwd so the resumed session stays where the user already is.
 		const headerCwd = header.cwd ? path.resolve(header.cwd) : undefined;
-		if (headerCwd && headerCwd !== path.resolve(this.#cwd) && (await directoryExists(headerCwd))) {
+		if (headerCwd && headerCwd !== path.resolve(this.#cwd) && !(await directoryIsMissing(headerCwd))) {
 			this.#cwd = headerCwd;
 			this.#sessionDir = path.dirname(resolvedSessionFile);
 			this.#rememberBreadcrumb(this.#cwd, resolvedSessionFile);
@@ -2733,7 +2733,7 @@ export class SessionManager {
 		// a missing path, so fall back to the launch cwd and anchor /new and /branch
 		// there too, keeping the resumed session where the user already is.
 		const recordedCwd = header?.cwd;
-		const recordedCwdUsable = !!recordedCwd && (await directoryExists(recordedCwd));
+		const recordedCwdUsable = !!recordedCwd && !(await directoryIsMissing(recordedCwd));
 		const cwd = recordedCwdUsable ? recordedCwd : (options?.initialCwd ?? getProjectDir());
 		const dir =
 			sessionDir ??

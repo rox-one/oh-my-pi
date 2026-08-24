@@ -15,6 +15,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { engines, version } from "../package.json" with { type: "json" };
+import { isEnoent, isEnotdir } from "./fs-error";
 
 /** App name (e.g. "omp") */
 export const APP_NAME: string = "omp";
@@ -186,7 +187,18 @@ export function getProjectDir(): string {
 		try {
 			projectDir = standardizeMacOSPath(process.cwd());
 		} catch {
-			projectDir = process.env.PWD ?? os.homedir();
+			const candidates = [process.env.PWD, os.homedir(), os.tmpdir()];
+			for (const candidate of candidates) {
+				if (!candidate || !path.isAbsolute(candidate)) continue;
+				try {
+					process.chdir(candidate);
+					projectDir = standardizeMacOSPath(candidate);
+					break;
+				} catch {}
+			}
+			if (projectDir === undefined) {
+				throw new Error("Unable to determine an accessible working directory");
+			}
 		}
 	}
 	return projectDir;
@@ -197,6 +209,15 @@ export function setProjectDir(dir: string): void {
 	const resolved = standardizeMacOSPath(path.resolve(dir));
 	process.chdir(resolved);
 	projectDir = resolved;
+}
+
+/** Whether a path is absent or not a directory. Other stat failures return false. */
+export async function directoryIsMissing(dir: string): Promise<boolean> {
+	try {
+		return !(await fs.promises.stat(dir)).isDirectory();
+	} catch (error) {
+		return isEnoent(error) || isEnotdir(error);
+	}
 }
 
 /**
