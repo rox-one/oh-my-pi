@@ -2011,8 +2011,15 @@ export class AcpAgent implements Agent {
 		// content as context (the file keeps its agent-chosen name — no rename),
 		// then exit plan mode so the agent regains full tools.
 		session.setPlanReferencePath(planFilePath);
-		session.setPlanProposalHandler?.(null);
-		session.setPlanModeState(undefined);
+		try {
+			await this.#applyModeChange(session, ACP_DEFAULT_MODE_ID);
+		} catch (error) {
+			logger.warn("Failed to reconcile ACP tools after plan approval", {
+				sessionId: session.sessionId,
+				error,
+			});
+			throw error;
+		}
 		try {
 			await this.#connection.sessionUpdate({
 				sessionId: session.sessionId,

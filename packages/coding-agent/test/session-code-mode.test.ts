@@ -510,11 +510,13 @@ describe("Code Mode session reconciliation", () => {
 
 		await session.prompt("please orchestrate and workflowz this");
 
-		const messages = promptSpy.mock.calls[0]?.[0] as unknown as Array<{ customType?: string }>;
+		const messages = promptSpy.mock.calls[0]?.[0] as unknown as Array<{ customType?: string; content?: string }>;
+		const orchestration = messages.find(message => message.customType === "orchestrate-notice");
 		expect(messages.map(message => message.customType).filter(Boolean)).toEqual([
 			"orchestrate-notice",
 			"workflow-notice",
 		]);
+		expect(orchestration?.content).toContain("`tool.task` dispatch");
 	});
 
 	test("prompt refresh preserves the full Code Mode tool predicate", async () => {

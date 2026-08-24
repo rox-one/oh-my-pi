@@ -797,8 +797,9 @@ describe("ACP agent", () => {
 
 		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
 		const session = harness.findSession(created.sessionId)!;
+		session.enabledToolNames = ["eval", "write"];
+		session.activeToolNames = ["eval"];
 		await harness.agent.setSessionMode({ sessionId: created.sessionId, modeId: "plan" });
-
 		const localOptions = {
 			getArtifactsDir: () => session.sessionManager.getArtifactsDir(),
 			getSessionId: () => session.sessionManager.getSessionId(),
@@ -825,6 +826,7 @@ describe("ACP agent", () => {
 		expect(await Bun.file(planPath).exists()).toBe(true);
 		// Mode + handler are cleared; the agent regains write tools next turn.
 		expect(session.planModeState).toBeUndefined();
+		expect(session.activeToolNames).toEqual(["eval", "write"]);
 		expect(session.planProposalHandler).toBeUndefined();
 		expect(session.planReferencePath).toBe("local://words-counter-plan.md");
 		const approvalUpdates = harness.updates.slice(updatesBefore);

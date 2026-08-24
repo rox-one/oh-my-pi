@@ -20,8 +20,12 @@ import { keywordInProse } from "./markdown-prose";
 const ORCHESTRATE_WORD = magicKeywordRegex("orchestrate");
 
 /** Hidden system notice appended after a user message that mentions "orchestrate". */
-export function renderOrchestrateNotice(options: { tools: readonly string[] }): string {
-	return prompt.render(orchestrateNotice, { tools: options.tools }).trim();
+export function renderOrchestrateNotice(options: {
+	tools: readonly string[];
+	toolRefs?: Readonly<Record<string, string>>;
+}): string {
+	const toolRefs = options.toolRefs ?? Object.fromEntries(options.tools.map(name => [name, name]));
+	return prompt.render(orchestrateNotice, { tools: options.tools, toolRefs }).trim();
 }
 
 /**

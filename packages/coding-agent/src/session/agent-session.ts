@@ -6717,10 +6717,26 @@ export class AgentSession {
 			// The contract is entirely about `task` subagent dispatch; without the
 			// task tool the notice would demand an unavailable capability.
 			if (enabledToolNames.includes("task")) {
+				const activeToolNames = new Set(this.getActiveToolNames());
+				const mountedXdevToolNames = new Set(this.getMountedXdevToolNames());
+				const toolRefs = Object.fromEntries(
+					enabledToolNames.map(name => {
+						const tool = this.#tools.registry.get(name);
+						const reference =
+							mountedXdevToolNames.has(name) && !tool
+								? name
+								: formatCodeModeToolReference({
+										name,
+										wireName: tool?.customWireName,
+										direct: activeToolNames.has(name),
+									});
+						return [name, reference] as const;
+					}),
+				);
 				keywordNotices.push({
 					role: "custom",
 					customType: "orchestrate-notice",
-					content: renderOrchestrateNotice({ tools: enabledToolNames }),
+					content: renderOrchestrateNotice({ tools: enabledToolNames, toolRefs }),
 					display: false,
 					attribution: "user",
 					timestamp,

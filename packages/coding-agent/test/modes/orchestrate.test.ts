@@ -95,6 +95,27 @@ describe("orchestrate notice", () => {
 		expect(notice).not.toContain("$@");
 	});
 
+	it("renders transport-aware tool references", () => {
+		const notice = renderOrchestrateNotice({
+			tools: ["task", "edit", "write", "bash", "lsp", "todo"],
+			toolRefs: {
+				task: "tool.task",
+				edit: "tool.edit",
+				write: "write",
+				bash: "tool.bash",
+				lsp: "tool.lsp",
+				todo: "todo",
+			},
+		});
+
+		expect(notice).toContain("`tool.task` dispatch");
+		expect(notice).toContain("`tool.edit`/`write`");
+		expect(notice).toContain("`tool.bash`");
+		expect(notice).toContain("`tool.lsp diagnostics`");
+		expect(notice).toContain("`todo` tracking");
+		expect(notice).not.toContain("`task` dispatch");
+	});
+
 	it("omits tool-budget mentions for tools absent from the session", () => {
 		const notice = renderOrchestrateNotice({ tools: ["read"] });
 		expect(notice).not.toContain("`task` for dispatch");
