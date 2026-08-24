@@ -578,7 +578,7 @@ const sessionSegment: StatusLineSegment = {
 	render(ctx) {
 		const sessionManager = ctx.session.sessionManager;
 		const sessionId = sessionManager?.getSessionId?.();
-		const display = sessionId?.slice(0, 8) || "new";
+		const display = sessionId?.slice(0, ctx.options.session?.length ?? 13) || "new";
 
 		return { content: withIcon(theme.icon.session, display), visible: true };
 	},
