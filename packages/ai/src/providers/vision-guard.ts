@@ -79,6 +79,15 @@ export function isTextOnlyDeepSeek(model: Model<"openai-completions">): boolean 
 	const name = (model.name ?? "").toLowerCase();
 	// DeepSeek OCR is a genuinely multimodal model served by Novita.
 	if (id.includes("deepseek-ocr") || name.includes("deepseek-ocr")) return false;
+	// DeepSeek's official vision models (e.g. `deepseek-v4-flash-vision-exp`)
+	// accept `image_url` parts on api.deepseek.com — see the official Vision
+	// guide. Exempt them like deepseek-ocr so the defensive text-only override
+	// doesn't strip images from a genuinely vision-capable official model
+	// (mirrors the qwen*-max >=3.8 exemption added in issue #8305). The
+	// exemption keys on the official `vision` naming, not on `input`, so a
+	// misconfigured `models.yml` claiming vision for a text-only DeepSeek model
+	// still gets scrubbed.
+	if (/\bvision\b/.test(id) || /\bvision\b/.test(name)) return false;
 	return (
 		modelMatchesHost(model, "deepseekFamily") ||
 		isDeepseekModelIdOrName(model.id) ||
