@@ -1,5 +1,8 @@
-import { describe, expect, it } from "bun:test";
+import { beforeAll, describe, expect, it } from "bun:test";
+import type { AssistantMessage } from "@oh-my-pi/pi-ai";
+import { AssistantMessageComponent } from "@oh-my-pi/pi-coding-agent/modes/components/assistant-message";
 import { TranscriptContainer } from "@oh-my-pi/pi-coding-agent/modes/components/transcript-container";
+import { initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 import type { Component } from "@oh-my-pi/pi-tui";
 
 class Block implements Component {
@@ -30,9 +33,31 @@ class Block implements Component {
 	}
 }
 
+const finalAnswer: AssistantMessage = {
+	role: "assistant",
+	content: [{ type: "text", text: "## Implemented" }],
+	api: "openai-codex-responses",
+	provider: "openai-codex",
+	model: "gpt-5.6-sol",
+	stopReason: "stop",
+	usage: {
+		input: 0,
+		output: 0,
+		cacheRead: 0,
+		cacheWrite: 0,
+		totalTokens: 0,
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+	},
+	timestamp: 1,
+};
+
 const frame = { tick: 0, now: 0 };
 
 describe("TranscriptContainer", () => {
+	beforeAll(async () => {
+		await initTheme(false);
+	});
+
 	it("keeps settled blocks live while the viewport has room", () => {
 		const transcript = new TranscriptContainer();
 		transcript.addChild(new Block(["settled"], true));
@@ -117,32 +142,18 @@ describe("TranscriptContainer", () => {
 		// settled transcript prefix live for one frame while it drains next.
 		expect(transcript.renderViewport(80, 1, frame)).toEqual(["current tool"]);
 	});
-	it("excludes empty blocks so pressure never emits blank rows (issue 9483)", () => {
+	it("keeps a completed assistant answer visible behind an active prefix", () => {
 		const transcript = new TranscriptContainer();
-		// Text blocks interleaved with empty (hidden tool-activity) blocks that
-		// render nothing but stay live until retired.
-		for (let i = 0; i < 6; i++) {
-			transcript.addChild(new Block([`t${i}a`, `t${i}b`, `t${i}c`], true));
-			for (let j = 0; j < 8; j++) transcript.addChild(new Block([], true));
-		}
-		// Emergency path: more non-empty blocks than rows. Every row carries real
-		// text — no block's tail is dropped as blank padding.
-		const out = transcript.renderViewport(80, 12, frame);
-		expect(out).toHaveLength(12);
-		expect(out.every(row => /\S/.test(row))).toBe(true);
-	});
+		transcript.addChild(new Block(["stale active"], false));
+		transcript.addChild(new AssistantMessageComponent(finalAnswer));
+		transcript.addChild(new Block(["continued turn"], false));
+		transcript.addChild(new Block(["task running"], false));
 
-	it("empty blocks do not reserve capacity from real text under pressure (issue 9483)", () => {
-		const transcript = new TranscriptContainer();
-		transcript.addChild(new Block(["A1", "A2", "A3", "A4"], true));
-		transcript.addChild(new Block([], true));
-		transcript.addChild(new Block(["B1", "B2", "B3", "B4"], true));
-		transcript.addChild(new Block([], true));
-		transcript.addChild(new Block(["C1", "C2", "C3", "C4"], true));
-		// Capacity 10 fits all real content once the two empty blocks stop
-		// stealing a base row each; the older block keeps its tail rows.
-		const out = transcript.renderViewport(80, 10, frame);
-		expect(out).toEqual(["A3", "A4", "B1", "B2", "B3", "B4", "C1", "C2", "C3", "C4"]);
+		expect(transcript.peekFinalizedBatch(80, 3)).toBeUndefined();
+		const rows = transcript.renderViewport(80, 3, frame);
+		expect(rows[0]).toBe("1 more transcript blocks active");
+		expect(Bun.stripANSI(rows[1] ?? "").trim()).toBe("Implemented");
+		expect(rows[2]).toBe("task running");
 	});
 
 	it("permits removing settled blocks until they are offered or committed", () => {

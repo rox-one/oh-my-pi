@@ -15,6 +15,8 @@ export interface TranscriptPresentationTarget {
 
 interface FinalizableBlock {
 	isTranscriptBlockFinalized?(): boolean;
+	/** Whether emergency pressure should reserve one viewport row for this settled block. */
+	isTranscriptBlockEmergencyVisible?(): boolean;
 }
 
 /**
@@ -395,9 +397,17 @@ export class TranscriptContainer extends Container {
 		}
 		if (hiddenActive > 0) output.push(`${hiddenActive} more transcript blocks active`);
 		const visibleRows = rows - output.length;
-		const visible = visibleRows > 0 ? shown.slice(-visibleRows) : [];
-		// Callers pass only non-empty blocks; trim residual edge blanks so each
-		// block contributes its first real row instead of a reserved blank.
+		let visible = visibleRows > 0 ? live.slice(-visibleRows) : [];
+		if (visibleRows > 0) {
+			const visibleStart = live.length - visibleRows;
+			for (let index = visibleStart - 1; index >= 0; index--) {
+				const entry = live[index]!;
+				const block = entry.component as Component & FinalizableBlock;
+				if (entry.state !== "settled" || block.isTranscriptBlockEmergencyVisible?.() !== true) continue;
+				visible = [entry, ...visible.slice(1)];
+				break;
+			}
+		}
 		for (const entry of visible) {
 			this.#setAllocation(entry.component, 1, frame);
 			output.push(trimBlankEdges(entry.component.render(width))[0] ?? "");
