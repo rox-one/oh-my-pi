@@ -182,6 +182,82 @@ describe("runRootCommand — cross-project --resume", () => {
 		expect(preloadedDestinationAtCreation).toBe(true);
 	}, 15_000);
 
+	it("rolls back the session manager when the resumed cwd is denied", async () => {
+		const match = buildGlobalMatch(resumedProject);
+		vi.spyOn(sessionListingModule, "resolveResumableSession").mockResolvedValue(match);
+		const settings = Settings.isolated({ "marketplace.autoUpdate": "off" });
+		const authStorage = await AuthStorage.create(path.join(root, "auth.db"));
+		const originalChdir = process.chdir.bind(process);
+		const chdir = vi.spyOn(process, "chdir").mockImplementation(dir => {
+			if (normalizePathForComparison(dir) === normalizePathForComparison(resumedProject)) {
+				throw new Error("operation not permitted");
+			}
+			originalChdir(dir);
+		});
+		const parsed = parseArgs(["--resume", "019e84ed", "--print"]);
+		parsed.noExtensions = true;
+		parsed.noSkills = true;
+		parsed.noRules = true;
+		parsed.noTools = true;
+		parsed.noLsp = true;
+		let resumedManager: SessionManager | undefined;
+
+		try {
+			await runRootCommand(parsed, ["--resume", "019e84ed", "--print"], {
+				discoverAuthStorage: async () => authStorage,
+				settings,
+				createAgentSession: async options => {
+					if (!options) throw new Error("Expected session options");
+					resumedManager = options.sessionManager;
+					throw new Error("stop after session options");
+				},
+			});
+		} catch (error) {
+			if (!(error instanceof Error) || error.message !== "stop after session options") throw error;
+		} finally {
+			chdir.mockRestore();
+			authStorage.close();
+			await resumedManager?.close();
+		}
+
+		expect(getProjectDir()).toBe(launchProject);
+		expect(resumedManager?.getCwd()).toBe(launchProject);
+	});
+
+	it("aborts startup when the resumed cwd rollback fails", async () => {
+		const match = buildGlobalMatch(resumedProject);
+		vi.spyOn(sessionListingModule, "resolveResumableSession").mockResolvedValue(match);
+		const settings = Settings.isolated({ "marketplace.autoUpdate": "off" });
+		const authStorage = await AuthStorage.create(path.join(root, "auth.db"));
+		const originalChdir = process.chdir.bind(process);
+		const chdir = vi.spyOn(process, "chdir").mockImplementation(dir => {
+			if (normalizePathForComparison(dir) === normalizePathForComparison(resumedProject)) {
+				throw new Error("operation not permitted");
+			}
+			originalChdir(dir);
+		});
+		const moveTo = vi.spyOn(SessionManager.prototype, "moveTo").mockRejectedValue(new Error("rollback unavailable"));
+		const parsed = parseArgs(["--resume", "019e84ed", "--print"]);
+		parsed.noExtensions = true;
+		parsed.noSkills = true;
+		parsed.noRules = true;
+		parsed.noTools = true;
+		parsed.noLsp = true;
+
+		try {
+			await expect(
+				runRootCommand(parsed, ["--resume", "019e84ed", "--print"], {
+					discoverAuthStorage: async () => authStorage,
+					settings,
+				}),
+			).rejects.toThrow("failed to restore launch directory");
+		} finally {
+			moveTo.mockRestore();
+			chdir.mockRestore();
+			authStorage.close();
+		}
+	});
+
 	it("re-resolves the model scope from the resumed project's enabledModels after the switch", async () => {
 		const match = buildGlobalMatch(resumedProject);
 		vi.spyOn(sessionListingModule, "resolveResumableSession").mockResolvedValue(match);

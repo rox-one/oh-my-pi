@@ -1,4 +1,4 @@
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "bun:test";
 import { Agent } from "@oh-my-pi/pi-agent-core";
 import type { Model } from "@oh-my-pi/pi-ai";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
@@ -151,5 +151,32 @@ describe("AgentSession.switchSession previous-context build", () => {
 			{ sessionFile: sessionFile!, transcript: undefined },
 			{ sessionFile: sessionFile!, transcript: undefined },
 		]);
+	});
+
+	it("restores the previous session when cwd adoption is rejected", async () => {
+		const sourceDir = TempDir.createSync("@pi-switch-cwd-source-");
+		const targetDir = TempDir.createSync("@pi-switch-cwd-target-");
+		tempDirs.push(sourceDir, targetDir);
+
+		const { session, sessionManager } = buildSession(sourceDir);
+		sessionManager.appendMessage({ role: "user", content: "source", timestamp: 1 });
+		await sessionManager.flush();
+		const previousSessionFile = sessionManager.getSessionFile();
+		const targetManager = SessionManager.create(targetDir.path(), targetDir.path());
+		targetManager.appendMessage({ role: "user", content: "target", timestamp: 2 });
+		await targetManager.ensureOnDisk();
+		await targetManager.flush();
+		const targetSessionFile = targetManager.getSessionFile();
+		await targetManager.close();
+		expect(previousSessionFile).toBeString();
+		expect(targetSessionFile).toBeString();
+
+		const onCwdChange = vi.fn(async () => false);
+		const switched = await session.switchSession(targetSessionFile!, { onCwdChange });
+
+		expect(switched).toBe(false);
+		expect(onCwdChange).toHaveBeenCalledWith(targetDir.path(), sourceDir.path());
+		expect(sessionManager.getSessionFile()).toBe(previousSessionFile);
+		expect(sessionManager.getCwd()).toBe(sourceDir.path());
 	});
 });

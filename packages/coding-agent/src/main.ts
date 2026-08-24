@@ -11,7 +11,7 @@ import { EventLoopKeepalive, type ThinkingLevel } from "@oh-my-pi/pi-agent-core"
 import type { ImageContent, Model } from "@oh-my-pi/pi-ai";
 import {
 	$env,
-	directoryExists,
+	directoryIsMissing,
 	getLogPath,
 	getProjectDir,
 	isBunTestRuntime,
@@ -733,7 +733,7 @@ async function switchToResumedProject(
 	if (
 		!resumedCwd ||
 		normalizePathForComparison(resumedCwd) === normalizePathForComparison(launchCwd) ||
-		!(await directoryExists(resumedCwd))
+		(await directoryIsMissing(resumedCwd))
 	) {
 		return { cwd: launchCwd };
 	}
@@ -747,10 +747,9 @@ async function switchToResumedProject(
 		try {
 			await sessionManager.moveTo(launchCwd);
 		} catch (rollbackError) {
-			logger.warn("Could not roll back resumed session directory", {
-				cwd: launchCwd,
-				error: String(rollbackError),
-			});
+			throw new SessionResolutionError(
+				`Could not switch to resumed project ${resumedCwd}; failed to restore launch directory ${launchCwd}: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`,
+			);
 		}
 		return { cwd: launchCwd, chdirFailed: resumedCwd };
 	}
