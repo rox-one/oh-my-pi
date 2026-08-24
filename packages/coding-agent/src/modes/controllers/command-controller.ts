@@ -1103,13 +1103,21 @@ export class CommandController {
 			return;
 		}
 
+		const previousCwd = this.ctx.sessionManager.getCwd();
 		try {
 			await this.ctx.session.moveSession(resolvedPath);
 		} catch (err) {
 			this.ctx.showError(`Move failed: ${err instanceof Error ? err.message : String(err)}`);
 			return;
 		}
-		await this.ctx.applyCwdChange(resolvedPath);
+		if (!(await this.ctx.applyCwdChange(resolvedPath))) {
+			try {
+				await this.ctx.session.moveSession(previousCwd);
+			} catch (err) {
+				this.ctx.showError(`Failed to roll back move: ${err instanceof Error ? err.message : String(err)}`);
+			}
+			return;
+		}
 
 		this.ctx.updateEditorBorderColor();
 		await this.ctx.reloadTodos();
@@ -1200,10 +1208,18 @@ export class CommandController {
 	}
 
 	async #moveInteractiveCwd(resolvedPath: string): Promise<void> {
+		const previousCwd = this.ctx.sessionManager.getCwd();
 		await this.ctx.sessionManager.moveTo(resolvedPath);
-		await this.ctx.applyCwdChange(resolvedPath);
-		this.ctx.updateEditorBorderColor();
-		await this.ctx.reloadTodos();
+		if (await this.ctx.applyCwdChange(resolvedPath)) {
+			this.ctx.updateEditorBorderColor();
+			await this.ctx.reloadTodos();
+			return;
+		}
+		try {
+			await this.ctx.sessionManager.moveTo(previousCwd);
+		} catch (err) {
+			this.ctx.showError(`Failed to roll back move: ${err instanceof Error ? err.message : String(err)}`);
+		}
 	}
 
 	async #applyBashResultCwd(result: BashResult): Promise<void> {

@@ -95,7 +95,11 @@ export async function loadPuppeteer(): Promise<typeof Puppeteer> {
 		puppeteerModule = (await import("puppeteer-core")).default;
 		return puppeteerModule;
 	} finally {
-		process.chdir(prev);
+		try {
+			process.chdir(prev);
+		} catch {
+			// Keep the safe scratch cwd if the original cwd is inaccessible.
+		}
 	}
 }
 

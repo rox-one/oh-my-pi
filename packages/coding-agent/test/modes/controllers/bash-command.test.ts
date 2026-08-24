@@ -54,6 +54,7 @@ function createCwdContext(sourceDir: string, isStreaming = false) {
 		showWarning: vi.fn(),
 		applyCwdChange: vi.fn(async (cwd: string) => {
 			expect(state.cwd).toBe(cwd);
+			return true;
 		}),
 		updateEditorBorderColor: vi.fn(),
 		reloadTodos: vi.fn(async () => {}),

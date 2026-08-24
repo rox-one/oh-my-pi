@@ -573,7 +573,16 @@ export const BUILTIN_LIFECYCLE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> =
 			} catch (err) {
 				return usage(`Move failed: ${errorMessage(err)}`, runtime);
 			}
-			setProjectDir(resolvedPath);
+			try {
+				setProjectDir(resolvedPath);
+			} catch (err) {
+				try {
+					await runtime.session.moveSession(runtime.cwd);
+				} catch (rollbackError) {
+					return usage(`Move failed and rollback failed: ${errorMessage(rollbackError)}`, runtime);
+				}
+				return usage(`Move failed: ${errorMessage(err)}`, runtime);
+			}
 			await runtime.settings.reloadForCwd(resolvedPath);
 			applyProviderGlobalsFromSettings(runtime.settings);
 			// Reload plugin/capability caches so the next prompt sees commands and

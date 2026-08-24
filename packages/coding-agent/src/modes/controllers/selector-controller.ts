@@ -1698,9 +1698,10 @@ export class SelectorController {
 
 	async handleResumeSession(sessionPath: string, options?: { settingsFlushed?: boolean }): Promise<boolean> {
 		const previousCwd = this.ctx.sessionManager.getCwd();
+		const previousSessionFile = this.ctx.sessionManager.getSessionFile?.();
 		// Flush pending settings writes before switching sessions so a save
 		// failure leaves the session, process project dir, and Settings in the
-		// source scope — the switch below mutates the SessionManager cwd.
+		// source scope.
 		if (!options?.settingsFlushed) {
 			try {
 				await this.ctx.settings.flush();
@@ -1711,14 +1712,23 @@ export class SelectorController {
 		}
 		// Switch session via AgentSession (emits hook and tool session events). The
 		// SessionManager adopts the resumed session's own cwd when it differs.
-		await this.ctx.session.switchSession(sessionPath);
+		if ((await this.ctx.session.switchSession(sessionPath)) === false) return false;
 		this.ctx.clearTransientSessionUi();
 		const newCwd = this.ctx.sessionManager.getCwd();
 		const movedProject = normalizePathForComparison(newCwd) !== normalizePathForComparison(previousCwd);
-		if (movedProject) {
-			// Resumed a session from another project: re-point the process and every
-			// cwd-derived cache at it before rendering.
-			await this.ctx.applyCwdChange(newCwd);
+		if (movedProject && (await this.ctx.applyCwdChange(newCwd)) === false) {
+			try {
+				if (previousSessionFile) {
+					await this.ctx.session.switchSession(previousSessionFile);
+				} else {
+					await this.ctx.sessionManager.moveTo(previousCwd);
+				}
+			} catch (err) {
+				this.ctx.showError(
+					`Failed to roll back session switch: ${err instanceof Error ? err.message : String(err)}`,
+				);
+			}
+			return false;
 		}
 		this.#refreshSessionTerminalTitle();
 		this.ctx.updateEditorBorderColor();

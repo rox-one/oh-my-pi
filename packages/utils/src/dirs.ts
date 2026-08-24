@@ -178,17 +178,25 @@ export function relativePathWithinRoot(root: string, candidate: string): string 
 	return relative || null;
 }
 
-let projectDir = standardizeMacOSPath(process.cwd());
+let projectDir: string | undefined;
 
 /** Get the project directory. */
 export function getProjectDir(): string {
+	if (projectDir === undefined) {
+		try {
+			projectDir = standardizeMacOSPath(process.cwd());
+		} catch {
+			projectDir = process.env.PWD ?? os.homedir();
+		}
+	}
 	return projectDir;
 }
 
 /** Set the project directory. */
 export function setProjectDir(dir: string): void {
-	projectDir = standardizeMacOSPath(path.resolve(dir));
-	process.chdir(projectDir);
+	const resolved = standardizeMacOSPath(path.resolve(dir));
+	process.chdir(resolved);
+	projectDir = resolved;
 }
 
 /**

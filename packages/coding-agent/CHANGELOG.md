@@ -26,6 +26,53 @@
 - Fixed resize and display replays, ensuring stable rendering and full transcript flushing on agent shutdown
 - Fixed fast tool completions leaving a permanent running summary that blocked transcript retirement and squeezed later tool output.
 - Fixed `omp git` hunk navigation (`alt+↓`/`alt+↑`) appearing to do nothing while the file sidebar had focus: the diff cursor band now stays visible (dimmed) when the pane is unfocused.
+- Fixed race condition where tunnel startup was incorrectly reported as failure on quick process exit
+- Fixed Obsidian theme task instructions and usage-limit text becoming unreadable against dark backgrounds.
+- Fixed marketplace-installed plugins failing to discover their `rules/` directories.
+- Fixed advisor notes in `/tree` displaying internal XML wrappers instead of readable text.
+- Fixed successful agent and subagent results being discarded when cleanup exceeded its deadline.
+- Fixed exiting plan mode mid-turn so the active turn now stops immediately.
+- Fixed Windows workstation context reporting a virtual display adapter instead of the physical GPU.
+- Fixed numbered selector menus such as `/review` ignoring digit-key selection.
+- Fixed the welcome screen failing to reflow after terminal resizing.
+- Fixed transcript layout issues that could clip assistant text, leave stale tool cards, disrupt scrolling, or make large-session rendering and shutdown unreliable.
+- Fixed streamed assistant responses failing when later provider updates revised earlier Markdown.
+- Fixed cache-miss status placement after streamed assistant output.
+- Fixed `/model` role-cycle icons overlapping their ordinal on full-width terminals.
+- Fixed constrained `/collab` QR codes rendering as empty rows; the browser URL hint is now shown instead.
+- Fixed `hub list` and child peer rosters incorrectly including parked agents in model context and restored accurate status counts.
+- Fixed browser relay clients hanging when enabling the Runtime domain on a shared tab.
+- Fixed interactive TTSR interruptions being displayed as errors after successful rule injection.
+- Fixed fast tool completions leaving a persistent running summary that obstructed later output.
+- Fixed the Windows console welcome header being duplicated after cold launch.
+- Fixed git TUI hunk navigation feedback when the sidebar has focus and preserved file selection after staging or unstaging.
+- Fixed long sessions becoming unrecoverable when providers reject histories exceeding message-count limits.
+- Improved `/dump` output with readable system-notice titles and XML-fenced raw payloads.
+- Fixed kernel sessions failing to recover when cancellation was reported by a dead kernel.
+- Applied advisor tool-call loop limits to prevent repeated failing calls from continuing without bound.
+- Fixed `lsp rename_file` incorrectly reporting inaccessible paths as nonexistent and mishandling uncertain destination checks.
+- Fixed LSP clients with different launch or initialization configurations incorrectly sharing one process; reloading now replaces superseded clients.
+- Fixed the browser relay leaving Chrome's debugging infobar attached after the last client released a tab.
+- Fixed auto-retry countdowns appearing frozen during long provider-requested waits.
+- Fixed the Todo HUD becoming stale after viewing a subagent and returning to the main session.
+- Fixed child-task artifact links and duplicate `hub jobs` result bodies.
+- Fixed `omp update` showing a POSIX reinstall command on Windows after a package-rename migration failure.
+- Preserved `thinking.requiresEffort: false` in custom model configuration so supported local Qwen templates can disable thinking explicitly.
+- Fixed project settings from shared capability files being able to replace an entire settings group when a conflicting non-object value is present; the conflicting value is now ignored with a warning.
+- Jina Reader requests now use configured credentials for higher authenticated rate limits while remaining available anonymously.
+- Fixed advisor session persistence and loading performance for repeated retries and unusually large advisor transcripts.
+- Fixed failed `browser.open` calls leaving OMP-spawned application processes running when no tab could be acquired.
+- Improved browser-handle failures with prompt, operation-specific timeout errors instead of waiting for the entire browser cell.
+- Fixed autonomous runs becoming idle after thinking-only length stops during speculative handoff.
+- Fixed completed assistant replies disappearing from the live transcript under viewport pressure.
+- Accelerated SHA-2 and SHA-3 checksums on supported ARM64 hardware.
+- Fixed large MCP tool payloads being stored redundantly on disk.
+- Fixed resize and display replays, ensuring stable rendering and full transcript flushing on agent shutdown
+- Fixed fast tool completions leaving a permanent running summary that blocked transcript retirement and squeezed later tool output.
+- Fixed `omp git` hunk navigation (`alt+↓`/`alt+↑`) appearing to do nothing while the file sidebar had focus: the diff cursor band now stays visible (dimmed) when the pane is unfocused.
+### Fixed
+
+- Handle denied working-directory changes without crashing resume, move, or startup flows.
 
 ## [18.0.4] - 2026-08-24
 

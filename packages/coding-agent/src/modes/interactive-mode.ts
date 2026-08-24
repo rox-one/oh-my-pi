@@ -1525,8 +1525,15 @@ export class InteractiveMode implements InteractiveModeContext {
 	 * a session from another project). The SessionManager's cwd MUST already
 	 * reflect `newCwd` before this is called.
 	 */
-	async applyCwdChange(newCwd: string): Promise<void> {
-		setProjectDir(newCwd);
+	async applyCwdChange(newCwd: string): Promise<boolean> {
+		try {
+			setProjectDir(newCwd);
+		} catch (error) {
+			this.showError(
+				`Cannot change working directory to ${newCwd}: ${error instanceof Error ? error.message : String(error)}`,
+			);
+			return false;
+		}
 		// Re-scope project settings (`.claude/settings.yml` etc.) to the new
 		// directory in place so the active session and every settings reader pick
 		// up the destination project's configuration.
@@ -1547,6 +1554,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		await this.refreshSlashCommandState(newCwd);
 		setSessionTerminalTitle(this.sessionManager.getSessionName(), this.sessionManager.getCwd());
 		this.statusLine.applyCwdChange();
+		return true;
 	}
 
 	async getUserInput(): Promise<SubmittedUserInput> {
