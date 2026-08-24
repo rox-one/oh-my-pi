@@ -493,6 +493,19 @@ export class SessionAdvisors {
 	}
 
 	/**
+	 * Seed the persisted spend recorded before this session was resumed. Applied
+	 * off the critical path (see {@link AgentSession.restoreInitialAdvisorCosts}),
+	 * so a slug already billed this process — a turn that finished before the
+	 * transcript scan did — keeps its accumulated value instead of being
+	 * clobbered or double-counted.
+	 */
+	restoreInitialCost(costs: ReadonlyMap<string, number>): void {
+		for (const [slug, total] of costs) {
+			if (!this.#advisorCosts.has(slug)) this.#advisorCosts.set(slug, total);
+		}
+	}
+
+	/**
 	 * Rebind every live advisor to the active primary conversation's provider
 	 * identity (session id, prompt-cache key, credential + metadata resolvers,
 	 * telemetry). Invoked on every provider-session change — including branch

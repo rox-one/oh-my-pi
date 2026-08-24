@@ -12055,17 +12055,8 @@ export class AgentSession {
 	 * and headless callers that must observe the hydrated total.
 	 */
 	beginInitialAdvisorCostRestore(): void {
-		const sessionId = this.sessionId;
-		let costsAtSnapshot: ReadonlyMap<string, number> = new Map();
-		this.#advisorCostRestore = loadAdvisorTranscriptCosts(this.sessionFile, {
-			onSnapshot: () => {
-				costsAtSnapshot = this.#advisors.costSnapshot();
-			},
-		})
-			.then(costs => {
-				if (this.sessionId !== sessionId) return;
-				this.restoreInitialAdvisorCosts(costs, costsAtSnapshot);
-			})
+		this.#advisorCostRestore = loadAdvisorTranscriptCosts(this.sessionFile)
+			.then(costs => this.restoreInitialAdvisorCosts(costs))
 			.catch(err => logger.debug("advisor cost restore failed", { err: String(err) }));
 	}
 
@@ -12075,16 +12066,13 @@ export class AgentSession {
 	}
 
 	/**
-	 * Restore persisted advisor spend plus the process-local delta billed after
-	 * `costsAtSnapshot`. The loader fixes every transcript's byte length before
-	 * capturing that baseline, so a turn completed while the scan runs is added
-	 * exactly once.
+	 * Seed persisted advisor spend into the status-line ledger. A slug already
+	 * billed this process keeps its accumulated value, so a late-settling scan
+	 * (see {@link beginInitialAdvisorCostRestore}) never clobbers or
+	 * double-counts a turn that finished first.
 	 */
-	restoreInitialAdvisorCosts(
-		costs: ReadonlyMap<string, number>,
-		costsAtSnapshot: ReadonlyMap<string, number> = new Map(),
-	): void {
-		this.#advisors.restoreInitialCost(costs, costsAtSnapshot);
+	restoreInitialAdvisorCosts(costs: ReadonlyMap<string, number>): void {
+		this.#advisors.restoreInitialCost(costs);
 	}
 	/** Return whether any active or configured advisor is running on an OAuth/subscription model. */
 	isAdvisorUsingSubscription(): boolean {

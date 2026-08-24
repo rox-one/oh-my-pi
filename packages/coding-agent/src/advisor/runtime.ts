@@ -16,11 +16,6 @@ import type { AdvisorPolicyAttribution } from "./advise-tool";
 import { ADVISOR_RENDER_OPTIONS, renderAdvisorDeltaChunks } from "./delta-split";
 import { fingerprintMessage } from "./message-fingerprint";
 
-export interface AdvisorExtensionContext {
-	text: string;
-	policyAttributions: readonly AdvisorPolicyAttribution[];
-}
-
 /**
  * Minimal slice of `Agent` the runtime drives — satisfied by pi-agent-core
  * `Agent`. `state.error` mirrors `Agent.state.error`: provider/stream failures
