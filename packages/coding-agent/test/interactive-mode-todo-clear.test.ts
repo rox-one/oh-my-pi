@@ -148,6 +148,45 @@ describe("InteractiveMode todo HUD persistence", () => {
 		expect(renderTodos(mode)).toContain("done task");
 	});
 
+	it("reloads the visible HUD from the explicitly attached session", async () => {
+		setTodoClearDelay(-1);
+		const focusedDir = TempDir.createSync("@pi-focused-todo-");
+		const model = modelRegistry.find("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected claude-sonnet-4-5 to exist in registry");
+		const focusedSession = new AgentSession({
+			agent: new Agent({
+				initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+			}),
+			sessionManager: SessionManager.create(focusedDir.path(), focusedDir.path()),
+			settings: Settings.isolated(),
+			modelRegistry,
+		});
+		try {
+			session.setTodoPhases([{ name: "Main plan", tasks: [{ content: "stale main task", status: "in_progress" }] }]);
+			mode.setTodos(session.getTodoPhases());
+			focusedSession.setTodoPhases([
+				{
+					name: "Worker plan",
+					tasks: [
+						{ content: "finished worker task", status: "completed" },
+						{ content: "current worker task", status: "in_progress" },
+					],
+				},
+			]);
+
+			await mode.reloadTodos(focusedSession);
+
+			const rendered = renderTodos(mode);
+			expect(rendered).toContain("Worker plan");
+			expect(rendered).toContain("1/2");
+			expect(rendered).toContain("current worker task");
+			expect(rendered).not.toContain("stale main task");
+		} finally {
+			await focusedSession.dispose();
+			focusedDir.removeSync();
+		}
+	});
+
 	it("clears closed todos after the configured delay", () => {
 		setTodoClearDelay(1);
 		vi.useFakeTimers();

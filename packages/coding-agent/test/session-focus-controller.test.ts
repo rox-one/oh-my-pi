@@ -45,11 +45,11 @@ interface Harness {
 	main: SessionStub;
 	handledEvents: unknown[];
 	setSessionCalls: Array<[AgentSession, string | undefined]>;
+	reloadTodoSessions: AgentSession[];
 	counts: {
 		clearTransientSessionUi: () => number;
 		resetTranscriptAnchors: () => number;
 		renderInitialMessages: () => number;
-		reloadTodos: () => number;
 		mainUnsubscribe: () => number;
 	};
 }
@@ -58,10 +58,10 @@ function makeHarness(): Harness {
 	const main = makeSessionStub();
 	const handledEvents: unknown[] = [];
 	const setSessionCalls: Array<[AgentSession, string | undefined]> = [];
+	const reloadTodoSessions: AgentSession[] = [];
 	let clearTransientSessionUi = 0;
 	let resetTranscriptAnchors = 0;
 	let renderInitialMessages = 0;
-	let reloadTodos = 0;
 	let mainUnsubscribe = 0;
 
 	const ctx = {
@@ -89,8 +89,8 @@ function makeHarness(): Harness {
 		renderInitialMessages: () => {
 			renderInitialMessages++;
 		},
-		reloadTodos: async () => {
-			reloadTodos++;
+		reloadTodos: async (source?: AgentSession) => {
+			reloadTodoSessions.push(source ?? main.session);
 		},
 		updateEditorBorderColor() {},
 		ui: { requestRender() {} },
@@ -109,11 +109,11 @@ function makeHarness(): Harness {
 		main,
 		handledEvents,
 		setSessionCalls,
+		reloadTodoSessions,
 		counts: {
 			clearTransientSessionUi: () => clearTransientSessionUi,
 			resetTranscriptAnchors: () => resetTranscriptAnchors,
 			renderInitialMessages: () => renderInitialMessages,
-			reloadTodos: () => reloadTodos,
 			mainUnsubscribe: () => mainUnsubscribe,
 		},
 	};
@@ -142,7 +142,7 @@ describe("SessionFocusController", () => {
 		expect(h.counts.clearTransientSessionUi()).toBe(1);
 		expect(h.counts.resetTranscriptAnchors()).toBe(1);
 		expect(h.counts.renderInitialMessages()).toBe(1);
-		expect(h.counts.reloadTodos()).toBe(1);
+		expect(h.reloadTodoSessions).toEqual([worker.session]);
 		expect(h.setSessionCalls).toEqual([[worker.session, "Worker"]]);
 
 		const event = { type: "message_start", message: { role: "user" } };
@@ -161,13 +161,12 @@ describe("SessionFocusController", () => {
 		registerSub(h.registry, "Worker", worker.session, MAIN_AGENT_ID);
 
 		await h.controller.focusAgent("Worker");
-		expect(h.counts.reloadTodos()).toBe(1);
+		expect(h.reloadTodoSessions).toEqual([worker.session]);
 
 		await h.controller.unfocus();
 		expect(h.controller.focusedAgentId).toBeUndefined();
 		expect(h.setSessionCalls.at(-1)).toEqual([h.main.session, undefined]);
-		// The return-to-main attach reloaded the HUD from the main session.
-		expect(h.counts.reloadTodos()).toBe(2);
+		expect(h.reloadTodoSessions).toEqual([worker.session, h.main.session]);
 	});
 
 	it("mid-turn attach synthesizes agent_start, and an orphaned assistant message_update gets a synthesized message_start", async () => {
