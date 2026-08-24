@@ -4,9 +4,9 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { resumeCommand, resumeCommandForSession } from "@oh-my-pi/pi-coding-agent/utils/resume-command";
 import {
+	__resetDirsFromEnvForTests,
 	APP_NAME,
 	getActiveProfile,
-	getAgentDir,
 	getSessionsDir,
 	removeSyncWithRetries,
 	Snowflake,
@@ -35,20 +35,28 @@ describe("resumeCommand", () => {
 });
 
 describe("resumeCommandForSession", () => {
-	const originalProfile = getActiveProfile();
-	const originalAgentDir = getAgentDir();
+	// setAgentDir / setProfile rewrite process env and the dirs snapshot; capture
+	// and restore the exact env, then rebuild dirs from it, so a suite that starts
+	// under a named profile is not left in the default profile with a stale
+	// override for the next test file.
+	const ENV_KEYS = ["PI_CODING_AGENT_DIR", "OMP_PROFILE", "PI_PROFILE"] as const;
+	const originalEnv: Record<string, string | undefined> = {};
 	let tempDir: string;
 
 	beforeEach(() => {
+		for (const key of ENV_KEYS) originalEnv[key] = process.env[key];
 		tempDir = path.join(os.tmpdir(), `resume-hint-${Snowflake.next()}`);
 		fs.mkdirSync(tempDir, { recursive: true });
 		setAgentDir(path.join(tempDir, "omp-agent"));
-		setProfile(undefined);
 	});
 
 	afterEach(() => {
-		setProfile(originalProfile);
-		setAgentDir(originalAgentDir);
+		for (const key of ENV_KEYS) {
+			const value = originalEnv[key];
+			if (value === undefined) delete process.env[key];
+			else process.env[key] = value;
+		}
+		__resetDirsFromEnvForTests();
 		removeSyncWithRetries(tempDir);
 	});
 
