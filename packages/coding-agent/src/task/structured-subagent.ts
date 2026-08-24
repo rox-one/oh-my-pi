@@ -102,6 +102,8 @@ export interface StructuredSubagentRequest {
 	blockedAgent?: string;
 	/** Preserve a completed temporary artifacts directory for an agent:// handle. */
 	retainArtifacts?: boolean;
+	/** Transfers a published temporary lease to the caller's bounded lifecycle owner. */
+	onRetainedArtifactLease?: (release: () => Promise<void>) => void;
 	/** Task UI agents keep live registry references; eval one-shots normally do not. */
 	keepAlive?: boolean;
 	/** Task subagents share their parent's eval kernel; eval bridge children must not. */
@@ -344,7 +346,7 @@ interface ArtifactLease {
 	temporary: boolean;
 	/** Scope encoded in a temporary artifact URI so identical agent IDs stay unambiguous. */
 	uriScope?: string;
-	unregister: (() => void) | undefined;
+	release?: () => Promise<void>;
 }
 
 async function leaseArtifacts(
@@ -355,7 +357,7 @@ async function leaseArtifacts(
 	if (sessionFile) {
 		const artifactsDir = sessionFile.slice(0, -6);
 		await fs.mkdir(artifactsDir, { recursive: true });
-		return { sessionFile, artifactsDir, temporary: false, unregister: undefined };
+		return { sessionFile, artifactsDir, temporary: false };
 	}
 	const uriScope = Snowflake.next();
 	const artifactsDir = path.join(
@@ -363,13 +365,15 @@ async function leaseArtifacts(
 		`${invocationKind === "eval" ? "omp-eval-agent" : "omp-task"}-${uriScope}`,
 	);
 	await fs.mkdir(artifactsDir, { recursive: true });
-	return {
-		sessionFile: null,
-		artifactsDir,
-		temporary: true,
-		uriScope,
-		unregister: registerArtifactsDir(artifactsDir, uriScope),
+	const unregister = registerArtifactsDir(artifactsDir, uriScope);
+	let released = false;
+	const release = async (): Promise<void> => {
+		if (released) return;
+		released = true;
+		unregister();
+		await fs.rm(artifactsDir, { recursive: true, force: true });
 	};
+	return { sessionFile: null, artifactsDir, temporary: true, uriScope, release };
 }
 
 function resolveAutoloadSkills(session: ToolSession, agent: AgentDefinition) {
@@ -619,6 +623,16 @@ export async function runStructuredSubagent(request: StructuredSubagentRequest):
 			};
 		}
 		publishedArtifact = result.outputMeta !== undefined;
+		if (lease.temporary && publishedArtifact && lease.release) {
+			const release = lease.release;
+			if (request.onRetainedArtifactLease) {
+				request.onRetainedArtifactLease(release);
+			} else {
+				request.session.registerDisposeCallback?.(() => {
+					void release();
+				});
+			}
+		}
 		requiresRecoveryArtifacts =
 			policy.isIsolated &&
 			(result.exitCode !== 0 || result.error !== undefined || result.aborted === true) &&
@@ -686,18 +700,14 @@ export async function runStructuredSubagent(request: StructuredSubagentRequest):
 			(request.retainArtifacts && completedSuccessfully) ||
 			(policy.isIsolated && (!policy.applyChanges || changesApplied === false || requiresRecoveryArtifacts));
 		const shouldCleanup = lease.temporary && !shouldRetainArtifacts;
-		if (shouldCleanup) {
-			const cleanupArtifacts = async (): Promise<void> => {
-				await fs.rm(lease.artifactsDir, { recursive: true, force: true });
-				lease.unregister?.();
-			};
+		if (shouldCleanup && lease.release) {
 			if (deferredCleanup) {
-				trackLateCleanup(deferredCleanup.then(cleanupArtifacts), {
+				trackLateCleanup(deferredCleanup.then(lease.release), {
 					resource: "artifacts",
 					artifactsDir: lease.artifactsDir,
 				});
 			} else {
-				await cleanupArtifacts();
+				await lease.release();
 			}
 		}
 	}

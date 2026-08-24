@@ -1,13 +1,18 @@
 import { afterEach, describe, expect, it } from "bun:test";
+import * as fs from "node:fs/promises";
 import type { AgentToolResult } from "@oh-my-pi/pi-agent-core";
+import { TempDir } from "@oh-my-pi/pi-utils";
 import { AsyncJobManager } from "../../src/async";
+import { AgentProtocolHandler } from "../../src/internal-urls/agent-protocol";
+import { parseInternalUrl } from "../../src/internal-urls/parse";
+import { registerArtifactsDir } from "../../src/internal-urls/registry-helpers";
 import { buildJobResult, snapshotJobs } from "../../src/tools/hub/jobs";
 import type { CoordinationDetails } from "../../src/tools/hub/types";
 
 const managers: AsyncJobManager[] = [];
 
-function createManager(): AsyncJobManager {
-	const manager = new AsyncJobManager({});
+function createManager(retentionMs?: number): AsyncJobManager {
+	const manager = new AsyncJobManager(retentionMs === undefined ? {} : { retentionMs });
 	managers.push(manager);
 	return manager;
 }
@@ -94,6 +99,44 @@ describe("hub task artifact receipts", () => {
 		);
 	});
 
+	it("releases a published temporary artifact when its task job is evicted", async () => {
+		using dir = TempDir.createSync("@omp-hub-artifact-eviction-");
+		const lease = "eviction-test";
+		const unregister = registerArtifactsDir(dir.path(), lease);
+		const manager = createManager(60_000);
+		const id = await settleTask(manager, "retained task body");
+		const uri = `agent://Auditor?lease=${lease}`;
+		await Bun.write(dir.join("Auditor.md"), "retained artifact body");
+		const released = Promise.withResolvers<void>();
+		const release = async (): Promise<void> => {
+			try {
+				unregister();
+				await fs.rm(dir.path(), { recursive: true, force: true });
+			} finally {
+				released.resolve();
+			}
+		};
+		manager.setTaskArtifactOutcome(
+			id,
+			{
+				outputMeta: {
+					uri,
+					sha256: "c".repeat(64),
+					bytes: 22,
+					lineCount: 1,
+					charCount: 22,
+				},
+			},
+			release,
+		);
+
+		const handler = new AgentProtocolHandler();
+		expect((await handler.resolve(parseInternalUrl(uri))).content).toBe("retained artifact body");
+		expect(manager.evictCompletedJobs()).toBe(1);
+		await released.promise;
+		await expect(handler.resolve(parseInternalUrl(uri))).rejects.toThrow("Artifact lease unavailable");
+	});
+
 	it("keeps an unpersisted task result available through wait", async () => {
 		const manager = createManager();
 		const body = "The artifact write failed, but this delivery body remains available.";
@@ -104,9 +147,9 @@ describe("hub task artifact receipts", () => {
 		const [snapshot] = snapshotJobs(session, manager.getAllJobs());
 		expect(snapshot?.outputMeta).toBeUndefined();
 		expect(snapshot?.artifactError).toBe("artifact readback mismatch");
-		expect(resultText(buildJobResult(session, manager, "jobs", manager.getAllJobs(), []))).toContain(
-			"read it with `wait` on this id",
-		);
+		const jobs = resultText(buildJobResult(session, manager, "jobs", manager.getAllJobs(), []));
+		expect(jobs).toContain("read it with `wait` on this id");
+		expect(jobs).not.toContain("agent://Auditor");
 		expect(resultText(buildJobResult(session, manager, "wait", manager.getAllJobs(), []))).toContain(body);
 	});
 });

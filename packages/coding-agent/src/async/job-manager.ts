@@ -59,6 +59,8 @@ export interface AsyncJob extends AsyncJobArtifactOutcome {
 	errorText?: string;
 	/** Latest tool-render details reported by the running job. */
 	latestDetails?: Record<string, unknown>;
+	/** Removes a temporary artifact lease when this job leaves retention. */
+	artifactCleanup?: () => Promise<void>;
 	/**
 	 * Registry id of the agent that registered the job (e.g. "Main",
 	 * "AuthLoader"). Used by scoped cancel/list APIs so a subagent's teardown
@@ -315,9 +317,12 @@ export class AsyncJobManager {
 	}
 
 	/** Retain a task artifact outcome only when its receipt names this job's agent. */
-	setTaskArtifactOutcome(id: string, outcome: AsyncJobArtifactOutcome): void {
+	setTaskArtifactOutcome(id: string, outcome: AsyncJobArtifactOutcome, artifactCleanup?: () => Promise<void>): void {
 		const job = this.#jobs.get(id);
-		if (job?.type !== "task") return;
+		if (job?.type !== "task") {
+			this.#runArtifactCleanup(id, artifactCleanup);
+			return;
+		}
 
 		const receipt = outcome.outputMeta;
 		const agentId = job.agentId ?? job.id;
@@ -330,10 +335,12 @@ export class AsyncJobManager {
 		if (!receiptMatchesAgent) {
 			job.outputMeta = undefined;
 			job.artifactError = outcome.artifactError ?? `artifact receipt does not match ${agentId}`;
+			this.#runArtifactCleanup(job.id, artifactCleanup);
 			return;
 		}
 		job.outputMeta = receipt;
 		job.artifactError = outcome.artifactError;
+		if (artifactCleanup) job.artifactCleanup = artifactCleanup;
 	}
 
 	getRunningJobs(filter?: AsyncJobFilter): AsyncJob[] {
@@ -644,6 +651,11 @@ export class AsyncJobManager {
 		const jobsSettled = await this.#waitForAllUntil(deadline);
 		const drained = await this.drainDeliveries({ timeoutMs: Math.max(deadline - Date.now(), 0) });
 		this.#clearEvictionTimers();
+		for (const job of this.#jobs.values()) {
+			const cleanup = job.artifactCleanup;
+			job.artifactCleanup = undefined;
+			this.#runArtifactCleanup(job.id, cleanup);
+		}
 		this.#jobs.clear();
 		this.#deliveries.length = 0;
 		this.#notifyDeliveryQueueChanged();
@@ -681,11 +693,28 @@ export class AsyncJobManager {
 	}
 
 	#evictJob(jobId: string): boolean {
+		const job = this.#jobs.get(jobId);
 		clearTimeout(this.#evictionTimers.get(jobId));
 		this.#evictionTimers.delete(jobId);
 		this.#suppressedDeliveries.delete(jobId);
 		this.#watchedJobs.delete(jobId);
+		if (job) {
+			const cleanup = job.artifactCleanup;
+			job.artifactCleanup = undefined;
+			this.#runArtifactCleanup(job.id, cleanup);
+		}
 		return this.#jobs.delete(jobId);
+	}
+
+	#runArtifactCleanup(jobId: string, cleanup: (() => Promise<void>) | undefined): void {
+		if (!cleanup) return;
+		try {
+			void cleanup().catch(error => {
+				logger.warn("Async job artifact cleanup failed", { jobId, error: String(error) });
+			});
+		} catch (error) {
+			logger.warn("Async job artifact cleanup failed", { jobId, error: String(error) });
+		}
 	}
 
 	#scheduleEviction(jobId: string): void {
