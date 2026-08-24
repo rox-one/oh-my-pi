@@ -57,6 +57,39 @@ describe("hub task artifact receipts", () => {
 		expect(status).not.toContain("agent://Other");
 	});
 
+	it("keeps a colliding task receipt on the resolved job ID", async () => {
+		const manager = createManager();
+		const retainedId = await settleTask(manager, "retained task body");
+		const receipt = {
+			uri: "agent://Auditor",
+			sha256: "b".repeat(64),
+			bytes: 9,
+			lineCount: 1,
+			charCount: 9,
+		};
+		const resolvedId = manager.register(
+			"task",
+			"Auditor",
+			async ({ jobId }) => {
+				await Promise.resolve();
+				manager.setTaskArtifactOutcome(jobId, { outputMeta: receipt });
+				return "new task";
+			},
+			{ id: "Auditor", agentId: "Auditor" },
+		);
+		const resolvedJob = manager.getJob(resolvedId);
+		if (!resolvedJob) throw new Error("expected the colliding task job to be registered");
+		await resolvedJob.promise;
+
+		expect(resolvedId).not.toBe(retainedId);
+		expect(manager.getJob(retainedId)?.outputMeta).toBeUndefined();
+		expect(manager.getJob(resolvedId)?.outputMeta).toEqual(receipt);
+		const session = { asyncJobManager: manager };
+		expect(resultText(buildJobResult(session, manager, "jobs", manager.getAllJobs(), []))).toContain(
+			"artifact 9 B at `agent://Auditor`",
+		);
+	});
+
 	it("keeps an unpersisted task result available through wait", async () => {
 		const manager = createManager();
 		const body = "The artifact write failed, but this delivery body remains available.";
