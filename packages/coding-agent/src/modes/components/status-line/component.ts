@@ -2086,16 +2086,19 @@ export class StatusLineComponent implements Component {
 		// past the window label — `──200K─120%` with the percent in error color.
 		const percentOverflow = pct > 100;
 		if (embedContext) {
-			const candidatePercent = formatEmbeddedContextPercent(percentOverflow ? pct : clampedPct);
-			const candidateWindow = formatNumber(ctx.contextWindow);
-			if (gapWidth >= candidatePercent.length + candidateWindow.length + 4) {
+			const compactContext = effectiveSettings.segmentOptions.context_pct?.compact === true;
+			const formattedPercent = formatEmbeddedContextPercent(percentOverflow ? pct : clampedPct);
+			const candidatePercent = compactContext ? `ctx:${formattedPercent}` : formattedPercent;
+			const candidateWindow = compactContext ? "" : formatNumber(ctx.contextWindow);
+			const minimumPadding = compactContext ? 2 : 4;
+			if (gapWidth >= candidatePercent.length + candidateWindow.length + minimumPadding) {
 				percentLabel = candidatePercent;
 				windowLabel = candidateWindow;
 				if (percentOverflow) {
 					percentStart = gapWidth - percentLabel.length;
-					windowStart = percentStart - 1 - windowLabel.length;
+					if (windowLabel) windowStart = percentStart - 1 - windowLabel.length;
 				} else {
-					windowStart = gapWidth - windowLabel.length - 1;
+					windowStart = windowLabel ? gapWidth - windowLabel.length - 1 : gapWidth;
 				}
 				scaleWidth = windowStart;
 			}
