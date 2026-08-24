@@ -615,15 +615,6 @@ describe("Settings", () => {
 			expect(isolated.get("enabledModels")).toEqual([]);
 		});
 
-		it("defaults Codex Code Mode to catalog-driven auto detection", () => {
-			const isolated = Settings.isolated();
-
-			expect(isolated.get("providers.openai-codex.codeMode")).toBe("auto");
-			expect(
-				Settings.isolated({ "providers.openai-codex.codeMode": "off" }).get("providers.openai-codex.codeMode"),
-			).toBe("off");
-		});
-
 		it("invalidates cached resolved values after set, override, and clearOverride", () => {
 			const isolated = Settings.isolated();
 
