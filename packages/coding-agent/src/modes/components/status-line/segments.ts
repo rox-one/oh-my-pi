@@ -81,7 +81,7 @@ function formatAdvisorSpend(amount: number, usingSubscription: boolean, uiTheme:
 	return `${spend} (adv)`;
 }
 
-function formatCompactContextPercent(percent: number | null | undefined): string {
+export function formatCompactContextPercent(percent: number | null | undefined): string {
 	if (percent === null || percent === undefined) return "?";
 	if (percent === 0) return "0%";
 	if (percent > 0 && percent < 1) return `${percent.toFixed(1)}%`;

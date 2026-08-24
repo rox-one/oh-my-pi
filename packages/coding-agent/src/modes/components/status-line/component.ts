@@ -23,7 +23,7 @@ import {
 } from "../codex-reset-fireworks";
 import { canReuseCachedPr, createPrCacheContext, isSamePrCacheContext, type PrCacheContext } from "./git-utils";
 import { getPreset } from "./presets";
-import { renderSegment, type SegmentContext } from "./segments";
+import { formatCompactContextPercent, renderSegment, type SegmentContext } from "./segments";
 import { getSeparator } from "./separators";
 import type {
 	CollabStatus,
@@ -1895,6 +1895,10 @@ export class StatusLineComponent implements Component {
 			ctx.contextWindow > 0 &&
 			(hasContextSegment(leftSegIds) || hasContextSegment(rightSegIds)) &&
 			(hasNonContextSegment(leftSegIds) || hasNonContextSegment(rightSegIds));
+		const embedCompactContext =
+			embedContext &&
+			ctx.options.context_pct?.compact === true &&
+			(leftSegIds.includes("context_pct") || rightSegIds.includes("context_pct"));
 		if (embedContext) {
 			removeContextSegments(leftParts, leftSegIds);
 			removeContextSegments(rightParts, rightSegIds);
@@ -2043,7 +2047,11 @@ export class StatusLineComponent implements Component {
 		// `session_name`, emptying the default preset's right group) the gauge
 		// runs to the border edge instead of disappearing, so embedded context
 		// labels don't fall back to a context chip until the session is titled.
-		return leftGroup + this.#buildContextGaugeFill(gapWidth, ctx, effectiveSettings, embedContext) + rightGroup;
+		return (
+			leftGroup +
+			this.#buildContextGaugeFill(gapWidth, ctx, effectiveSettings, embedContext, embedCompactContext) +
+			rightGroup
+		);
 	}
 
 	/**
@@ -2061,6 +2069,7 @@ export class StatusLineComponent implements Component {
 		ctx: SegmentContext,
 		effectiveSettings: EffectiveStatusLineSettings,
 		embedContext: boolean,
+		embedCompactContext: boolean,
 	): string {
 		const sessionName =
 			effectiveSettings.sessionAccent !== false ? this.session.sessionManager?.getSessionName() : undefined;
@@ -2086,21 +2095,25 @@ export class StatusLineComponent implements Component {
 		// past the window label — `──200K─120%` with the percent in error color.
 		const percentOverflow = pct > 100;
 		if (embedContext) {
-			const compactContext = effectiveSettings.segmentOptions.context_pct?.compact === true;
-			const formattedPercent = formatEmbeddedContextPercent(percentOverflow ? pct : clampedPct);
-			const candidatePercent = compactContext ? `ctx:${formattedPercent}` : formattedPercent;
-			const candidateWindow = compactContext ? "" : formatNumber(ctx.contextWindow);
-			const minimumPadding = compactContext ? 2 : 4;
-			if (gapWidth >= candidatePercent.length + candidateWindow.length + minimumPadding) {
+			const candidatePercent = embedCompactContext
+				? `ctx:${formatCompactContextPercent(percentOverflow ? pct : clampedPct)}`
+				: formatEmbeddedContextPercent(percentOverflow ? pct : clampedPct);
+			const candidateWindow = embedCompactContext ? "" : formatNumber(ctx.contextWindow);
+			const labelPadding = embedCompactContext ? 2 : candidateWindow.length + 4;
+			if (gapWidth >= candidatePercent.length + labelPadding) {
 				percentLabel = candidatePercent;
-				windowLabel = candidateWindow;
-				if (percentOverflow) {
-					percentStart = gapWidth - percentLabel.length;
-					if (windowLabel) windowStart = percentStart - 1 - windowLabel.length;
+				if (embedCompactContext) {
+					if (percentOverflow) percentStart = gapWidth - percentLabel.length;
 				} else {
-					windowStart = windowLabel ? gapWidth - windowLabel.length - 1 : gapWidth;
+					windowLabel = candidateWindow;
+					if (percentOverflow) {
+						percentStart = gapWidth - percentLabel.length;
+						windowStart = percentStart - 1 - windowLabel.length;
+					} else {
+						windowStart = gapWidth - windowLabel.length - 1;
+					}
+					scaleWidth = windowStart;
 				}
-				scaleWidth = windowStart;
 			}
 		}
 

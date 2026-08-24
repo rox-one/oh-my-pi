@@ -60,6 +60,7 @@ test("renders profile plus compact metric status line", () => {
 		rightSegments: ["token_total", "context_pct"],
 		separator: "pipe",
 		sessionAccent: false,
+		contextLine: "embedded",
 		segmentOptions: {
 			token_total: { breakdown: true },
 			context_pct: { compact: true },
@@ -71,4 +72,5 @@ test("renders profile plus compact metric status line", () => {
 	expect(rendered).toContain("p:work");
 	expect(rendered).toContain("in:25K out:5");
 	expect(rendered).toContain("ctx:9.1%");
+	expect(rendered).not.toContain("100K");
 });
