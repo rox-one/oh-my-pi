@@ -179,4 +179,36 @@ describe("AgentSession.switchSession previous-context build", () => {
 		expect(sessionManager.getSessionFile()).toBe(previousSessionFile);
 		expect(sessionManager.getCwd()).toBe(sourceDir.path());
 	});
+
+	it("restores cwd when cwd adoption throws after changing it", async () => {
+		const sourceDir = TempDir.createSync("@pi-switch-cwd-error-source-");
+		const targetDir = TempDir.createSync("@pi-switch-cwd-error-target-");
+		tempDirs.push(sourceDir, targetDir);
+
+		const { session, sessionManager } = buildSession(sourceDir);
+		const targetManager = SessionManager.create(targetDir.path(), targetDir.path());
+		targetManager.appendMessage({ role: "user", content: "target", timestamp: 2 });
+		await targetManager.ensureOnDisk();
+		await targetManager.flush();
+		const targetSessionFile = targetManager.getSessionFile();
+		await targetManager.close();
+		expect(targetSessionFile).toBeString();
+
+		let actualCwd = sourceDir.path();
+		let callbackCount = 0;
+		const onCwdChange = vi.fn(async (newCwd: string, _previousCwd: string) => {
+			actualCwd = newCwd;
+			if (callbackCount++ === 0) throw new Error("settings reload failed");
+			return true;
+		});
+
+		await expect(session.switchSession(targetSessionFile!, { onCwdChange })).rejects.toThrow(
+			"settings reload failed",
+		);
+
+		expect(actualCwd).toBe(sourceDir.path());
+		expect(onCwdChange).toHaveBeenCalledTimes(2);
+		expect(onCwdChange).toHaveBeenNthCalledWith(2, sourceDir.path(), targetDir.path());
+		expect(sessionManager.getCwd()).toBe(sourceDir.path());
+	});
 });
