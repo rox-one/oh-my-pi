@@ -3,6 +3,7 @@ import type { Usage } from "@oh-my-pi/pi-ai";
 import { $env } from "@oh-my-pi/pi-utils";
 import type { AgentSessionEvent } from "../session/agent-session";
 import type { ConfiguredThinkingLevel, TaskEffort } from "../thinking";
+import type { AgentOutputArtifact } from "./output-manager";
 import type { NestedRepoPatch } from "./worktree";
 
 /** Source of an agent definition */
@@ -518,7 +519,11 @@ export interface SingleResult {
 	abortReason?: string;
 	/** Aggregated usage from the subprocess, accumulated incrementally from message_end events. */
 	usage?: Usage;
-	/** Output path for the task result */
+	/**
+	 * Path of the `<id>.md` output artifact. Set **only** after a verified
+	 * readback (see {@link SingleResult.outputMeta}); an unverifiable write
+	 * leaves this undefined so nothing advertises an unreadable file.
+	 */
 	outputPath?: string;
 	/** Patch path for isolated worktree output */
 	patchPath?: string;
@@ -544,8 +549,14 @@ export interface SingleResult {
 		attempt: number;
 		errorMessage: string;
 	};
-	/** Output metadata for agent:// URL integration */
-	outputMeta?: { lineCount: number; charCount: number };
+	/**
+	 * Receipt for the verified `<id>.md` artifact: `agent://<id>`, its SHA-256,
+	 * and its byte count. Present only when the bytes were read back and
+	 * matched, so a parent that sees this can always resolve `uri`.
+	 */
+	outputMeta?: AgentOutputArtifact;
+	/** Why no artifact receipt exists, when the write or its readback failed. */
+	artifactError?: string;
 }
 
 /** Tool details for TUI rendering */

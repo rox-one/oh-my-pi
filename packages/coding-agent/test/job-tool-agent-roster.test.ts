@@ -136,6 +136,25 @@ describe("hub jobs snapshot", () => {
 		expect((result.details as CoordinationDetails)?.jobs?.find(job => job.id === "AgentB")?.status).toBe("completed");
 		expect((result.details as CoordinationDetails)?.agents?.map(agent => agent.id)).toEqual(["AgentB"]);
 	});
+
+	test("settled rows consume delivery but do not repeat their result bodies", async () => {
+		const manager = createManager();
+		const evalBody = "unrelated eval body: 4181 rows scanned, 12 anomalies";
+		const taskBody = "full task report body";
+		manager.register("eval", "Eval-1", async () => evalBody, { id: "Eval-1", ownerId: "Main" });
+		manager.register("task", "Auditor", async () => taskBody, { id: "Auditor", ownerId: "Main" });
+		await manager.waitForAll();
+
+		const result = await new HubTool(createToolSession({ manager, agentId: "Main" })).execute("call", { op: "jobs" });
+		const text = resultText(result);
+
+		expect(text).not.toContain(evalBody);
+		expect(text).not.toContain(taskBody);
+		expect(text).toContain(`result ${Buffer.byteLength(evalBody, "utf8")} B, read it with \`wait\` on this id`);
+		expect(text).toContain("agent://Auditor");
+		expect(manager.isDeliverySuppressed("Eval-1")).toBe(true);
+		expect(manager.isDeliverySuppressed("Auditor")).toBe(true);
+	});
 });
 
 describe("hub wait with no matching jobs", () => {

@@ -11,7 +11,78 @@
  * collisions across repeated or nested task invocations.
  */
 import * as fs from "node:fs/promises";
+import * as path from "node:path";
 import { ADVISOR_TRANSCRIPT_STEM } from "../advisor/transcript-recorder";
+
+/**
+ * Receipt for a subagent output artifact that was written **and read back**.
+ *
+ * Existence of a receipt is the only proof a parent has that `uri` resolves:
+ * the executor writes `<id>.md`, reads the bytes back off disk, and hashes
+ * them. A silent write failure (full disk, evicted temp dir, racing cleanup)
+ * therefore yields no receipt instead of a pointer to a missing file.
+ */
+export interface AgentOutputArtifact {
+	/** Internal URL that resolves to the verified file (`agent://<id>`). */
+	readonly uri: string;
+	/** Absolute path of the verified `<id>.md`. */
+	readonly path: string;
+	/** SHA-256 of the bytes on disk, lowercase hex. */
+	readonly sha256: string;
+	/** Byte length on disk. */
+	readonly bytes: number;
+	/** Line count of the written text. */
+	readonly lineCount: number;
+	/** UTF-16 length of the written text. */
+	readonly charCount: number;
+}
+
+/** Outcome of {@link writeVerifiedAgentOutput}: a receipt, or why there is none. */
+export type AgentOutputWriteResult =
+	| { readonly ok: true; readonly artifact: AgentOutputArtifact }
+	| { readonly ok: false; readonly error: string };
+
+/**
+ * Write `<artifactsDir>/<id>.md` and verify it by reading the bytes back and
+ * comparing length + SHA-256 against what was meant to land there.
+ *
+ * Callers MUST treat a non-`ok` result as "no artifact exists": advertising
+ * the path anyway is what let a completed task point at an unreadable file
+ * (issue #9646).
+ */
+export async function writeVerifiedAgentOutput(
+	artifactsDir: string,
+	id: string,
+	text: string,
+): Promise<AgentOutputWriteResult> {
+	const target = path.join(artifactsDir, `${id}.md`);
+	const expected = Buffer.from(text, "utf8");
+	try {
+		await Bun.write(target, expected);
+		const actual = await Bun.file(target).bytes();
+		const sha256 = new Bun.CryptoHasher("sha256").update(actual).digest("hex");
+		const expectedSha256 = new Bun.CryptoHasher("sha256").update(expected).digest("hex");
+		if (actual.byteLength !== expected.byteLength || sha256 !== expectedSha256) {
+			return {
+				ok: false,
+				error: `artifact readback mismatch for ${id}.md (wrote ${expected.byteLength} bytes, read ${actual.byteLength})`,
+			};
+		}
+		return {
+			ok: true,
+			artifact: {
+				uri: `agent://${id}`,
+				path: target,
+				sha256,
+				bytes: actual.byteLength,
+				lineCount: text.split("\n").length,
+				charCount: text.length,
+			},
+		};
+	} catch (error) {
+		return { ok: false, error: error instanceof Error ? error.message : String(error) };
+	}
+}
 
 /**
  * Manages agent output ID allocation to ensure uniqueness.

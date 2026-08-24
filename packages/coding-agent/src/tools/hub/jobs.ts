@@ -143,6 +143,24 @@ function describeAgents(agents: AgentActivitySnapshot[]): string[] {
 	return lines;
 }
 
+/**
+ * Row suffix for a settled job whose body the `jobs` poll withholds: size plus
+ * where to read it. Without this the caller cannot tell an empty result from a
+ * large one it should go fetch.
+ */
+function describeWithheldBody(job: JobSnapshot): string {
+	const error = job.errorText?.trim();
+	if (error) {
+		const firstLine = error.split("\n", 1)[0] ?? error;
+		return ` — error: ${truncateToWidth(firstLine, 160)}`;
+	}
+	const bytes = job.resultText ? Buffer.byteLength(job.resultText, "utf8") : 0;
+	if (bytes === 0) return " — empty result";
+	return job.type === "task"
+		? ` — result ${bytes} B at \`agent://${job.id}\``
+		: ` — result ${bytes} B, read it with \`wait\` on this id`;
+}
+
 interface TrackedJobLike {
 	id: string;
 	type: AsyncJobType;
@@ -210,7 +228,17 @@ export function buildJobResult(
 	});
 	const jobResults = snapshotJobs(session, uniqueJobs);
 
+	// Every settled row still consumes the pending auto-delivery, for `jobs` as
+	// much as for `wait`/`cancel`: observing a settled job IS its delivery, and
+	// re-enqueueing would inject a duplicate `async-result` (issue #5869).
 	manager.acknowledgeDeliveries(jobResults.filter(j => j.status !== "running").map(j => j.id));
+
+	// `wait` and `cancel` name the jobs the caller is blocked on or is killing,
+	// so those hand the body back. `jobs` is a status poll over every owned job:
+	// printing each settled body there duplicated bytes the caller never asked
+	// for, including unrelated eval jobs (issue #9646). Rows carry the size and
+	// the retrieval pointer instead.
+	const deliversResults = op !== "jobs";
 
 	const completed = jobResults.filter(j => j.status !== "running");
 	const running = jobResults.filter(j => j.status === "running");
@@ -226,6 +254,10 @@ export function buildJobResult(
 	if (completed.length > 0) {
 		lines.push(`## Completed (${completed.length})\n`);
 		for (const j of completed) {
+			if (!deliversResults) {
+				lines.push(`- \`${j.id}\` [${j.type}] — ${j.status}: ${j.label}${describeWithheldBody(j)}`);
+				continue;
+			}
 			lines.push(`### ${j.id} [${j.type}] — ${j.status}`);
 			lines.push(`Label: ${j.label}`);
 			if (j.resultText) {
@@ -235,6 +267,12 @@ export function buildJobResult(
 				lines.push(`Error: ${j.errorText}`);
 			}
 			lines.push("");
+		}
+		if (!deliversResults) {
+			lines.push("");
+			lines.push(
+				"Bodies are withheld from this status poll. A task's full output is at `agent://<id>` (`history://<id>` for its transcript); for any other job read the body with `wait` on that id.",
+			);
 		}
 	}
 

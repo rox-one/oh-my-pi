@@ -181,8 +181,13 @@ export interface MCPToolDetails {
 	mcpToolName: string;
 	/** Whether the call resulted in an error */
 	isError?: boolean;
-	/** Raw content from MCP response */
-	rawContent?: MCPContent[];
+	/**
+	 * Shape of the MCP response content — one entry per block, in order. The
+	 * payload itself is NOT copied here: every byte already lives in
+	 * `result.content`, and duplicating it doubled the bytes persisted per MCP
+	 * call (issue #9646). Renderers read the content; this is for diagnostics.
+	 */
+	contentBlocks?: MCPContentBlockMeta[];
 	/** Structured metadata from the MCP response */
 	mcpMeta?: Record<string, unknown>;
 	/** Provider ID (e.g., "claude", "mcp-json") */
@@ -192,6 +197,42 @@ export interface MCPToolDetails {
 	/** Structured output metadata (set by the spill wrapper when output is truncated to an artifact). */
 	meta?: OutputMeta;
 }
+
+/** Per-block descriptor of an MCP response: kind, size, and any resource identity. */
+export interface MCPContentBlockMeta {
+	type: MCPContent["type"];
+	/** Byte length of the block's payload (text, base64 image data, or resource text/blob). */
+	bytes: number;
+	/** MIME type, for image and resource blocks that declare one. */
+	mimeType?: string;
+	/** Resource URI, for resource blocks. */
+	uri?: string;
+}
+
+/** Describe each response block without copying its payload. */
+export function summarizeMCPContent(content: readonly MCPContent[]): MCPContentBlockMeta[] {
+	const out: MCPContentBlockMeta[] = [];
+	for (const item of content) {
+		if (item.type === "text") {
+			out.push({ type: item.type, bytes: Buffer.byteLength(item.text, "utf8") });
+			continue;
+		}
+		if (item.type === "image") {
+			out.push({ type: item.type, bytes: Buffer.byteLength(item.data, "utf8"), mimeType: item.mimeType });
+			continue;
+		}
+		const payload = item.resource.text ?? item.resource.blob ?? "";
+		const summary: MCPContentBlockMeta = {
+			type: item.type,
+			bytes: Buffer.byteLength(payload, "utf8"),
+			uri: item.resource.uri,
+		};
+		if (item.resource.mimeType) summary.mimeType = item.resource.mimeType;
+		out.push(summary);
+	}
+	return out;
+}
+
 /**
  * Convert MCP content to agent content while retaining image payloads.
  */
@@ -242,7 +283,7 @@ function buildResult(
 		serverName,
 		mcpToolName,
 		isError: result.isError,
-		rawContent: result.content,
+		contentBlocks: summarizeMCPContent(result.content),
 		mcpMeta: result._meta,
 		provider,
 		providerName,

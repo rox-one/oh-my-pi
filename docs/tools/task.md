@@ -68,11 +68,11 @@ Settled response (`async.enabled=false`, no job manager, every item's agent `blo
 - output: `output`, `stderr`, `truncated`, `durationMs`, `tokens`, `requests`, optional `contextTokens`/`contextWindow`, `usage`
 - model: optional `modelOverride`, `resolvedModel`, `resolvedModelIsFallback`
 - structured result: optional `structuredOutput` with schema source/mode, validation status, parsed `data`, and validation `error`
-- artifact metadata: `outputPath?`, `patchPath?`, `branchName?`, `branchBaseSha?`, `nestedPatches?`, `outputMeta?`
+- artifact metadata: `outputPath?`, `patchPath?`, `branchName?`, `branchBaseSha?`, `nestedPatches?`, `outputMeta?`, `artifactError?`. `outputPath` and `outputMeta` are set together and only after a verified readback; `outputMeta` is the receipt (`uri`, `path`, `sha256`, `bytes`, `lineCount`, `charCount`). A write or readback that fails leaves both unset and records `artifactError` instead, so a completed run never names a file the parent cannot read.
 - extracted tool data: `extractedToolData?` from registered subprocess tool handlers such as `yield`
 
 Artifacts and side channels:
-- Every subagent with an artifacts dir writes `<id>.md`; `agent://<id>` resolves to that file.
+- Every subagent with an artifacts dir writes `<id>.md`, then reads the bytes back and hashes them; `agent://<id>` resolves to that file. The `<task-result>` envelope publishes the receipt as `<artifact uri bytes lines sha256 />` and only claims `full-output` when a receipt exists — an unverifiable write emits `<artifact-unavailable>` instead.
 - A subagent's own children are dot-qualified (`<id>.<child>`); `agent://<id>/<child>` reads that nested output. When the path names no nested output and the file is JSON, `agent://<id>/<path>` and `agent://<id>?q=<query>` perform JSON extraction.
 - Each subagent gets `<id>.jsonl` session history when the parent persists artifacts; `history://<id>` renders it as a concise transcript (works for live and parked agents).
 - Isolated patch mode writes `<id>.patch` before merge.

@@ -62,6 +62,7 @@ import { buildNamedToolChoice } from "../utils/tool-choice";
 import type { WorkspaceTree } from "../workspace-tree";
 import { attributeSubagentError } from "./error-attribution";
 import { generateTaskLabel } from "./label";
+import { type AgentOutputArtifact, writeVerifiedAgentOutput } from "./output-manager";
 import { resolveAgentPrewalkDefault } from "./prewalk";
 import { isReadOnlyAgent } from "./read-only-policy";
 import { subprocessToolRegistry } from "./subprocess-tool-registry";
@@ -2252,26 +2253,28 @@ async function finalizeRunResult(args: FinalizeRunArgs): Promise<SingleResult> {
 		maxLines: MAX_OUTPUT_LINES,
 	});
 
-	// Write output artifact (input and jsonl already written in real-time).
-	// Compute output metadata for agent:// URL integration.
+	// Write output artifact (input and jsonl already written in real-time), then
+	// read it back: `outputPath`/`outputMeta` are set only for bytes proven to be
+	// on disk, so a completed run can never hand the parent a pointer to a file
+	// it cannot read (issue #9646). This runs before the result text reaches the
+	// async delivery queue, so a receipt is always older than its delivery.
 	//
 	// A revival/follow-up turn only (re)writes <id>.md when it produced a real
 	// yield result. A subagent revived to answer a hub message never yields, so
 	// writing here would overwrite the completed run's authoritative artifact with
 	// a missing-yield warning body (issue #9518). The initial run is unaffected
 	// (followUpTurn is unset), preserving the documented missing-yield artifact.
-	let outputMeta: { lineCount: number; charCount: number } | undefined;
+	let outputMeta: AgentOutputArtifact | undefined;
 	let outputPath: string | undefined;
+	let artifactError: string | undefined;
 	if (args.artifactsDir && (!args.followUpTurn || hasYield)) {
-		outputPath = path.join(args.artifactsDir, `${id}.md`);
-		try {
-			await Bun.write(outputPath, rawOutput);
-			outputMeta = {
-				lineCount: rawOutput.split("\n").length,
-				charCount: rawOutput.length,
-			};
-		} catch {
-			// Non-fatal
+		const written = await writeVerifiedAgentOutput(args.artifactsDir, id, rawOutput);
+		if (written.ok) {
+			outputMeta = written.artifact;
+			outputPath = written.artifact.path;
+		} else {
+			artifactError = written.error;
+			logger.warn("task: subagent output artifact could not be verified", { id, error: written.error });
 		}
 	}
 
@@ -2346,6 +2349,7 @@ async function finalizeRunResult(args: FinalizeRunArgs): Promise<SingleResult> {
 		extractedToolData: progress.extractedToolData,
 		retryFailure: progress.retryFailure,
 		outputMeta,
+		artifactError,
 	};
 }
 

@@ -1522,12 +1522,15 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			resumable,
 			preview,
 			truncated,
-			meta: result.outputMeta
+			artifact: result.outputMeta
 				? {
+						uri: result.outputMeta.uri,
+						sha256: result.outputMeta.sha256,
+						size: formatBytes(result.outputMeta.bytes),
 						lineCount: result.outputMeta.lineCount,
-						charSize: formatBytes(result.outputMeta.charCount),
 					}
 				: undefined,
+			artifactError: result.artifactError,
 			mergeSummary,
 		});
 

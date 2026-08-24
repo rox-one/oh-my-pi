@@ -55,7 +55,7 @@ describe("job renderer task-result preview", () => {
 			duration: "8.7s",
 			preview: "Probe finished: spawned worker, ping ok.",
 			truncated: false,
-			meta: { lineCount: 3, charSize: "120 B" },
+			artifact: { uri: "agent://SpawnProbe", sha256: "a1b2c3d4", size: "120 B", lineCount: 3 },
 			mergeSummary: "",
 		});
 		const deliveryText = `${summary}\n\nSpawnProbe is now idle — message it via \`irc\` to follow up; transcript at history://SpawnProbe`;
