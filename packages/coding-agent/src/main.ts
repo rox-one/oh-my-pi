@@ -721,22 +721,39 @@ async function moveMissingCwdSessionIfNeeded(
 	return { status: "moved", manager };
 }
 
+type ResumedProjectResult = { cwd: string; chdirFailed?: string };
+
 async function switchToResumedProject(
 	resumedCwd: string | undefined,
 	activeSettings: Settings,
 	pluginPreloadPromise: Promise<unknown>,
-): Promise<string> {
+	sessionManager: SessionManager,
+): Promise<ResumedProjectResult> {
+	const launchCwd = getProjectDir();
 	if (
 		!resumedCwd ||
-		normalizePathForComparison(resumedCwd) === normalizePathForComparison(getProjectDir()) ||
+		normalizePathForComparison(resumedCwd) === normalizePathForComparison(launchCwd) ||
 		!(await directoryExists(resumedCwd))
 	) {
-		return getProjectDir();
+		return { cwd: launchCwd };
 	}
 
 	// Let the launch-cwd preload settle before clearing and re-warming its caches.
 	await pluginPreloadPromise.catch(() => {});
-	setProjectDir(resumedCwd);
+	try {
+		setProjectDir(resumedCwd);
+	} catch (error) {
+		logger.warn("Could not switch to resumed project directory", { cwd: resumedCwd, error: String(error) });
+		try {
+			await sessionManager.moveTo(launchCwd);
+		} catch (rollbackError) {
+			logger.warn("Could not roll back resumed session directory", {
+				cwd: launchCwd,
+				error: String(rollbackError),
+			});
+		}
+		return { cwd: launchCwd, chdirFailed: resumedCwd };
+	}
 	clearPluginRootsAndCaches();
 	resetCapabilities();
 	const cwd = getProjectDir();
@@ -745,7 +762,7 @@ async function switchToResumedProject(
 	// read the launch project's stale/empty roots during session creation.
 	await preloadPluginRoots(os.homedir(), cwd);
 	await activeSettings.reloadForCwd(cwd);
-	return cwd;
+	return { cwd };
 }
 
 /**
@@ -1346,7 +1363,13 @@ export async function runRootCommand(
 		await logger.time("initTheme:initial", ensureTheme);
 
 		const parsedArgs = parsed;
-		await logger.time("applyStartupCwd", applyStartupCwd, parsedArgs);
+		try {
+			await logger.time("applyStartupCwd", applyStartupCwd, parsedArgs);
+		} catch (error: unknown) {
+			const message = error instanceof Error ? error.message : String(error);
+			process.stderr.write(`${chalk.red(`Error: ${message}`)}\n`);
+			process.exit(1);
+		}
 
 		const notifs: (InteractiveModeNotify | null)[] = [];
 
@@ -1640,7 +1663,19 @@ export async function runRootCommand(
 
 		if ((typeof parsedArgs.resume === "string" || foreignSource) && sessionManager) {
 			const previousCwd = cwd;
-			cwd = await switchToResumedProject(sessionManager.getCwd(), settingsInstance, pluginPreloadPromise);
+			const resumedProject = await switchToResumedProject(
+				sessionManager.getCwd(),
+				settingsInstance,
+				pluginPreloadPromise,
+				sessionManager,
+			);
+			cwd = resumedProject.cwd;
+			if (resumedProject.chdirFailed) {
+				writeStartupNotice(
+					parsedArgs,
+					`${chalk.yellow(`Could not switch to resumed project ${resumedProject.chdirFailed}; staying in ${cwd}.`)}\n`,
+				);
+			}
 			if (cwd !== previousCwd) {
 				// applyStartupCwd persists an explicit --cwd in parsedArgs; once resume
 				// switches projects, keep session construction on the destination too.
@@ -1699,14 +1734,25 @@ export async function runRootCommand(
 				stopStartupWatchdog();
 				process.exit(0);
 			}
-			// Re-scope every cwd-derived input before building the resumed session.
+			sessionManager = await SessionManager.open(selected.path);
 			const previousCwd = cwd;
-			cwd = await switchToResumedProject(selected.cwd, settingsInstance, pluginPreloadPromise);
+			const resumedProject = await switchToResumedProject(
+				sessionManager.getCwd(),
+				settingsInstance,
+				pluginPreloadPromise,
+				sessionManager,
+			);
+			cwd = resumedProject.cwd;
+			if (resumedProject.chdirFailed) {
+				writeStartupNotice(
+					parsedArgs,
+					`${chalk.yellow(`Could not switch to resumed project ${resumedProject.chdirFailed}; staying in ${cwd}.`)}\n`,
+				);
+			}
 			if (cwd !== previousCwd) {
 				parsedArgs.cwd = cwd;
 				scopedModels = await resolveScopedModels(parsedArgs, modelRegistry, settingsInstance);
 			}
-			sessionManager = await SessionManager.open(selected.path);
 		}
 
 		if (sessionManager && (parsedArgs.continue || parsedArgs.resume || parsedArgs.fork || foreignSource)) {

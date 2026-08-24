@@ -11,6 +11,7 @@ function createMoveContext(sourceDir: string, settingsFlush?: () => Promise<void
 	const present = vi.fn();
 	const applyCwdChange = vi.fn(async (cwd: string) => {
 		expect(state.cwd).toBe(cwd);
+		return true;
 	});
 	const moveSession = vi.fn(async (cwd: string) => {
 		state.cwd = cwd;
@@ -62,6 +63,28 @@ describe("CommandController /move", () => {
 			expect(ctx.ui.requestRender).toHaveBeenCalledWith();
 			expect(present).toHaveBeenCalled();
 			expect(ctx.showError).not.toHaveBeenCalled();
+		} finally {
+			await fs.rm(sourceDir, { recursive: true, force: true });
+			await fs.rm(targetDir, { recursive: true, force: true });
+		}
+	});
+
+	it("rolls back the session when cwd application fails", async () => {
+		const sourceDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-move-source-"));
+		const targetDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-move-target-"));
+		try {
+			const { ctx, state } = createMoveContext(sourceDir);
+			ctx.applyCwdChange = vi.fn(async () => false);
+			const controller = new CommandController(ctx);
+
+			await controller.handleMoveCommand(targetDir);
+
+			expect(ctx.session.moveSession).toHaveBeenNthCalledWith(1, targetDir);
+			expect(ctx.session.moveSession).toHaveBeenNthCalledWith(2, sourceDir);
+			expect(state.cwd).toBe(sourceDir);
+			expect(ctx.updateEditorBorderColor).not.toHaveBeenCalled();
+			expect(ctx.reloadTodos).not.toHaveBeenCalled();
+			expect(ctx.ui.requestRender).not.toHaveBeenCalled();
 		} finally {
 			await fs.rm(sourceDir, { recursive: true, force: true });
 			await fs.rm(targetDir, { recursive: true, force: true });
