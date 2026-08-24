@@ -488,12 +488,17 @@ describe("system prompt tool inventory", () => {
 			description: "Runs code cells.",
 			parameters: { type: "object", properties: {} },
 		});
+		tools.set("task", {
+			label: "Task",
+			description: "Delegates work to subagents.",
+			parameters: { type: "object", properties: {} },
+		});
 		const { systemPrompt } = await buildSystemPrompt({
 			cwd: tempDir,
 			contextFiles: [],
 			skills: [],
 			rules: [],
-			toolNames: ["eval", "read", "computer"],
+			toolNames: ["eval", "read", "task", "computer"],
 			directToolNames: ["eval"],
 			tools,
 			workspaceTree: { ...EMPTY_TREE, rootPath: tempDir },
@@ -501,6 +506,11 @@ describe("system prompt tool inventory", () => {
 			inlineToolDescriptors: true,
 		});
 		const text = systemPrompt.join("\n\n");
+		expect(text).toContain("type eval =");
+		expect(text).not.toContain("type read =");
+		expect(text).not.toContain("type task =");
+		expect(text).toContain("`tool.read`");
+		expect(text).toContain("`tool.task`");
 		// Only the direct keep-set renders as provider-callable functions.
 		expect(text).toContain("Runs code cells.");
 		expect(text).not.toContain("Reads files from disk.");

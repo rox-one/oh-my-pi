@@ -4,9 +4,15 @@ import planModeActivePrompt from "../../src/prompts/system/plan-mode-active.md" 
 
 const BASE = {
 	planFilePath: "local://old-feature-plan.md",
-	askToolName: "ask",
-	writeToolName: "write",
-	editToolName: "edit",
+	toolRefs: {
+		ask: "ask",
+		write: "write",
+		edit: "edit",
+		glob: "glob",
+		grep: "grep",
+		read: "read",
+		task: "task",
+	},
 	isHashlineEditMode: false,
 	iterative: false,
 	askAvailable: true,
@@ -16,7 +22,16 @@ const BASE = {
 	planExists: true,
 } as const;
 
-type Overrides = Partial<Record<keyof typeof BASE, boolean | string>>;
+type Overrides = Partial<{
+	planFilePath: string;
+	isHashlineEditMode: boolean;
+	iterative: boolean;
+	askAvailable: boolean;
+	taskAvailable: boolean;
+	scoutAvailable: boolean;
+	reentry: boolean;
+	planExists: boolean;
+}>;
 
 function render(overrides: Overrides = {}): string {
 	return prompt.render(planModeActivePrompt, { ...BASE, ...overrides });

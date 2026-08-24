@@ -32,6 +32,7 @@ import friendlyPersonality from "./prompts/system/personalities/friendly.md" wit
 import pragmaticPersonality from "./prompts/system/personalities/pragmatic.md" with { type: "text" };
 import projectPromptTemplate from "./prompts/system/project-prompt.md" with { type: "text" };
 import systemPromptTemplate from "./prompts/system/system-prompt.md" with { type: "text" };
+import { formatCodeModeToolReference } from "./session/code-mode";
 import { normalizeConcurrencyLimit } from "./task/parallel";
 import { usesCodexTaskPrompt } from "./task/prompt-policy";
 import { type ActiveRepoContext, resolveActiveRepoContext } from "./utils/active-repo-context";
@@ -882,8 +883,20 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 	// stay in provider-native tool schemas AND native tool calling is active.
 	// Otherwise render the full functions-namespace catalog in the system prompt.
 	const toolListMode = !inlineToolDescriptors && nativeTools;
+	const directSet = directToolNames === undefined ? undefined : new Set(directToolNames);
+	const xdevToolNames = new Set(xdevTools.map(mounted => mounted.name));
 	// Build tool descriptions for system prompt rendering.
-	const toolPromptNames = new Map<string, string>(toolNames.map(name => [name, tools?.get(name)?.wireName ?? name]));
+	const toolPromptNames = new Map<string, string>(
+		toolNames.map(name => {
+			const meta = tools?.get(name);
+			const direct = directSet === undefined || directSet.has(name);
+			const reference =
+				xdevToolNames.has(name) && !meta
+					? name
+					: formatCodeModeToolReference({ name, wireName: meta?.wireName, direct });
+			return [name, reference] as const;
+		}),
+	);
 	// xd://-mounted tools count as present for prompt gates ({{#has tools "lsp"}})
 	// and resolve their own name as the reference — the xd:// section explains
 	// the access path. The Tool Inventory list stays limited to real defs.
@@ -891,12 +904,10 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		if (!toolPromptNames.has(mounted.name)) toolPromptNames.set(mounted.name, mounted.name);
 	}
 	const toolRefs = Object.fromEntries(toolPromptNames.entries());
-	const xdevToolNames = new Set(xdevTools.map(mounted => mounted.name));
 	// A direct custom tool can share a name with a retained built-in device.
 	// Presence in both toolNames and tools proves it still has a top-level definition.
 	// Bridge-only Code Mode tools stay out of the callable inventory: the eval
 	// description documents their `tool.*` access path instead.
-	const directSet = directToolNames === undefined ? undefined : new Set(directToolNames);
 	const directInventoryNames = directSet === undefined ? toolNames : toolNames.filter(name => directSet.has(name));
 	const inventoryToolNames =
 		xdevToolNames.size === 0
