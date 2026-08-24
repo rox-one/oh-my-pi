@@ -12055,8 +12055,12 @@ export class AgentSession {
 	 * and headless callers that must observe the hydrated total.
 	 */
 	beginInitialAdvisorCostRestore(): void {
+		const sessionId = this.sessionId;
 		this.#advisorCostRestore = loadAdvisorTranscriptCosts(this.sessionFile)
-			.then(costs => this.restoreInitialAdvisorCosts(costs))
+			.then(costs => {
+				if (this.sessionId !== sessionId) return;
+				this.restoreInitialAdvisorCosts(costs);
+			})
 			.catch(err => logger.debug("advisor cost restore failed", { err: String(err) }));
 	}
 
