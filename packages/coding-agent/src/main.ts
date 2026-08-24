@@ -571,16 +571,13 @@ async function runInteractiveMode(
 	// Consume failures immediately, but defer any banner until the transcript is stable.
 	const checkedVersionPromise = versionCheckPromise.catch(() => undefined);
 
-	// Cold-launch cleanup. `init` already cleared native history once (via the
-	// prepaint composer's `start({ clearScrollback })` or its own
-	// `clearInitialTerminalHistory`). A *resumed* launch replays a transcript that
-	// must destructively replace that welcome/startup frame, so it clears again.
-	// A *fresh* launch has no transcript: the welcome frame `init` just painted is
-	// the final frame, so a second `clearTerminalHistory` here is redundant — and
-	// on conhost the ED3-then-ED2 pair archives that first welcome frame into
-	// scrollback instead of discarding it, leaving a duplicate header (issue #9597).
+	// `init` already cleared native history before painting the startup frame.
+	// The normal replay offers resumed transcript rows to the frame provider and
+	// repaints the viewport, so another destructive clear would only archive the
+	// startup frame on conhost (issue #9597). In-process session replacements
+	// still request `clearTerminalHistory` at their own callsites.
 	await logger.time("InteractiveMode.renderInitialMessages", () =>
-		mode.renderInitialMessages({ preserveExistingChat: true, clearTerminalHistory: resuming }),
+		mode.renderInitialMessages({ preserveExistingChat: true }),
 	);
 	// A resolved version check must not insert its banner into a partial transcript.
 	checkedVersionPromise.then(newVersion => {

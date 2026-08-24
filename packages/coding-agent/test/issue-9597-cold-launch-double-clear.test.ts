@@ -9,7 +9,7 @@ import {
 } from "@oh-my-pi/pi-coding-agent/modes/startup-composer";
 import { initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 import { VirtualTerminal } from "../../tui/test/virtual-terminal";
-import { createTestSession } from "./utilities";
+import { assistantMsg, createTestSession, userMsg } from "./utilities";
 
 // The single sequence the TUI emits for a destructive reset (erase scrollback +
 // viewport, repaint from row zero) — see `tui.ts` `#renderFrame`.
@@ -30,14 +30,11 @@ class CapturingTerminal extends VirtualTerminal {
 	}
 }
 
-// Cold launch runs two independent clear-native-history paths: the prepaint
-// composer's `start({ clearScrollback })` and, once InteractiveMode is ready,
-// `renderInitialMessages({ clearTerminalHistory })`. On conhost the destructive
-// reset's ED3-then-ED2 order archives the first welcome frame into scrollback
-// instead of discarding it, so a redundant second reset paints the welcome
-// header twice (issue #9597). The replay must clear again only when resuming a
-// transcript that has to replace the welcome frame; a fresh launch already
-// painted its final frame with the first clear.
+// Cold launch first clears native history while painting the prepaint welcome.
+// Once InteractiveMode is ready, a normal replay can offer resumed transcript
+// rows and repaint the viewport without another destructive reset. On conhost a
+// second ED3-then-ED2 reset would archive the prepaint frame into scrollback
+// after ED3 already ran, leaving a stale welcome above the live UI (issue #9597).
 describe("issue #9597 — cold-launch welcome duplication", () => {
 	let settings: Settings;
 	let config: ComposerPreferences;
@@ -66,14 +63,22 @@ describe("issue #9597 — cold-launch welcome duplication", () => {
 	});
 
 	// `resuming` mirrors `main.ts` `runInteractiveMode`: `false` on a plain `omp`
-	// launch, `true` for --continue/--resume/--fork. The replay's
-	// `clearTerminalHistory` follows it.
-	async function coldLaunch(resuming: boolean): Promise<{ resets: number; welcomeRows: number }> {
+	// launch, `true` for --continue/--resume/--fork.
+	async function coldLaunch(resuming: boolean): Promise<{
+		resets: number;
+		welcomeRows: number;
+		scrollBuffer: string;
+	}> {
 		const terminal = new CapturingTerminal(100, 30);
 		beginStartupComposer({ preferences: config, terminal, version: "18.0.4", cache: false });
+		await terminal.waitForRender();
 		const lease = takeStartupComposerLease();
 		expect(lease).toBeDefined();
 		const testSession = await createTestSession({ inMemory: true });
+		if (resuming) {
+			testSession.sessionManager.appendMessage(userMsg("resume marker question"));
+			testSession.sessionManager.appendMessage(assistantMsg("resume marker answer"));
+		}
 		const mode = new InteractiveMode(
 			testSession.session,
 			"18.0.4",
@@ -87,19 +92,19 @@ describe("issue #9597 — cold-launch welcome duplication", () => {
 		lease!.adopt();
 		vi.spyOn(mode.statusLine, "watchBranch").mockImplementation(() => {});
 		try {
-			// First clear (prepaint welcome) flushes as its own frame before the
-			// replay, exactly as it does in the app across the setup/init gap.
-			await mode.init({ clearInitialTerminalHistory: true });
+			await mode.init({ suppressWelcomeIntro: resuming, clearInitialTerminalHistory: true });
 			await terminal.waitForRender();
-			await mode.renderInitialMessages({ preserveExistingChat: true, clearTerminalHistory: resuming });
+			await mode.renderInitialMessages({ preserveExistingChat: true });
 			await terminal.waitForRender();
-			const welcomeRows = terminal
-				.getScrollBuffer()
-				.map(l => Bun.stripANSI(l))
-				.filter(l => l.includes("18.0.4")).length;
-			return { resets: terminal.countResets(), welcomeRows };
+			const rows = terminal.getScrollBuffer().map(l => Bun.stripANSI(l));
+			return {
+				resets: terminal.countResets(),
+				welcomeRows: rows.filter(l => l.includes("18.0.4")).length,
+				scrollBuffer: rows.join("\n"),
+			};
 		} finally {
 			mode.stop();
+			await testSession.cleanup();
 		}
 	}
 
@@ -111,11 +116,10 @@ describe("issue #9597 — cold-launch welcome duplication", () => {
 		expect(welcomeRows).toBe(1);
 	});
 
-	it("still clears on the replay when resuming a transcript", async () => {
-		const { resets, welcomeRows } = await coldLaunch(true);
-		// A resumed launch must destructively replace the welcome frame with the
-		// transcript, so the gate keeps the second clear here.
-		expect(resets).toBe(2);
+	it("replays a resumed transcript without clearing native history again", async () => {
+		const { resets, scrollBuffer, welcomeRows } = await coldLaunch(true);
+		expect(resets).toBe(1);
+		expect(scrollBuffer).toContain("resume marker answer");
 		expect(welcomeRows).toBe(1);
 	});
 });
