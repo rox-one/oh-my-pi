@@ -110,7 +110,11 @@ export async function loadSlashCommands(options: LoadSlashCommandsOptions = {}):
  * Expand a slash command if it matches a file-based command.
  * Returns the expanded content or the original text if not a slash command.
  */
-export function expandSlashCommand(text: string, fileCommands: FileSlashCommand[]): string {
+export function expandSlashCommand(
+	text: string,
+	fileCommands: FileSlashCommand[],
+	options: { toolRefs?: Readonly<Record<string, string>> } = {},
+): string {
 	if (!text.startsWith("/")) return text;
 
 	const spaceIndex = text.indexOf(" ");
@@ -123,7 +127,12 @@ export function expandSlashCommand(text: string, fileCommands: FileSlashCommand[
 		const argsText = args.join(" ");
 		const usesInlineArgPlaceholders = templateUsesInlineArgPlaceholders(fileCommand.content);
 		const substituted = substituteArgs(fileCommand.content, args);
-		const rendered = prompt.render(substituted, { args, ARGUMENTS: argsText, arguments: argsText });
+		const rendered = prompt.render(substituted, {
+			args,
+			ARGUMENTS: argsText,
+			arguments: argsText,
+			toolRefs: options.toolRefs ?? {},
+		});
 		return appendInlineArgsFallback(rendered, argsText, usesInlineArgPlaceholders);
 	}
 

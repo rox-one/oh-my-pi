@@ -421,6 +421,7 @@ export async function handleSecurityCommand(
 							findingUri: target.uri,
 							scanId: target.scanId,
 							findingId: target.findingId,
+							toolRef: runtime.session.getToolReference("security_scan"),
 						})
 						.trim(),
 				};

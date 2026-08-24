@@ -6832,7 +6832,9 @@ export class AgentSession {
 			// Try file-based slash commands (markdown files from commands/ directories)
 			// Only if text still starts with "/" (wasn't transformed by custom command)
 			if (text.startsWith("/")) {
-				text = expandSlashCommand(text, this.#slashCommands);
+				text = expandSlashCommand(text, this.#slashCommands, {
+					toolRefs: { task: this.getToolReference("task") },
+				});
 			}
 		}
 

@@ -110,6 +110,10 @@ export class ExtensionRuntime implements IExtensionRuntime {
 		throw new ExtensionRuntimeNotInitializedError();
 	}
 
+	getToolReference = (_name: string): string => {
+		throw new ExtensionRuntimeNotInitializedError();
+	};
+
 	getAllTools(): ToolInfo[] {
 		throw new ExtensionRuntimeNotInitializedError();
 	}
@@ -290,6 +294,10 @@ class ConcreteExtensionAPI implements ExtensionAPI, IExtensionRuntime {
 
 	getActiveTools(): string[] {
 		return this.runtime.getActiveTools();
+	}
+
+	getToolReference(name: string): string {
+		return this.runtime.getToolReference?.(name) ?? name;
 	}
 
 	getAllTools(): ToolInfo[] {

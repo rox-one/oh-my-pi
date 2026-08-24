@@ -29,6 +29,7 @@ import { createUpdateNotesTool } from "./tools/update-notes";
 import type { AutoresearchRuntime, ExperimentResult, PendingRunSummary } from "./types";
 
 const EXPERIMENT_TOOL_NAMES = ["init_experiment", "run_experiment", "log_experiment", "update_notes"];
+const AUTORESEARCH_PROMPT_TOOL_NAMES = [...EXPERIMENT_TOOL_NAMES, "bash", "edit"] as const;
 
 export const createAutoresearchExtension: ExtensionFactory = api => {
 	const runtimeStore = createRuntimeStore();
@@ -36,6 +37,13 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 
 	const getSessionKey = (ctx: ExtensionContext): string => ctx.sessionManager.getSessionId();
 	const getRuntime = (ctx: ExtensionContext): AutoresearchRuntime => runtimeStore.ensure(getSessionKey(ctx));
+	const getAutoresearchToolRefs = (): Record<string, string> =>
+		Object.fromEntries(
+			AUTORESEARCH_PROMPT_TOOL_NAMES.map(name => [
+				name,
+				typeof api.getToolReference === "function" ? api.getToolReference(name) : name,
+			]),
+		);
 
 	const loadActiveSession = async (
 		ctx: ExtensionContext,
@@ -371,6 +379,7 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 						branch: currentBranch ?? "",
 						has_baseline_warning: baselineWarning !== null,
 						baseline_warning: baselineWarning ?? "",
+						toolRefs: getAutoresearchToolRefs(),
 					}),
 				],
 			};
@@ -411,6 +420,7 @@ export const createAutoresearchExtension: ExtensionFactory = api => {
 						pendingRun?.parsedPrimary !== null && pendingRun?.parsedPrimary !== undefined
 							? formatNum(pendingRun.parsedPrimary, state.metricUnit)
 							: null,
+					toolRefs: getAutoresearchToolRefs(),
 				}),
 			],
 		};

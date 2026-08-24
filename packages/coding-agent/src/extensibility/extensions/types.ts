@@ -1552,6 +1552,7 @@ export interface ExtensionAPI {
 
 	/** Get the list of currently active tool names. */
 	getActiveTools(): string[];
+	getToolReference(name: string): string;
 
 	/** Get all configured tools (built-in + extension tools) with schema and source metadata. */
 	getAllTools(): ToolInfo[];
@@ -1798,6 +1799,7 @@ export interface ExtensionActions {
 	setLabel: (targetId: string, label: string | undefined) => void;
 	getActiveTools: GetActiveToolsHandler;
 	getAllTools: GetAllToolsHandler;
+	getToolReference?: (name: string) => string;
 	setActiveTools: SetActiveToolsHandler;
 	getCommands: GetCommandsHandler;
 	setModel: SetModelHandler;
