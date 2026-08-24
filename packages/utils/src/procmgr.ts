@@ -83,6 +83,23 @@ export function isPowerShell(shell: string): boolean {
 }
 
 /**
+ * Quote a single argument for a copy-pasteable command hint shown to the user
+ * (e.g. a resume/recovery banner). Targets the interactive host shell the user
+ * returns to, so it keys off {@link process.platform} rather than
+ * {@link getShellConfig} (which resolves the bash-tool shell, not the parent
+ * shell that launched the process). POSIX shells group single-quoted arguments
+ * (`'\''` escapes an embedded quote); cmd.exe does not treat single quotes
+ * specially, so a spaced path would split — Windows (cmd.exe and PowerShell
+ * both group double-quoted arguments) uses double quotes, doubling any embedded
+ * `"` (a Windows filename cannot contain `"`, so that only guards pathological
+ * input). `platform` is injectable for tests.
+ */
+export function quoteHostShellArg(value: string, platform: NodeJS.Platform = process.platform): string {
+	if (platform === "win32") return `"${value.replaceAll('"', '""')}"`;
+	return `'${value.replaceAll("'", "'\\''")}'`;
+}
+
+/**
  * Get shell prefix for wrapping commands (profilers, strace, etc.).
  */
 function getShellPrefix(): string | undefined {

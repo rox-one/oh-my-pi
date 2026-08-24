@@ -3,7 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { getAgentDir, MAIN_CONFIG_FILENAMES } from "../src/dirs";
-import { getShellArgs, getShellConfig, resolveWindowsShell } from "../src/procmgr";
+import { getShellArgs, getShellConfig, quoteHostShellArg, resolveWindowsShell } from "../src/procmgr";
 
 describe("getShellConfig", () => {
 	it("directs invalid custom shell paths to the canonical config file", () => {
@@ -36,6 +36,20 @@ describe("getShellArgs", () => {
 		expect(getShellArgs("C:\\Windows\\System32\\cmd.exe", {})).toEqual(["/c"]);
 		expect(getShellArgs("/bin/bash", {})).toEqual(["-l", "-c"]);
 		expect(getShellArgs("/bin/bash", { PI_BASH_NO_LOGIN: "1" })).toEqual(["-c"]);
+	});
+});
+
+describe("quoteHostShellArg", () => {
+	it("single-quotes for POSIX host shells, escaping embedded quotes", () => {
+		expect(quoteHostShellArg("/home/u/my sessions/s.jsonl", "linux")).toBe("'/home/u/my sessions/s.jsonl'");
+		expect(quoteHostShellArg("a'b", "darwin")).toBe("'a'\\''b'");
+	});
+
+	it("double-quotes on Windows so cmd.exe groups a spaced path instead of splitting it", () => {
+		// cmd.exe does not treat single quotes specially, so the POSIX form would
+		// hand `--resume` a split path; double quotes group in cmd.exe and PowerShell.
+		expect(quoteHostShellArg("C:\\Users\\a b\\s.jsonl", "win32")).toBe('"C:\\Users\\a b\\s.jsonl"');
+		expect(quoteHostShellArg('a"b', "win32")).toBe('"a""b"');
 	});
 });
 
