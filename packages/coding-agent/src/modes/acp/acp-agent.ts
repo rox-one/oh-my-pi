@@ -783,7 +783,7 @@ export class AcpAgent implements Agent {
 
 	async setSessionMode(params: SetSessionModeRequest): Promise<SetSessionModeResponse> {
 		const record = this.#getSessionRecord(params.sessionId);
-		await this.#applyModeChange(record, params.modeId);
+		await this.#applyModeChange(record.session, params.modeId);
 		await this.#connection.sessionUpdate({
 			sessionId: record.session.sessionId,
 			update: this.#buildCurrentModeUpdate(record.session),
@@ -800,7 +800,7 @@ export class AcpAgent implements Agent {
 
 		switch (params.configId) {
 			case MODE_CONFIG_ID:
-				await this.#applyModeChange(record, params.value);
+				await this.#applyModeChange(record.session, params.value);
 				break;
 			case MODEL_CONFIG_ID:
 				await this.#setModelById(record.session, params.value);
@@ -1914,8 +1914,7 @@ export class AcpAgent implements Agent {
 		return session.getPlanModeState()?.enabled ? ACP_PLAN_MODE_ID : ACP_DEFAULT_MODE_ID;
 	}
 
-	async #applyModeChange(record: ManagedSessionRecord, modeId: string): Promise<void> {
-		const session = record.session;
+	async #applyModeChange(session: AgentSession, modeId: string): Promise<void> {
 		const availableModes = this.#getAvailableModes(session);
 		if (!availableModes.some(mode => mode.id === modeId)) {
 			throw new Error(`Unsupported ACP mode: ${modeId}`);
@@ -1924,8 +1923,6 @@ export class AcpAgent implements Agent {
 		const previousPlanProposalHandler = session.peekPlanProposalHandler?.();
 		if (modeId === ACP_PLAN_MODE_ID) {
 			const enabledToolNames = session.getEnabledToolNames();
-			const capturedPlanTools = record.planModePreviousTools === undefined;
-			if (capturedPlanTools) record.planModePreviousTools = [...enabledToolNames];
 			const planToolNames =
 				session.hasBuiltInTool("write") && !enabledToolNames.includes("write")
 					? [...enabledToolNames, "write"]
@@ -1940,7 +1937,6 @@ export class AcpAgent implements Agent {
 				await session.setActiveToolsByName(planToolNames);
 			} catch (error) {
 				session.setPlanModeState(previous);
-				if (capturedPlanTools) record.planModePreviousTools = undefined;
 				throw error;
 			}
 			// Mirror `InteractiveMode.#enterPlanMode`: register the plan-proposal
@@ -1950,16 +1946,14 @@ export class AcpAgent implements Agent {
 			session.setPlanProposalHandler?.(title => this.#handleAcpPlanProposal(session, title));
 			return;
 		}
-		const restoreToolNames = record.planModePreviousTools ?? session.getEnabledToolNames();
 		session.setPlanModeState(undefined);
 		try {
-			await session.setActiveToolsByName(restoreToolNames);
+			await session.setActiveToolsByName(session.getEnabledToolNames());
 		} catch (error) {
 			session.setPlanModeState(previous);
 			session.setPlanProposalHandler?.(previousPlanProposalHandler ?? null);
 			throw error;
 		}
-		record.planModePreviousTools = undefined;
 		session.setPlanProposalHandler?.(null);
 	}
 
