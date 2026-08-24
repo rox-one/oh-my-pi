@@ -632,7 +632,7 @@ export const SETTINGS_SCHEMA = {
 			group: "Services",
 			label: "Codex Code Mode",
 			description:
-				"Route Codex code_mode_only models (GPT-5.6) through the eval tool as a programmatic execution surface: the direct tool surface collapses to eval/ask/todo and every other session tool is invoked from eval cells. Mirrors codex-rs Code Mode. 'auto' follows the model catalog flag by default; 'on' forces it for any Codex model; 'off' opts out and leaves the full direct surface.",
+				"Route Codex code_mode_only models (GPT-5.6) through the eval tool as a programmatic execution surface: the direct tool surface collapses to eval/ask/todo, retains the goal control tool while Goal Mode is active, and routes every other session tool through eval cells. Mirrors codex-rs Code Mode. 'auto' follows the model catalog flag by default; 'on' forces it for any Codex model; 'off' opts out and leaves the full direct surface.",
 		},
 	},
 

@@ -20,7 +20,7 @@ import { buildToolNamespacesInfo, formatCodeModeToolReference, resolveCodeMode }
 import { SessionManager } from "../src/session/session-manager";
 import { generateCodeModeDeclarations } from "../src/tools/eval-format/code-mode-declarations";
 
-const ENABLED = ["eval", "ask", "todo", "yield", "think", "read", "bash", "edit", "mcp__gmail__search"];
+const ENABLED = ["eval", "ask", "todo", "goal", "yield", "think", "read", "bash", "edit", "mcp__gmail__search"];
 
 describe("resolveCodeMode", () => {
 	test("off: inactive regardless of catalog flag", () => {
@@ -43,7 +43,7 @@ describe("resolveCodeMode", () => {
 			evalTransportAvailable: true,
 		});
 		expect(r.active).toBe(true);
-		expect([...r.directToolNames].sort()).toEqual(["ask", "eval", "think", "todo", "yield"]);
+		expect([...r.directToolNames].sort()).toEqual(["ask", "eval", "goal", "think", "todo", "yield"]);
 	});
 	test("auto without flag: inactive", () => {
 		expect(
@@ -517,6 +517,33 @@ describe("Code Mode session reconciliation", () => {
 			"workflow-notice",
 		]);
 		expect(orchestration?.content).toContain("`tool.task` dispatch");
+	});
+
+	test("bridge-enabled Vibe tools use bridge references", async () => {
+		const vibeNames = ["vibe_spawn", "vibe_send", "vibe_wait", "vibe_kill", "vibe_list"];
+		const { session } = createSession(
+			Settings.isolated({ "providers.openai-codex.codeMode": "auto" }),
+			undefined,
+			undefined,
+			[tool("todo"), ...vibeNames.map(name => tool(name))],
+		);
+		await session.setActiveToolsByName(["eval", "read", "todo", ...vibeNames]);
+		session.setVibeModeState({ enabled: true });
+		await session.sendVibeModeContext();
+
+		const message = session.state.messages.find(entry => {
+			if (typeof entry !== "object" || entry === null || !("customType" in entry)) return false;
+			return entry.customType === "vibe-mode-context";
+		});
+		const content =
+			message && typeof message === "object" && "content" in message && typeof message.content === "string"
+				? message.content
+				: "";
+		expect(content).toContain("`tool.read`");
+		expect(content).toContain("`todo`");
+		expect(content).toContain("`tool.vibe_spawn`");
+		expect(content).toContain("`tool.vibe_wait`");
+		expect(content).not.toContain("`vibe_spawn`");
 	});
 
 	test("prompt refresh preserves the full Code Mode tool predicate", async () => {

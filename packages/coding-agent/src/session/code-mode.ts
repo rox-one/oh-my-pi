@@ -18,6 +18,7 @@ export const CODE_MODE_KEEP_TOOLS: Record<string, true> = {
 	eval: true,
 	ask: true,
 	todo: true,
+	goal: true,
 	yield: true,
 	think: true,
 	__agent__: true,
