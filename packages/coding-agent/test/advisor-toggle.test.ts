@@ -579,6 +579,20 @@ describe("AgentSession advisor toggle", () => {
 		session.restoreInitialAdvisorCosts(new Map([["", 0.5]]));
 		expect(session.getAdvisorCost()).toBeCloseTo(0.25, 8);
 	});
+	it("ignores an initial cost restore after the active session changes", async () => {
+		const restore = Promise.withResolvers<Map<string, number>>();
+		const load = vi.spyOn(advisorModule, "loadAdvisorTranscriptCosts").mockReturnValue(restore.promise);
+		try {
+			session.beginInitialAdvisorCostRestore();
+			await session.newSession();
+			restore.resolve(new Map([["", 0.5]]));
+			await session.advisorCostRestore;
+
+			expect(session.getAdvisorCost()).toBe(0);
+		} finally {
+			load.mockRestore();
+		}
+	});
 	it("starts a new session with only post-transition advisor cost", async () => {
 		const advisor = enableAdvisor();
 		appendAdvisorCost(advisor, 0.5, 1);
