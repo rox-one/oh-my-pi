@@ -6,7 +6,8 @@
  * so the parent can verify the pointer it was handed; when the write cannot be
  * verified there is no receipt and no pointer at all.
  */
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, spyOn } from "bun:test";
+import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { writeVerifiedAgentOutput } from "@oh-my-pi/pi-coding-agent/task/output-manager";
 import { prompt, TempDir } from "@oh-my-pi/pi-utils";
@@ -42,6 +43,29 @@ describe("writeVerifiedAgentOutput", () => {
 		expect(written.artifact.charCount).toBe(4);
 	});
 
+	it("preserves the prior artifact and removes the temporary file after a short write", async () => {
+		using dir = TempDir.createSync("@omp-artifact-receipt-short-write-");
+		const original = "known good artifact";
+		const replacement = "01234567890123456789";
+		const initial = await writeVerifiedAgentOutput(dir.path(), "Auditor", original);
+		if (!initial.ok) throw new Error(`expected an initial receipt, got ${initial.error}`);
+
+		const originalWrite = Bun.write;
+		const writeSpy = spyOn(Bun, "write").mockImplementation(async target => {
+			await originalWrite(target, replacement.slice(0, 1));
+			return 1;
+		});
+		try {
+			const written = await writeVerifiedAgentOutput(dir.path(), "Auditor", replacement);
+			expect(written.ok).toBe(false);
+		} finally {
+			writeSpy.mockRestore();
+		}
+
+		expect(await Bun.file(path.join(dir.path(), "Auditor.md")).text()).toBe(original);
+		expect(await fs.readdir(dir.path())).toEqual(["Auditor.md"]);
+	});
+
 	it("reports an error instead of a receipt when the artifact cannot be written", async () => {
 		using dir = TempDir.createSync("@omp-artifact-receipt-fail-");
 		// A file where the artifacts dir should be: every write below it fails.
@@ -66,21 +90,19 @@ describe("task-result envelope", () => {
 		mergeSummary: "",
 	};
 
-	it("publishes the verified artifact URI, size, and hash", () => {
+	it("publishes the verified artifact URI, exact byte count, and hash", () => {
 		const rendered = prompt.render(taskSummaryTemplate, {
 			...base,
 			truncated: true,
 			artifact: {
 				uri: "agent://Auditor",
 				sha256: "d1e8a0b3c5f2",
-				size: "12.4 KB",
+				bytes: 12697,
 				lineCount: 214,
 			},
 		});
 
-		expect(rendered).toContain(
-			'<artifact uri="agent://Auditor" bytes="12.4 KB" lines="214" sha256="d1e8a0b3c5f2" />',
-		);
+		expect(rendered).toContain('<artifact uri="agent://Auditor" bytes="12697" lines="214" sha256="d1e8a0b3c5f2" />');
 		expect(rendered).toContain('<preview full-output="agent://Auditor">');
 		expect(rendered).not.toContain("<artifact-unavailable>");
 	});

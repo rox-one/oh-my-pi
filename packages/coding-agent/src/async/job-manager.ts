@@ -32,7 +32,22 @@ interface PollEscalationState {
 /** Kind of work a managed job runs; drives job-row badges and delivery labels. */
 export type AsyncJobType = "bash" | "task" | "eval";
 
-export interface AsyncJob {
+/** Receipt for task output that the executor verified before publication. */
+export interface AsyncJobArtifactReceipt {
+	uri: string;
+	sha256: string;
+	bytes: number;
+	lineCount: number;
+	charCount: number;
+}
+
+/** Artifact publication outcome retained with a task job until eviction. */
+export interface AsyncJobArtifactOutcome {
+	outputMeta?: AsyncJobArtifactReceipt;
+	artifactError?: string;
+}
+
+export interface AsyncJob extends AsyncJobArtifactOutcome {
 	id: string;
 	type: AsyncJobType;
 	status: "running" | "completed" | "failed" | "cancelled";
@@ -297,6 +312,22 @@ export class AsyncJobManager {
 
 	getJob(id: string): AsyncJob | undefined {
 		return this.#jobs.get(id);
+	}
+
+	/** Retain a task artifact outcome only when its receipt names this job's agent. */
+	setTaskArtifactOutcome(id: string, outcome: AsyncJobArtifactOutcome): void {
+		const job = this.#jobs.get(id);
+		if (job?.type !== "task") return;
+
+		const receipt = outcome.outputMeta;
+		const agentId = job.agentId ?? job.id;
+		if (receipt && receipt.uri !== `agent://${agentId}`) {
+			job.outputMeta = undefined;
+			job.artifactError = outcome.artifactError ?? `artifact receipt does not match ${agentId}`;
+			return;
+		}
+		job.outputMeta = receipt;
+		job.artifactError = outcome.artifactError;
 	}
 
 	getRunningJobs(filter?: AsyncJobFilter): AsyncJob[] {

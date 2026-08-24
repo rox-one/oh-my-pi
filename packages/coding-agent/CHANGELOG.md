@@ -694,6 +694,8 @@
 - Fixed fast tool completions leaving a permanent running summary that blocked transcript retirement and squeezed later tool output.
 - Fixed `omp git` hunk navigation (`alt+↓`/`alt+↑`) appearing to do nothing while the file sidebar had focus: the diff cursor band now stays visible (dimmed) when the pane is unfocused.
 - Fixed the git TUI sidebar jumping back to the top of the file list after staging or unstaging a file; selection now stays on the nearest remaining row
+- Fixed background task output links so `agent://<id>` is only offered after the artifact is verified, while failed writes remain readable through `hub wait`.
+- Preserved embedded MCP resource blobs in tool results.
 
 ## [18.0.4] - 2026-08-24
 

@@ -26,7 +26,7 @@ import taskSummaryTemplate from "../prompts/tools/task-summary.md" with { type: 
 import { TASK_EFFORTS, type TaskEffort } from "../thinking";
 import { truncateForPrompt } from "../tools/approval";
 import { isIrcEnabled } from "../tools/hub";
-import { formatBytes, formatDuration } from "../tools/render-utils";
+import { formatDuration } from "../tools/render-utils";
 import { isReadOnlyAgent } from "./read-only-policy";
 import { isScoutSpawnable, resolveSpawnPolicy } from "./spawn-policy";
 import {
@@ -1181,6 +1181,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					);
 					const finalText = result.content.find(part => part.type === "text")?.text ?? "(no output)";
 					const singleResult = result.details?.results[0];
+					if (singleResult) manager.setTaskArtifactOutcome(agentId, singleResult);
 					// A missing result means the sync path failed at the tool level
 					// (results: []) — treat it as a failure, not success.
 					const resultFailed = !singleResult || (singleResult.aborted ?? false) || singleResult.exitCode !== 0;
@@ -1526,7 +1527,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				? {
 						uri: result.outputMeta.uri,
 						sha256: result.outputMeta.sha256,
-						size: formatBytes(result.outputMeta.bytes),
+						bytes: result.outputMeta.bytes,
 						lineCount: result.outputMeta.lineCount,
 					}
 				: undefined,

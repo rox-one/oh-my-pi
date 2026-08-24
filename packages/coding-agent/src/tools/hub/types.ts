@@ -5,7 +5,7 @@
  */
 
 import type { AgentToolResult } from "@oh-my-pi/pi-agent-core";
-import type { AsyncJobType } from "../../async";
+import type { AsyncJobArtifactReceipt, AsyncJobType } from "../../async";
 import type { IrcDeliveryReceipt, IrcMessage } from "../../irc/bus";
 import type { LaunchParams, LaunchToolDetails } from "./launch";
 
@@ -51,6 +51,10 @@ export interface JobSnapshot {
 	resolvedModel?: string;
 	resultText?: string;
 	errorText?: string;
+	/** Verified task artifact receipt. Its absence means callers must retrieve the retained job body with `wait`. */
+	outputMeta?: AsyncJobArtifactReceipt;
+	/** Why no verified artifact receipt was published for a task result. */
+	artifactError?: string;
 }
 
 export type CancelStatus = "cancelled" | "not_found" | "already_completed";

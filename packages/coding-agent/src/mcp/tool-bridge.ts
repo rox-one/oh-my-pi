@@ -257,13 +257,15 @@ function formatMCPContent(content: MCPContent[]): Array<TextContent | ImageConte
 				flushText();
 				blocks.push(item);
 				break;
-			case "resource":
+			case "resource": {
+				const payload = item.resource.text ?? item.resource.blob;
 				appendText(
-					item.resource.text
-						? `[Resource: ${item.resource.uri}]\n${item.resource.text}`
-						: `[Resource: ${item.resource.uri}]`,
+					payload === undefined
+						? `[Resource: ${item.resource.uri}]`
+						: `[Resource: ${item.resource.uri}]\n${payload}`,
 				);
 				break;
+			}
 		}
 	}
 	flushText();

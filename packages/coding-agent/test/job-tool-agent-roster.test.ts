@@ -142,8 +142,17 @@ describe("hub jobs snapshot", () => {
 		const evalBody = "unrelated eval body: 4181 rows scanned, 12 anomalies";
 		const taskBody = "full task report body";
 		manager.register("eval", "Eval-1", async () => evalBody, { id: "Eval-1", ownerId: "Main" });
-		manager.register("task", "Auditor", async () => taskBody, { id: "Auditor", ownerId: "Main" });
+		manager.register("task", "Auditor", async () => taskBody, { id: "Auditor", agentId: "Auditor", ownerId: "Main" });
 		await manager.waitForAll();
+		manager.setTaskArtifactOutcome("Auditor", {
+			outputMeta: {
+				uri: "agent://Auditor",
+				sha256: "a".repeat(64),
+				bytes: Buffer.byteLength(taskBody, "utf8"),
+				lineCount: 1,
+				charCount: taskBody.length,
+			},
+		});
 
 		const result = await new HubTool(createToolSession({ manager, agentId: "Main" })).execute("call", { op: "jobs" });
 		const text = resultText(result);

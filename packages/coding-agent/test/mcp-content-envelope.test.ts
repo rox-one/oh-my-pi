@@ -5,8 +5,10 @@
  * the compact metadata builder used by its details envelope.
  */
 import { describe, expect, it } from "bun:test";
-import { summarizeMCPContent } from "@oh-my-pi/pi-coding-agent/mcp/tool-bridge";
-import type { MCPContent, MCPImageContent } from "@oh-my-pi/pi-coding-agent/mcp/types";
+import type { CustomToolContext } from "@oh-my-pi/pi-coding-agent/extensibility/custom-tools";
+import { MCPTool, summarizeMCPContent } from "@oh-my-pi/pi-coding-agent/mcp/tool-bridge";
+import type { MCPContent, MCPImageContent, MCPToolDefinition } from "@oh-my-pi/pi-coding-agent/mcp/types";
+import { createMockConnection, createMockTransport } from "./mcp-test-utils";
 
 describe("MCP result envelope", () => {
 	it("describes each block instead of duplicating its payload", () => {
@@ -46,5 +48,38 @@ describe("MCP result envelope", () => {
 			},
 		]);
 		expect(JSON.stringify(details)).not.toContain(resourceText);
+	});
+
+	it("keeps an embedded resource blob in canonical tool content", async () => {
+		const blob = "AAECAwQ=";
+		const definition: MCPToolDefinition = {
+			name: "read_binary",
+			inputSchema: { type: "object" },
+		};
+		const transport = createMockTransport(
+			new Map([
+				[
+					"tools/call",
+					[
+						{
+							content: [
+								{
+									type: "resource",
+									resource: { uri: "test://binary", mimeType: "application/octet-stream", blob },
+								},
+							],
+						},
+					],
+				],
+			]),
+		);
+		const tool = new MCPTool(createMockConnection({ tools: {} }, transport), definition);
+
+		// SAFETY: empty arguments contain no local URL, so this execution reads no context fields.
+		const context = {} as CustomToolContext;
+		const result = await tool.execute("call-1", {}, undefined, context);
+
+		expect(result.content).toEqual([{ type: "text", text: "[Resource: test://binary]\nAAECAwQ=" }]);
+		expect(JSON.stringify(result.details)).not.toContain(blob);
 	});
 });

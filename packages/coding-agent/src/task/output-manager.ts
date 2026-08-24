@@ -43,8 +43,9 @@ export type AgentOutputWriteResult =
 	| { readonly ok: false; readonly error: string };
 
 /**
- * Write `<artifactsDir>/<id>.md` and verify it by reading the bytes back and
- * comparing length + SHA-256 against what was meant to land there.
+ * Write a sibling temporary file, verify it by reading the bytes back, then
+ * atomically replace `<artifactsDir>/<id>.md`. Verification compares length
+ * and SHA-256 against what was meant to land there.
  *
  * Callers MUST treat a non-`ok` result as "no artifact exists": advertising
  * the path anyway is what let a completed task point at an unreadable file
@@ -56,10 +57,11 @@ export async function writeVerifiedAgentOutput(
 	text: string,
 ): Promise<AgentOutputWriteResult> {
 	const target = path.join(artifactsDir, `${id}.md`);
+	const temporary = path.join(artifactsDir, `.${id}.${crypto.randomUUID()}.tmp`);
 	const expected = Buffer.from(text, "utf8");
 	try {
-		await Bun.write(target, expected);
-		const actual = await Bun.file(target).bytes();
+		await Bun.write(temporary, expected);
+		const actual = await Bun.file(temporary).bytes();
 		const sha256 = new Bun.CryptoHasher("sha256").update(actual).digest("hex");
 		const expectedSha256 = new Bun.CryptoHasher("sha256").update(expected).digest("hex");
 		if (actual.byteLength !== expected.byteLength || sha256 !== expectedSha256) {
@@ -68,6 +70,7 @@ export async function writeVerifiedAgentOutput(
 				error: `artifact readback mismatch for ${id}.md (wrote ${expected.byteLength} bytes, read ${actual.byteLength})`,
 			};
 		}
+		await fs.rename(temporary, target);
 		return {
 			ok: true,
 			artifact: {
@@ -81,6 +84,8 @@ export async function writeVerifiedAgentOutput(
 		};
 	} catch (error) {
 		return { ok: false, error: error instanceof Error ? error.message : String(error) };
+	} finally {
+		await fs.rm(temporary, { force: true }).catch(() => {});
 	}
 }
 

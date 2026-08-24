@@ -7,7 +7,7 @@
 import type { AgentToolResult } from "@oh-my-pi/pi-agent-core";
 import type { Component } from "@oh-my-pi/pi-tui";
 import { Text } from "@oh-my-pi/pi-tui";
-import type { AsyncJob, AsyncJobManager, AsyncJobType } from "../../async";
+import type { AsyncJob, AsyncJobManager } from "../../async";
 import { settings } from "../../config/settings";
 import type { RenderResultOptions } from "../../extensibility/custom-tools/types";
 import { shimmerEnabled, shimmerText } from "../../modes/theme/shimmer";
@@ -149,6 +149,15 @@ function describeAgents(agents: AgentActivitySnapshot[]): string[] {
  * large one it should go fetch.
  */
 function describeWithheldBody(job: JobSnapshot): string {
+	if (job.type === "task") {
+		if (job.outputMeta) {
+			return ` — artifact ${job.outputMeta.bytes} B at \`${job.outputMeta.uri}\``;
+		}
+		const body = job.resultText ?? job.errorText;
+		if (body) {
+			return ` — result ${Buffer.byteLength(body, "utf8")} B, read it with \`wait\` on this id`;
+		}
+	}
 	const error = job.errorText?.trim();
 	if (error) {
 		const firstLine = error.split("\n", 1)[0] ?? error;
@@ -156,23 +165,26 @@ function describeWithheldBody(job: JobSnapshot): string {
 	}
 	const bytes = job.resultText ? Buffer.byteLength(job.resultText, "utf8") : 0;
 	if (bytes === 0) return " — empty result";
-	return job.type === "task"
-		? ` — result ${bytes} B at \`agent://${job.id}\``
-		: ` — result ${bytes} B, read it with \`wait\` on this id`;
+	return ` — result ${bytes} B, read it with \`wait\` on this id`;
 }
 
-interface TrackedJobLike {
-	id: string;
-	type: AsyncJobType;
-	status: string;
-	label: string;
-	startTime: number;
-	latestDetails?: Record<string, unknown>;
-	resultText?: string;
-	errorText?: string;
-}
+type TrackedJobLike = Pick<
+	AsyncJob,
+	| "id"
+	| "type"
+	| "status"
+	| "label"
+	| "startTime"
+	| "latestDetails"
+	| "resultText"
+	| "errorText"
+	| "outputMeta"
+	| "artifactError"
+>;
 
-export function snapshotJobs(session: ToolSession, jobs: TrackedJobLike[]): JobSnapshot[] {
+type JobSnapshotSession = Pick<ToolSession, "asyncJobManager">;
+
+export function snapshotJobs(session: JobSnapshotSession, jobs: TrackedJobLike[]): JobSnapshot[] {
 	const now = Date.now();
 	return jobs.map(j => {
 		const current = session.asyncJobManager?.getJob(j.id);
@@ -198,21 +210,26 @@ export function snapshotJobs(session: ToolSession, jobs: TrackedJobLike[]): JobS
 				}
 			}
 		}
-		return {
+		const snapshot: JobSnapshot = {
 			id: latest.id,
 			type: latest.type,
-			status: latest.status as JobSnapshot["status"],
+			status: latest.status,
 			label: latest.label,
 			durationMs: Math.max(0, now - latest.startTime),
-			...(resolvedModel ? { resolvedModel } : {}),
-			...(latest.resultText ? { resultText: latest.resultText } : {}),
-			...(latest.errorText ? { errorText: latest.errorText } : {}),
 		};
+		if (resolvedModel) snapshot.resolvedModel = resolvedModel;
+		if (latest.resultText) snapshot.resultText = latest.resultText;
+		if (latest.errorText) snapshot.errorText = latest.errorText;
+		if (latest.type === "task") {
+			if (latest.outputMeta) snapshot.outputMeta = latest.outputMeta;
+			if (latest.artifactError) snapshot.artifactError = latest.artifactError;
+		}
+		return snapshot;
 	});
 }
 
 export function buildJobResult(
-	session: ToolSession,
+	session: JobSnapshotSession,
 	manager: AsyncJobManager,
 	op: "wait" | "cancel" | "jobs",
 	jobs: TrackedJobLike[],
@@ -271,7 +288,7 @@ export function buildJobResult(
 		if (!deliversResults) {
 			lines.push("");
 			lines.push(
-				"Bodies are withheld from this status poll. A task's full output is at `agent://<id>` (`history://<id>` for its transcript); for any other job read the body with `wait` on that id.",
+				"Bodies are withheld from this status poll. Read tasks with a verified artifact at `agent://<id>` (`history://<id>` for its transcript); read every other body with `wait` on that id.",
 			);
 		}
 	}
