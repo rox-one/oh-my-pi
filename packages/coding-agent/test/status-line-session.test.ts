@@ -29,4 +29,11 @@ describe("session status-line segment", () => {
 	it("honors the configured session prefix length", () => {
 		expect(renderSessionId("01a03242-993e-73f7-9bb9-4be42368e12f", 16)).toBe("01a03242-993e-73");
 	});
+
+	it("clamps non-positive prefix lengths to one character", () => {
+		const sessionId = "01a03242-993e-73f7-9bb9-4be42368e12f";
+
+		expect(renderSessionId(sessionId, 0)).toBe("0");
+		expect(renderSessionId(sessionId, -1)).toBe("0");
+	});
 });
