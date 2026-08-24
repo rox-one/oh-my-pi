@@ -3,6 +3,8 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import path from "node:path";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { AgentProtocolHandler } from "@oh-my-pi/pi-coding-agent/internal-urls/agent-protocol";
+import { parseInternalUrl } from "@oh-my-pi/pi-coding-agent/internal-urls/parse";
 import {
 	artifactsDirsFromRegistry,
 	resetRegisteredArtifactDirsForTests,
@@ -11,6 +13,7 @@ import * as planHandoff from "@oh-my-pi/pi-coding-agent/plan-mode/plan-handoff";
 import * as discoveryModule from "@oh-my-pi/pi-coding-agent/task/discovery";
 import * as executorModule from "@oh-my-pi/pi-coding-agent/task/executor";
 import * as isolationRunner from "@oh-my-pi/pi-coding-agent/task/isolation-runner";
+import { writeVerifiedAgentOutput } from "@oh-my-pi/pi-coding-agent/task/output-manager";
 import {
 	buildStructuredSubagentRecoveryHint,
 	resolveEffectiveSubagentPolicy,
@@ -349,6 +352,29 @@ describe("structured subagent primitive", () => {
 			data: { ok: true },
 		});
 		expect(path.basename(settled.artifactsDir)).toStartWith("omp-task-");
+		await fs.rm(settled.artifactsDir, { recursive: true, force: true });
+	});
+
+	it("keeps a nonpersistent task artifact lease while its verified URI is published", async () => {
+		mockDiscovery();
+		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => {
+			if (!options.artifactsDir) throw new Error("artifactsDir missing");
+			const written = await writeVerifiedAgentOutput(options.artifactsDir, options.id, "published output");
+			if (!written.ok) throw new Error(written.error);
+			return {
+				...result(),
+				id: options.id,
+				output: "published output",
+				outputMeta: written.artifact,
+				outputPath: written.artifact.path,
+			};
+		});
+
+		const settled = await runStructuredSubagent(request());
+		const resource = await new AgentProtocolHandler().resolve(parseInternalUrl(`agent://${settled.result.id}`));
+
+		expect(settled.temporaryArtifacts).toBe(true);
+		expect(resource.content).toBe("published output");
 		await fs.rm(settled.artifactsDir, { recursive: true, force: true });
 	});
 	it("uses identical non-plan LSP and IRC policy for task and eval invocations", async () => {
