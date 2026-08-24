@@ -5627,11 +5627,13 @@ export class AgentSession {
 
 	/** Formats a model-facing reference for a registered session tool. */
 	getToolReference(name: string): string {
+		const direct = this.getActiveToolNames().includes(name);
+		if (!direct && this.getMountedXdevToolNames().includes(name)) return name;
 		const tool = this.#tools.registry.get(name);
 		return formatCodeModeToolReference({
 			name,
 			wireName: tool?.customWireName,
-			direct: this.getActiveToolNames().includes(name),
+			direct,
 		});
 	}
 
