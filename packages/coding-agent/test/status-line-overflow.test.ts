@@ -10,9 +10,10 @@ import { renderSegment } from "@oh-my-pi/pi-coding-agent/modes/components/status
 import { initTheme, theme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 import { getSessionAccentAnsi, getSessionAccentHex } from "@oh-my-pi/pi-coding-agent/utils/session-color";
 import { visibleWidth } from "@oh-my-pi/pi-tui";
-import { getProjectDir, setProfile, setProjectDir } from "@oh-my-pi/pi-utils";
+import { getActiveProfile, getProjectDir, setProfile, setProjectDir } from "@oh-my-pi/pi-utils";
 
 const originalProjectDir = getProjectDir();
+const originalProfile = getActiveProfile();
 
 beforeAll(async () => {
 	resetSettingsForTest();
@@ -22,7 +23,7 @@ beforeAll(async () => {
 
 afterAll(() => {
 	resetSettingsForTest();
-	setProfile(undefined);
+	setProfile(originalProfile);
 	setProjectDir(originalProjectDir);
 });
 
@@ -211,6 +212,15 @@ describe("profile status-line segment", () => {
 		expect(stripAnsi(seg.content)).toBe("p:work");
 		setProfile(undefined);
 	});
+
+	it("bounds long profile labels for narrow status lines", () => {
+		setProfile(`profile-${"x".repeat(56)}`);
+		const seg = renderSegment("profile", createCtx());
+		expect(seg.visible).toBe(true);
+		expect(visibleWidth(seg.content)).toBeLessThanOrEqual(40);
+		expect(stripAnsi(seg.content)).toEndWith("…");
+		setProfile(undefined);
+	});
 });
 
 describe("token_total breakdown", () => {
@@ -235,6 +245,21 @@ describe("token_total breakdown", () => {
 
 		expect(seg.visible).toBe(true);
 		expect(stripAnsi(seg.content)).toBe("in:25K out:5");
+	});
+
+	it("fails closed for a non-boolean breakdown value", () => {
+		const seg = renderSegment("token_total", {
+			...createCtx(),
+			options: { token_total: { breakdown: "false" } },
+			usageStats: {
+				...createCtx().usageStats,
+				input: 25,
+				output: 5,
+			},
+		} as unknown as SegmentContext);
+
+		expect(stripAnsi(seg.content)).not.toContain("in:");
+		expect(stripAnsi(seg.content)).not.toContain("out:");
 	});
 });
 

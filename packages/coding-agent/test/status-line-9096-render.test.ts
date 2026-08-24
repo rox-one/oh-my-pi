@@ -3,7 +3,9 @@ import { stripVTControlCharacters } from "node:util";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { StatusLineComponent } from "@oh-my-pi/pi-coding-agent/modes/components/status-line";
 import { initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
-import { setProfile } from "@oh-my-pi/pi-utils";
+import { getActiveProfile, setProfile } from "@oh-my-pi/pi-utils";
+
+const originalProfile = getActiveProfile();
 
 beforeAll(async () => {
 	resetSettingsForTest();
@@ -12,7 +14,7 @@ beforeAll(async () => {
 });
 
 afterAll(() => {
-	setProfile(undefined);
+	setProfile(originalProfile);
 	resetSettingsForTest();
 });
 

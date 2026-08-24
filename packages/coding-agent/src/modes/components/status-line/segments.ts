@@ -358,7 +358,8 @@ const profileSegment: StatusLineSegment = {
 		const profile = getActiveProfile();
 		if (!profile) return { content: "", visible: false };
 
-		const content = `p:${sanitizeStatusText(profile)}`;
+		const label = truncateToWidth(sanitizeStatusText(profile), TRUNCATE_LENGTHS.SHORT - 2);
+		const content = `p:${label}`;
 		return { content: theme.fg("accent", content), visible: true };
 	},
 };
@@ -475,7 +476,7 @@ const tokenTotalSegment: StatusLineSegment = {
 		const total = input + output + cacheWrite + orchestrationInput + orchestrationOutput;
 		if (!total) return { content: "", visible: false };
 
-		if (ctx.options.token_total?.breakdown) {
+		if (ctx.options.token_total?.breakdown === true) {
 			const inTotal = input + cacheWrite + orchestrationInput;
 			const outTotal = output + orchestrationOutput;
 			const parts: string[] = [];
