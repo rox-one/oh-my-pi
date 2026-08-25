@@ -8655,29 +8655,30 @@ export class AgentSession {
 
 	/**
 	 * Set steering mode.
-	 * Saves to settings.
+	 * Saves to settings unless `persist` is false — reload reconciliation must
+	 * apply an overlay-provided value without promoting it into global config.
 	 */
-	setSteeringMode(mode: "all" | "one-at-a-time"): void {
+	setSteeringMode(mode: "all" | "one-at-a-time", persist: boolean = true): void {
 		this.agent.setSteeringMode(mode);
-		this.settings.set("steeringMode", mode);
+		if (persist) this.settings.set("steeringMode", mode);
 	}
 
 	/**
 	 * Set follow-up mode.
-	 * Saves to settings.
+	 * Saves to settings unless `persist` is false (see {@link setSteeringMode}).
 	 */
-	setFollowUpMode(mode: "all" | "one-at-a-time"): void {
+	setFollowUpMode(mode: "all" | "one-at-a-time", persist: boolean = true): void {
 		this.agent.setFollowUpMode(mode);
-		this.settings.set("followUpMode", mode);
+		if (persist) this.settings.set("followUpMode", mode);
 	}
 
 	/**
 	 * Set interrupt mode.
-	 * Saves to settings.
+	 * Saves to settings unless `persist` is false (see {@link setSteeringMode}).
 	 */
-	setInterruptMode(mode: "immediate" | "wait"): void {
+	setInterruptMode(mode: "immediate" | "wait", persist: boolean = true): void {
 		this.agent.setInterruptMode(mode);
-		this.settings.set("interruptMode", mode);
+		if (persist) this.settings.set("interruptMode", mode);
 	}
 
 	/**
@@ -11703,6 +11704,18 @@ export class AgentSession {
 	 */
 	setAdvisorEnabled(enabled: boolean): boolean {
 		return this.#advisors.setAdvisorEnabled(enabled);
+	}
+
+	/**
+	 * Re-resolves role-driven consumers (advisors) against the current registry.
+	 * A reload that changes role assignments resolves them against whatever
+	 * catalog is loaded at signal time; call this after `refreshModels()` so a
+	 * consumer that recorded `no_model` during the stale window heals without
+	 * waiting for the next role change.
+	 */
+	reapplyModelRoles(): void {
+		if (this.#isDisposed) return;
+		this.#advisors.onModelRolesChanged();
 	}
 
 	/**

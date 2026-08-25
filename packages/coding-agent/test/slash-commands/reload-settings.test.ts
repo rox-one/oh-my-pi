@@ -44,8 +44,9 @@ describe("/reload-settings slash command", () => {
 		output: Mock<(message?: string) => void>;
 		notifyConfigChanged: Mock<() => void>;
 		refreshModels: Mock<() => Promise<void>>;
+		reapplyModelRoles: Mock<() => void>;
 		setAdvisorEnabled: Mock<(enabled: boolean) => void>;
-		setSteeringMode: Mock<(mode: "all" | "one-at-a-time") => void>;
+		setSteeringMode: Mock<(mode: "all" | "one-at-a-time", persist?: boolean) => void>;
 	}
 
 	async function runCommand(
@@ -57,10 +58,12 @@ describe("/reload-settings slash command", () => {
 		const output = vi.fn();
 		const notifyConfigChanged = vi.fn();
 		const refreshModels = vi.fn(async () => {});
+		const reapplyModelRoles = vi.fn();
 		const setAdvisorEnabled = vi.fn();
 		const setSteeringMode = vi.fn();
 		const session = {
 			refreshModels,
+			reapplyModelRoles,
 			isAdvisorEnabled: () => true,
 			setAdvisorEnabled,
 			steeringMode: "one-at-a-time",
@@ -86,6 +89,7 @@ describe("/reload-settings slash command", () => {
 			output,
 			notifyConfigChanged,
 			refreshModels: session.refreshModels as unknown as Mock<() => Promise<void>>,
+			reapplyModelRoles,
 			setAdvisorEnabled,
 			setSteeringMode,
 		};
@@ -163,26 +167,39 @@ describe("/reload-settings slash command", () => {
 		expect(output).toHaveBeenCalledWith(expect.stringContaining("No effective values changed"));
 	});
 
-	it("refreshes the catalog before the settings reload so role signals resolve against new models", async () => {
+	it("reloads settings before refreshing the catalog so provider discovery sees the new disabled set", async () => {
 		await writeSettings({ advisor: { syncBacklog: "1" } });
 		const settings = await Settings.init({ cwd: projectDir, agentDir });
 		const reloadSpy = vi.spyOn(settings, "reloadFromDisk");
 
 		const { refreshModels } = await runCommand(settings);
-		expect(refreshModels.mock.invocationCallOrder[0]).toBeLessThan(reloadSpy.mock.invocationCallOrder[0]);
+		expect(reloadSpy.mock.invocationCallOrder[0]).toBeLessThan(refreshModels.mock.invocationCallOrder[0]);
 	});
 
-	it("reconciles session-owned advisor and queue-mode settings from the reloaded values", async () => {
+	it("re-resolves role consumers after the catalog refresh", async () => {
+		await writeSettings({ advisor: { syncBacklog: "1" } });
+		const settings = await Settings.init({ cwd: projectDir, agentDir });
+
+		const { refreshModels, reapplyModelRoles } = await runCommand(settings);
+		expect(reapplyModelRoles).toHaveBeenCalled();
+		expect(reapplyModelRoles.mock.invocationCallOrder[0]).toBeGreaterThan(refreshModels.mock.invocationCallOrder[0]);
+	});
+
+	it("reconciles session-owned advisor and queue-mode settings without promoting them into config", async () => {
 		await writeSettings({ advisor: { enabled: false, syncBacklog: "1" }, steeringMode: "one-at-a-time" });
 		const settings = await Settings.init({ cwd: projectDir, agentDir });
 		await writeSettings({ advisor: { enabled: true, syncBacklog: "1" }, steeringMode: "all" });
+		const setSpy = vi.spyOn(settings, "set");
 
 		const { setAdvisorEnabled, setSteeringMode, output } = await runCommand(settings, {
 			isAdvisorEnabled: () => false,
 			steeringMode: "one-at-a-time",
 		});
 		expect(setAdvisorEnabled).toHaveBeenCalledWith(true);
-		expect(setSteeringMode).toHaveBeenCalledWith("all");
+		expect(setSteeringMode).toHaveBeenCalledWith("all", false);
+		for (const [key] of setSpy.mock.calls) {
+			expect(["steeringMode", "followUpMode", "interruptMode"]).not.toContain(key);
+		}
 		expect(output).toHaveBeenCalledWith(expect.stringContaining("advisor.enabled"));
 	});
 

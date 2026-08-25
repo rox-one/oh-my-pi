@@ -341,6 +341,17 @@ export async function executeBuiltinSlashCommand(
 			},
 			refreshCommands: () => ctx.refreshSlashCommandState(),
 			reloadPlugins: () => reloadTuiPluginState(ctx),
+			notifyConfigChanged: async () => {
+				// Replay the settings components cache at construction; a layer swap
+				// alone leaves them stale until the next editor swap.
+				ctx.editor.setImeSafeCursorLayout(ctx.settings.get("tui.imeSafeCursor"));
+				const maxVisible = ctx.settings.get("autocompleteMaxVisible");
+				ctx.editor.setAutocompleteMaxVisible(
+					typeof maxVisible === "number" ? maxVisible : Number(maxVisible),
+				);
+				ctx.syncEditorSpelling();
+				ctx.ui.requestRender();
+			},
 		};
 		const result = await command.handle(parsed, adapted);
 		ctx.editor.setText("");

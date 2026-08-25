@@ -13,23 +13,27 @@ export const BUILTIN_SETTINGS_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = 
 			for (const key of Object.keys(SETTINGS_SCHEMA) as SettingPath[]) {
 				before.set(key, runtime.settings.get(key));
 			}
-			// Refresh the catalog BEFORE the settings reload: reloadFromDisk fires
-			// the modelRoles signal, and consumers such as SessionAdvisors resolve
-			// the new role against the registry immediately. The registry must
-			// already contain models added in the same edit, or the new role
-			// records `no_model` and stays inactive until the next role change.
+			await runtime.settings.reloadFromDisk();
+			await runtime.notifyConfigChanged?.();
+			// Refresh AFTER the settings reload so provider discovery sees the new
+			// disabled-provider set: an edit that enables a discovery-backed
+			// provider must surface its models in the same reload. Then re-resolve
+			// role consumers — the reload's modelRoles signal fired against the
+			// pre-refresh registry, so an advisor may have recorded no_model for a
+			// role that resolves fine now.
 			let modelsFailure: string | undefined;
 			try {
 				await runtime.session?.refreshModels();
 			} catch (error) {
 				modelsFailure = error instanceof Error ? error.message : String(error);
 			}
-			await runtime.settings.reloadFromDisk();
-			await runtime.notifyConfigChanged?.();
+			runtime.session?.reapplyModelRoles();
 			// Reconcile session-owned settings the reload cannot reach on its own:
 			// the live session snapshots these at construction (agent/SDK fields),
 			// so settings.get() alone would report them applied without changing
-			// actual behavior.
+			// actual behavior. persist=false — the value may come from a project
+			// or --config overlay, and writing it through settings.set would
+			// promote an overlay-only value into global config.
 			if (runtime.session) {
 				const nextAdvisorEnabled = runtime.settings.get("advisor.enabled");
 				if (runtime.session.isAdvisorEnabled() !== nextAdvisorEnabled) {
@@ -37,15 +41,15 @@ export const BUILTIN_SETTINGS_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = 
 				}
 				const nextSteeringMode = runtime.settings.get("steeringMode");
 				if (runtime.session.steeringMode !== nextSteeringMode) {
-					runtime.session.setSteeringMode(nextSteeringMode);
+					runtime.session.setSteeringMode(nextSteeringMode, false);
 				}
 				const nextFollowUpMode = runtime.settings.get("followUpMode");
 				if (runtime.session.followUpMode !== nextFollowUpMode) {
-					runtime.session.setFollowUpMode(nextFollowUpMode);
+					runtime.session.setFollowUpMode(nextFollowUpMode, false);
 				}
 				const nextInterruptMode = runtime.settings.get("interruptMode");
 				if (runtime.session.interruptMode !== nextInterruptMode) {
-					runtime.session.setInterruptMode(nextInterruptMode);
+					runtime.session.setInterruptMode(nextInterruptMode, false);
 				}
 			}
 
