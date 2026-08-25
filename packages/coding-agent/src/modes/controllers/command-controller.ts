@@ -1111,11 +1111,12 @@ export class CommandController {
 			return;
 		}
 		if (!(await this.ctx.applyCwdChange(resolvedPath))) {
-			// Restore the captured manager state instead of re-running a forward
-			// move: moveTo rewrites the header and filters its target from
-			// additionalDirectories, so a rollback "move back" would permanently
-			// drop a workspace root equal to the previous cwd.
+			// moveTo already renamed the session and artifacts into the target
+			// bucket, so an in-memory restore alone orphans the transcript on
+			// disk. Invert the relocation with an explicit session dir, then
+			// restore the captured metadata (additional roots, header cwd).
 			try {
+				await this.ctx.session.moveSession(previousState.cwd, previousState.sessionDir);
 				this.ctx.sessionManager.restoreState(previousState);
 			} catch (err) {
 				this.ctx.showError(`Failed to roll back move: ${err instanceof Error ? err.message : String(err)}`);
@@ -1220,6 +1221,7 @@ export class CommandController {
 			return;
 		}
 		try {
+			await this.ctx.sessionManager.moveTo(previousState.cwd, previousState.sessionDir);
 			this.ctx.sessionManager.restoreState(previousState);
 		} catch (err) {
 			this.ctx.showError(`Failed to roll back move: ${err instanceof Error ? err.message : String(err)}`);
