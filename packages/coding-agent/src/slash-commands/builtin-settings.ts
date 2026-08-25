@@ -1,6 +1,15 @@
 import { SETTINGS_SCHEMA, type SettingPath } from "../config/settings";
 import type { SlashCommandSpec } from "./types";
 
+/**
+ * Maps a sampling setting value to the agent-field form: negative sentinels
+ * mean provider default and clear the field.
+ */
+function optionalNumber(raw: unknown): number | undefined {
+	const num = typeof raw === "number" ? raw : Number(raw);
+	return num >= 0 ? num : undefined;
+}
+
 export const BUILTIN_SETTINGS_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 	{
 		name: "reload-settings",
@@ -50,6 +59,39 @@ export const BUILTIN_SETTINGS_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = 
 				const nextInterruptMode = runtime.settings.get("interruptMode");
 				if (runtime.session.interruptMode !== nextInterruptMode) {
 					runtime.session.setInterruptMode(nextInterruptMode, false);
+				}
+				// Agent-owned request options: written through agent fields (never
+				// persisted), read per request by the SDK in every mode, so this
+				// reconcile is mode-independent. Negative settings values mean
+				// provider default and clear the field.
+				const agent = runtime.session.agent;
+				const nextTemperature = optionalNumber(runtime.settings.get("temperature"));
+				if (agent.temperature !== nextTemperature) {
+					agent.temperature = nextTemperature;
+				}
+				const nextTopP = optionalNumber(runtime.settings.get("topP"));
+				if (agent.topP !== nextTopP) {
+					agent.topP = nextTopP;
+				}
+				const nextTopK = optionalNumber(runtime.settings.get("topK"));
+				if (agent.topK !== nextTopK) {
+					agent.topK = nextTopK;
+				}
+				const nextMinP = optionalNumber(runtime.settings.get("minP"));
+				if (agent.minP !== nextMinP) {
+					agent.minP = nextMinP;
+				}
+				const nextPresencePenalty = optionalNumber(runtime.settings.get("presencePenalty"));
+				if (agent.presencePenalty !== nextPresencePenalty) {
+					agent.presencePenalty = nextPresencePenalty;
+				}
+				const nextRepetitionPenalty = optionalNumber(runtime.settings.get("repetitionPenalty"));
+				if (agent.repetitionPenalty !== nextRepetitionPenalty) {
+					agent.repetitionPenalty = nextRepetitionPenalty;
+				}
+				const nextOmitThinking = runtime.settings.get("omitThinking");
+				if (agent.hideThinkingSummary !== nextOmitThinking) {
+					agent.hideThinkingSummary = nextOmitThinking;
 				}
 			}
 

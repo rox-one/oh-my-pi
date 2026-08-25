@@ -3,10 +3,15 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { clearCustomApis } from "@oh-my-pi/pi-ai/api-registry";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
+import type { SettingPath } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { REPLAYED_SETTING_IDS } from "@oh-my-pi/pi-coding-agent/modes/controllers/setting-side-effects";
 import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
-import { lookupBuiltinSlashCommand } from "@oh-my-pi/pi-coding-agent/slash-commands/builtin-registry";
+import {
+	executeBuiltinSlashCommand,
+	lookupBuiltinSlashCommand,
+} from "@oh-my-pi/pi-coding-agent/slash-commands/builtin-registry";
 import type { SlashCommandRuntime } from "@oh-my-pi/pi-coding-agent/slash-commands/types";
 import { getProjectAgentDir, TempDir } from "@oh-my-pi/pi-utils";
 import { YAML } from "bun";
@@ -47,6 +52,15 @@ describe("/reload-settings slash command", () => {
 		reapplyModelRoles: Mock<() => void>;
 		setAdvisorEnabled: Mock<(enabled: boolean) => void>;
 		setSteeringMode: Mock<(mode: "all" | "one-at-a-time", persist?: boolean) => void>;
+		agent: {
+			temperature?: number;
+			topP?: number;
+			topK?: number;
+			minP?: number;
+			presencePenalty?: number;
+			repetitionPenalty?: number;
+			hideThinkingSummary?: boolean;
+		};
 	}
 
 	async function runCommand(
@@ -61,6 +75,15 @@ describe("/reload-settings slash command", () => {
 		const reapplyModelRoles = vi.fn();
 		const setAdvisorEnabled = vi.fn();
 		const setSteeringMode = vi.fn();
+		const agentFields = {
+			temperature: undefined as number | undefined,
+			topP: undefined as number | undefined,
+			topK: undefined as number | undefined,
+			minP: undefined as number | undefined,
+			presencePenalty: undefined as number | undefined,
+			repetitionPenalty: undefined as number | undefined,
+			hideThinkingSummary: false as boolean | undefined,
+		};
 		const session = {
 			refreshModels,
 			reapplyModelRoles,
@@ -72,6 +95,7 @@ describe("/reload-settings slash command", () => {
 			setSteeringMode,
 			setFollowUpMode: vi.fn(),
 			setInterruptMode: vi.fn(),
+			agent: agentFields,
 			...sessionOverrides,
 		};
 		const runtime = {
@@ -92,6 +116,7 @@ describe("/reload-settings slash command", () => {
 			reapplyModelRoles,
 			setAdvisorEnabled,
 			setSteeringMode,
+			agent: agentFields,
 		};
 	}
 
@@ -227,5 +252,84 @@ describe("/reload-settings slash command", () => {
 		expect(settings.get("advisor.syncBacklog")).toBe("3");
 		const onDisk = YAML.parse(await Bun.file(configPath()).text());
 		expect((onDisk as { advisor: { syncBacklog: string } }).advisor.syncBacklog).toBe("3");
+	});
+	it("reconciles agent-owned request options without persisting them", async () => {
+		await writeSettings({ advisor: { syncBacklog: "1" }, temperature: -1, omitThinking: false });
+		const settings = await Settings.init({ cwd: projectDir, agentDir });
+		await writeSettings({ advisor: { syncBacklog: "1" }, temperature: 0.7, omitThinking: true });
+		const setSpy = vi.spyOn(settings, "set");
+
+		const { agent } = await runCommand(settings);
+		expect(agent.temperature).toBe(0.7);
+		expect(agent.hideThinkingSummary).toBe(true);
+		for (const [key] of setSpy.mock.calls) {
+			expect(["temperature", "omitThinking"]).not.toContain(key);
+		}
+	});
+
+	it("replays only ids that are valid setting paths", async () => {
+		const settings = await Settings.init({ cwd: projectDir, agentDir });
+		for (const id of REPLAYED_SETTING_IDS) {
+			expect(() => settings.get(id as SettingPath)).not.toThrow();
+		}
+	});
+
+	it("runs the full reload through the TUI adapter without aborting", async () => {
+		await writeSettings({ advisor: { syncBacklog: "1" }, autocompleteMaxVisible: 7 });
+		const settings = await Settings.init({ cwd: projectDir, agentDir });
+
+		const editorSetAutocomplete = vi.fn();
+		const ctx = {
+			session: {
+				refreshModels: vi.fn(async () => {}),
+				reapplyModelRoles: vi.fn(),
+				isAdvisorEnabled: () => true,
+				setAdvisorEnabled: vi.fn(),
+				steeringMode: "one-at-a-time",
+				followUpMode: "one-at-a-time",
+				interruptMode: "wait",
+				setSteeringMode: vi.fn(),
+				setFollowUpMode: vi.fn(),
+				setInterruptMode: vi.fn(),
+				setThinkingLevel: vi.fn(),
+				refreshBaseSystemPrompt: vi.fn(async () => {}),
+				applyMemoryBackend: vi.fn(async () => {}),
+				setThinkToolEnabled: vi.fn(async () => {}),
+				setAutoCompactionEnabled: vi.fn(),
+				agent: {},
+			},
+			sessionManager: { getCwd: () => projectDir },
+			settings,
+			ui: {
+				requestRender: vi.fn(),
+				invalidate: vi.fn(),
+				clearInlineImages: vi.fn(),
+				setResizeScrollback: vi.fn(),
+			},
+			editor: {
+				setText: vi.fn(),
+				setAutocompleteMaxVisible: editorSetAutocomplete,
+				setImeSafeCursorLayout: vi.fn(),
+			},
+			syncEditorSpelling: vi.fn(),
+			syncComposerShape: vi.fn(),
+			updateEditorBorderColor: vi.fn(),
+			rebuildChatFromMessages: vi.fn(),
+			effectiveHideThinkingBlock: false,
+			hideToolActivity: false,
+			toolOutputExpanded: false,
+			showError: vi.fn(),
+			statusLine: {
+				invalidate: vi.fn(),
+				setAutoCompactEnabled: vi.fn(),
+				updateSettings: vi.fn(),
+			},
+			chatContainer: { children: [], setToolActivityVisible: vi.fn() },
+			showStatus: vi.fn(),
+			refreshSlashCommandState: vi.fn(),
+		};
+		const result = await executeBuiltinSlashCommand("/reload-settings", { ctx } as never);
+		expect(result).toBe(true);
+		expect(editorSetAutocomplete).toHaveBeenCalledWith(7);
 	});
 });
