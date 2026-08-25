@@ -8467,8 +8467,15 @@ export class AgentSession {
 	 * visible to /models and /switch without a restart.
 	 */
 	async refreshModels(strategy: ModelRefreshStrategy = "online-if-uncached"): Promise<void> {
-		await this.#modelRegistry.refresh(strategy);
+		// Force the static rebuild BEFORE the online pass. `refresh()`'s static
+		// reload is mtime-gated, so a reload that only edits settings (e.g.
+		// removing a provider from `disabledProviders`, or toggling `extendedContext`)
+		// would reuse the old `#discoverableProviders` list; `reapplyModelPolicies()`
+		// forces the rebuild for the fresh settings, and the online pass below then
+		// discovers against it. Newly-enabled implicit providers (e.g. ollama) with
+		// no prior cache only surface here.
 		await this.#modelRegistry.reapplyModelPolicies();
+		await this.#modelRegistry.refresh(strategy);
 		// refresh() does not reject on a malformed models.yml: the custom layer
 		// comes back empty with a configError. Surface it so callers never report
 		// success while the live custom providers were dropped.
