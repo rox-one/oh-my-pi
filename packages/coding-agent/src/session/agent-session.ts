@@ -107,7 +107,7 @@ import {
 	getModelMatchPreferences,
 	type ResolvedModelRoleValue,
 	resolveModelScope,
-	sameScopedModelSet,
+	sameScopedModelSequence,
 	toSessionScopedModels,
 } from "../config/model-resolver";
 import { expandPromptTemplate, type PromptTemplate } from "../config/prompt-templates";
@@ -6231,7 +6231,7 @@ export class AgentSession {
 			this.settings,
 		);
 		const mapped = toSessionScopedModels(resolved, this.settings);
-		if (mapped.length === 0 || sameScopedModelSet(this.#models.scopedModels, mapped)) return false;
+		if (mapped.length === 0 || sameScopedModelSequence(this.#models.scopedModels, mapped)) return false;
 		this.#models.setScopedModels(mapped);
 		return true;
 	}

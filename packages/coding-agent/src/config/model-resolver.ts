@@ -1684,11 +1684,36 @@ export function toSessionScopedModels(
 	}));
 }
 
-/** Whether two scope lists reference the same set of models (order-independent). */
+/**
+ * Whether two scope lists reference the same set of models (order-independent).
+ */
 export function sameScopedModelSet(a: ReadonlyArray<{ model: Model }>, b: ReadonlyArray<{ model: Model }>): boolean {
 	if (a.length !== b.length) return false;
 	const keys = new Set(a.map(entry => `${entry.model.provider}/${entry.model.id}`));
 	return b.every(entry => keys.has(`${entry.model.provider}/${entry.model.id}`));
+}
+
+/**
+ * Whether two scope lists are element-wise identical — same order, provider,
+ * id, and thinking level. Stricter than {@link sameScopedModelSet}: used where
+ * order and level carry user intent, so a level change (`foo:low` →
+ * `foo:high`) or a reorder must be treated as a change even though the model
+ * set is unchanged (the `/reload-settings` path must reinstall the rebuilt
+ * scope, not silently keep the stale one).
+ */
+export function sameScopedModelSequence(
+	a: ReadonlyArray<{ model: Model; thinkingLevel?: ThinkingLevel }>,
+	b: ReadonlyArray<{ model: Model; thinkingLevel?: ThinkingLevel }>,
+): boolean {
+	if (a.length !== b.length) return false;
+	return a.every((entry, index) => {
+		const other = b[index];
+		return (
+			entry.model.provider === other.model.provider &&
+			entry.model.id === other.model.id &&
+			entry.thinkingLevel === other.thinkingLevel
+		);
+	});
 }
 
 /**

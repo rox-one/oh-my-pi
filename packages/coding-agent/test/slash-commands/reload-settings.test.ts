@@ -5,7 +5,11 @@ import type { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { Model } from "@oh-my-pi/pi-ai";
 import { clearCustomApis } from "@oh-my-pi/pi-ai/api-registry";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
-import { sameScopedModelSet, toSessionScopedModels } from "@oh-my-pi/pi-coding-agent/config/model-resolver";
+import {
+	sameScopedModelSequence,
+	sameScopedModelSet,
+	toSessionScopedModels,
+} from "@oh-my-pi/pi-coding-agent/config/model-resolver";
 import type { SettingPath } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { REPLAYED_SETTING_IDS } from "@oh-my-pi/pi-coding-agent/modes/controllers/setting-side-effects";
@@ -404,5 +408,23 @@ describe("session scope helpers", () => {
 		const a = [{ model: fakeModel("p", "x") }, { model: fakeModel("q", "y") }];
 		expect(sameScopedModelSet(a, [{ model: fakeModel("q", "y") }, { model: fakeModel("p", "x") }])).toBe(true);
 		expect(sameScopedModelSet(a, [{ model: fakeModel("p", "x") }, { model: fakeModel("p", "z") }])).toBe(false);
+	});
+
+	it("is element-wise ordered and level-sensitive for the reload guard", () => {
+		const a = [
+			{ model: fakeModel("p", "x"), thinkingLevel: "low" as ThinkingLevel },
+			{ model: fakeModel("q", "y"), thinkingLevel: "high" as ThinkingLevel },
+		];
+		expect(sameScopedModelSequence(a, [...a])).toBe(true);
+		// Same set, reordered: a reorder carries user intent in the scope cycle.
+		expect(sameScopedModelSequence(a, [a[1], a[0]])).toBe(false);
+		// Same order and set, thinking level changed: must reinstall the rebuilt scope.
+		expect(
+			sameScopedModelSequence(a, [{ model: fakeModel("p", "x"), thinkingLevel: "high" as ThinkingLevel }, a[1]]),
+		).toBe(false);
+		// Same order, level, different model id.
+		expect(
+			sameScopedModelSequence(a, [{ model: fakeModel("p", "z"), thinkingLevel: "low" as ThinkingLevel }, a[1]]),
+		).toBe(false);
 	});
 });
