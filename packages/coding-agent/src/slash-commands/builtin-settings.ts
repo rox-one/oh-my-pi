@@ -1,11 +1,6 @@
+import { applyProviderGlobalsFromSettings } from "../config/provider-globals";
 import { buildServiceTierByFamily } from "../config/service-tier";
 import { SETTINGS_SCHEMA, type SettingPath } from "../config/settings";
-import {
-	isSearchProviderId,
-	setExcludedSearchProviders,
-	setImageProviderOrder,
-	setSearchProviderOrder,
-} from "../tools";
 import type { SlashCommandSpec } from "./types";
 
 /**
@@ -46,18 +41,7 @@ export const BUILTIN_SETTINGS_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = 
 			runtime.session?.reapplyModelRoles();
 			// Provider selection globals are module state consumed by web search
 			// and image tools in every host; a layer swap alone does not update it.
-			const webSearchOrder = runtime.settings.get("providers.webSearchOrder");
-			if (Array.isArray(webSearchOrder)) {
-				setSearchProviderOrder(webSearchOrder.filter(isSearchProviderId));
-			}
-			const webSearchExclude = runtime.settings.get("providers.webSearchExclude");
-			if (Array.isArray(webSearchExclude)) {
-				setExcludedSearchProviders(webSearchExclude.filter(isSearchProviderId));
-			}
-			const imageOrder = runtime.settings.get("providers.imageOrder");
-			if (Array.isArray(imageOrder)) {
-				setImageProviderOrder(imageOrder);
-			}
+			applyProviderGlobalsFromSettings(runtime.settings);
 			if (runtime.session && before.get("inspect_image.mode") !== runtime.settings.get("inspect_image.mode")) {
 				await runtime.session.applyInspectImageModeChange();
 			}
