@@ -10,8 +10,74 @@ import type { Api, Model } from "@oh-my-pi/pi-ai";
 import { modelFamilyToken } from "@oh-my-pi/pi-catalog/identity";
 import type { ModelRegistry } from "../../config/model-registry";
 import { getModelMatchPreferences, resolveModelRoleValue } from "../../config/model-resolver";
+import { getKnownRoleIds } from "../../config/model-roles";
 import type { Settings } from "../../config/settings";
-import type { ExtensionModelQuery } from "./types";
+import type { ExtensionModelAlias, ExtensionModelAliasResult, ExtensionModelQuery } from "./types";
+
+function resolveAlias(
+	role: string,
+	settings: Settings,
+	availableModels: Model<Api>[],
+	allModels: Model<Api>[],
+): ExtensionModelAlias {
+	const matchPreferences = getModelMatchPreferences(settings);
+	const available = resolveModelRoleValue(`@${role}`, availableModels, {
+		settings,
+		matchPreferences,
+	});
+	const catalog = available.model
+		? available
+		: resolveModelRoleValue(`@${role}`, allModels, {
+				settings,
+				matchPreferences,
+			});
+	const status = available.model ? "resolved" : catalog.model ? "unavailable" : "unresolved";
+	const selector = settings.getModelRole(role);
+
+	return {
+		name: role,
+		...(selector ? { selector } : {}),
+		...(catalog.model ? { model: catalog.model } : {}),
+		...(catalog.thinkingLevel !== undefined ? { thinkingLevel: catalog.thinkingLevel } : {}),
+		explicitThinkingLevel: catalog.explicitThinkingLevel,
+		status,
+		...(catalog.warning ? { warning: catalog.warning } : {}),
+	};
+}
+
+export async function setExtensionModelAlias(
+	name: string,
+	modelRegistry: ModelRegistry,
+	settings: Settings,
+	setModelTemporary: (
+		model: Model,
+		thinkingLevel?: ExtensionModelAlias["thinkingLevel"],
+		options?: { ephemeral?: boolean },
+	) => Promise<void>,
+): Promise<ExtensionModelAliasResult> {
+	const aliases = createExtensionModelAliases(modelRegistry, settings);
+	const alias = aliases.find(candidate => candidate.name === name);
+	if (!alias) return { ok: false, alias: name, reason: "unknown_alias" };
+	if (alias.status !== "resolved" || !alias.model) {
+		return {
+			ok: false,
+			alias: name,
+			reason: alias.status === "unavailable" ? "unavailable_alias" : "unresolved_alias",
+		};
+	}
+
+	try {
+		await setModelTemporary(alias.model, alias.thinkingLevel, { ephemeral: true });
+		return { ok: true, alias, scope: "session" };
+	} catch {
+		return { ok: false, alias: name, reason: "unavailable_alias" };
+	}
+}
+function createExtensionModelAliases(modelRegistry: ModelRegistry, settings: Settings): ExtensionModelAlias[] {
+	const availableModels = modelRegistry.getAvailable();
+	const allModels = modelRegistry.getAll();
+	return getKnownRoleIds(settings).map(role => resolveAlias(role, settings, availableModels, allModels));
+}
 
 /**
  * Build the `ctx.models` facade. `getModel` is read lazily so `current()` always
@@ -25,6 +91,7 @@ export function createExtensionModelQuery(
 	return {
 		list: () => modelRegistry.getAvailable(),
 		current: () => getModel(),
+		listAliases: (): ExtensionModelAlias[] => (settings ? createExtensionModelAliases(modelRegistry, settings) : []),
 		// resolveModelRoleValue expands a role alias (`@slow`) to its full configured
 		// priority list and tries each pattern — the same path core selection uses — so a
 		// fallback model lower in the list still resolves. Plain model strings pass through

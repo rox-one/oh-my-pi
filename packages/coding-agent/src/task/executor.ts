@@ -30,6 +30,7 @@ import type { ToolPathWithSource } from "../extensibility/custom-tools";
 import type { CustomTool } from "../extensibility/custom-tools/types";
 import { runExtensionCompact, runExtensionSetModel } from "../extensibility/extensions/compact-handler";
 import { getSessionSlashCommands } from "../extensibility/extensions/get-commands-handler";
+import { setExtensionModelAlias } from "../extensibility/extensions/model-api";
 import { buildSkillPromptMessage, type Skill } from "../extensibility/skills";
 import type { HindsightSessionState } from "../hindsight/state";
 import type { LocalProtocolOptions } from "../internal-urls";
@@ -3381,6 +3382,13 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 							session.setActiveToolsByName(toolNames.filter(name => !isParentOwnedTool(name))),
 						getCommands: () => getSessionSlashCommands(session),
 						setModel: model => runExtensionSetModel(session, model),
+						setModelAlias: name =>
+							setExtensionModelAlias(
+								name,
+								session.modelRegistry,
+								session.settings,
+								(model, thinkingLevel, options) => session.setModelTemporary(model, thinkingLevel, options),
+							),
 						getThinkingLevel: () => session.thinkingLevel,
 						setThinkingLevel: level => session.setThinkingLevel(level),
 						getServiceTiers: () => session.serviceTierByFamily,

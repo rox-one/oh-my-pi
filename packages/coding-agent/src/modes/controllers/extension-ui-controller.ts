@@ -22,6 +22,7 @@ import type {
 	TerminalInputHandler,
 } from "../../extensibility/extensions";
 import { getSessionSlashCommands } from "../../extensibility/extensions/get-commands-handler";
+import { setExtensionModelAlias } from "../../extensibility/extensions/model-api";
 import { AskDialogComponent, boundPromptTitle } from "../../modes/components/ask-dialog";
 import { installExtensionComposerShape } from "../../modes/components/composer-shape-registry";
 import { HookEditorComponent } from "../../modes/components/hook-editor";
@@ -193,6 +194,13 @@ export class ExtensionUiController {
 				await this.ctx.session.setModel(model);
 				return true;
 			},
+			setModelAlias: name =>
+				setExtensionModelAlias(
+					name,
+					this.ctx.session.modelRegistry,
+					this.ctx.session.settings,
+					(model, thinkingLevel, options) => this.ctx.session.setModelTemporary(model, thinkingLevel, options),
+				),
 			getThinkingLevel: () => this.ctx.session.thinkingLevel,
 			setThinkingLevel: level => this.ctx.session.setThinkingLevel(level),
 			getServiceTiers: () => this.ctx.session.serviceTierByFamily,
@@ -427,6 +435,13 @@ export class ExtensionUiController {
 				await this.ctx.session.setModel(model);
 				return true;
 			},
+			setModelAlias: name =>
+				setExtensionModelAlias(
+					name,
+					this.ctx.session.modelRegistry,
+					this.ctx.session.settings,
+					(model, thinkingLevel, options) => this.ctx.session.setModelTemporary(model, thinkingLevel, options),
+				),
 			getThinkingLevel: () => this.ctx.session.thinkingLevel,
 			setThinkingLevel: (level, persist) => this.ctx.session.setThinkingLevel(level, persist),
 			getServiceTiers: () => this.ctx.session.serviceTierByFamily,

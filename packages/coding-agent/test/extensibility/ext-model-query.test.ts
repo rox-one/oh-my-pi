@@ -3,7 +3,7 @@ import type { Api, Model } from "@oh-my-pi/pi-ai";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import type { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import type { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import { createExtensionModelQuery } from "../../src/extensibility/extensions/model-api";
+import { createExtensionModelQuery, setExtensionModelAlias } from "../../src/extensibility/extensions/model-api";
 
 function model(id: string, name: string, provider: string): Model<"anthropic-messages"> {
 	return buildModel({
@@ -61,6 +61,90 @@ describe("createExtensionModelQuery", () => {
 		} as unknown as Settings;
 		const q = createExtensionModelQuery(registry(), settings, () => undefined);
 		expect(q.resolve("@slow")).toBe(claude);
+	});
+
+	test("listAliases() exposes effective built-in and custom role resolution", () => {
+		const unavailable = model("claude-haiku-4-5", "Claude Haiku 4.5", "anthropic");
+		const settings = {
+			get: (path: string) => {
+				if (path === "cycleOrder") return ["smol", "default", "slow"];
+				if (path === "modelTags") return {};
+				return undefined;
+			},
+			getModelRole: (role: string) =>
+				({
+					slow: "anthropic/claude-opus-4-8:high",
+					unavailable: "anthropic/claude-haiku-4-5",
+					missing: "anthropic/not-in-catalog",
+				})[role],
+			getModelRoles: () => ({
+				slow: "anthropic/claude-opus-4-8:high",
+				unavailable: "anthropic/claude-haiku-4-5",
+				missing: "anthropic/not-in-catalog",
+			}),
+		} as unknown as Settings;
+		const q = createExtensionModelQuery(
+			{
+				getAvailable: () => available,
+				getAll: () => [...available, unavailable],
+			} as unknown as ModelRegistry,
+			settings,
+			() => undefined,
+		);
+
+		const aliases = q.listAliases();
+		expect(aliases.find(alias => alias.name === "slow")).toMatchObject({
+			status: "resolved",
+			model: claude,
+			explicitThinkingLevel: true,
+		});
+		expect(aliases.find(alias => alias.name === "unavailable")).toMatchObject({
+			status: "unavailable",
+			model: unavailable,
+		});
+		expect(aliases.find(alias => alias.name === "missing")).toMatchObject({
+			status: "unresolved",
+			model: undefined,
+		});
+	});
+
+	test("listAliases() returns no aliases without settings", () => {
+		const q = createExtensionModelQuery(registry(), undefined, () => undefined);
+		expect(q.listAliases()).toEqual([]);
+	});
+	test("setModelAlias() applies a resolved alias to the current session", async () => {
+		const settings = {
+			get: (path: string) => (path === "cycleOrder" ? ["slow"] : path === "modelTags" ? {} : undefined),
+			getModelRole: (role: string) => (role === "slow" ? "anthropic/claude-opus-4-8:high" : undefined),
+			getModelRoles: () => ({ slow: "anthropic/claude-opus-4-8:high" }),
+		} as unknown as Settings;
+		let switched: { model: Model<Api>; thinkingLevel: unknown; options: unknown } | undefined;
+		const result = await setExtensionModelAlias(
+			"slow",
+			registry(),
+			settings,
+			async (model, thinkingLevel, options) => {
+				switched = { model, thinkingLevel, options };
+			},
+		);
+
+		expect(result).toMatchObject({ ok: true, scope: "session" });
+		expect(switched).toEqual({ model: claude, thinkingLevel: "high", options: { ephemeral: true } });
+	});
+
+	test("setModelAlias() refuses unresolved aliases without switching", async () => {
+		const settings = {
+			get: (path: string) => (path === "cycleOrder" ? ["missing"] : path === "modelTags" ? {} : undefined),
+			getModelRole: (role: string) => (role === "missing" ? "anthropic/not-in-catalog" : undefined),
+			getModelRoles: () => ({ missing: "anthropic/not-in-catalog" }),
+		} as unknown as Settings;
+		let switched = false;
+		const result = await setExtensionModelAlias("missing", registry(), settings, async () => {
+			switched = true;
+		});
+
+		expect(result).toEqual({ ok: false, alias: "missing", reason: "unresolved_alias" });
+		expect(switched).toBe(false);
 	});
 
 	test("family() groups a vendor's point releases and separates vendors", () => {

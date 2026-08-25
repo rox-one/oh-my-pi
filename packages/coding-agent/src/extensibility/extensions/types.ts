@@ -66,6 +66,7 @@ import type { AsyncJobSnapshot } from "../../session/agent-session";
 import type { CompactMode } from "../../session/compact-modes";
 import type { CustomMessage, CustomMessagePayload } from "../../session/messages";
 import type { ReadonlySessionManager, SessionManager } from "../../session/session-manager";
+import type { ConfiguredThinkingLevel } from "../../thinking";
 import type {
 	BashToolDetails,
 	BashToolInput,
@@ -432,6 +433,29 @@ export interface CompactOptions {
 // access). Field overlap is incidental; merging into a base would require
 // hooks to widen their public contract.
 /**
+ * The effective alias state exposed to extensions.
+ *
+ * `model` is populated for both resolved and unavailable aliases when the
+ * catalog knows the target. An unresolved alias has no matching catalog model.
+ */
+export interface ExtensionModelAlias {
+	name: string;
+	selector?: string;
+	model?: Model;
+	thinkingLevel?: ConfiguredThinkingLevel;
+	explicitThinkingLevel: boolean;
+	status: "resolved" | "unavailable" | "unresolved";
+	warning?: string;
+}
+export type ExtensionModelAliasResult =
+	| { ok: true; alias: ExtensionModelAlias; scope: "session" }
+	| {
+			ok: false;
+			alias: string;
+			reason: "unknown_alias" | "unresolved_alias" | "unavailable_alias";
+	  };
+
+/**
  * Read-only model query facade exposed at `ctx.models`. Lets an extension select a
  * model the same way core does — list authenticated models, read the session model,
  * resolve a model string or role alias, and compare model families — without reaching
@@ -442,6 +466,8 @@ export interface ExtensionModelQuery {
 	list(): Model[];
 	/** The current session model, if one is set. */
 	current(): Model | undefined;
+	/** Effective built-in and custom model-role aliases. */
+	listAliases(): ExtensionModelAlias[];
 	/**
 	 * Resolve a model string (`provider/id`, bare id) or role alias (`@slow`, a
 	 * configured role) to a Model, using the same settings-backed aliases and match
@@ -1565,6 +1591,8 @@ export interface ExtensionAPI {
 
 	/** Set the current model. Returns false if no API key available. */
 	setModel(model: Model): Promise<boolean>;
+	/** Select a configured model alias for this session without persisting settings. */
+	setModelAlias(name: string): Promise<ExtensionModelAliasResult>;
 
 	/** Get current thinking level. */
 	getThinkingLevel(): ThinkingLevel | undefined;
@@ -1754,6 +1782,7 @@ export type SendMessageHandler = <T = unknown>(
 	 */
 	options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
 ) => void;
+export type SetModelAliasHandler = (name: string) => Promise<ExtensionModelAliasResult>;
 
 export type SendUserMessageHandler = (
 	content: string | (TextContent | ImageContent)[],
@@ -1803,6 +1832,7 @@ export interface ExtensionActions {
 	setActiveTools: SetActiveToolsHandler;
 	getCommands: GetCommandsHandler;
 	setModel: SetModelHandler;
+	setModelAlias?: SetModelAliasHandler;
 	getThinkingLevel: GetThinkingLevelHandler;
 	setThinkingLevel: SetThinkingLevelHandler;
 	getServiceTiers?: GetServiceTiersHandler;

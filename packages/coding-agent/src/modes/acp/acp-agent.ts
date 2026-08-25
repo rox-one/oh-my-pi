@@ -53,6 +53,7 @@ import {
 } from "../../extensibility/extensions";
 import { runExtensionCompact } from "../../extensibility/extensions/compact-handler";
 import { getSessionSlashCommands } from "../../extensibility/extensions/get-commands-handler";
+import { setExtensionModelAlias } from "../../extensibility/extensions/model-api";
 import { buildSkillPromptMessage, parseSkillInvocation } from "../../extensibility/skills";
 import { loadSlashCommands } from "../../extensibility/slash-commands";
 import { resolveLocalUrlToPath } from "../../internal-urls";
@@ -2676,6 +2677,13 @@ export class AcpAgent implements Agent {
 					await record.session.setModel(model);
 					return true;
 				},
+				setModelAlias: name =>
+					setExtensionModelAlias(
+						name,
+						record.session.modelRegistry,
+						record.session.settings,
+						(model, thinkingLevel, options) => record.session.setModelTemporary(model, thinkingLevel, options),
+					),
 				getThinkingLevel: () => record.session.thinkingLevel,
 				setThinkingLevel: level => record.session.setThinkingLevel(level),
 				getServiceTiers: () => record.session.serviceTierByFamily,
