@@ -44,6 +44,10 @@ function createCwdContext(sourceDir: string, isStreaming = false) {
 			moveTo: vi.fn(async (cwd: string) => {
 				state.cwd = cwd;
 			}),
+			captureState: vi.fn(() => ({ cwd: state.cwd })),
+			restoreState: vi.fn((snapshot: { cwd: string }) => {
+				state.cwd = snapshot.cwd;
+			}),
 		},
 		chatContainer: createContainer(),
 		pendingMessagesContainer,

@@ -17,8 +17,6 @@
 ### Fixed
 
 - Fixed managed Chrome-for-Testing installation failures when extracting the trusted browser download.
-### Fixed
-
 - Keep project-directory state unchanged when changing directories fails.
 
 ## [18.0.4] - 2026-08-24
