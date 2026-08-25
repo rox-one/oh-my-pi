@@ -5,11 +5,7 @@ import type { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { Model } from "@oh-my-pi/pi-ai";
 import { clearCustomApis } from "@oh-my-pi/pi-ai/api-registry";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
-import {
-	sameScopedModelSequence,
-	sameScopedModelSet,
-	toSessionScopedModels,
-} from "@oh-my-pi/pi-coding-agent/config/model-resolver";
+import { sameScopedModelSequence, toSessionScopedModels } from "@oh-my-pi/pi-coding-agent/config/model-resolver";
 import type { SettingPath } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { REPLAYED_SETTING_IDS } from "@oh-my-pi/pi-coding-agent/modes/controllers/setting-side-effects";
@@ -402,12 +398,6 @@ describe("session scope helpers", () => {
 		);
 		expect(mapped.map(entry => entry.thinkingLevel).join(",")).toBe("low,high");
 		expect(toSessionScopedModels([], Settings.isolated())).toEqual([]);
-	});
-
-	it("compares scope sets order-independently by provider/id", () => {
-		const a = [{ model: fakeModel("p", "x") }, { model: fakeModel("q", "y") }];
-		expect(sameScopedModelSet(a, [{ model: fakeModel("q", "y") }, { model: fakeModel("p", "x") }])).toBe(true);
-		expect(sameScopedModelSet(a, [{ model: fakeModel("p", "x") }, { model: fakeModel("p", "z") }])).toBe(false);
 	});
 
 	it("is element-wise ordered and level-sensitive for the reload guard", () => {

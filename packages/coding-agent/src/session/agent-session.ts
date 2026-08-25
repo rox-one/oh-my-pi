@@ -6212,14 +6212,15 @@ export class AgentSession {
 	}
 	/**
 	 * Re-resolve the settings-derived `enabledModels` scope against the current
-	 * registry and push it into the Ctrl+P cycle / scoped pickers when the set
-	 * changed. Mirrors the post-startup `rebuildScopedModelsAfterDiscovery` edge
-	 * for the `/reload-settings` path: startup resolves the scope before
-	 * discovery settles and re-pushes once it does, but a live reload that adds
-	 * a model never reached the frozen scope, leaving the picker stale until
-	 * restart. Empty resolutions intentionally leave the previous scope intact
-	 * rather than collapsing it mid-session. No-op for `--models`-scoped
-	 * sessions and sessions without a configured scope.
+	 * registry and push it into the Ctrl+P cycle / scoped pickers when the
+	 * rebuilt list differs in order, provider/id, or thinking level. Mirrors
+	 * the post-startup `rebuildScopedModelsAfterDiscovery` edge for the
+	 * `/reload-settings` path: startup resolves the scope before discovery
+	 * settles and re-pushes once it does, but a live reload that adds a model
+	 * never reached the frozen scope, leaving the picker stale until restart.
+	 * Empty resolutions intentionally leave the previous scope intact rather
+	 * than collapsing it mid-session. No-op for `--models`-scoped sessions and
+	 * sessions without a configured scope.
 	 */
 	async refreshScopedModels(): Promise<boolean> {
 		const patterns = this.#scopedModelPatterns;

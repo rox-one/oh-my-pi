@@ -1685,21 +1685,14 @@ export function toSessionScopedModels(
 }
 
 /**
- * Whether two scope lists reference the same set of models (order-independent).
- */
-export function sameScopedModelSet(a: ReadonlyArray<{ model: Model }>, b: ReadonlyArray<{ model: Model }>): boolean {
-	if (a.length !== b.length) return false;
-	const keys = new Set(a.map(entry => `${entry.model.provider}/${entry.model.id}`));
-	return b.every(entry => keys.has(`${entry.model.provider}/${entry.model.id}`));
-}
-
-/**
- * Whether two scope lists are element-wise identical — same order, provider,
- * id, and thinking level. Stricter than {@link sameScopedModelSet}: used where
- * order and level carry user intent, so a level change (`foo:low` →
- * `foo:high`) or a reorder must be treated as a change even though the model
- * set is unchanged (the `/reload-settings` path must reinstall the rebuilt
- * scope, not silently keep the stale one).
+ * Whether two scope lists are equivalent in effect: identical length, order,
+ * provider/id, and thinking level. The scope feeds the Ctrl+P cycle and
+ * `/switch` picker, and `resolveModelScope` preserves pattern order, so both
+ * a level change (`foo:low` → `foo:high`) and a reorder carry user intent and
+ * must count as a change even though the model set is unchanged. This is the
+ * single guard for every scope-rebuild path — startup's post-discovery
+ * rebuild and `/reload-settings` — so a rebuilt list is only skipped when it
+ * is byte-for-byte identical to what is already installed.
  */
 export function sameScopedModelSequence(
 	a: ReadonlyArray<{ model: Model; thinkingLevel?: ThinkingLevel }>,
