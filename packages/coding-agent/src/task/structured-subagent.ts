@@ -537,6 +537,38 @@ async function isolationRecoveryHint(result: SingleResult, artifactsDir: string)
 	return hints.length > 0 ? ` ${hints.join(" ")}` : "";
 }
 
+function hasRecoveryFiles(result: SingleResult): boolean {
+	return result.patchPath !== undefined || (result.nestedPatches?.length ?? 0) > 0;
+}
+
+/** Move manual-recovery files out of the temporary result-artifact lease. */
+async function promoteRecoveryArtifacts(
+	session: ToolSession,
+	temporaryArtifactsDir: string,
+	result: SingleResult,
+): Promise<string | undefined> {
+	try {
+		let durableArtifactsDir = session.getArtifactsDir?.();
+		if (!durableArtifactsDir) {
+			await session.sessionManager?.ensureOnDisk();
+			durableArtifactsDir = session.getArtifactsDir?.() ?? session.getSessionFile()?.slice(0, -6);
+		}
+		if (!durableArtifactsDir || path.resolve(durableArtifactsDir) === path.resolve(temporaryArtifactsDir)) {
+			// In-memory SDK sessions have no session-owned artifact directory. Keep recovery files apart from the URI lease.
+			durableArtifactsDir = path.join(os.tmpdir(), `omp-recovery-${path.basename(temporaryArtifactsDir)}`);
+		}
+		await fs.mkdir(durableArtifactsDir, { recursive: true });
+		if (result.patchPath && path.dirname(result.patchPath) === temporaryArtifactsDir) {
+			const destination = path.join(durableArtifactsDir, path.basename(result.patchPath));
+			await fs.rename(result.patchPath, destination);
+			result.patchPath = destination;
+		}
+		return durableArtifactsDir;
+	} catch {
+		return undefined;
+	}
+}
+
 function attachStructuredOutputMetadata(result: SingleResult, schema: StructuredSubagentSchemaResolution): void {
 	if (schema.source === "none") {
 		delete result.structuredOutput;
@@ -567,6 +599,7 @@ export async function runStructuredSubagent(request: StructuredSubagentRequest):
 	let changesApplied: boolean | null = null;
 	let mergeSummary = "";
 	let requiresRecoveryArtifacts = false;
+	let recoveryArtifactsDir: string | undefined;
 	let completedSuccessfully = false;
 	let publishedArtifact = false;
 	let deferredCleanup: Promise<void> | undefined;
@@ -623,20 +656,6 @@ export async function runStructuredSubagent(request: StructuredSubagentRequest):
 			};
 		}
 		publishedArtifact = result.outputMeta !== undefined;
-		if (lease.temporary && publishedArtifact && lease.release) {
-			const release = lease.release;
-			if (request.onRetainedArtifactLease) {
-				request.onRetainedArtifactLease(release);
-			} else {
-				request.session.registerDisposeCallback?.(() => {
-					void release();
-				});
-			}
-		}
-		requiresRecoveryArtifacts =
-			policy.isIsolated &&
-			(result.exitCode !== 0 || result.error !== undefined || result.aborted === true) &&
-			(result.patchPath !== undefined || result.branchName !== undefined || (result.nestedPatches?.length ?? 0) > 0);
 
 		if (
 			policy.isIsolated &&
@@ -676,13 +695,38 @@ export async function runStructuredSubagent(request: StructuredSubagentRequest):
 			else mergeSummary = "\n\nIsolation: no changes captured.";
 		}
 
+		requiresRecoveryArtifacts ||=
+			policy.isIsolated &&
+			hasRecoveryFiles(result) &&
+			(!policy.applyChanges ||
+				changesApplied === false ||
+				result.exitCode !== 0 ||
+				result.error !== undefined ||
+				result.aborted === true);
+		if (lease.temporary && requiresRecoveryArtifacts) {
+			const previousPatchPath = result.patchPath;
+			recoveryArtifactsDir = await promoteRecoveryArtifacts(request.session, lease.artifactsDir, result);
+			if (previousPatchPath && result.patchPath && previousPatchPath !== result.patchPath) {
+				mergeSummary = mergeSummary.replaceAll(previousPatchPath, result.patchPath);
+			}
+		}
+		if (lease.temporary && publishedArtifact && lease.release) {
+			const release = lease.release;
+			if (request.onRetainedArtifactLease) {
+				request.onRetainedArtifactLease(release);
+			} else {
+				request.session.registerDisposeCallback?.(() => {
+					void release();
+				});
+			}
+		}
 		completedSuccessfully = result.exitCode === 0 && !result.error && !result.aborted;
 		return {
 			result,
 			policy,
 			mergeSummary,
 			changesApplied,
-			artifactsDir: lease.artifactsDir,
+			artifactsDir: recoveryArtifactsDir ?? lease.artifactsDir,
 			temporaryArtifacts: lease.temporary,
 		};
 	} catch (error) {
@@ -698,7 +742,7 @@ export async function runStructuredSubagent(request: StructuredSubagentRequest):
 		const shouldRetainArtifacts =
 			(lease.temporary && publishedArtifact) ||
 			(request.retainArtifacts && completedSuccessfully) ||
-			(policy.isIsolated && (!policy.applyChanges || changesApplied === false || requiresRecoveryArtifacts));
+			(requiresRecoveryArtifacts && recoveryArtifactsDir === undefined);
 		const shouldCleanup = lease.temporary && !shouldRetainArtifacts;
 		if (shouldCleanup && lease.release) {
 			if (deferredCleanup) {

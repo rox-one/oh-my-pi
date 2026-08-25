@@ -23,6 +23,7 @@ import {
 } from "@oh-my-pi/pi-coding-agent/task/structured-subagent";
 import type { AgentDefinition, SingleResult } from "@oh-my-pi/pi-coding-agent/task/types";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
+import { AsyncJobManager } from "../../src/async";
 
 const AGENT: AgentDefinition = {
 	name: "worker",
@@ -40,6 +41,7 @@ function session(
 		maxDepth?: number;
 		isolationMode?: "none" | "worktree";
 		isolationApply?: boolean;
+		artifactsDir?: string;
 		modelRoles?: Record<string, string>;
 	} = {},
 ): ToolSession {
@@ -55,6 +57,7 @@ function session(
 			...(options.isolationApply !== undefined ? { "task.isolation.apply": options.isolationApply } : {}),
 		}),
 		getSessionFile: () => null,
+		getArtifactsDir: () => options.artifactsDir ?? null,
 		getSessionSpawns: () => "*",
 		getPlanModeState: () => (options.planMode ? { enabled: true } : undefined),
 	} as unknown as ToolSession;
@@ -620,22 +623,82 @@ describe("structured subagent primitive", () => {
 		await expect(fs.stat(artifactsDir ?? "")).rejects.toThrow();
 	});
 
-	it("retains isolated failure artifacts needed for recovery", async () => {
+	it("evicts a published isolated task result without removing its durable recovery patch", async () => {
 		mockDiscovery();
-		let artifactsDir: string | undefined;
-		vi.spyOn(isolationRunner, "prepareIsolationContext").mockResolvedValue({ repoRoot: "/tmp" } as never);
-		vi.spyOn(isolationRunner, "runIsolatedSubprocess").mockImplementation(async ({ baseOptions }) => {
-			artifactsDir = baseOptions.artifactsDir;
-			return { ...result(), exitCode: 1, error: "agent failed", patchPath: "/recovery/Worker.patch" };
-		});
+		const manager = new AsyncJobManager({ retentionMs: 60_000 });
+		let temporaryArtifactsDir: string | undefined;
+		let recoveryDir: string | undefined;
+		let artifactCleanup: (() => Promise<void>) | undefined;
+		const released = Promise.withResolvers<void>();
+		try {
+			// SAFETY: the mocked isolated runner only reads repoRoot in this test.
+			vi.spyOn(isolationRunner, "prepareIsolationContext").mockResolvedValue({ repoRoot: "/tmp" } as never);
+			vi.spyOn(isolationRunner, "runIsolatedSubprocess").mockImplementation(async ({ baseOptions }) => {
+				if (!baseOptions.artifactsDir) throw new Error("expected temporary artifact directory");
+				temporaryArtifactsDir = baseOptions.artifactsDir;
+				const written = await writeVerifiedAgentOutput(
+					baseOptions.artifactsDir,
+					baseOptions.id,
+					"published result",
+				);
+				if (!written.ok) throw new Error(written.error);
+				const patchPath = path.join(baseOptions.artifactsDir, `${baseOptions.id}.patch`);
+				await Bun.write(patchPath, "durable recovery patch");
+				return {
+					...result(),
+					id: baseOptions.id,
+					output: "published result",
+					outputMeta: written.artifact,
+					outputPath: written.artifact.path,
+					patchPath,
+				};
+			});
+			const jobId = manager.register("task", "Worker", async () => "job complete", {
+				id: "Worker",
+				agentId: "Worker",
+			});
+			const job = manager.getJob(jobId);
+			if (!job) throw new Error("expected task job");
+			await job.promise;
 
-		const settled = await runStructuredSubagent(
-			request({ session: session({ isolationMode: "worktree" }), isolation: { requested: true } }),
-		);
+			const settled = await runStructuredSubagent(
+				request({
+					session: session({ isolationMode: "worktree", isolationApply: false }),
+					identity: { id: "Worker" },
+					isolation: { requested: true },
+					onRetainedArtifactLease: release => {
+						artifactCleanup = async () => {
+							try {
+								await release();
+							} finally {
+								released.resolve();
+							}
+						};
+					},
+				}),
+			);
+			const uri = settled.result.outputMeta?.uri;
+			const patchPath = settled.result.patchPath;
+			if (!uri || !patchPath || !temporaryArtifactsDir || !artifactCleanup)
+				throw new Error("expected retained artifacts");
+			recoveryDir = path.dirname(patchPath);
+			manager.setTaskArtifactOutcome(jobId, settled.result, artifactCleanup);
 
-		expect(artifactsDirsFromRegistry()).toContain(settled.artifactsDir);
-		expect(await fs.stat(artifactsDir ?? "")).toBeDefined();
-		await fs.rm(settled.artifactsDir, { recursive: true, force: true });
+			const handler = new AgentProtocolHandler();
+			expect((await handler.resolve(parseInternalUrl(uri))).content).toBe("published result");
+			expect(recoveryDir).toBe(path.join(os.tmpdir(), `omp-recovery-${path.basename(temporaryArtifactsDir)}`));
+			expect(settled.mergeSummary).toContain(patchPath);
+			expect(await Bun.file(patchPath).text()).toBe("durable recovery patch");
+
+			expect(manager.evictCompletedJobs()).toBe(1);
+			await released.promise;
+			await expect(handler.resolve(parseInternalUrl(uri))).rejects.toThrow("Artifact lease unavailable");
+			await expect(fs.stat(temporaryArtifactsDir)).rejects.toThrow();
+			expect(await Bun.file(patchPath).text()).toBe("durable recovery patch");
+		} finally {
+			await manager.dispose({ timeoutMs: 200 });
+			if (recoveryDir) await fs.rm(recoveryDir, { recursive: true, force: true });
+		}
 	});
 
 	it("defaults task isolation to auto-apply and lets config retain artifacts", async () => {
@@ -663,28 +726,41 @@ describe("structured subagent primitive", () => {
 		expect(evalPolicy.applyChanges).toBe(true);
 	});
 
-	it("retains successful isolated task artifacts when auto-apply is disabled", async () => {
+	it("moves recovery files out of temporary storage when auto-apply is disabled", async () => {
 		mockDiscovery();
-		let artifactsDir: string | undefined;
-		vi.spyOn(isolationRunner, "prepareIsolationContext").mockResolvedValue({ repoRoot: "/tmp" } as never);
-		vi.spyOn(isolationRunner, "runIsolatedSubprocess").mockImplementation(async ({ baseOptions }) => {
-			artifactsDir = baseOptions.artifactsDir;
-			return { ...result(), patchPath: "/recovery/Worker.patch" };
-		});
-		const merge = vi.spyOn(isolationRunner, "mergeIsolatedChanges");
+		const recoveryRoot = await fs.mkdtemp(path.join(os.tmpdir(), "omp-structured-recovery-"));
+		const recoveryDir = path.join(recoveryRoot, "session");
+		let temporaryArtifactsDir: string | undefined;
+		try {
+			// SAFETY: the mocked isolated runner only reads repoRoot in this test.
+			vi.spyOn(isolationRunner, "prepareIsolationContext").mockResolvedValue({ repoRoot: "/tmp" } as never);
+			vi.spyOn(isolationRunner, "runIsolatedSubprocess").mockImplementation(async ({ baseOptions }) => {
+				if (!baseOptions.artifactsDir) throw new Error("expected temporary artifact directory");
+				temporaryArtifactsDir = baseOptions.artifactsDir;
+				const patchPath = path.join(baseOptions.artifactsDir, `${baseOptions.id}.patch`);
+				await Bun.write(patchPath, "durable recovery patch");
+				return { ...result(), id: baseOptions.id, patchPath };
+			});
+			const merge = vi.spyOn(isolationRunner, "mergeIsolatedChanges");
 
-		const settled = await runStructuredSubagent(
-			request({
-				session: session({ isolationMode: "worktree", isolationApply: false }),
-				isolation: { requested: true },
-			}),
-		);
+			const settled = await runStructuredSubagent(
+				request({
+					session: session({ isolationMode: "worktree", isolationApply: false, artifactsDir: recoveryDir }),
+					identity: { id: "Worker" },
+					isolation: { requested: true },
+				}),
+			);
 
-		expect(merge).not.toHaveBeenCalled();
-		expect(settled.changesApplied).toBeNull();
-		expect(settled.mergeSummary).toContain("/recovery/Worker.patch");
-		expect(artifactsDirsFromRegistry()).toContain(settled.artifactsDir);
-		expect(await fs.stat(artifactsDir ?? "")).toBeDefined();
-		await fs.rm(settled.artifactsDir, { recursive: true, force: true });
+			const patchPath = path.join(recoveryDir, "Worker.patch");
+			expect(merge).not.toHaveBeenCalled();
+			expect(settled.changesApplied).toBeNull();
+			expect(settled.result.patchPath).toBe(patchPath);
+			expect(settled.mergeSummary).toContain(patchPath);
+			expect(await Bun.file(patchPath).text()).toBe("durable recovery patch");
+			if (!temporaryArtifactsDir) throw new Error("expected temporary artifact directory");
+			await expect(fs.stat(temporaryArtifactsDir)).rejects.toThrow();
+		} finally {
+			await fs.rm(recoveryRoot, { recursive: true, force: true });
+		}
 	});
 });
