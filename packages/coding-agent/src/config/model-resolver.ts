@@ -1685,16 +1685,16 @@ export function toSessionScopedModels(
 }
 
 /**
- * Whether two scope lists are equivalent in effect: identical length, order,
- * provider/id, and thinking level. The scope feeds the Ctrl+P cycle and
- * `/switch` picker, and `resolveModelScope` preserves pattern order, so both
- * a level change (`foo:low` → `foo:high`) and a reorder carry user intent and
- * must count as a change even though the model set is unchanged. This is the
- * single guard for every scope-rebuild path — startup's post-discovery
- * rebuild and `/reload-settings` — so a rebuilt list is only skipped when it
- * is byte-for-byte identical to what is already installed.
+ * Whether two scope lists are equivalent for the live cycle: identical length,
+ * order, provider/id, thinking level, AND model-record reference. A rebuilt
+ * list is skipped only when it is byte-for-byte identical to what is already
+ * installed. This is the single guard for both scope-rebuild paths — startup's
+ * post-discovery rebuild and `/reload-settings` — so a reorder, a level change
+ * (`foo:low` → `foo:high`), OR a catalog-metadata change (a refresh that swaps
+ * in a new model object for the same provider/id) forces a reinstall: the cycle
+ * must adopt fresh records or later cycling keeps the stale metadata.
  */
-export function sameScopedModelSequence(
+export function sameScopedModelCycle(
 	a: ReadonlyArray<{ model: Model; thinkingLevel?: ThinkingLevel }>,
 	b: ReadonlyArray<{ model: Model; thinkingLevel?: ThinkingLevel }>,
 ): boolean {
@@ -1704,6 +1704,7 @@ export function sameScopedModelSequence(
 		return (
 			entry.model.provider === other.model.provider &&
 			entry.model.id === other.model.id &&
+			entry.model === other.model &&
 			entry.thinkingLevel === other.thinkingLevel
 		);
 	});

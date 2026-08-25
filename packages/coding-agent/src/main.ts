@@ -42,7 +42,7 @@ import {
 	resolveModelRoleValue,
 	resolveModelScope,
 	type ScopedModel,
-	sameScopedModelSequence,
+	sameScopedModelCycle,
 	toSessionScopedModels,
 } from "./config/model-resolver";
 
@@ -835,7 +835,7 @@ export async function rebuildScopedModelsAfterDiscovery(
 		activeSettings,
 	);
 	const mapped = toSessionScopedModels(rebuilt, activeSettings);
-	if (mapped.length === 0 || sameScopedModelSequence(session.scopedModels, mapped)) return;
+	if (mapped.length === 0 || sameScopedModelCycle(session.scopedModels, mapped)) return;
 	session.setScopedModels(mapped);
 }
 async function getChangelogForDisplay(parsed: Args): Promise<string | undefined> {
@@ -1298,10 +1298,10 @@ export async function buildSessionOptions(
 	if (scopedModels.length > 0) {
 		options.scopedModels = toSessionScopedModels(scopedModels, activeSettings);
 	}
-	// Settings-derived scope patterns for /reload-settings re-resolution; explicit
-	// --models scopes stay fixed and leave this unset for the session lifetime.
-	options.scopedModelPatterns =
-		parsed.models && parsed.models.length > 0 ? undefined : activeSettings.get("enabledModels");
+	// Frozen CLI `--models` scope for /reload-settings: when present the CLI scope
+	// never re-resolves (highest precedence); when absent the session is
+	// settings-derived and refreshScopedModels reads the live enabledModels value.
+	options.cliModelScope = parsed.models && parsed.models.length > 0 ? parsed.models : undefined;
 
 	// API key from CLI - set in authStorage
 	// (handled by caller before createAgentSession)

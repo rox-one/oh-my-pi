@@ -107,7 +107,7 @@ import {
 	getModelMatchPreferences,
 	type ResolvedModelRoleValue,
 	resolveModelScope,
-	sameScopedModelSequence,
+	sameScopedModelCycle,
 	toSessionScopedModels,
 } from "../config/model-resolver";
 import { expandPromptTemplate, type PromptTemplate } from "../config/prompt-templates";
@@ -1520,7 +1520,7 @@ export class AgentSession {
 	// Model registry for API key resolution
 	#modelRegistry: ModelRegistry;
 	/** Settings-derived enabledModels scope; undefined keeps a --models scope fixed at its launch resolution. */
-	#scopedModelPatterns: readonly string[] | undefined;
+	#cliModelScope: readonly string[] | undefined;
 	#usageFallbackConfirmer: UsageFallbackConfirmer | undefined;
 	#usagePreflightAbortControllers = new Set<AbortController>();
 	#queuedMessageDrainBlocked = false;
@@ -2065,7 +2065,7 @@ export class AgentSession {
 			thinkingLevelCeiling: config.thinkingLevelCeiling,
 			serviceTierByFamily: config.serviceTierByFamily,
 		});
-		this.#scopedModelPatterns = config.scopedModelPatterns;
+		this.#cliModelScope = config.cliModelScope;
 
 		this.#promptTemplates = config.promptTemplates ?? [];
 		this.#slashCommands = config.slashCommands ?? [];
@@ -6211,28 +6211,44 @@ export class AgentSession {
 		this.#models.setScopedModels(scopedModels);
 	}
 	/**
-	 * Re-resolve the settings-derived `enabledModels` scope against the current
-	 * registry and push it into the Ctrl+P cycle / scoped pickers when the
-	 * rebuilt list differs in order, provider/id, or thinking level. Mirrors
-	 * the post-startup `rebuildScopedModelsAfterDiscovery` edge for the
-	 * `/reload-settings` path: startup resolves the scope before discovery
-	 * settles and re-pushes once it does, but a live reload that adds a model
-	 * never reached the frozen scope, leaving the picker stale until restart.
-	 * Empty resolutions intentionally leave the previous scope intact rather
-	 * than collapsing it mid-session. No-op for `--models`-scoped sessions and
-	 * sessions without a configured scope.
+	 * Re-resolve the settings-derived scope and push it into the Ctrl+P cycle /
+	 * scoped pickers when the rebuilt list differs. Reads the LIVE `enabledModels`
+	 * value — not the one captured at construction — so a mid-session edit that
+	 * changes the configured scope (A→B) or clears it takes effect on the same
+	 * reload. When the setting becomes empty the scope is cleared (unfrozen) so
+	 * the picker falls back to the full catalog; a non-empty setting that merely
+	 * resolves to zero models keeps the previous scope to avoid a transient
+	 * collapse while discovery settles. No-op for `--models`-scoped sessions
+	 * (`#cliModelScope` set): the CLI scope is frozen and outranks settings.
 	 */
 	async refreshScopedModels(): Promise<boolean> {
-		const patterns = this.#scopedModelPatterns;
-		if (this.#isDisposed || !patterns || patterns.length === 0) return false;
+		if (this.#isDisposed || this.#cliModelScope) return false;
+		const patterns = this.settings.get("enabledModels");
+		// Explicitly cleared (or never set and now absent): unfreeze the pickers.
+		if (!patterns || patterns.length === 0) {
+			if (this.#models.scopedModels.length === 0) return false;
+			this.#models.setScopedModels([]);
+			return true;
+		}
 		const resolved = await resolveModelScope(
 			[...patterns],
 			this.#modelRegistry,
 			getModelMatchPreferences(this.settings),
 			this.settings,
 		);
+		// Adopt the fresh model records for the active model too: a reload that
+		// edits the current model's metadata (baseUrl, compat, limits) rebuilds
+		// the registry into new objects with the same provider/id, and the next
+		// request must read them rather than the stale construction-time record.
+		const current = this.agent.state.model;
+		if (current) {
+			const fresh = resolved.find(
+				entry => entry.model.provider === current.provider && entry.model.id === current.id,
+			)?.model;
+			if (fresh && fresh !== current) this.agent.setModel(fresh);
+		}
 		const mapped = toSessionScopedModels(resolved, this.settings);
-		if (mapped.length === 0 || sameScopedModelSequence(this.#models.scopedModels, mapped)) return false;
+		if (mapped.length === 0 || sameScopedModelCycle(this.#models.scopedModels, mapped)) return false;
 		this.#models.setScopedModels(mapped);
 		return true;
 	}
