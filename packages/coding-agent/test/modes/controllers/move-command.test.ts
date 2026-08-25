@@ -17,7 +17,8 @@ function createMoveContext(sourceDir: string, settingsFlush?: () => Promise<void
 		state.cwd = cwd;
 		state.movedTo = cwd;
 	});
-	const captureState = vi.fn(() => ({ cwd: state.cwd, movedTo: state.movedTo }));
+	const sessionDir = `${sourceDir}/.sessions`;
+	const captureState = vi.fn(() => ({ cwd: state.cwd, sessionDir, movedTo: state.movedTo }));
 	const restoreState = vi.fn((snapshot: { cwd: string }) => {
 		state.cwd = snapshot.cwd;
 	});
@@ -42,7 +43,7 @@ function createMoveContext(sourceDir: string, settingsFlush?: () => Promise<void
 		ui: { requestRender: vi.fn() },
 		present,
 	} as unknown as InteractiveModeContext;
-	return { ctx, state, present, captureState, restoreState };
+	return { ctx, state, present, captureState, restoreState, sessionDir };
 }
 
 describe("CommandController /move", () => {
@@ -79,14 +80,14 @@ describe("CommandController /move", () => {
 		const sourceDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-move-source-"));
 		const targetDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-move-target-"));
 		try {
-			const { ctx, state, captureState, restoreState } = createMoveContext(sourceDir);
+			const { ctx, state, captureState, restoreState, sessionDir } = createMoveContext(sourceDir);
 			ctx.applyCwdChange = vi.fn(async () => false);
 			const controller = new CommandController(ctx);
 
 			await controller.handleMoveCommand(targetDir);
 
-			expect(ctx.session.moveSession).toHaveBeenCalledTimes(1);
-			expect(ctx.session.moveSession).toHaveBeenCalledWith(targetDir);
+			expect(ctx.session.moveSession).toHaveBeenCalledTimes(2);
+			expect(ctx.session.moveSession).toHaveBeenNthCalledWith(2, sourceDir, sessionDir);
 			expect(restoreState).toHaveBeenCalledWith(captureState.mock.results[0]?.value);
 			expect(state.cwd).toBe(sourceDir);
 			expect(ctx.updateEditorBorderColor).not.toHaveBeenCalled();

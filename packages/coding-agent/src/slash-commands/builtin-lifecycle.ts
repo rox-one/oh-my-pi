@@ -578,6 +578,7 @@ export const BUILTIN_LIFECYCLE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> =
 				setProjectDir(resolvedPath);
 			} catch (err) {
 				try {
+					await runtime.session.moveSession(previousState.cwd, previousState.sessionDir);
 					runtime.sessionManager.restoreState(previousState);
 				} catch (rollbackError) {
 					return usage(`Move failed and rollback failed: ${errorMessage(rollbackError)}`, runtime);
