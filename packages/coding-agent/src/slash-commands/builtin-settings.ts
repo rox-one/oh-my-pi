@@ -1,3 +1,4 @@
+import { buildServiceTierByFamily } from "../config/service-tier";
 import { SETTINGS_SCHEMA, type SettingPath } from "../config/settings";
 import {
 	isSearchProviderId,
@@ -127,6 +128,21 @@ export const BUILTIN_SETTINGS_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = 
 				const nextOmitThinking = runtime.settings.get("omitThinking");
 				if (agent.hideThinkingSummary !== nextOmitThinking) {
 					agent.hideThinkingSummary = nextOmitThinking;
+				}
+				// Service tiers snapshot into ModelControls at construction; rebuild
+				// the per-family map from the reloaded `tier.*` settings and apply
+				// per-family changes so requests use the new tier without a restart.
+				// setServiceTierFamily does not persist — it mutates the live map.
+				const nextTierByFamily = buildServiceTierByFamily(
+					runtime.settings.get("tier.openai"),
+					runtime.settings.get("tier.anthropic"),
+					runtime.settings.get("tier.google"),
+				);
+				for (const family of ["openai", "anthropic", "google"] as const) {
+					const next = nextTierByFamily[family];
+					if (runtime.session.serviceTierByFamily[family] !== next) {
+						runtime.session.setServiceTierFamily(family, next);
+					}
 				}
 			}
 

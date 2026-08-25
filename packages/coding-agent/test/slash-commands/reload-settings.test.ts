@@ -55,6 +55,7 @@ describe("/reload-settings slash command", () => {
 		reapplyModelRoles: Mock<() => void>;
 		setAdvisorEnabled: Mock<(enabled: boolean) => void>;
 		setSteeringMode: Mock<(mode: "all" | "one-at-a-time", persist?: boolean) => void>;
+		setServiceTierFamily: Mock<(family: "openai" | "anthropic" | "google", tier: unknown) => void>;
 		agent: {
 			temperature?: number;
 			topP?: number;
@@ -79,6 +80,7 @@ describe("/reload-settings slash command", () => {
 		const reapplyModelRoles = vi.fn();
 		const setAdvisorEnabled = vi.fn();
 		const setSteeringMode = vi.fn();
+		const setServiceTierFamily = vi.fn();
 		const agentFields = {
 			temperature: undefined as number | undefined,
 			topP: undefined as number | undefined,
@@ -100,6 +102,8 @@ describe("/reload-settings slash command", () => {
 			setSteeringMode,
 			setFollowUpMode: vi.fn(),
 			setInterruptMode: vi.fn(),
+			serviceTierByFamily: {},
+			setServiceTierFamily,
 			agent: agentFields,
 			...sessionOverrides,
 		};
@@ -121,6 +125,7 @@ describe("/reload-settings slash command", () => {
 			reapplyModelRoles: session.reapplyModelRoles as unknown as Mock<() => void>,
 			setAdvisorEnabled,
 			setSteeringMode,
+			setServiceTierFamily,
 			agent: agentFields,
 		};
 	}
@@ -258,6 +263,30 @@ describe("/reload-settings slash command", () => {
 		const onDisk = YAML.parse(await Bun.file(configPath()).text());
 		expect((onDisk as { advisor: { syncBacklog: string } }).advisor.syncBacklog).toBe("3");
 	});
+	it("reapplies a changed service tier to the live session", async () => {
+		await writeSettings({ advisor: { syncBacklog: "1" } });
+		const settings = await Settings.init({ cwd: projectDir, agentDir });
+		await writeSettings({ advisor: { syncBacklog: "1" }, tier: { openai: "priority" } });
+
+		const { setServiceTierFamily, output } = await runCommand(settings);
+		expect(setServiceTierFamily).toHaveBeenCalledWith("openai", "priority");
+		expect(output).toHaveBeenCalledWith(expect.stringContaining("tier.openai"));
+	});
+
+	it("clears a service tier when its setting becomes empty", async () => {
+		await writeSettings({ advisor: { syncBacklog: "1" }, tier: { openai: "priority" } });
+		const settings = await Settings.init({ cwd: projectDir, agentDir });
+		const setServiceTierFamily = vi.fn();
+		await writeSettings({ advisor: { syncBacklog: "1" } });
+
+		const { output } = await runCommand(settings, {
+			serviceTierByFamily: { openai: "priority" },
+			setServiceTierFamily,
+		});
+		expect(setServiceTierFamily).toHaveBeenCalledWith("openai", undefined);
+		expect(output).toHaveBeenCalledWith(expect.stringContaining("tier.openai"));
+	});
+
 	it("reconciles agent-owned request options without persisting them", async () => {
 		await writeSettings({ advisor: { syncBacklog: "1" }, temperature: -1, omitThinking: false });
 		const settings = await Settings.init({ cwd: projectDir, agentDir });
@@ -301,6 +330,8 @@ describe("/reload-settings slash command", () => {
 				applyMemoryBackend: vi.fn(async () => {}),
 				setThinkToolEnabled: vi.fn(async () => {}),
 				setAutoCompactionEnabled: vi.fn(),
+				serviceTierByFamily: {},
+				setServiceTierFamily: vi.fn(),
 				agent: {},
 			},
 			sessionManager: { getCwd: () => projectDir },
