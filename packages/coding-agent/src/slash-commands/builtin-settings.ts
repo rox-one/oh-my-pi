@@ -1,4 +1,10 @@
 import { SETTINGS_SCHEMA, type SettingPath } from "../config/settings";
+import {
+	isSearchProviderId,
+	setExcludedSearchProviders,
+	setImageProviderOrder,
+	setSearchProviderOrder,
+} from "../tools";
 import type { SlashCommandSpec } from "./types";
 
 /**
@@ -33,10 +39,30 @@ export const BUILTIN_SETTINGS_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = 
 			let modelsFailure: string | undefined;
 			try {
 				await runtime.session?.refreshModels();
+				// The scoped /switch and Ctrl+P lists freeze at startup; re-resolve
+				// them against the refreshed registry so newly added models appear.
+				await runtime.session?.refreshScopedModels();
 			} catch (error) {
 				modelsFailure = error instanceof Error ? error.message : String(error);
 			}
 			runtime.session?.reapplyModelRoles();
+			// Provider selection globals are module state consumed by web search
+			// and image tools in every host; a layer swap alone does not update it.
+			const webSearchOrder = runtime.settings.get("providers.webSearchOrder");
+			if (Array.isArray(webSearchOrder)) {
+				setSearchProviderOrder(webSearchOrder.filter(isSearchProviderId));
+			}
+			const webSearchExclude = runtime.settings.get("providers.webSearchExclude");
+			if (Array.isArray(webSearchExclude)) {
+				setExcludedSearchProviders(webSearchExclude.filter(isSearchProviderId));
+			}
+			const imageOrder = runtime.settings.get("providers.imageOrder");
+			if (Array.isArray(imageOrder)) {
+				setImageProviderOrder(imageOrder.filter((entry): entry is string => typeof entry === "string"));
+			}
+			if (runtime.session && before.get("inspect_image.mode") !== runtime.settings.get("inspect_image.mode")) {
+				await runtime.session.applyInspectImageModeChange();
+			}
 			// Reconcile session-owned settings the reload cannot reach on its own:
 			// the live session snapshots these at construction (agent/SDK fields),
 			// so settings.get() alone would report them applied without changing

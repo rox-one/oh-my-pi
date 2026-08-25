@@ -33,10 +33,10 @@ import {
 	AUTO_THINKING,
 	type ConfiguredThinkingLevel,
 	concreteThinkingLevel,
+	parseConfiguredThinkingLevel,
 	parseThinkingLevel,
 	resolveThinkingLevelForModel,
 } from "../thinking";
-import { isAuthenticated, kNoAuth, type ModelRegistry } from "./model-registry";
 import {
 	DEFAULT_MODEL_ROLE_ALIAS,
 	formatModelRoleAlias,
@@ -1661,6 +1661,26 @@ export async function resolveModelScope(
 	}
 
 	return scopedModels;
+}
+/**
+ * Map resolver scope entries to the session's Ctrl+P cycle shape, filling in the
+ * configured default thinking level for entries without an explicit `:level`
+ * suffix. `auto` is session-level only, so it is coerced to a concrete default here.
+ */
+export function toSessionScopedModels(
+	scopedModels: readonly ScopedModel[],
+	activeSettings: Settings,
+): Array<{ model: Model; thinkingLevel?: ThinkingLevel }> {
+	if (scopedModels.length === 0) return [];
+	const defaultThinkingLevel = concreteThinkingLevel(
+		parseConfiguredThinkingLevel(activeSettings.get("defaultThinkingLevel")),
+	);
+	return scopedModels.map(scopedModel => ({
+		model: scopedModel.model,
+		thinkingLevel: scopedModel.explicitThinkingLevel
+			? (scopedModel.thinkingLevel ?? defaultThinkingLevel)
+			: defaultThinkingLevel,
+	}));
 }
 
 /**

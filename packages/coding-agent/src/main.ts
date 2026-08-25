@@ -789,9 +789,51 @@ export async function resolveScopedModels(
 	if (scopedModels.length > 0 || modelRegistry.getDiscoverableProviders().length === 0) {
 		return scopedModels;
 	}
-	await logger.time("resolveModelScopeDiscoveryFallback", () => modelRegistry.refresh("online-if-uncached"));
-	return await resolveModelScope(
-		modelPatterns,
+	await modelRegistry.refresh("online-if-uncached");
+	return await resolveModelScope(modelPatterns, modelRegistry, preferences, activeSettings);
+}
+export { toSessionScopedModels } from "./config/model-resolver";
+
+/** Whether two scope lists reference the same set of models (order-independent). */
+function sameScopedModelSet(a: ReadonlyArray<{ model: Model }>, b: ReadonlyArray<{ model: Model }>): boolean {
+	if (a.length !== b.length) return false;
+	const keys = new Set(a.map(entry => `${entry.model.provider}/${entry.model.id}`));
+	return b.every(entry => keys.has(`${entry.model.provider}/${entry.model.id}`));
+}
+
+/** Minimal session surface the post-discovery scope rebuild mutates. */
+export interface ScopedModelSink {
+	readonly isDisposed: boolean;
+	readonly scopedModels: ReadonlyArray<{ model: Model; thinkingLevel?: ThinkingLevel }>;
+	setScopedModels(scopedModels: Array<{ model: Model; thinkingLevel?: ThinkingLevel }>): void;
+}
+
+/**
+ * Startup resolves the `--models`/`enabledModels` scope from the model registry
+ * before background provider discovery runs — `createSession` fires
+ * `refreshInBackground()` only after the session is built — so a scoped selector
+ * whose model first materializes through runtime discovery (e.g.
+ * `opencode-go/ox-alpha-free` on a fresh launch with no cache row) is absent from
+ * the frozen scoped `/models` list even though it is in `enabledModels`, invokable
+ * via `--model`, and listed by `omp models find`. Once the initial refresh settles,
+ * re-resolve the scope and, when the set changed, push the fuller list into the
+ * session so the scoped picker and Ctrl+P cycle include it. A scope that resolved
+ * to zero models may become active here when the startup discovery pass returned
+ * no models but the background pass succeeded. Fire-and-forget — never blocks the
+ * prompt on background discovery latency. Issue #9220.
+ */
+export async function rebuildScopedModelsAfterDiscovery(
+	session: ScopedModelSink,
+	parsed: Args,
+	modelRegistry: Pick<ModelRegistry, "getAvailable" | "awaitBackgroundRefresh">,
+	activeSettings: Settings,
+): Promise<void> {
+	const patterns = parsed.models ?? activeSettings.get("enabledModels");
+	if (!patterns || patterns.length === 0) return;
+	await modelRegistry.awaitBackgroundRefresh();
+	if (session.isDisposed) return;
+	const rebuilt = await resolveModelScope(
+		patterns,
 		modelRegistry,
 		getModelMatchPreferences(activeSettings),
 		activeSettings,
