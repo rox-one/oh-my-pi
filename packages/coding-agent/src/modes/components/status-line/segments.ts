@@ -471,17 +471,24 @@ const tokenTotalSegment: StatusLineSegment = {
 		// Excludes cacheRead: that field re-reads the full cached context every
 		// turn, making the cumulative sum N×context_size. Orchestration cache read
 		// follows the same rule; orchestration input/output remain in the total so
-		// provider-side service work is preserved without labeling it prompt input.
+		// provider-side service work is preserved (surfaced under its own orch:
+		// label in the breakdown rather than folded into in:/out:).
 		const { input, output, cacheWrite, orchestrationInput, orchestrationOutput } = ctx.usageStats;
 		const total = input + output + cacheWrite + orchestrationInput + orchestrationOutput;
 		if (!total) return { content: "", visible: false };
 
 		if (ctx.options.token_total?.breakdown === true) {
-			const inTotal = input + cacheWrite + orchestrationInput;
-			const outTotal = output + orchestrationOutput;
+			// Keep orchestration out of the in:/out: labels: SessionManager and
+			// /usage track it separately from prompt input/output, so folding it in
+			// would inflate the labeled traffic. Surface it under its own orch:
+			// label instead, preserving it in the visible total.
+			const inTotal = input + cacheWrite;
+			const outTotal = output;
+			const orchTotal = orchestrationInput + orchestrationOutput;
 			const parts: string[] = [];
 			if (inTotal > 0) parts.push(`in:${formatNumber(inTotal)}`);
 			if (outTotal > 0) parts.push(`out:${formatNumber(outTotal)}`);
+			if (orchTotal > 0) parts.push(`orch:${formatNumber(orchTotal)}`);
 			if (parts.length === 0) return { content: "", visible: false };
 			return { content: theme.fg("statusLineSpend", parts.join(" ")), visible: true };
 		}
