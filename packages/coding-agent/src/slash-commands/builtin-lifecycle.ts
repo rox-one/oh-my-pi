@@ -568,6 +568,7 @@ export const BUILTIN_LIFECYCLE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> =
 			} catch (err) {
 				return usage(`Failed to save pending settings: ${errorMessage(err)}`, runtime);
 			}
+			const previousState = runtime.sessionManager.captureState();
 			try {
 				await runtime.session.moveSession(resolvedPath);
 			} catch (err) {
@@ -577,7 +578,7 @@ export const BUILTIN_LIFECYCLE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> =
 				setProjectDir(resolvedPath);
 			} catch (err) {
 				try {
-					await runtime.session.moveSession(runtime.cwd);
+					runtime.sessionManager.restoreState(previousState);
 				} catch (rollbackError) {
 					return usage(`Move failed and rollback failed: ${errorMessage(rollbackError)}`, runtime);
 				}

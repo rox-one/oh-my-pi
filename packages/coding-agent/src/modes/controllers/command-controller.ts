@@ -1103,7 +1103,7 @@ export class CommandController {
 			return;
 		}
 
-		const previousCwd = this.ctx.sessionManager.getCwd();
+		const previousState = this.ctx.sessionManager.captureState();
 		try {
 			await this.ctx.session.moveSession(resolvedPath);
 		} catch (err) {
@@ -1111,8 +1111,12 @@ export class CommandController {
 			return;
 		}
 		if (!(await this.ctx.applyCwdChange(resolvedPath))) {
+			// Restore the captured manager state instead of re-running a forward
+			// move: moveTo rewrites the header and filters its target from
+			// additionalDirectories, so a rollback "move back" would permanently
+			// drop a workspace root equal to the previous cwd.
 			try {
-				await this.ctx.session.moveSession(previousCwd);
+				this.ctx.sessionManager.restoreState(previousState);
 			} catch (err) {
 				this.ctx.showError(`Failed to roll back move: ${err instanceof Error ? err.message : String(err)}`);
 			}
@@ -1208,7 +1212,7 @@ export class CommandController {
 	}
 
 	async #moveInteractiveCwd(resolvedPath: string): Promise<void> {
-		const previousCwd = this.ctx.sessionManager.getCwd();
+		const previousState = this.ctx.sessionManager.captureState();
 		await this.ctx.sessionManager.moveTo(resolvedPath);
 		if (await this.ctx.applyCwdChange(resolvedPath)) {
 			this.ctx.updateEditorBorderColor();
@@ -1216,7 +1220,7 @@ export class CommandController {
 			return;
 		}
 		try {
-			await this.ctx.sessionManager.moveTo(previousCwd);
+			this.ctx.sessionManager.restoreState(previousState);
 		} catch (err) {
 			this.ctx.showError(`Failed to roll back move: ${err instanceof Error ? err.message : String(err)}`);
 		}

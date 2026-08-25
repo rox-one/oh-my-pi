@@ -284,6 +284,7 @@ export async function getOrCreateSnapshot(
 			}
 		}
 		const child = Bun.spawn([shell, "-c", script], {
+			cwd: os.homedir(),
 			env: spawnEnv,
 			stdin: "ignore",
 			stdout: "ignore",
