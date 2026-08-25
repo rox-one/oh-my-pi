@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, expect, test } from "bun:test";
 import { stripVTControlCharacters } from "node:util";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { StatusLineComponent } from "@oh-my-pi/pi-coding-agent/modes/components/status-line";
@@ -11,6 +11,13 @@ beforeAll(async () => {
 	resetSettingsForTest();
 	await Settings.init({ inMemory: true });
 	await initTheme();
+});
+
+afterEach(() => {
+	// Profile is process-wide; restore it after every test so a mutation (or an
+	// assertion failure before cleanup) can't leak into sibling tests or
+	// concurrently executing files. AGENTS.md: tests must isolate global state.
+	setProfile(originalProfile);
 });
 
 afterAll(() => {
@@ -129,4 +136,70 @@ test("breakdown keeps orchestration usage out of in/out labels", () => {
 	expect(rendered).toContain("in:25K out:5");
 	// orchestration usage is surfaced under its own label, not folded in.
 	expect(rendered).toContain("orch:12K");
+});
+
+test("keeps the embedded context percentage visible when every slot collides with a boundary marker", () => {
+	// Narrow gauge (small window makes the "50K" label wide relative to the gap)
+	// where the only legal label positions overlap the speculation/threshold
+	// markers. Regression: the context percent is the primary readout, so it
+	// must still render rather than being dropped when the placement search
+	// finds no gap that clears both markers.
+	const component = new StatusLineComponent({
+		state: { messages: [], model: { name: "M", contextWindow: 50000 } },
+		messages: [],
+		model: { name: "M", contextWindow: 50000 },
+		systemPrompt: [],
+		agent: { state: { tools: [] } },
+		skills: [],
+		isStreaming: false,
+		isAutoThinking: false,
+		autoResolvedThinkingLevel: () => undefined,
+		isFastModeActive: () => false,
+		isAdvisorActive: () => false,
+		getAdvisorStatusOverview: () => ({ configured: false, advisors: [] }),
+		getAsyncJobSnapshot: () => ({ running: [] }),
+		settings: {
+			get: () => false,
+			getGroup: (group: string) =>
+				group === "compaction"
+					? {
+							enabled: true,
+							strategy: "summarize",
+							asyncEnabled: true,
+							thresholdPercent: 30,
+							methodOrder: ["soft"],
+						}
+					: {},
+		},
+		modelRegistry: { isUsingOAuth: () => false },
+		sessionManager: {
+			getSessionName: () => "s",
+			getUsageStatistics: () => ({
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				orchestrationInput: 0,
+				orchestrationOutput: 0,
+				orchestrationCacheRead: 0,
+				premiumRequests: 0,
+				cost: 0,
+			}),
+		},
+		getContextUsage: () => ({ tokens: 12500, contextWindow: 50000, percent: 25 }),
+	} as unknown as ConstructorParameters<typeof StatusLineComponent>[0]);
+	component.setAutoCompactEnabled(true);
+	component.updateSettings({
+		preset: "custom",
+		leftSegments: ["model", "context_pct"],
+		rightSegments: ["model", "context_total"],
+		separator: "pipe",
+		sessionAccent: false,
+		contextLine: "embedded",
+	});
+
+	const rendered = stripVTControlCharacters(component.getTopBorder(20).content);
+	expect(rendered).toContain("25%");
+	expect(rendered).toContain("50K");
 });

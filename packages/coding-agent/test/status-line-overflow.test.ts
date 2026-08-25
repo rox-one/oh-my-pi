@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, it } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -19,6 +19,13 @@ beforeAll(async () => {
 	resetSettingsForTest();
 	await Settings.init({ inMemory: true });
 	await initTheme();
+});
+
+afterEach(() => {
+	// Profile is process-wide; restore it after every test so a mutation (or an
+	// assertion failure before a manual reset) can't leak into sibling tests or
+	// concurrently executing files. AGENTS.md: tests must isolate global state.
+	setProfile(originalProfile);
 });
 
 afterAll(() => {
@@ -210,7 +217,6 @@ describe("profile status-line segment", () => {
 		const seg = renderSegment("profile", createCtx());
 		expect(seg.visible).toBe(true);
 		expect(stripAnsi(seg.content)).toBe("p:work");
-		setProfile(undefined);
 	});
 
 	it("bounds long profile labels for narrow status lines", () => {

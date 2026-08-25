@@ -2159,6 +2159,14 @@ export class StatusLineComponent implements Component {
 					break;
 				}
 			}
+			// Every candidate slot collides with a boundary marker (narrow gauge,
+			// marker sits in the only legal range). The context percentage is the
+			// primary readout, so keep it visible and let it overwrite the marker
+			// cell — the render loop already draws the percent label ahead of the
+			// speculation/threshold glyphs — rather than showing no percentage.
+			if (percentStart < 0 && maxStart >= 1) {
+				percentStart = preferredStart;
+			}
 		}
 
 		const speculationGlyph = theme.symbol("context.speculation");
