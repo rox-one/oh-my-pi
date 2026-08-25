@@ -220,7 +220,12 @@ describe("openai-responses parseRequest", () => {
 		expect(result.content).toEqual([
 			{ type: "image", data: imageData, mimeType: "image/png", detail: "original" },
 			{ type: "text", text: "Read image file [image/png]" },
-			{ type: "text", text: "[image: file_image_123]" },
+			{
+				type: "image",
+				data: "",
+				mimeType: "application/octet-stream",
+				providerFile: { provider: "openai", id: "file_image_123" },
+			},
 			{ type: "text", text: "[file: https://example.invalid/report.pdf]" },
 			{ type: "text", text: "done" },
 		]);
@@ -267,8 +272,10 @@ describe("openai-responses parseRequest", () => {
 		]);
 	});
 
-	it("round-trips Pi image-read results as native function output blocks", () => {
+	it("round-trips Pi image-read image forms as native function output blocks", () => {
 		const imageData = Buffer.from("read tool image").toString("base64");
+		const imageUrl = "https://blob.example.invalid/read-image.png";
+		const providerFileId = "file_read_image_123";
 		const model = buildModel({
 			id: "gpt-5.6-sol",
 			name: "GPT-5.6 Sol",
@@ -300,6 +307,14 @@ describe("openai-responses parseRequest", () => {
 					content: [
 						{ type: "text", text: "Read image file [image/png]" },
 						{ type: "image", data: imageData, mimeType: "image/png", detail: "original" },
+						{ type: "image", data: imageData, mimeType: "image/png", detail: "high", url: imageUrl },
+						{
+							type: "image",
+							data: imageData,
+							mimeType: "image/png",
+							detail: "low",
+							providerFile: { provider: "openai", id: providerFileId },
+						},
 					],
 					isError: false,
 					timestamp: 2,
@@ -322,6 +337,8 @@ describe("openai-responses parseRequest", () => {
 				detail: "original",
 				image_url: `data:image/png;base64,${imageData}`,
 			},
+			{ type: "input_image", detail: "high", image_url: imageUrl },
+			{ type: "input_image", detail: "low", file_id: providerFileId },
 		]);
 		expect(wireInput.some(item => "role" in item && item.role === "user")).toBe(false);
 
@@ -331,7 +348,31 @@ describe("openai-responses parseRequest", () => {
 		expect(result.content).toEqual([
 			{ type: "text", text: "Read image file [image/png]" },
 			{ type: "image", data: imageData, mimeType: "image/png", detail: "original" },
+			{
+				type: "image",
+				data: "",
+				mimeType: "application/octet-stream",
+				detail: "high",
+				url: imageUrl,
+			},
+			{
+				type: "image",
+				data: "",
+				mimeType: "application/octet-stream",
+				detail: "low",
+				providerFile: { provider: "openai", id: providerFileId },
+			},
 		]);
+
+		const replayInput = buildResponsesInput({
+			model,
+			context: parsed.context,
+			strictResponsesPairing: true,
+			supportsImageDetailOriginal: true,
+		});
+		const replayOutput = replayInput.find(item => item.type === "function_call_output");
+		if (replayOutput?.type !== "function_call_output") throw new Error("expected replayed function output");
+		expect(replayOutput.output).toEqual(wireOutput.output);
 	});
 
 	it("rejects raw explicit prompt-cache controls instead of silently dropping them", () => {

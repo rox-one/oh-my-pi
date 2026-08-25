@@ -329,15 +329,25 @@ function functionOutputContent(output: string | readonly unknown[] | undefined):
 			flushLegacyText();
 			const imageUrl = asString(raw.image_url) || undefined;
 			const decoded = imageUrl ? decodeDataUri(imageUrl) : undefined;
+			const detail =
+				raw.detail === "auto" || raw.detail === "low" || raw.detail === "high" || raw.detail === "original"
+					? raw.detail
+					: undefined;
 			if (decoded) {
-				const detail =
-					raw.detail === "auto" || raw.detail === "low" || raw.detail === "high" || raw.detail === "original"
-						? raw.detail
-						: undefined;
 				content.push({ type: "image", ...decoded, ...(detail ? { detail } : {}) });
 			} else {
-				const reference = imageUrl ?? (asString(raw.file_id) || undefined);
-				if (reference) content.push({ type: "text", text: `[image: ${reference}]` });
+				const referenceImage: ImageContent = {
+					type: "image",
+					data: "",
+					mimeType: "application/octet-stream",
+					...(detail ? { detail } : {}),
+				};
+				if (imageUrl) {
+					content.push({ ...referenceImage, url: imageUrl });
+				} else {
+					const fileId = asString(raw.file_id) || undefined;
+					if (fileId) content.push({ ...referenceImage, providerFile: { provider: "openai", id: fileId } });
+				}
 			}
 			continue;
 		}
