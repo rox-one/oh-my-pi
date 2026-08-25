@@ -1,8 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, type Mock, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import type { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
+import type { Model } from "@oh-my-pi/pi-ai";
 import { clearCustomApis } from "@oh-my-pi/pi-ai/api-registry";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
+import { sameScopedModelSet, toSessionScopedModels } from "@oh-my-pi/pi-coding-agent/config/model-resolver";
 import type { SettingPath } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { REPLAYED_SETTING_IDS } from "@oh-my-pi/pi-coding-agent/modes/controllers/setting-side-effects";
@@ -333,5 +336,73 @@ describe("/reload-settings slash command", () => {
 		const result = await executeBuiltinSlashCommand("/reload-settings", { ctx } as never);
 		expect(result).toBe(true);
 		expect(editorSetAutocomplete).toHaveBeenCalledWith(7);
+	});
+
+	it("re-resolves the settings-derived model scope and reports it", async () => {
+		await writeSettings({ enabledModels: ["liveprov/alpha-base"] });
+		const settings = await Settings.init({ cwd: projectDir, agentDir });
+
+		const refreshScopedModels = vi.fn(async () => true);
+		const { output } = await runCommand(settings, { refreshScopedModels });
+
+		expect(refreshScopedModels).toHaveBeenCalled();
+		expect(output).toHaveBeenCalledWith(expect.stringContaining("Model scope re-resolved."));
+	});
+
+	it("reports a scope-refresh failure without losing the reload result", async () => {
+		await writeSettings({ advisor: { syncBacklog: "1" } });
+		const settings = await Settings.init({ cwd: projectDir, agentDir });
+		await writeSettings({ advisor: { syncBacklog: "3" } });
+
+		const { output } = await runCommand(settings, {
+			refreshScopedModels: vi.fn(async () => {
+				throw new Error("scope exploded");
+			}),
+		});
+
+		expect(output).toHaveBeenCalledWith(expect.stringContaining("advisor.syncBacklog"));
+		expect(output).toHaveBeenCalledWith(expect.stringContaining("Model scope refresh failed: scope exploded"));
+	});
+
+	it("re-resolves the scope only after the reloaded settings take effect", async () => {
+		await writeSettings({ advisor: { syncBacklog: "1" } });
+		const settings = await Settings.init({ cwd: projectDir, agentDir });
+		await writeSettings({
+			advisor: { syncBacklog: "1" },
+			enabledModels: ["liveprov/alpha-base"],
+		});
+
+		let seenDuringScopeRefresh: unknown;
+		await runCommand(settings, {
+			refreshScopedModels: vi.fn(async () => {
+				seenDuringScopeRefresh = settings.get("enabledModels");
+				return false;
+			}),
+		});
+
+		// A pre-reload resolution would observe the stale empty list.
+		expect(seenDuringScopeRefresh).toEqual(["liveprov/alpha-base"]);
+	});
+});
+
+describe("session scope helpers", () => {
+	const fakeModel = (provider: string, id: string): Model => ({ provider, id }) as unknown as Model;
+
+	it("maps resolver scope to cycle entries, filling non-explicit levels with the configured default", () => {
+		const mapped = toSessionScopedModels(
+			[
+				{ model: fakeModel("prov", "one"), thinkingLevel: "low" as ThinkingLevel, explicitThinkingLevel: true },
+				{ model: fakeModel("prov", "two"), thinkingLevel: undefined, explicitThinkingLevel: false },
+			],
+			Settings.isolated({ defaultThinkingLevel: "high" }),
+		);
+		expect(mapped.map(entry => entry.thinkingLevel).join(",")).toBe("low,high");
+		expect(toSessionScopedModels([], Settings.isolated())).toEqual([]);
+	});
+
+	it("compares scope sets order-independently by provider/id", () => {
+		const a = [{ model: fakeModel("p", "x") }, { model: fakeModel("q", "y") }];
+		expect(sameScopedModelSet(a, [{ model: fakeModel("q", "y") }, { model: fakeModel("p", "x") }])).toBe(true);
+		expect(sameScopedModelSet(a, [{ model: fakeModel("p", "x") }, { model: fakeModel("p", "z") }])).toBe(false);
 	});
 });

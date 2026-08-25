@@ -1684,6 +1684,13 @@ export function toSessionScopedModels(
 	}));
 }
 
+/** Whether two scope lists reference the same set of models (order-independent). */
+export function sameScopedModelSet(a: ReadonlyArray<{ model: Model }>, b: ReadonlyArray<{ model: Model }>): boolean {
+	if (a.length !== b.length) return false;
+	const keys = new Set(a.map(entry => `${entry.model.provider}/${entry.model.id}`));
+	return b.every(entry => keys.has(`${entry.model.provider}/${entry.model.id}`));
+}
+
 /**
  * Resolve the set of models a session is allowed to use, given the active
  * settings. Starts from `modelRegistry.getAvailable()` (so disabled providers

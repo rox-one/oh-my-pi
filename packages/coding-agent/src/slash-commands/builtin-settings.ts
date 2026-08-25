@@ -39,9 +39,6 @@ export const BUILTIN_SETTINGS_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = 
 			let modelsFailure: string | undefined;
 			try {
 				await runtime.session?.refreshModels();
-				// The scoped /switch and Ctrl+P lists freeze at startup; re-resolve
-				// them against the refreshed registry so newly added models appear.
-				await runtime.session?.refreshScopedModels();
 			} catch (error) {
 				modelsFailure = error instanceof Error ? error.message : String(error);
 			}
@@ -69,7 +66,19 @@ export const BUILTIN_SETTINGS_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = 
 			// actual behavior. persist=false — the value may come from a project
 			// or --config overlay, and writing it through settings.set would
 			// promote an overlay-only value into global config.
+			let scopeChanged = false;
+			let scopeFailure: string | undefined;
 			if (runtime.session) {
+				// Re-resolve the settings-derived model scope AFTER reloadFromDisk (new
+				// enabledModels values) and after refreshModels (fresh registry): the
+				// session freezes its scope at construction, so a reload that adds a
+				// model must push the rebuilt list or every scoped picker keeps the
+				// startup snapshot until restart.
+				try {
+					scopeChanged = (await runtime.session.refreshScopedModels?.()) ?? false;
+				} catch (error) {
+					scopeFailure = error instanceof Error ? error.message : String(error);
+				}
 				const nextAdvisorEnabled = runtime.settings.get("advisor.enabled");
 				if (runtime.session.isAdvisorEnabled() !== nextAdvisorEnabled) {
 					runtime.session.setAdvisorEnabled(nextAdvisorEnabled);
@@ -127,15 +136,20 @@ export const BUILTIN_SETTINGS_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = 
 					changed.push(key);
 				}
 			}
+			const scopeNote = scopeFailure
+				? ` Model scope refresh failed: ${scopeFailure}`
+				: scopeChanged
+					? " Model scope re-resolved."
+					: "";
 			if (modelsFailure) {
-				await runtime.output(`Settings reloaded from disk (models.yml failed: ${modelsFailure})`);
+				await runtime.output(`Settings reloaded from disk (models.yml failed: ${modelsFailure})${scopeNote}`);
 				return;
 			}
 			if (changed.length === 0) {
-				await runtime.output("Settings reloaded from disk. No effective values changed.");
+				await runtime.output(`Settings reloaded from disk. No effective values changed.${scopeNote}`);
 				return;
 			}
-			await runtime.output(`Settings reloaded from disk. Applied: ${changed.join(", ")}`);
+			await runtime.output(`Settings reloaded from disk. Applied: ${changed.join(", ")}${scopeNote}`);
 		},
 	},
 ];

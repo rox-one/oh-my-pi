@@ -42,6 +42,7 @@ import {
 	resolveModelRoleValue,
 	resolveModelScope,
 	type ScopedModel,
+	sameScopedModelSet,
 	toSessionScopedModels,
 } from "./config/model-resolver";
 
@@ -796,13 +797,6 @@ export async function resolveScopedModels(
 	return await resolveModelScope(modelPatterns, modelRegistry, preferences, activeSettings);
 }
 
-/** Whether two scope lists reference the same set of models (order-independent). */
-function sameScopedModelSet(a: ReadonlyArray<{ model: Model }>, b: ReadonlyArray<{ model: Model }>): boolean {
-	if (a.length !== b.length) return false;
-	const keys = new Set(a.map(entry => `${entry.model.provider}/${entry.model.id}`));
-	return b.every(entry => keys.has(`${entry.model.provider}/${entry.model.id}`));
-}
-
 /** Minimal session surface the post-discovery scope rebuild mutates. */
 export interface ScopedModelSink {
 	readonly isDisposed: boolean;
@@ -1301,6 +1295,10 @@ export async function buildSessionOptions(
 	if (scopedModels.length > 0) {
 		options.scopedModels = toSessionScopedModels(scopedModels, activeSettings);
 	}
+	// Settings-derived scope patterns for /reload-settings re-resolution; explicit
+	// --models scopes stay fixed and leave this unset for the session lifetime.
+	options.scopedModelPatterns =
+		parsed.models && parsed.models.length > 0 ? undefined : activeSettings.get("enabledModels");
 
 	// API key from CLI - set in authStorage
 	// (handled by caller before createAgentSession)

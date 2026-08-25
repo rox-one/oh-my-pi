@@ -107,6 +107,7 @@ import {
 	getModelMatchPreferences,
 	type ResolvedModelRoleValue,
 	resolveModelScope,
+	sameScopedModelSet,
 	toSessionScopedModels,
 } from "../config/model-resolver";
 import { expandPromptTemplate, type PromptTemplate } from "../config/prompt-templates";
@@ -1518,6 +1519,8 @@ export class AgentSession {
 
 	// Model registry for API key resolution
 	#modelRegistry: ModelRegistry;
+	/** Settings-derived enabledModels scope; undefined keeps a --models scope fixed at its launch resolution. */
+	#scopedModelPatterns: readonly string[] | undefined;
 	#usageFallbackConfirmer: UsageFallbackConfirmer | undefined;
 	#usagePreflightAbortControllers = new Set<AbortController>();
 	#queuedMessageDrainBlocked = false;
@@ -2062,6 +2065,7 @@ export class AgentSession {
 			thinkingLevelCeiling: config.thinkingLevelCeiling,
 			serviceTierByFamily: config.serviceTierByFamily,
 		});
+		this.#scopedModelPatterns = config.scopedModelPatterns;
 
 		this.#promptTemplates = config.promptTemplates ?? [];
 		this.#slashCommands = config.slashCommands ?? [];
@@ -6207,30 +6211,29 @@ export class AgentSession {
 		this.#models.setScopedModels(scopedModels);
 	}
 	/**
-	 * Re-resolves the `enabledModels` scope against the current registry and
-	 * installs it when the model set changed. Startup freezes the scoped list
-	 * after one resolution, so a reload that adds models to models.yml must
-	 * refresh it or the scoped `/switch` picker and Ctrl+P cycle keep serving
-	 * the stale array. A `--models` CLI scope cannot be reconstructed at reload
-	 * time and keeps its startup resolution.
+	 * Re-resolve the settings-derived `enabledModels` scope against the current
+	 * registry and push it into the Ctrl+P cycle / scoped pickers when the set
+	 * changed. Mirrors the post-startup `rebuildScopedModelsAfterDiscovery` edge
+	 * for the `/reload-settings` path: startup resolves the scope before
+	 * discovery settles and re-pushes once it does, but a live reload that adds
+	 * a model never reached the frozen scope, leaving the picker stale until
+	 * restart. Empty resolutions intentionally leave the previous scope intact
+	 * rather than collapsing it mid-session. No-op for `--models`-scoped
+	 * sessions and sessions without a configured scope.
 	 */
-	async refreshScopedModels(): Promise<void> {
-		const patterns = this.settings.get("enabledModels");
-		if (!patterns || patterns.length === 0) return;
-		const rebuilt = await resolveModelScope(
-			patterns,
+	async refreshScopedModels(): Promise<boolean> {
+		const patterns = this.#scopedModelPatterns;
+		if (this.#isDisposed || !patterns || patterns.length === 0) return false;
+		const resolved = await resolveModelScope(
+			[...patterns],
 			this.#modelRegistry,
 			getModelMatchPreferences(this.settings),
 			this.settings,
 		);
-		const mapped = toSessionScopedModels(rebuilt, this.settings);
-		if (mapped.length === 0) return;
-		const current = this.scopedModels;
-		if (current.length === mapped.length) {
-			const keys = new Set(current.map(entry => `${entry.model.provider}/${entry.model.id}`));
-			if (mapped.every(entry => keys.has(`${entry.model.provider}/${entry.model.id}`))) return;
-		}
-		this.setScopedModels(mapped);
+		const mapped = toSessionScopedModels(resolved, this.settings);
+		if (mapped.length === 0 || sameScopedModelSet(this.#models.scopedModels, mapped)) return false;
+		this.#models.setScopedModels(mapped);
+		return true;
 	}
 
 	/** Prompt templates */
