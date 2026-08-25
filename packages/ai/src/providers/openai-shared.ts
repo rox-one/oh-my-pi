@@ -2327,18 +2327,16 @@ export function convertResponsesAssistantMessage<TApi extends Api>(
 	return outputItems;
 }
 
-/** Appends one Responses tool result. */
-export function appendResponsesToolResultMessages<TApi extends Api>(
-	messages: ResponseInput,
+export interface ResponsesToolResultOutputEncoding {
+	output: string | ResponseInputContent[];
+	outputText: string;
+}
+
+export function encodeResponsesToolResultOutput<TApi extends Api>(
 	toolResult: ToolResultMessage,
 	model: Model<TApi>,
-	strictResponsesPairing: boolean,
 	supportsImageDetailOriginal: boolean,
-	knownCallIds: ReadonlySet<string>,
-	customCallIds?: ReadonlySet<string>,
-	supportsCustomToolCalls = true,
-	computerCallIds?: ReadonlySet<string>,
-): void {
+): ResponsesToolResultOutputEncoding {
 	const supportsImages = model.input.includes("image");
 	const textResult = toolResult.content
 		.filter((block): block is TextContent => block.type === "text")
@@ -2346,7 +2344,6 @@ export function appendResponsesToolResultMessages<TApi extends Api>(
 		.join("\n");
 	const hasImages = toolResult.content.some((block): block is ImageContent => block.type === "image");
 	const omittedImages = hasImages && !supportsImages;
-	const normalized = normalizeResponsesToolCallId(toolResult.toolCallId);
 	const rawOutput = (
 		omittedImages
 			? joinTextWithImagePlaceholder(textResult, true)
@@ -2372,6 +2369,27 @@ export function appendResponsesToolResultMessages<TApi extends Api>(
 					};
 				})
 			: outputText;
+	return { output, outputText };
+}
+
+/** Appends one Responses tool result. */
+export function appendResponsesToolResultMessages<TApi extends Api>(
+	messages: ResponseInput,
+	toolResult: ToolResultMessage,
+	model: Model<TApi>,
+	strictResponsesPairing: boolean,
+	supportsImageDetailOriginal: boolean,
+	knownCallIds: ReadonlySet<string>,
+	customCallIds?: ReadonlySet<string>,
+	supportsCustomToolCalls = true,
+	computerCallIds?: ReadonlySet<string>,
+): void {
+	const { output, outputText } = encodeResponsesToolResultOutput(
+		toolResult,
+		model,
+		supportsImageDetailOriginal,
+	);
+	const normalized = normalizeResponsesToolCallId(toolResult.toolCallId);
 	if (toolResult.providerMetadata?.type === "computer" && model.supportsComputerUse !== true) {
 		messages.push({
 			type: "message",
