@@ -21,6 +21,7 @@ import type {
 	ToolResultMessage,
 	TSchema,
 } from "../types";
+import { decodeDataUri } from "./openai-data-uri";
 import {
 	type OpenAIChatContentPart,
 	type OpenAIChatMessage,
@@ -250,18 +251,6 @@ function parseUserLikeContent(
 		}
 	}
 	return parts;
-}
-
-function decodeDataUri(url: string): { data: string; mimeType: string } | undefined {
-	if (!url.startsWith("data:")) return undefined;
-	const comma = url.indexOf(",");
-	if (comma < 0) return undefined;
-	const header = url.slice(5, comma);
-	const payload = url.slice(comma + 1);
-	const isBase64 = header.endsWith(";base64");
-	const mimeType = (isBase64 ? header.slice(0, -";base64".length) : header) || "application/octet-stream";
-	const data = isBase64 ? payload : Buffer.from(decodeURIComponent(payload), "utf8").toString("base64");
-	return { data, mimeType };
 }
 
 function buildAssistantMessage(

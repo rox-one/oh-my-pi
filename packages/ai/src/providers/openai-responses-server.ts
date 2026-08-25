@@ -28,12 +28,15 @@ import type {
 	Tool,
 	ToolCall,
 } from "../types";
+import { decodeDataUri } from "./openai-data-uri";
 import {
 	type OpenAIResponsesComputerCallItem,
 	type OpenAIResponsesComputerCallOutputItem,
 	type OpenAIResponsesFunctionCallItem,
 	type OpenAIResponsesFunctionCallOutputItem,
 	type OpenAIResponsesInputContent,
+	type OpenAIResponsesInputFileBlock,
+	type OpenAIResponsesInputImageBlock,
 	type OpenAIResponsesOutputContent,
 	type OpenAIResponsesReasoningItem,
 	type OpenAIResponsesTool,
@@ -162,8 +165,8 @@ function extractReasoningTextFromItem(item: OpenAIResponsesReasoningItem): strin
 type InputBlockUnion =
 	| { type: "input_text"; text: string }
 	| { type: "text"; text: string }
-	| { type: "input_image"; detail?: "auto" | "low" | "high" | "original"; image_url?: string; file_id?: string }
-	| { type: "input_file"; file_id?: string; filename?: string; file_data?: string; file_url?: string };
+	| OpenAIResponsesInputImageBlock
+	| OpenAIResponsesInputFileBlock;
 
 /** Walk an input message's content array and retain only text for the generic view.
  * Native image/file references are preserved on the message provider payload. */
@@ -291,34 +294,23 @@ function ensureAssistantPlaceholder(messages: Message[], modelId: string, now: n
 	return placeholder;
 }
 
-function decodeDataUri(url: string): { data: string; mimeType: string } | undefined {
-	if (!url.startsWith("data:")) return undefined;
-	const comma = url.indexOf(",");
-	if (comma < 0) return undefined;
-	const header = url.slice(5, comma);
-	const payload = url.slice(comma + 1);
-	const isBase64 = header.endsWith(";base64");
-	const mimeType = (isBase64 ? header.slice(0, -";base64".length) : header) || "application/octet-stream";
-	const data = isBase64 ? payload : Buffer.from(decodeURIComponent(payload), "utf8").toString("base64");
-	return { data, mimeType };
-}
-
 function functionOutputContent(output: string | readonly unknown[] | undefined): (TextContent | ImageContent)[] {
 	if (typeof output === "string") return [{ type: "text", text: output }];
 	if (!output) return [{ type: "text", text: "" }];
 
-	const parts: (TextContent | ImageContent)[] = [];
+	const textParts: string[] = [];
+	const additionalContent: (TextContent | ImageContent)[] = [];
 	for (const raw of output) {
 		if (!isObj(raw)) continue;
 		const blockType = raw.type;
 		if (blockType === "input_text" || blockType === "output_text" || blockType === "text") {
 			const text = asString(raw.text);
-			if (text !== undefined) parts.push({ type: "text", text });
+			if (text) textParts.push(text);
 			continue;
 		}
 		if (blockType === "refusal") {
 			const refusal = asString(raw.refusal);
-			if (refusal !== undefined) parts.push({ type: "text", text: `[refusal: ${refusal}]` });
+			if (refusal) textParts.push(`[refusal: ${refusal}]`);
 			continue;
 		}
 		if (blockType === "input_image") {
@@ -329,10 +321,10 @@ function functionOutputContent(output: string | readonly unknown[] | undefined):
 					raw.detail === "auto" || raw.detail === "low" || raw.detail === "high" || raw.detail === "original"
 						? raw.detail
 						: undefined;
-				parts.push({ type: "image", ...decoded, ...(detail ? { detail } : {}) });
+				additionalContent.push({ type: "image", ...decoded, ...(detail ? { detail } : {}) });
 			} else {
 				const reference = imageUrl ?? asString(raw.file_id);
-				if (reference) parts.push({ type: "text", text: `[image: ${reference}]` });
+				if (reference) additionalContent.push({ type: "text", text: `[image: ${reference}]` });
 			}
 			continue;
 		}
@@ -342,10 +334,12 @@ function functionOutputContent(output: string | readonly unknown[] | undefined):
 				asString(raw.file_id) ??
 				asString(raw.file_url) ??
 				(asString(raw.file_data) ? "inline data" : undefined);
-			if (reference) parts.push({ type: "text", text: `[file: ${reference}]` });
+			if (reference) additionalContent.push({ type: "text", text: `[file: ${reference}]` });
 		}
 	}
-	return parts.length > 0 ? parts : [{ type: "text", text: "" }];
+	const text = textParts.join("");
+	if (text.length > 0) return [{ type: "text", text }, ...additionalContent];
+	return additionalContent.length > 0 ? additionalContent : [{ type: "text", text: "" }];
 }
 
 // ─── parseRequest ───────────────────────────────────────────────────────────

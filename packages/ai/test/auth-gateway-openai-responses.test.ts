@@ -197,10 +197,18 @@ describe("openai-responses parseRequest", () => {
 						{
 							type: "input_image",
 							image_url: `data:image/png;base64,${imageData}`,
+							file_id: null,
 							detail: "original",
 						},
-						{ type: "input_image", file_id: "file_image_123" },
-						{ type: "input_file", filename: "report.pdf", file_data: "opaque" },
+						{ type: "input_image", image_url: null, file_id: "file_image_123", detail: null },
+						{
+							type: "input_file",
+							detail: "high",
+							filename: "report.pdf",
+							file_data: null,
+							file_id: null,
+							file_url: null,
+						},
 					],
 				},
 			],
@@ -213,6 +221,47 @@ describe("openai-responses parseRequest", () => {
 			{ type: "image", data: imageData, mimeType: "image/png", detail: "original" },
 			{ type: "text", text: "[image: file_image_123]" },
 			{ type: "text", text: "[file: report.pdf]" },
+		]);
+	});
+
+	it("rejects function output images without a usable source", () => {
+		expect(() =>
+			parseRequest({
+				model: "gpt-5.6-sol",
+				input: [
+					{
+						type: "function_call_output",
+						call_id: "call_read",
+						output: [{ type: "input_image", image_url: null, file_id: null, detail: null }],
+					},
+				],
+			}),
+		).toThrow(/at least one of `image_url` or `file_id`/);
+	});
+
+	it("concatenates legacy function output text while retaining inline images", () => {
+		const imageData = Buffer.from("legacy image").toString("base64");
+		const parsed = parseRequest({
+			model: "gpt-5.6-sol",
+			input: [
+				{
+					type: "function_call_output",
+					call_id: "call_legacy",
+					output: [
+						{ type: "output_text", text: "foo" },
+						{ type: "input_image", image_url: `data:image/png;base64,${imageData}` },
+						{ type: "text", text: "bar" },
+						{ type: "refusal", refusal: "no" },
+					],
+				},
+			],
+		});
+
+		const result = parsed.context.messages[0];
+		if (result?.role !== "toolResult") throw new Error("expected tool result");
+		expect(result.content).toEqual([
+			{ type: "text", text: "foobar[refusal: no]" },
+			{ type: "image", data: imageData, mimeType: "image/png" },
 		]);
 	});
 

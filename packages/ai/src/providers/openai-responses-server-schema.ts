@@ -34,9 +34,9 @@ const plainTextSchema = type({
 
 const inputImageBlockSchema = type({
 	type: "'input_image'",
-	"detail?": "'auto' | 'low' | 'high' | 'original'",
-	"image_url?": "string",
-	"file_id?": "string",
+	"detail?": "'auto' | 'low' | 'high' | 'original' | null",
+	"image_url?": "string | null",
+	"file_id?": "string | null",
 }).narrow((v, ctx) => {
 	return (
 		typeof v.image_url === "string" ||
@@ -47,10 +47,11 @@ const inputImageBlockSchema = type({
 
 const inputFileBlockSchema = type({
 	type: "'input_file'",
-	"file_id?": "string",
-	"filename?": "string",
-	"file_data?": "string",
-	"file_url?": "string",
+	"detail?": "'low' | 'high'",
+	"file_id?": "string | null",
+	"filename?": "string | null",
+	"file_data?": "string | null",
+	"file_url?": "string | null",
 });
 
 const outputTextSchema = type({
