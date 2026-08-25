@@ -43,6 +43,9 @@ describe("AgentSession.refreshModels ordering", () => {
 		});
 
 		const order: string[] = [];
+		vi.spyOn(modelRegistry, "awaitBackgroundRefresh").mockImplementation(async () => {
+			order.push("awaitBackgroundRefresh");
+		});
 		vi.spyOn(modelRegistry, "reapplyModelPolicies").mockImplementation(async () => {
 			order.push("reapply");
 		});
@@ -52,9 +55,10 @@ describe("AgentSession.refreshModels ordering", () => {
 
 		await session.refreshModels("offline");
 
+		// awaitBackgroundRefresh serializes against startup's in-flight discovery;
 		// reapplyModelPolicies forces the mtime-gated static rebuild; refresh then
-		// discovers against the fresh provider set. A flipped order would reuse the
-		// stale #discoverableProviders and never surface a newly-enabled provider.
-		expect(order).toEqual(["reapply", "refresh"]);
+		// discovers against the fresh provider set. Any other order would reuse the
+		// stale provider set or let an out-of-order refresh re-add a disabled provider.
+		expect(order).toEqual(["awaitBackgroundRefresh", "reapply", "refresh"]);
 	});
 });

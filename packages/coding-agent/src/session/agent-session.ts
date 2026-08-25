@@ -8483,6 +8483,12 @@ export class AgentSession {
 	 * visible to /models and /switch without a restart.
 	 */
 	async refreshModels(strategy: ModelRefreshStrategy = "online-if-uncached"): Promise<void> {
+		// Serialize against startup's refreshInBackground(): a reload issued while
+		// background discovery is still running would start an unsynchronized
+		// refresh, and the older request could finish last and re-add a provider the
+		// reload just disabled (or overwrite the fresh catalog). No-op when no
+		// refresh is in flight.
+		await this.#modelRegistry.awaitBackgroundRefresh();
 		// Force the static rebuild BEFORE the online pass. `refresh()`'s static
 		// reload is mtime-gated, so a reload that only edits settings (e.g.
 		// removing a provider from `disabledProviders`, or toggling `extendedContext`)
