@@ -16,6 +16,10 @@
 
 - Fixed `--model <id>:<effort>` dropping the effort from the `default` role, so cycling back to `default` with ctrl+p ran at the previous role's reasoning effort. An explicit `--thinking` still wins over the flag's suffix.
 
+### Fixed
+
+- Fixed imported and legacy sessions with missing assistant usage metadata dropping RPC lifecycle events ([#9743](https://github.com/can1357/oh-my-pi/issues/9743)).
+
 ## [18.0.5] - 2026-08-25
 
 ### Added
