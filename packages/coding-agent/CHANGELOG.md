@@ -25,6 +25,7 @@
 - Added `s`/`u` shortcuts to stage/unstage files directly from the sidebar
 - Added `space` shortcut as page down in the diff pane
 - Expanded `omp git` keyboard navigation: `alt+↓`/`alt+↑` jump hunks and roll into the adjacent file at the edges, `]`/`[` switch files, `←`/`→` collapse/expand sidebar directories, `enter` opens the selected file, vim motions (`j`/`k`/`h`/`l`/`g`/`G`) work in both panes, `1`–`4` pick a diff view directly, and `c` jumps to the commit form.
+- Clarified the computer tool prompt: `desktop.window()` returns a promise that must be awaited, and `win.ax()` snapshots are textual trees rather than structured node lists.
 
 ### Fixed
 
