@@ -77,6 +77,10 @@ const inputContentBlockSchema = inputTextSchema.or(plainTextSchema).or(inputImag
 
 const outputContentBlockSchema = outputTextSchema.or(plainTextSchema).or(outputRefusalSchema);
 
+// The Responses API defines function output arrays in terms of input content.
+// Keep output text/refusal blocks for compatibility with older Codex clients.
+const functionCallOutputContentBlockSchema = inputContentBlockSchema.or(outputTextSchema).or(outputRefusalSchema);
+
 // ─── Input items ────────────────────────────────────────────────────────────
 
 const userMessageItemSchema = type({
@@ -118,8 +122,8 @@ const functionCallItemSchema = type({
 const functionCallOutputItemSchema = type({
 	type: "'function_call_output'",
 	call_id: "string >= 1",
-	// Codex CLI replays multimodal tool results in array form (text + refusal).
-	"output?": type("string").or(outputContentBlockSchema.array()),
+	// Function outputs may carry text, image, or file input blocks.
+	"output?": type("string").or(functionCallOutputContentBlockSchema.array()),
 });
 
 const customToolCallItemSchema = type({

@@ -177,6 +177,45 @@ describe("openai-responses parseRequest", () => {
 		expect(parsed.options.extra).toBeUndefined();
 	});
 
+	it("accepts multimodal function outputs using Responses input content blocks", () => {
+		const imageData = Buffer.from("tool image").toString("base64");
+		const parsed = parseRequest({
+			model: "gpt-5.6-sol",
+			input: [
+				{
+					type: "function_call",
+					id: "fc_read",
+					call_id: "call_read",
+					name: "read",
+					arguments: '{"path":"image.png"}',
+				},
+				{
+					type: "function_call_output",
+					call_id: "call_read",
+					output: [
+						{ type: "input_text", text: "Read image file [image/png]" },
+						{
+							type: "input_image",
+							image_url: `data:image/png;base64,${imageData}`,
+							detail: "original",
+						},
+						{ type: "input_image", file_id: "file_image_123" },
+						{ type: "input_file", filename: "report.pdf", file_data: "opaque" },
+					],
+				},
+			],
+		});
+
+		const result = parsed.context.messages[1];
+		if (result?.role !== "toolResult") throw new Error("expected tool result");
+		expect(result.content).toEqual([
+			{ type: "text", text: "Read image file [image/png]" },
+			{ type: "image", data: imageData, mimeType: "image/png", detail: "original" },
+			{ type: "text", text: "[image: file_image_123]" },
+			{ type: "text", text: "[file: report.pdf]" },
+		]);
+	});
+
 	it("rejects raw explicit prompt-cache controls instead of silently dropping them", () => {
 		expect(() =>
 			parseRequest({

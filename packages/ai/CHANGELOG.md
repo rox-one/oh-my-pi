@@ -27,6 +27,9 @@
 - Added safe retries for transient mid-stream socket closures across OpenAI Responses, Chat Completions, Azure OpenAI Responses, and Codex SSE when no replay-unsafe output has been emitted.
 - Fixed usage and cost reporting for OpenAI-compatible gateways backed by Vertex AI or Gemini by recognizing cached prompt tokens reported through `cachedContentTokenCount`.
 - Fixed DeepSeek's official vision model `deepseek-v4-flash-vision-exp` having every image stripped from outbound Chat Completions requests: `isTextOnlyDeepSeek` (vision guard, introduced for legacy DeepSeek endpoints that reject `image_url` with HTTP 400) now exempts model IDs/names carrying the official `vision` marker, so images reach `api.deepseek.com` instead of being replaced by the non-vision placeholder. Text-only DeepSeek models with a misconfigured `input: [text, image]` remain scrubbed.
+### Fixed
+
+- Fixed auth-gateway OpenAI Responses requests rejecting multimodal function-call outputs containing input text, images, or files; inline data images are now preserved as tool-result content.
 
 ## [18.0.4] - 2026-08-24
 

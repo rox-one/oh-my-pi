@@ -21,6 +21,7 @@ import type {
 	ComputerSafetyCheck,
 	ComputerScreenshotRef,
 	Context,
+	ImageContent,
 	Message,
 	TextContent,
 	ThinkingContent,
@@ -290,21 +291,61 @@ function ensureAssistantPlaceholder(messages: Message[], modelId: string, now: n
 	return placeholder;
 }
 
-/** Flatten a function_call_output array form (text + refusal) into a single string. */
-function flattenFunctionOutputArray(blocks: readonly unknown[]): string {
-	const parts: string[] = [];
-	for (const raw of blocks) {
+function decodeDataUri(url: string): { data: string; mimeType: string } | undefined {
+	if (!url.startsWith("data:")) return undefined;
+	const comma = url.indexOf(",");
+	if (comma < 0) return undefined;
+	const header = url.slice(5, comma);
+	const payload = url.slice(comma + 1);
+	const isBase64 = header.endsWith(";base64");
+	const mimeType = (isBase64 ? header.slice(0, -";base64".length) : header) || "application/octet-stream";
+	const data = isBase64 ? payload : Buffer.from(decodeURIComponent(payload), "utf8").toString("base64");
+	return { data, mimeType };
+}
+
+function functionOutputContent(output: string | readonly unknown[] | undefined): (TextContent | ImageContent)[] {
+	if (typeof output === "string") return [{ type: "text", text: output }];
+	if (!output) return [{ type: "text", text: "" }];
+
+	const parts: (TextContent | ImageContent)[] = [];
+	for (const raw of output) {
 		if (!isObj(raw)) continue;
-		const t = raw.type;
-		if (t === "output_text" || t === "text") {
+		const blockType = raw.type;
+		if (blockType === "input_text" || blockType === "output_text" || blockType === "text") {
 			const text = asString(raw.text);
-			if (text) parts.push(text);
-		} else if (t === "refusal") {
+			if (text !== undefined) parts.push({ type: "text", text });
+			continue;
+		}
+		if (blockType === "refusal") {
 			const refusal = asString(raw.refusal);
-			if (refusal) parts.push(`[refusal: ${refusal}]`);
+			if (refusal !== undefined) parts.push({ type: "text", text: `[refusal: ${refusal}]` });
+			continue;
+		}
+		if (blockType === "input_image") {
+			const imageUrl = asString(raw.image_url);
+			const decoded = imageUrl ? decodeDataUri(imageUrl) : undefined;
+			if (decoded) {
+				const detail =
+					raw.detail === "auto" || raw.detail === "low" || raw.detail === "high" || raw.detail === "original"
+						? raw.detail
+						: undefined;
+				parts.push({ type: "image", ...decoded, ...(detail ? { detail } : {}) });
+			} else {
+				const reference = imageUrl ?? asString(raw.file_id);
+				if (reference) parts.push({ type: "text", text: `[image: ${reference}]` });
+			}
+			continue;
+		}
+		if (blockType === "input_file") {
+			const reference =
+				asString(raw.filename) ??
+				asString(raw.file_id) ??
+				asString(raw.file_url) ??
+				(asString(raw.file_data) ? "inline data" : undefined);
+			if (reference) parts.push({ type: "text", text: `[file: ${reference}]` });
 		}
 	}
-	return parts.join("");
+	return parts.length > 0 ? parts : [{ type: "text", text: "" }];
 }
 
 // ─── parseRequest ───────────────────────────────────────────────────────────
@@ -477,18 +518,11 @@ export function parseRequest(body: unknown, headers?: Headers): ParsedRequest {
 			}
 			if (effectiveType === "function_call_output") {
 				const output = item as OpenAIResponsesFunctionCallOutputItem;
-				const toolName = findToolNameById(messages, output.call_id);
-				const text =
-					typeof output.output === "string"
-						? output.output
-						: Array.isArray(output.output)
-							? flattenFunctionOutputArray(output.output)
-							: "";
 				messages.push({
 					role: "toolResult",
 					toolCallId: output.call_id,
-					toolName,
-					content: [{ type: "text", text }],
+					toolName: findToolNameById(messages, output.call_id),
+					content: functionOutputContent(output.output),
 					isError: false,
 					timestamp: now,
 				});
