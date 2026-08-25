@@ -42,7 +42,11 @@ import {
 	resolveModelRoleValue,
 	resolveModelScope,
 	type ScopedModel,
+	toSessionScopedModels,
 } from "./config/model-resolver";
+
+export { toSessionScopedModels };
+
 import { ModelsConfigFile } from "./config/models-config";
 import { serviceTierSettingToTier } from "./config/service-tier";
 import { getDefault, type SettingPath, Settings, type SettingValue, settings } from "./config/settings";
@@ -104,7 +108,6 @@ import { shouldShowStartupSplash } from "./startup-splash";
 import { discoverTitleSystemPromptFile, resolvePromptInput } from "./system-prompt";
 import { createPersistedSubagentReviverFactory } from "./task/persisted-revive";
 import { createTelemetryExportConfig, initTelemetryExport, isTelemetryExportEnabled } from "./telemetry-export";
-import { concreteThinkingLevel, parseConfiguredThinkingLevel } from "./thinking";
 import type { LspStartupServerInfo } from "./tools";
 import { getChangelogPath, resolveStartupChangelogForDisplay, type StartupChangelogSelection } from "./utils/changelog";
 import { EventBus } from "./utils/event-bus";
@@ -792,7 +795,6 @@ export async function resolveScopedModels(
 	await modelRegistry.refresh("online-if-uncached");
 	return await resolveModelScope(modelPatterns, modelRegistry, preferences, activeSettings);
 }
-export { toSessionScopedModels } from "./config/model-resolver";
 
 /** Whether two scope lists reference the same set of models (order-independent). */
 function sameScopedModelSet(a: ReadonlyArray<{ model: Model }>, b: ReadonlyArray<{ model: Model }>): boolean {

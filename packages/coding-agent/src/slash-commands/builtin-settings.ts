@@ -58,7 +58,7 @@ export const BUILTIN_SETTINGS_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = 
 			}
 			const imageOrder = runtime.settings.get("providers.imageOrder");
 			if (Array.isArray(imageOrder)) {
-				setImageProviderOrder(imageOrder.filter((entry): entry is string => typeof entry === "string"));
+				setImageProviderOrder(imageOrder);
 			}
 			if (runtime.session && before.get("inspect_image.mode") !== runtime.settings.get("inspect_image.mode")) {
 				await runtime.session.applyInspectImageModeChange();

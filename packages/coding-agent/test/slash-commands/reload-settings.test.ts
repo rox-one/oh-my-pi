@@ -72,6 +72,7 @@ describe("/reload-settings slash command", () => {
 		const output = vi.fn();
 		const notifyConfigChanged = vi.fn();
 		const refreshModels = vi.fn(async () => {});
+		const refreshScopedModels = vi.fn(async () => {});
 		const reapplyModelRoles = vi.fn();
 		const setAdvisorEnabled = vi.fn();
 		const setSteeringMode = vi.fn();
@@ -86,6 +87,7 @@ describe("/reload-settings slash command", () => {
 		};
 		const session = {
 			refreshModels,
+			refreshScopedModels,
 			reapplyModelRoles,
 			isAdvisorEnabled: () => true,
 			setAdvisorEnabled,
@@ -113,7 +115,7 @@ describe("/reload-settings slash command", () => {
 			output,
 			notifyConfigChanged,
 			refreshModels: session.refreshModels as unknown as Mock<() => Promise<void>>,
-			reapplyModelRoles,
+			reapplyModelRoles: session.reapplyModelRoles as unknown as Mock<() => void>,
 			setAdvisorEnabled,
 			setSteeringMode,
 			agent: agentFields,

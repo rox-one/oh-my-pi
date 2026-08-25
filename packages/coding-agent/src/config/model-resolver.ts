@@ -37,6 +37,7 @@ import {
 	parseThinkingLevel,
 	resolveThinkingLevelForModel,
 } from "../thinking";
+import { isAuthenticated, kNoAuth, type ModelRegistry } from "./model-registry";
 import {
 	DEFAULT_MODEL_ROLE_ALIAS,
 	formatModelRoleAlias,
