@@ -1,5 +1,7 @@
 import type { AutocompleteItem } from "@oh-my-pi/pi-tui";
 import { COLLAB_GUEST_ALLOWED_COMMANDS } from "../collab/guest";
+import type { SettingPath } from "../config/settings";
+import { applySettingSideEffects, REPLAYED_SETTING_IDS } from "../modes/controllers/setting-side-effects";
 import { BUILTIN_COLLABORATION_SLASH_COMMANDS } from "./builtin-collaboration";
 import {
 	buildArgumentCompletions,
@@ -342,15 +344,13 @@ export async function executeBuiltinSlashCommand(
 			refreshCommands: () => ctx.refreshSlashCommandState(),
 			reloadPlugins: () => reloadTuiPluginState(ctx),
 			notifyConfigChanged: async () => {
-				// Replay the settings components cache at construction; a layer swap
-				// alone leaves them stale until the next editor swap.
-				ctx.editor.setImeSafeCursorLayout(ctx.settings.get("tui.imeSafeCursor"));
-				const maxVisible = ctx.settings.get("autocompleteMaxVisible");
-				ctx.editor.setAutocompleteMaxVisible(
-					typeof maxVisible === "number" ? maxVisible : Number(maxVisible),
-				);
-				ctx.syncEditorSpelling();
-				ctx.ui.requestRender();
+				// Replay the settings that components and agent fields cache at
+				// construction; a layer swap alone leaves them stale until the
+				// next editor swap. Queue modes are reconciled by the handler
+				// itself with persist=false, so they stay out of the replay list.
+				for (const id of REPLAYED_SETTING_IDS) {
+					applySettingSideEffects(ctx, id, ctx.settings.get(id as SettingPath), { persist: false });
+				}
 			},
 		};
 		const result = await command.handle(parsed, adapted);
