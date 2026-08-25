@@ -81,4 +81,22 @@ describe("parseArgs — --cwd flag", () => {
 		chdir.mockRestore();
 		expect(getProjectDir()).toBe(launchDir);
 	});
+
+	it("appends the macOS permission hint only for permission errors", async () => {
+		const launchDir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-cwd-hint-launch-"));
+		setProjectDir(launchDir);
+		const targetDir = path.join(launchDir, "blocked");
+		const parsed = parseArgs(["--cwd", targetDir]);
+		const chdir = vi.spyOn(process, "chdir").mockImplementation(() => {
+			throw Object.assign(new Error("operation not permitted"), { code: "EACCES" });
+		});
+
+		try {
+			await expect(applyStartupCwd(parsed)).rejects.toThrow(
+				/operation not permitted\. On macOS, grant omp Files & Folders/,
+			);
+		} finally {
+			chdir.mockRestore();
+		}
+	});
 });

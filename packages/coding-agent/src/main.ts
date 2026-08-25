@@ -759,9 +759,35 @@ async function switchToResumedProject(
 	// clearPluginRootsAndCaches only kicks off an unawaited re-warm; await a fresh
 	// destination preload so sync consumers (plugin-provided LSP/DAP config) never
 	// read the launch project's stale/empty roots during session creation.
-	await preloadPluginRoots(os.homedir(), cwd);
-	await activeSettings.reloadForCwd(cwd);
+	try {
+		await preloadPluginRoots(os.homedir(), cwd);
+		await activeSettings.reloadForCwd(cwd);
+	} catch (error) {
+		// The process cwd is already committed to the target. If rescoping the
+		// cwd-derived state fails, undo the whole transition instead of building
+		// the session with target-scoped cwd and launch-scoped settings.
+		logger.warn("Could not rescope to resumed project directory", { cwd, error: String(error) });
+		try {
+			setProjectDir(launchCwd);
+			await sessionManager.moveTo(launchCwd);
+			clearPluginRootsAndCaches();
+			await preloadPluginRoots(os.homedir(), launchCwd);
+		} catch (rollbackError) {
+			throw new SessionResolutionError(
+				`Could not switch to resumed project ${resumedCwd} (${error instanceof Error ? error.message : String(error)}); failed to restore launch directory ${launchCwd}: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`,
+			);
+		}
+		return { cwd: launchCwd, chdirFailed: resumedCwd };
+	}
 	return { cwd };
+}
+
+function notifyResumeCwdFallback(parsedArgs: Args, resumedProject: ResumedProjectResult, cwd: string): void {
+	if (!resumedProject.chdirFailed) return;
+	writeStartupNotice(
+		parsedArgs,
+		`${chalk.yellow(`Could not switch to resumed project ${resumedProject.chdirFailed}; staying in ${cwd}.`)}\n`,
+	);
 }
 
 /**
@@ -1669,12 +1695,7 @@ export async function runRootCommand(
 				sessionManager,
 			);
 			cwd = resumedProject.cwd;
-			if (resumedProject.chdirFailed) {
-				writeStartupNotice(
-					parsedArgs,
-					`${chalk.yellow(`Could not switch to resumed project ${resumedProject.chdirFailed}; staying in ${cwd}.`)}\n`,
-				);
-			}
+			notifyResumeCwdFallback(parsedArgs, resumedProject, cwd);
 			if (cwd !== previousCwd) {
 				// applyStartupCwd persists an explicit --cwd in parsedArgs; once resume
 				// switches projects, keep session construction on the destination too.
@@ -1742,12 +1763,7 @@ export async function runRootCommand(
 				sessionManager,
 			);
 			cwd = resumedProject.cwd;
-			if (resumedProject.chdirFailed) {
-				writeStartupNotice(
-					parsedArgs,
-					`${chalk.yellow(`Could not switch to resumed project ${resumedProject.chdirFailed}; staying in ${cwd}.`)}\n`,
-				);
-			}
+			notifyResumeCwdFallback(parsedArgs, resumedProject, cwd);
 			if (cwd !== previousCwd) {
 				parsedArgs.cwd = cwd;
 				scopedModels = await resolveScopedModels(parsedArgs, modelRegistry, settingsInstance);
@@ -1768,7 +1784,6 @@ export async function runRootCommand(
 				}
 			}
 		}
-
 		await pluginPreloadPromise;
 		if (deps === DEFAULT_RUN_ROOT_DEPENDENCIES) {
 			await logger.time("registerDaemonProjectPresence", registerDaemonProjectPresence, cwd);

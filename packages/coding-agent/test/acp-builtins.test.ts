@@ -74,6 +74,7 @@ interface FakeAcpBuiltinSessionManager {
 	moveTo(newCwd: string): Promise<void>;
 	captureState(): { cwd: string; sessionDir: string };
 	restoreState(snapshot: { cwd: string }): void;
+	rollbackMove(snapshot: { cwd: string; sessionDir: string }): Promise<void>;
 	setSessionFile(sessionFile: string): Promise<void>;
 	dropSession(sessionPath: string): Promise<void>;
 	getCwd(): string;
@@ -200,6 +201,10 @@ function createRuntime() {
 		restoreState(snapshot: { cwd: string }) {
 			this._cwd = snapshot.cwd;
 			this._movedTo = snapshot.cwd;
+		},
+		async rollbackMove(snapshot: { cwd: string; sessionDir: string }) {
+			await this.moveTo(snapshot.cwd);
+			this.restoreState(snapshot);
 		},
 		async setSessionFile(sessionFile: string) {
 			this._sessionFile = path.resolve(sessionFile);

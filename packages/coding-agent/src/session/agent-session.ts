@@ -8315,17 +8315,21 @@ export class AgentSession {
 				});
 			}
 			if (cwdChangeTarget && error !== SESSION_CWD_CHANGE_REJECTED && options?.onCwdChange) {
+				let rollbackFailure: string | undefined;
 				try {
 					if (!(await options.onCwdChange(previousSessionState.cwd, cwdChangeTarget))) {
-						logger.warn("Cwd rollback was rejected after session switch", {
-							cwd: previousSessionState.cwd,
-						});
+						rollbackFailure = "cwd rollback was rejected";
 					}
 				} catch (rollbackError) {
-					logger.warn("Cwd rollback failed after session switch", {
-						cwd: previousSessionState.cwd,
-						error: String(rollbackError),
-					});
+					rollbackFailure = `cwd rollback failed: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`;
+				}
+				if (rollbackFailure) {
+					logger.warn("Failed to restore cwd after session switch", { cwd: previousSessionState.cwd });
+					// The session is restored to the source, but the process cwd
+					// may still sit at the target. Surface both halves instead of
+					// failing open with only the original error.
+					const original = error instanceof Error ? error.message : String(error);
+					throw new Error(`${original} (${rollbackFailure}; the process may remain in ${cwdChangeTarget})`);
 				}
 			}
 			this.#bash.finishSessionTransition(bashTransition, false);

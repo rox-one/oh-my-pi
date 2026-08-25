@@ -1338,6 +1338,7 @@ export class SessionManager {
 		this.#applyEntries(snapshot.header, [...snapshot.entries]);
 		this.#additionalDirectories = snapshot.header.additionalDirectories ?? [];
 		this.#sessionName = snapshot.sessionName;
+
 		this.#titleSource = snapshot.titleSource;
 		this.#titleUpdatedAt = snapshot.titleUpdatedAt;
 		this.#hasTitleSlot = snapshot.hasTitleSlot;
@@ -1346,6 +1347,27 @@ export class SessionManager {
 		this.#adoptedArtifactManager = null;
 
 		if (this.#sessionFile) this.#rememberBreadcrumb(this.#cwd, this.#sessionFile);
+	}
+
+	/**
+	 * Undo a {@link moveTo} using a {@link captureState} snapshot: rename the
+	 * session and artifacts back into the captured bucket, then restore the
+	 * captured metadata (cwd, header, additionalDirectories). Rollbacks must
+	 * not re-enter forward-move hooks, so this bypasses AgentSession entirely.
+	 * If the rename-back itself fails, in-memory state is still restored and
+	 * the error names where the session file actually lives.
+	 */
+	async rollbackMove(snapshot: SessionManagerStateSnapshot): Promise<void> {
+		try {
+			await this.moveTo(snapshot.cwd, snapshot.sessionDir);
+		} catch (error) {
+			const movedFile = this.getSessionFile();
+			this.restoreState(snapshot);
+			throw new Error(
+				`could not relocate the session back to ${snapshot.sessionDir} (${error instanceof Error ? error.message : String(error)}); the session file remains at ${movedFile}`,
+			);
+		}
+		this.restoreState(snapshot);
 	}
 
 	/** Switch to a different session file (resume / branch). */

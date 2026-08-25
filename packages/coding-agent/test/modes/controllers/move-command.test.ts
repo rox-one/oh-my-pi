@@ -22,12 +22,18 @@ function createMoveContext(sourceDir: string, settingsFlush?: () => Promise<void
 	const restoreState = vi.fn((snapshot: { cwd: string }) => {
 		state.cwd = snapshot.cwd;
 	});
+	const rollbackMove = vi.fn(async (snapshot: { cwd: string }) => {
+		state.cwd = snapshot.cwd;
+		state.movedTo = snapshot.cwd;
+		restoreState(snapshot);
+	});
 	const ctx = {
 		session: { isStreaming: false, moveSession },
 		sessionManager: {
 			getCwd: () => state.cwd,
 			captureState,
 			restoreState,
+			rollbackMove,
 			dropSession: vi.fn(async () => {}),
 		},
 		settings: {
@@ -43,7 +49,7 @@ function createMoveContext(sourceDir: string, settingsFlush?: () => Promise<void
 		ui: { requestRender: vi.fn() },
 		present,
 	} as unknown as InteractiveModeContext;
-	return { ctx, state, present, captureState, restoreState, sessionDir };
+	return { ctx, state, present, captureState, restoreState, rollbackMove, sessionDir };
 }
 
 describe("CommandController /move", () => {
@@ -80,16 +86,16 @@ describe("CommandController /move", () => {
 		const sourceDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-move-source-"));
 		const targetDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-move-target-"));
 		try {
-			const { ctx, state, captureState, restoreState, sessionDir } = createMoveContext(sourceDir);
+			const { ctx, state, captureState, restoreState, rollbackMove } = createMoveContext(sourceDir);
 			ctx.applyCwdChange = vi.fn(async () => false);
 			const controller = new CommandController(ctx);
 
 			await controller.handleMoveCommand(targetDir);
 
-			expect(ctx.session.moveSession).toHaveBeenCalledTimes(2);
-			expect(ctx.session.moveSession).toHaveBeenNthCalledWith(2, sourceDir, sessionDir);
-			expect(restoreState).toHaveBeenCalledWith(captureState.mock.results[0]?.value);
+			expect(ctx.session.moveSession).toHaveBeenCalledTimes(1);
+			expect(rollbackMove).toHaveBeenCalledWith(captureState.mock.results[0]?.value);
 			expect(state.cwd).toBe(sourceDir);
+			expect(restoreState).toHaveBeenCalledWith(captureState.mock.results[0]?.value);
 			expect(ctx.updateEditorBorderColor).not.toHaveBeenCalled();
 			expect(ctx.reloadTodos).not.toHaveBeenCalled();
 			expect(ctx.ui.requestRender).not.toHaveBeenCalled();

@@ -578,18 +578,26 @@ export const BUILTIN_LIFECYCLE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> =
 				setProjectDir(resolvedPath);
 			} catch (err) {
 				try {
-					await runtime.session.moveSession(previousState.cwd, previousState.sessionDir);
-					runtime.sessionManager.restoreState(previousState);
+					await runtime.sessionManager.rollbackMove(previousState);
 				} catch (rollbackError) {
 					return usage(`Move failed and rollback failed: ${errorMessage(rollbackError)}`, runtime);
 				}
 				return usage(`Move failed: ${errorMessage(err)}`, runtime);
 			}
-			await runtime.settings.reloadForCwd(resolvedPath);
-			applyProviderGlobalsFromSettings(runtime.settings);
-			// Reload plugin/capability caches so the next prompt sees commands and
-			// capabilities scoped to the new cwd.
-			await runtime.reloadPlugins();
+			try {
+				await runtime.settings.reloadForCwd(resolvedPath);
+				applyProviderGlobalsFromSettings(runtime.settings);
+				// Reload plugin/capability caches so the next prompt sees commands and
+				// capabilities scoped to the new cwd.
+				await runtime.reloadPlugins();
+			} catch (err) {
+				try {
+					await runtime.sessionManager.rollbackMove(previousState);
+				} catch (rollbackError) {
+					return usage(`Move failed and rollback failed: ${errorMessage(rollbackError)}`, runtime);
+				}
+				return usage(`Move failed: ${errorMessage(err)}`, runtime);
+			}
 			await runtime.notifyConfigChanged?.();
 			await runtime.notifyTitleChanged?.();
 			await runtime.output(`Moved to ${runtime.sessionManager.getCwd()}.`);

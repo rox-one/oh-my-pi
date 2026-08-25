@@ -1526,6 +1526,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	 * reflect `newCwd` before this is called.
 	 */
 	async applyCwdChange(newCwd: string): Promise<boolean> {
+		const previousCwd = getProjectDir();
 		try {
 			setProjectDir(newCwd);
 		} catch (error) {
@@ -1534,24 +1535,42 @@ export class InteractiveMode implements InteractiveModeContext {
 			);
 			return false;
 		}
-		// Re-scope project settings (`.claude/settings.yml` etc.) to the new
-		// directory in place so the active session and every settings reader pick
-		// up the destination project's configuration.
-		if (isSettingsInitialized()) {
-			await settings.reloadForCwd(newCwd);
-			// Reapply provider preferences from the newly-loaded settings so the
-			// module-level search/image provider state reflects the destination
-			// project's configuration. Without this, the previous project's
-			// exclusions leak and newly-excluded providers are still used.
-			applyProviderGlobalsFromSettings(settings);
+		// Everything after chdir is a rescope of cwd-derived state. If any of it
+		// fails, undo the chdir so `false` reliably means "nothing committed";
+		// callers roll back their own session/manager state on false.
+		try {
+			// Re-scope project settings (`.claude/settings.yml` etc.) to the new
+			// directory in place so the active session and every settings reader pick
+			// up the destination project's configuration.
+			if (isSettingsInitialized()) {
+				await settings.reloadForCwd(newCwd);
+				// Reapply provider preferences from the newly-loaded settings so the
+				// module-level search/image provider state reflects the destination
+				// project's configuration. Without this, the previous project's
+				// exclusions leak and newly-excluded providers are still used.
+				applyProviderGlobalsFromSettings(settings);
+			}
+			// Re-warm plugin roots, capabilities, slash commands, and the ssh tool so
+			// the next prompt sees everything scoped to the new project directory.
+			clearClaudePluginRootsCache();
+			await this.refreshTitleSystemPrompt(newCwd);
+			resetCapabilities();
+			await this.refreshSkillState();
+			await this.refreshSlashCommandState(newCwd);
+		} catch (error) {
+			try {
+				setProjectDir(previousCwd);
+			} catch (restoreError) {
+				this.showError(
+					`Failed to switch to ${newCwd} (${error instanceof Error ? error.message : String(error)}), and restoring the previous directory failed: ${restoreError instanceof Error ? restoreError.message : String(restoreError)}`,
+				);
+				return false;
+			}
+			this.showError(
+				`Cannot change working directory to ${newCwd}: ${error instanceof Error ? error.message : String(error)}`,
+			);
+			return false;
 		}
-		// Re-warm plugin roots, capabilities, slash commands, and the ssh tool so
-		// the next prompt sees everything scoped to the new project directory.
-		clearClaudePluginRootsCache();
-		await this.refreshTitleSystemPrompt(newCwd);
-		resetCapabilities();
-		await this.refreshSkillState();
-		await this.refreshSlashCommandState(newCwd);
 		setSessionTerminalTitle(this.sessionManager.getSessionName(), this.sessionManager.getCwd());
 		this.statusLine.applyCwdChange();
 		return true;

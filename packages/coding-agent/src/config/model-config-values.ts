@@ -44,7 +44,13 @@ function resolveCommandConfig(command: string, options?: ResolveConfigValueOptio
 		commandValueCache.set(command, trimmed);
 		return trimmed;
 	} catch (err) {
-		logger.warn("model-config: !command value resolution failed", { command, error: String(err) });
+		// The command may embed credentials inline, and execSync's message can
+		// echo the invocation and its output. Log only non-sensitive metadata.
+		const code =
+			typeof (err as NodeJS.ErrnoException | null)?.code === "string"
+				? (err as NodeJS.ErrnoException).code
+				: "unknown";
+		logger.warn("model-config: !command value resolution failed", { code });
 		commandFailureRetryAt.set(command, Date.now() + COMMAND_FAILURE_RETRY_MS);
 		return undefined;
 	}

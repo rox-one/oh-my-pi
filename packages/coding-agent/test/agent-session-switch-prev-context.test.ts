@@ -198,12 +198,14 @@ describe("AgentSession.switchSession previous-context build", () => {
 		let callbackCount = 0;
 		const onCwdChange = vi.fn(async (newCwd: string, _previousCwd: string) => {
 			actualCwd = newCwd;
-			if (callbackCount++ === 0) throw new Error("settings reload failed");
+			const call = callbackCount++;
+			if (call === 0) throw new Error("settings reload failed");
+			if (call === 1) throw new Error("cwd restore denied");
 			return true;
 		});
 
 		await expect(session.switchSession(targetSessionFile!, { onCwdChange })).rejects.toThrow(
-			"settings reload failed",
+			/settings reload failed.*cwd restore denied.*process may remain in/,
 		);
 
 		expect(actualCwd).toBe(sourceDir.path());

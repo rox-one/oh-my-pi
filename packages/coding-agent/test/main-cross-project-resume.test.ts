@@ -210,6 +210,43 @@ describe("runRootCommand — cross-project --resume", () => {
 		await fsp.rm(root, { recursive: true, force: true });
 	});
 
+	it("rolls back the whole transition when rescoping fails after chdir", async () => {
+		const match = buildGlobalMatch(resumedProject);
+		vi.spyOn(sessionListingModule, "resolveResumableSession").mockResolvedValue(match);
+		const settings = Settings.isolated({ "marketplace.autoUpdate": "off" });
+		const reloadForCwd = vi
+			.spyOn(settings, "reloadForCwd")
+			.mockRejectedValue(new Error("destination config unreadable"));
+		const authStorage = await AuthStorage.create(path.join(root, "auth.db"));
+		const parsed = parseArgs(["--resume", "019e84ed", "--print"]);
+		parsed.noExtensions = true;
+		parsed.noSkills = true;
+		parsed.noRules = true;
+		parsed.noTools = true;
+		parsed.noLsp = true;
+		let resumedManager: SessionManager | undefined;
+
+		try {
+			await runRootCommand(parsed, ["--resume", "019e84ed", "--print"], {
+				discoverAuthStorage: async () => authStorage,
+				settings,
+				createAgentSession: async options => {
+					if (!options) throw new Error("Expected session options");
+					resumedManager = options.sessionManager;
+					throw new Error("stop after session options");
+				},
+			});
+		} catch (error) {
+			if (!(error instanceof Error) || error.message !== "stop after session options") throw error;
+		} finally {
+			reloadForCwd.mockRestore();
+			authStorage.close();
+			await resumedManager?.close();
+		}
+
+		expect(getProjectDir()).toBe(launchProject);
+		expect(resumedManager?.getCwd()).toBe(launchProject);
+	});
 	it("uses the destination cwd and preloads its plugin roots before session creation", async () => {
 		const match = buildGlobalMatch(resumedProject);
 		vi.spyOn(sessionListingModule, "resolveResumableSession").mockResolvedValue(match);
