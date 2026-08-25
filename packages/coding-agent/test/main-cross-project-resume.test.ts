@@ -138,6 +138,45 @@ describe("SessionManager.open — recorded cwd adoption", () => {
 			await fsp.rm(root, { recursive: true, force: true });
 		}
 	});
+
+	it("keeps the launch cwd when the recorded cwd denies search permission", async () => {
+		const root = await fsp.mkdtemp(path.join(os.tmpdir(), "omp-xproj-noexec-"));
+		const launchProject = path.join(root, "launch");
+		const deniedProject = path.join(root, "denied");
+		await fsp.mkdir(launchProject);
+		await fsp.mkdir(deniedProject);
+		const match = buildGlobalMatch(deniedProject);
+		await Bun.write(
+			match.session.path,
+			`${JSON.stringify({
+				type: "session",
+				id: match.session.id,
+				cwd: deniedProject,
+				timestamp: new Date(0).toISOString(),
+			})}\n`,
+		);
+		const realAccess = fs.promises.access.bind(fs.promises);
+		const access = vi.spyOn(fs.promises, "access").mockImplementation(async (target, mode) => {
+			if (normalizePathForComparison(String(target)) === normalizePathForComparison(deniedProject)) {
+				throw Object.assign(new Error("permission denied"), { code: "EACCES" });
+			}
+			return realAccess(target, mode);
+		});
+
+		try {
+			const manager = await SessionManager.open(match.session.path, undefined, undefined, {
+				initialCwd: launchProject,
+			});
+			try {
+				expect(manager.getCwd()).toBe(launchProject);
+			} finally {
+				await manager.close();
+			}
+		} finally {
+			access.mockRestore();
+			await fsp.rm(root, { recursive: true, force: true });
+		}
+	});
 });
 
 describe("runRootCommand — cross-project --resume", () => {
