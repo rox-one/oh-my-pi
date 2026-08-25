@@ -8,7 +8,7 @@ import { AuthStorage } from "@oh-my-pi/pi-ai/auth-storage";
 import { createMockModel, registerMockApi } from "@oh-my-pi/pi-ai/providers/mock";
 import { encodeResponse, encodeStream, parseRequest } from "@oh-my-pi/pi-ai/providers/openai-responses-server";
 import { buildResponsesInput } from "@oh-my-pi/pi-ai/providers/openai-shared";
-import type { AssistantMessage, ModelSpec } from "@oh-my-pi/pi-ai/types";
+import type { AssistantMessage, Context, ModelSpec } from "@oh-my-pi/pi-ai/types";
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { Effort } from "@oh-my-pi/pi-catalog/effort";
@@ -177,7 +177,7 @@ describe("openai-responses parseRequest", () => {
 		expect(parsed.options.extra).toBeUndefined();
 	});
 
-	it("accepts multimodal function outputs using Responses input content blocks", () => {
+	it("preserves canonical multimodal order and nullable fallback sources", () => {
 		const imageData = Buffer.from("tool image").toString("base64");
 		const parsed = parseRequest({
 			model: "gpt-5.6-sol",
@@ -193,22 +193,23 @@ describe("openai-responses parseRequest", () => {
 					type: "function_call_output",
 					call_id: "call_read",
 					output: [
-						{ type: "input_text", text: "Read image file [image/png]" },
 						{
 							type: "input_image",
 							image_url: `data:image/png;base64,${imageData}`,
 							file_id: null,
 							detail: "original",
 						},
-						{ type: "input_image", image_url: null, file_id: "file_image_123", detail: null },
+						{ type: "input_text", text: "Read image file [image/png]" },
+						{ type: "input_image", image_url: "", file_id: "file_image_123", detail: null },
 						{
 							type: "input_file",
 							detail: "high",
-							filename: "report.pdf",
+							filename: "",
 							file_data: null,
 							file_id: null,
-							file_url: null,
+							file_url: "https://example.invalid/report.pdf",
 						},
+						{ type: "input_text", text: "done" },
 					],
 				},
 			],
@@ -217,14 +218,15 @@ describe("openai-responses parseRequest", () => {
 		const result = parsed.context.messages[1];
 		if (result?.role !== "toolResult") throw new Error("expected tool result");
 		expect(result.content).toEqual([
-			{ type: "text", text: "Read image file [image/png]" },
 			{ type: "image", data: imageData, mimeType: "image/png", detail: "original" },
+			{ type: "text", text: "Read image file [image/png]" },
 			{ type: "text", text: "[image: file_image_123]" },
-			{ type: "text", text: "[file: report.pdf]" },
+			{ type: "text", text: "[file: https://example.invalid/report.pdf]" },
+			{ type: "text", text: "done" },
 		]);
 	});
 
-	it("rejects function output images without a usable source", () => {
+	it("rejects function output images with an empty source", () => {
 		expect(() =>
 			parseRequest({
 				model: "gpt-5.6-sol",
@@ -232,7 +234,7 @@ describe("openai-responses parseRequest", () => {
 					{
 						type: "function_call_output",
 						call_id: "call_read",
-						output: [{ type: "input_image", image_url: null, file_id: null, detail: null }],
+						output: [{ type: "input_image", image_url: "", file_id: null, detail: null }],
 					},
 				],
 			}),
@@ -249,9 +251,9 @@ describe("openai-responses parseRequest", () => {
 					call_id: "call_legacy",
 					output: [
 						{ type: "output_text", text: "foo" },
-						{ type: "input_image", image_url: `data:image/png;base64,${imageData}` },
 						{ type: "text", text: "bar" },
 						{ type: "refusal", refusal: "no" },
+						{ type: "input_image", image_url: `data:image/png;base64,${imageData}` },
 					],
 				},
 			],
@@ -262,6 +264,73 @@ describe("openai-responses parseRequest", () => {
 		expect(result.content).toEqual([
 			{ type: "text", text: "foobar[refusal: no]" },
 			{ type: "image", data: imageData, mimeType: "image/png" },
+		]);
+	});
+
+	it("round-trips Pi image-read results as native function output blocks", () => {
+		const imageData = Buffer.from("read tool image").toString("base64");
+		const model = buildModel({
+			id: "gpt-5.6-sol",
+			name: "GPT-5.6 Sol",
+			api: "openai-responses",
+			provider: "openai",
+			baseUrl: "https://api.openai.com/v1",
+			reasoning: true,
+			input: ["text", "image"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 1_000_000,
+			maxTokens: 128_000,
+		} satisfies ModelSpec<"openai-responses">);
+		const context: Context = {
+			messages: [
+				{
+					role: "assistant",
+					content: [{ type: "toolCall", id: "call_read", name: "read", arguments: { path: "image.png" } }],
+					api: "openai-responses",
+					provider: "openai",
+					model: model.id,
+					usage: zeroUsage(),
+					stopReason: "toolUse",
+					timestamp: 1,
+				},
+				{
+					role: "toolResult",
+					toolCallId: "call_read",
+					toolName: "read",
+					content: [
+						{ type: "text", text: "Read image file [image/png]" },
+						{ type: "image", data: imageData, mimeType: "image/png", detail: "original" },
+					],
+					isError: false,
+					timestamp: 2,
+				},
+			],
+		};
+
+		const wireInput = buildResponsesInput({
+			model,
+			context,
+			strictResponsesPairing: true,
+			supportsImageDetailOriginal: true,
+		});
+		const wireOutput = wireInput.find(item => item.type === "function_call_output");
+		if (wireOutput?.type !== "function_call_output") throw new Error("expected function output");
+		expect(wireOutput.output).toEqual([
+			{ type: "input_text", text: "Read image file [image/png]" },
+			{
+				type: "input_image",
+				detail: "original",
+				image_url: `data:image/png;base64,${imageData}`,
+			},
+		]);
+		expect(wireInput.some(item => "role" in item && item.role === "user")).toBe(false);
+
+		const parsed = parseRequest({ model: model.id, input: wireInput });
+		const result = parsed.context.messages.find(message => message.role === "toolResult");
+		if (result?.role !== "toolResult") throw new Error("expected tool result");
+		expect(result.content).toEqual([
+			{ type: "text", text: "Read image file [image/png]" },
+			{ type: "image", data: imageData, mimeType: "image/png", detail: "original" },
 		]);
 	});
 

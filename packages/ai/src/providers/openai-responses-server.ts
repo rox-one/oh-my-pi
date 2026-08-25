@@ -32,6 +32,7 @@ import { decodeDataUri } from "./openai-data-uri";
 import {
 	type OpenAIResponsesComputerCallItem,
 	type OpenAIResponsesComputerCallOutputItem,
+	type OpenAIResponsesCustomToolCallOutputItem,
 	type OpenAIResponsesFunctionCallItem,
 	type OpenAIResponsesFunctionCallOutputItem,
 	type OpenAIResponsesInputContent,
@@ -298,48 +299,60 @@ function functionOutputContent(output: string | readonly unknown[] | undefined):
 	if (typeof output === "string") return [{ type: "text", text: output }];
 	if (!output) return [{ type: "text", text: "" }];
 
-	const textParts: string[] = [];
-	const additionalContent: (TextContent | ImageContent)[] = [];
+	const content: (TextContent | ImageContent)[] = [];
+	let legacyText = "";
+	const flushLegacyText = (): void => {
+		if (legacyText.length === 0) return;
+		content.push({ type: "text", text: legacyText });
+		legacyText = "";
+	};
 	for (const raw of output) {
 		if (!isObj(raw)) continue;
 		const blockType = raw.type;
-		if (blockType === "input_text" || blockType === "output_text" || blockType === "text") {
+		if (blockType === "input_text") {
+			flushLegacyText();
 			const text = asString(raw.text);
-			if (text) textParts.push(text);
+			if (text !== undefined) content.push({ type: "text", text });
+			continue;
+		}
+		if (blockType === "output_text" || blockType === "text") {
+			const text = asString(raw.text);
+			if (text) legacyText += text;
 			continue;
 		}
 		if (blockType === "refusal") {
 			const refusal = asString(raw.refusal);
-			if (refusal) textParts.push(`[refusal: ${refusal}]`);
+			if (refusal) legacyText += `[refusal: ${refusal}]`;
 			continue;
 		}
 		if (blockType === "input_image") {
-			const imageUrl = asString(raw.image_url);
+			flushLegacyText();
+			const imageUrl = asString(raw.image_url) || undefined;
 			const decoded = imageUrl ? decodeDataUri(imageUrl) : undefined;
 			if (decoded) {
 				const detail =
 					raw.detail === "auto" || raw.detail === "low" || raw.detail === "high" || raw.detail === "original"
 						? raw.detail
 						: undefined;
-				additionalContent.push({ type: "image", ...decoded, ...(detail ? { detail } : {}) });
+				content.push({ type: "image", ...decoded, ...(detail ? { detail } : {}) });
 			} else {
-				const reference = imageUrl ?? asString(raw.file_id);
-				if (reference) additionalContent.push({ type: "text", text: `[image: ${reference}]` });
+				const reference = imageUrl ?? (asString(raw.file_id) || undefined);
+				if (reference) content.push({ type: "text", text: `[image: ${reference}]` });
 			}
 			continue;
 		}
 		if (blockType === "input_file") {
+			flushLegacyText();
 			const reference =
-				asString(raw.filename) ??
-				asString(raw.file_id) ??
-				asString(raw.file_url) ??
+				(asString(raw.filename) || undefined) ??
+				(asString(raw.file_id) || undefined) ??
+				(asString(raw.file_url) || undefined) ??
 				(asString(raw.file_data) ? "inline data" : undefined);
-			if (reference) additionalContent.push({ type: "text", text: `[file: ${reference}]` });
+			if (reference) content.push({ type: "text", text: `[file: ${reference}]` });
 		}
 	}
-	const text = textParts.join("");
-	if (text.length > 0) return [{ type: "text", text }, ...additionalContent];
-	return additionalContent.length > 0 ? additionalContent : [{ type: "text", text: "" }];
+	flushLegacyText();
+	return content.length > 0 ? content : [{ type: "text", text: "" }];
 }
 
 // ─── parseRequest ───────────────────────────────────────────────────────────
@@ -540,13 +553,13 @@ export function parseRequest(body: unknown, headers?: Headers): ParsedRequest {
 				continue;
 			}
 			if (effectiveType === "custom_tool_call_output") {
-				const output = item as { call_id: string; output: string };
+				const output = item as OpenAIResponsesCustomToolCallOutputItem;
 				const toolName = findToolNameById(messages, output.call_id);
 				messages.push({
 					role: "toolResult",
 					toolCallId: output.call_id,
 					toolName,
-					content: [{ type: "text", text: output.output ?? "" }],
+					content: functionOutputContent(output.output),
 					isError: false,
 					timestamp: now,
 				});

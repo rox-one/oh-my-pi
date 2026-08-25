@@ -39,8 +39,8 @@ const inputImageBlockSchema = type({
 	"file_id?": "string | null",
 }).narrow((v, ctx) => {
 	return (
-		typeof v.image_url === "string" ||
-		typeof v.file_id === "string" ||
+		(typeof v.image_url === "string" && v.image_url.length > 0) ||
+		(typeof v.file_id === "string" && v.file_id.length > 0) ||
 		ctx.mustBe("at least one of `image_url` or `file_id` for input_image")
 	);
 });
@@ -140,7 +140,7 @@ const customToolCallItemSchema = type({
 const customToolCallOutputItemSchema = type({
 	type: "'custom_tool_call_output'",
 	call_id: "string >= 1",
-	output: "string",
+	output: type("string").or(functionCallOutputContentBlockSchema.array()),
 });
 
 const computerSafetyCheckSchema = type({
