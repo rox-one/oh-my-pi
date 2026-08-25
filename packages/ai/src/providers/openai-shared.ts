@@ -1895,15 +1895,23 @@ export interface BuildResponsesInputOptions<TApi extends Api> {
  */
 export function escapeReplayedControlTokens(items: ResponseInput): ResponseInput {
 	return items.map(item => {
-		if (item.type === "function_call_output" || item.type === "custom_tool_call_output") {
+		if (item.type === "function_call_output") {
 			return typeof item.output === "string"
 				? { ...item, output: escapeHarmonyControlTokens(item.output) }
 				: {
 						...item,
 						output: item.output.map(part =>
-							part.type === "input_text"
-								? { ...part, text: escapeHarmonyControlTokens(part.text) }
-								: part,
+							part.type === "input_text" ? { ...part, text: escapeHarmonyControlTokens(part.text) } : part,
+						),
+					};
+		}
+		if (item.type === "custom_tool_call_output") {
+			return typeof item.output === "string"
+				? { ...item, output: escapeHarmonyControlTokens(item.output) }
+				: {
+						...item,
+						output: item.output.map(part =>
+							part.type === "input_text" ? { ...part, text: escapeHarmonyControlTokens(part.text) } : part,
 						),
 					};
 		}
@@ -2384,11 +2392,7 @@ export function appendResponsesToolResultMessages<TApi extends Api>(
 	supportsCustomToolCalls = true,
 	computerCallIds?: ReadonlySet<string>,
 ): void {
-	const { output, outputText } = encodeResponsesToolResultOutput(
-		toolResult,
-		model,
-		supportsImageDetailOriginal,
-	);
+	const { output, outputText } = encodeResponsesToolResultOutput(toolResult, model, supportsImageDetailOriginal);
 	const normalized = normalizeResponsesToolCallId(toolResult.toolCallId);
 	if (toolResult.providerMetadata?.type === "computer" && model.supportsComputerUse !== true) {
 		messages.push({

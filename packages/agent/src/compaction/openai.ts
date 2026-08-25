@@ -693,11 +693,7 @@ export function buildOpenAiNativeHistory(
 
 		if (message.role === "toolResult") {
 			const normalized = normalizeResponsesToolCallId(message.toolCallId);
-			const { output, outputText } = encodeResponsesToolResultOutput(
-				message,
-				model,
-				supportsImageDetailOriginal,
-			);
+			const { output, outputText } = encodeResponsesToolResultOutput(message, model, supportsImageDetailOriginal);
 			if (demotedComputerCallIds.has(normalized.callId)) {
 				const resultItem =
 					message.providerMetadata?.type === "computer"

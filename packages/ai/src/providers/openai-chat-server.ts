@@ -21,7 +21,6 @@ import type {
 	ToolResultMessage,
 	TSchema,
 } from "../types";
-import { decodeDataUri } from "./openai-data-uri";
 import {
 	type OpenAIChatContentPart,
 	type OpenAIChatMessage,
@@ -30,6 +29,7 @@ import {
 	type OpenAIChatToolChoice,
 	openaiChatRequestSchema,
 } from "./openai-chat-server-schema";
+import { decodeDataUri } from "./openai-data-uri";
 
 export type { ParsedRequest };
 
