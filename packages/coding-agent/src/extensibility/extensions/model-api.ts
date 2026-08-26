@@ -28,7 +28,8 @@ function resolveAlias(
 		role === "default" &&
 		!settings.getModelRole("default") &&
 		currentModel &&
-		!disabledProviders.has(currentModel.provider)
+		!disabledProviders.has(currentModel.provider) &&
+		modelRegistry.hasConfiguredAuth(currentModel)
 			? { model: currentModel, thinkingLevel: undefined, explicitThinkingLevel: false, warning: undefined }
 			: undefined;
 	const available =

@@ -222,6 +222,28 @@ describe("createExtensionModelQuery", () => {
 			model: claude,
 		});
 	});
+	test("listAliases() keeps an unauthenticated active model unavailable for default fallback", async () => {
+		const settings = {
+			get: (path: string) => (path === "cycleOrder" ? ["default"] : path === "modelTags" ? {} : []),
+			getModelRole: () => undefined,
+			getModelRoles: () => ({}),
+		} as unknown as Settings;
+		const unauthenticatedRegistry = {
+			getAvailable: () => [],
+			getAll: () => [claude],
+			hasConfiguredAuth: () => false,
+		} as unknown as ModelRegistry;
+		const q = createExtensionModelQuery(unauthenticatedRegistry, settings, () => claude);
+		expect(q.listAliases().find(alias => alias.name === "default")).toMatchObject({
+			status: "unavailable",
+			model: claude,
+		});
+
+		const result = await setExtensionModelAlias("default", unauthenticatedRegistry, settings, claude, async () => {
+			throw new Error("must not switch");
+		});
+		expect(result).toEqual({ ok: false, alias: "default", reason: "unavailable_alias" });
+	});
 
 	test("listAliases() returns no aliases without settings", () => {
 		const q = createExtensionModelQuery(registry(), undefined, () => undefined);
