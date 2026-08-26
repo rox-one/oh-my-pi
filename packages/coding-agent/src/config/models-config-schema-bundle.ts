@@ -350,7 +350,6 @@ export const getModelsConfigSchemaBundle = once(() => {
 		return true;
 	});
 
-
 	const ProviderConfigSchema = type({
 		"baseUrl?": "string",
 		"apiKey?": "string",
