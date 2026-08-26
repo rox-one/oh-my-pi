@@ -134,7 +134,7 @@ describe("optional embeddings", () => {
 				expect(request.headers.get("content-type")).toBe("application/json");
 				expect(request.headers.get("user-agent")).toBe(`omp/${packageJson.version}`);
 				expect(request.headers.get("http-referer")).toBe("https://cli.rox.one/");
-				expect(request.headers.get("x-openrouter-title")).toBe("omp");
+				expect(request.headers.get("x-openrouter-title")).toBe("omr");
 				expect(request.headers.get("x-openrouter-categories")).toBe("cli-agent");
 				expect(request.headers.get("x-title")).toBeNull();
 				expect(request.headers.get("authorization")).toBeNull();

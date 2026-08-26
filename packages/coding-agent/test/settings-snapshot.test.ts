@@ -171,7 +171,6 @@ describe("settings snapshot", () => {
 			"tui.hyperlinks",
 			"tui.imeSafeCursor",
 			"tui.renderMermaid",
-			"tui.scrollbackRebuild",
 			"tui.textSizing",
 			"tui.tight",
 			"tui.titleState",
@@ -285,7 +284,7 @@ describe("settings snapshot", () => {
 
 	it("omits visibility for an unregistered RPC condition without changing panel behavior", () => {
 		const settings = Settings.isolated();
-		expect(getUi("providers.unexpectedStopModel")?.condition).toBe("unexpectedStopDetection");
+		expect(getUi("providers.unexpectedStopModel")?.condition).toBe("unexpectedStopSmart");
 		const entry = buildSettingsSnapshot(settings).settings.find(
 			item => item.path === "providers.unexpectedStopModel",
 		);
@@ -319,6 +318,7 @@ describe("settings snapshot", () => {
 		}
 		expect(snapshot.tabs.find(tab => tab.id === "appearance")?.groups).toEqual([
 			"Theme",
+			"Composer",
 			"Status Line",
 			"Display",
 			"Images",

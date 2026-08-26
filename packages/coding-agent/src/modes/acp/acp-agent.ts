@@ -1266,6 +1266,8 @@ export class AcpAgent implements Agent {
 	}
 
 	async #forkManagedSession(params: ForkSessionRequest): Promise<ManagedSessionRecord> {
+		const loaded = this.#sessions.get(params.sessionId);
+		if (loaded) this.#assertMatchingCwd(loaded.session, params.cwd);
 		const sourcePath = await this.#resolveForkSourceSessionPath(params.sessionId);
 		const { session, setToolUIContext } = normalizeCreatedAcpSession(
 			await this.#createSession(path.resolve(params.cwd), {
