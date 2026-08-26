@@ -194,6 +194,34 @@ describe("createExtensionModelQuery", () => {
 			model: claude,
 		});
 	});
+	test("listAliases() keeps a disabled active model unavailable for default fallback", () => {
+		const settings = {
+			get: (path: string) =>
+				path === "cycleOrder"
+					? ["default"]
+					: path === "modelTags"
+						? {}
+						: path === "disabledProviders"
+							? ["anthropic"]
+							: [],
+			getModelRole: () => undefined,
+			getModelRoles: () => ({}),
+		} as unknown as Settings;
+		const q = createExtensionModelQuery(
+			{
+				getAvailable: () => [],
+				getAll: () => [claude],
+				hasConfiguredAuth: () => true,
+			} as unknown as ModelRegistry,
+			settings,
+			() => claude,
+		);
+
+		expect(q.listAliases().find(alias => alias.name === "default")).toMatchObject({
+			status: "unavailable",
+			model: claude,
+		});
+	});
 
 	test("listAliases() returns no aliases without settings", () => {
 		const q = createExtensionModelQuery(registry(), undefined, () => undefined);

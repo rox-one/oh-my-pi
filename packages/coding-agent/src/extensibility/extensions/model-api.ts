@@ -25,7 +25,10 @@ function resolveAlias(
 	const matchPreferences = getModelMatchPreferences(settings);
 	const disabledProviders = new Set(settings.get("disabledProviders") ?? []);
 	const defaultFallback =
-		role === "default" && !settings.getModelRole("default") && currentModel
+		role === "default" &&
+		!settings.getModelRole("default") &&
+		currentModel &&
+		!disabledProviders.has(currentModel.provider)
 			? { model: currentModel, thinkingLevel: undefined, explicitThinkingLevel: false, warning: undefined }
 			: undefined;
 	const available =
