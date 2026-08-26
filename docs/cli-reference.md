@@ -13,7 +13,7 @@ with that message, while `omp models` runs the `models` subcommand.
 
 Runtime help is also available:
 
-- `omp --help` lists user-facing subcommands and common launch flags.
+- `omr --help` lists user-facing subcommands and common launch flags.
 - `omp <command> --help` prints that command's public flags and examples.
 
 This page is the consolidated reference for the shared **launch surface** (the

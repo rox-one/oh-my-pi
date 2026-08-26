@@ -10,8 +10,8 @@
 <p align="center">
   <a href="https://www.npmjs.com/package/@oh-my-pi/pi-coding-agent"><img src="https://img.shields.io/npm/v/@oh-my-pi/pi-coding-agent?style=flat&colorA=222222&colorB=CB3837" alt="npm version"></a>
   <a href="https://github.com/can1357/oh-my-pi/blob/main/packages/coding-agent/CHANGELOG.md"><img src="https://img.shields.io/badge/changelog-keep-E05735?style=flat&colorA=222222" alt="Changelog"></a>
-  <a href="https://github.com/can1357/oh-my-pi/actions"><img src="https://img.shields.io/github/actions/workflow/status/can1357/oh-my-rox/ci.yml?style=flat&colorA=222222&colorB=3FB950" alt="CI"></a>
-  <a href="https://github.com/can1357/oh-my-pi/blob/main/LICENSE"><img src="https://img.shields.io/github/license/can1357/oh-my-rox?style=flat&colorA=222222&colorB=58A6FF" alt="License"></a>
+  <a href="https://github.com/can1357/oh-my-pi/actions"><img src="https://img.shields.io/github/actions/workflow/status/can1357/oh-my-pi/ci.yml?style=flat&colorA=222222&colorB=3FB950" alt="CI"></a>
+  <a href="https://github.com/can1357/oh-my-pi/blob/main/LICENSE"><img src="https://img.shields.io/github/license/can1357/oh-my-pi?style=flat&colorA=222222&colorB=58A6FF" alt="License"></a>
   <a href="https://www.typescriptlang.org"><img src="https://img.shields.io/badge/TypeScript-3178C6?style=flat&colorA=222222&logo=typescript&logoColor=white" alt="TypeScript"></a>
   <a href="https://www.rust-lang.org"><img src="https://img.shields.io/badge/Rust-DEA584?style=flat&colorA=222222&logo=rust&logoColor=white" alt="Rust"></a>
   <a href="https://bun.sh"><img src="https://img.shields.io/badge/runtime-Bun-f472b6?style=flat&colorA=222222" alt="Bun"></a>
@@ -58,17 +58,17 @@ bun install -g @oh-my-pi/pi-coding-agent
 
 ```sh
 # Run without installing
-nix run github:can1357/oh-my-rox
+nix run github:can1357/oh-my-pi
 
 # Or install into the active profile
-nix profile install github:can1357/oh-my-rox
+nix profile install github:can1357/oh-my-pi
 ```
 
 Flake consumers can use `packages.<system>.omp`, `overlays.default`, `nixosModules.default`, or `homeManagerModules.default`. A Home Manager configuration can install OMP and own its settings declaratively:
 
 ```nix
 {
-  inputs.omp.url = "github:can1357/oh-my-rox";
+  inputs.omp.url = "github:can1357/oh-my-pi";
 
   # In your Home Manager module:
   imports = [ inputs.omp.homeManagerModules.default ];
@@ -88,7 +88,7 @@ irm https://cli.rox.one/install.ps1 | iex
 **Pinned versions (mise)**
 
 ```sh
-mise use -g github:can1357/oh-my-rox
+mise use -g github:can1357/oh-my-pi
 ```
 
 macOS · Linux · Windows · bun ≥ 1.3.14

@@ -242,7 +242,6 @@ function pathToSettingDef(path: SettingPath): SettingDef | null {
 	const control = getSettingPanelControlKind(path);
 	if (!ui || control === null) return null;
 
-	const schemaType = getType(path);
 	const visibilityCondition = ui.condition ? CONDITIONS[ui.condition] : undefined;
 	const condition = visibilityCondition ? () => visibilityCondition() : undefined;
 	const base = {

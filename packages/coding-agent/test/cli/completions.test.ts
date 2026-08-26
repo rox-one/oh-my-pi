@@ -56,9 +56,9 @@ describe("generateCompletion — bash", () => {
 
 	it("completes enum, dynamic, and comma-list flag values by previous flag", () => {
 		expect(out).toContain('--thinking)\n\t\t\tCOMPREPLY=( $(compgen -W "low high"');
-		expect(out).toContain('--model)\n\t\t\tCOMPREPLY=( $(compgen -W "$(command omp __complete models -- "$cur"');
+		expect(out).toContain('--model)\n\t\t\tCOMPREPLY=( $(compgen -W "$(command omr __complete models -- "$cur"');
 		expect(out).toContain("--resume|-r)");
-		expect(out).toContain("command omp __complete sessions");
+		expect(out).toContain("command omr __complete sessions");
 		// static comma list routes through the comma-aware helper
 		expect(out).toContain('--tools)\n\t\t\t_omp_comma "read bash"');
 		// multiple-value models flag also uses the comma helper
@@ -119,10 +119,10 @@ describe("generateCompletion — fish", () => {
 	});
 
 	it("maps value sources to fish completion args", () => {
-		expect(out).toContain("-l model -d 'Model to use' -x -a '(command omp __complete models -- (commandline -ct))'");
+		expect(out).toContain("-l model -d 'Model to use' -x -a '(command omr __complete models -- (commandline -ct))'");
 		expect(out).toContain("-l thinking -d 'Effort' -x -a 'low high'");
 		expect(out).toContain("-l tools -d 'Tools' -x -a 'read bash'");
-		expect(out).toContain("-s r -l resume -d 'Resume' -x -a '(command omp __complete sessions");
+		expect(out).toContain("-s r -l resume -d 'Resume' -x -a '(command omr __complete sessions");
 		// a bare boolean flag takes no value
 		expect(out).toContain("-s p -l print -d 'Print'");
 		expect(out).not.toContain("-l print -d 'Print' -x");
@@ -206,7 +206,7 @@ describe("live completion surface", () => {
 		// itself shells out to `omp __complete $kind`.
 		expect(stdout).toContain("_omp_call models");
 		expect(stdout).toContain("_omp_call sessions");
-		expect(stdout).toContain("command omp __complete $kind");
+		expect(stdout).toContain("command omr __complete $kind");
 		// Hidden/default commands must NOT surface as completable subcommands.
 		expect(stdout).not.toContain("_omp_cmd_launch");
 		expect(stdout).not.toContain("_omp_cmd___complete");

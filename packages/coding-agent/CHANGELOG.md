@@ -1042,7 +1042,7 @@
 - Exposed the script-driven computer schema to all models, including those with provider-native Computer Use support.
 - Reduced omp --help cold-start latency and memory usage by rendering lightweight command metadata.
 - Exposed the script-driven `computer` schema to every model, including models with provider-native Computer Use support, because native action declarations cannot express persistent desktop sessions or accessibility handles.
-- Reduced `omp --help` cold-start latency and memory use by rendering lightweight command metadata without loading every runtime command and provider graph.
+- Reduced `omr --help` cold-start latency and memory use by rendering lightweight command metadata without loading every runtime command and provider graph.
 - `delete_session` now requires a host confirmation bound to a server-issued `operationId`. A declined, expired, disconnected, or mismatched confirmation fails closed with the `confirmation_required` error code, and the capability manifest advertises `confirmation: "required"` so hosts can prompt before the round trip.
 
 ### Fixed

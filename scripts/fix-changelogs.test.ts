@@ -439,7 +439,7 @@ describe("runChangelogFixer size limit", () => {
 			await git("commit", "-m", "release 1.2.0");
 			await git("tag", "v1.2.0");
 			const head = (await git("rev-parse", "HEAD")).text().trim();
-			const repo = process.env.OMP_REPO ?? process.env.GITHUB_REPOSITORY ?? "can1357/oh-my-rox";
+			const repo = process.env.OMP_REPO ?? process.env.GITHUB_REPOSITORY ?? "can1357/oh-my-pi";
 			const expectedLink = `Older entries are archived in [packages/foo/CHANGELOG.md@${head.slice(0, 12)}](https://github.com/${repo}/blob/${head}/packages/foo/CHANGELOG.md).`;
 
 			// Budget only fits Unreleased + the two newest releases; 1.0.0 collapses.

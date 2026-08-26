@@ -3,7 +3,7 @@
  * the advisor `Agent` constructed by `#buildAdvisorRuntime` inherits them so
  * its OpenRouter/OpenAI requests cache and route like the main turn.
  *
- * Regression for can1357/oh-my-rox#3639: before the fix, the advisor was built
+ * Regression for can1357/oh-my-pi#3639: before the fix, the advisor was built
  * with only `sessionId`/`getApiKey`/telemetry — it dropped the session's
  * `streamFn` wrapper (so `providers.openrouterVariant` and `loopGuard` never
  * landed on advisor requests), its `promptCacheKey` (so OpenAI Responses

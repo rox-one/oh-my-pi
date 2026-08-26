@@ -334,7 +334,7 @@ def test_parse_issue_ref_accepts_github_issue_urls() -> None:
         "  https://github.com/can1357/oh-my-pi/issues/1348  ",
     )
     for case in cases:
-        assert parse_issue_ref(case) == ("can1357/oh-my-rox", 1348), case
+        assert parse_issue_ref(case) == ("can1357/oh-my-pi", 1348), case
 
 
 def test_parse_issue_ref_rejects_garbage() -> None:

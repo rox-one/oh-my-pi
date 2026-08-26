@@ -447,7 +447,7 @@ describe("github tool", () => {
 		const tool = new GithubTool(createSession());
 		const result = await tool.execute("file-read", {
 			op: "file_read",
-			repo: "can1357/oh-my-rox",
+			repo: "can1357/oh-my-pi",
 			branch: "main",
 			path: "packages/coding-agent/package.json",
 		});
@@ -458,7 +458,7 @@ describe("github tool", () => {
 			"/tmp/test",
 			[
 				"api",
-				"/repos/can1357/oh-my-rox/contents/packages/coding-agent/package.json",
+				"/repos/can1357/oh-my-pi/contents/packages/coding-agent/package.json",
 				"--method",
 				"GET",
 				"-H",

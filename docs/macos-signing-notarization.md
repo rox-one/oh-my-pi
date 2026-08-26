@@ -101,7 +101,7 @@ over stdin — no secret is ever printed to the terminal, argv, or shell history
 ```sh
 scripts/ci-macos-upload-secrets.sh ~/omp-signing --dry-run   # validate first
 scripts/ci-macos-upload-secrets.sh ~/omp-signing             # upload all five
-gh secret list --repo can1357/oh-my-rox                       # confirm
+gh secret list --repo can1357/oh-my-pi                       # confirm
 ```
 
 Re-run it whenever the certificate is renewed.
