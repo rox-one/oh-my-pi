@@ -80,7 +80,7 @@ export async function setExtensionModelAlias(
 	setModelTemporary: (
 		model: Model,
 		thinkingLevel?: ExtensionModelAlias["thinkingLevel"],
-		options?: { ephemeral?: boolean },
+		options?: { ephemeral?: boolean; role?: string },
 	) => Promise<void>,
 ): Promise<ExtensionModelAliasResult> {
 	const aliases = createExtensionModelAliases(modelRegistry, settings, currentModel);
@@ -94,7 +94,7 @@ export async function setExtensionModelAlias(
 		};
 	}
 
-	await setModelTemporary(alias.model, alias.thinkingLevel);
+	await setModelTemporary(alias.model, alias.thinkingLevel, { role: name });
 	return { ok: true, alias, scope: "session" };
 }
 function createExtensionModelAliases(

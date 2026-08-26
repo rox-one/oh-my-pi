@@ -8501,7 +8501,7 @@ export class AgentSession {
 	setModelTemporary(
 		model: Model,
 		thinkingLevel?: ConfiguredThinkingLevel,
-		options?: { ephemeral?: boolean },
+		options?: { ephemeral?: boolean; role?: string },
 	): Promise<void> {
 		return this.#models.setModelTemporary(model, thinkingLevel, options);
 	}

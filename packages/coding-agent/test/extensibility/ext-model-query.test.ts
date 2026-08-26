@@ -267,7 +267,7 @@ describe("createExtensionModelQuery", () => {
 		);
 
 		expect(result).toMatchObject({ ok: true, scope: "session" });
-		expect(switched).toEqual({ model: claude, thinkingLevel: "high", options: undefined });
+		expect(switched).toEqual({ model: claude, thinkingLevel: "high", options: { role: "slow" } });
 	});
 
 	test("setModelAlias() refuses unresolved aliases without switching", async () => {
