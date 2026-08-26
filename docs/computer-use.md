@@ -7,7 +7,7 @@
 
 ## Enable and configure
 
-The tool is disabled by default. Configure it in `~/.omp/agent/config.yml`, project `.omp/config.yml`, or a `--config` overlay:
+The tool is disabled by default. Configure it in `~/.omr/agent/config.yml`, project `.omp/config.yml`, or a `--config` overlay:
 
 ```yaml
 computer:

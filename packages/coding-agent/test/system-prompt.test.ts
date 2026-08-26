@@ -73,7 +73,7 @@ console.log(JSON.stringify({ elapsedMs: Math.round(performance.now() - startedAt
 		};
 		// Strip inherited dirs-resolver overrides so XDG_CACHE_HOME above wins and
 		// the test cannot touch the developer/CI profile's real gpu_cache.json.
-		for (const key of ["PI_CODING_AGENT_DIR", "OMP_PROFILE", "PI_PROFILE", "PI_CONFIG_DIR"]) {
+		for (const key of ["PI_CODING_AGENT_DIR", "OMR_PROFILE", "PI_PROFILE", "PI_CONFIG_DIR"]) {
 			delete env[key];
 		}
 		if (options.sleepSeconds === undefined) {

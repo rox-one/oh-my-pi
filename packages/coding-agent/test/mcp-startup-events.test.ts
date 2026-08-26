@@ -48,7 +48,7 @@ describe("mcp/startup-events — connection-status cross-module contract", () =>
 	});
 
 	it("sanitizes failure errors before rendering them in status text", () => {
-		const homePath = `${os.homedir()}/.omp/mcp.log`;
+		const homePath = `${os.homedir()}/.omr/mcp.log`;
 		const message = formatMCPConnectionStatusMessage({
 			pendingServers: ["slow"],
 			connectedServers: [],
@@ -58,7 +58,7 @@ describe("mcp/startup-events — connection-status cross-module contract", () =>
 		expect(message).not.toContain(os.homedir());
 		expect(message).not.toContain("\n");
 		expect(message).not.toContain("\t");
-		expect(message).toContain("broken: failed at   ~/.omp/mcp.log");
+		expect(message).toContain("broken: failed at   ~/.omr/mcp.log");
 	});
 
 	it("keeps the config source and transport error visible under independent truncation", () => {
@@ -114,9 +114,9 @@ describe("mcp/startup-events — connection-status cross-module contract", () =>
 		expect(message).not.toContain(os.homedir());
 		expect(message).not.toContain("\n");
 		expect(message).not.toContain("\t");
-		expect(message).toContain("Connected: ~/.omp/connected   server.");
-		expect(message).toContain("Failed: ~/.omp/broken server: missing command.");
-		expect(message).toContain("Still connecting: ~/.omp/pending");
+		expect(message).toContain("Connected: ~/.omr/connected   server.");
+		expect(message).toContain("Failed: ~/.omr/broken server: missing command.");
+		expect(message).toContain("Still connecting: ~/.omr/pending");
 	});
 
 	it("keeps pending servers visible while other servers settle", () => {

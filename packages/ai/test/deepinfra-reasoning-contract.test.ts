@@ -1,7 +1,7 @@
 /**
  * Wire-contract tests for DeepInfra's OpenAI-compatible chat endpoint, pinned
  * to the request/response payloads captured against production in
- * oh-my-pi#9522 (`deepseek-ai/DeepSeek-V4-Flash-0731`, representative of the
+ * oh-my-rox#9522 (`deepseek-ai/DeepSeek-V4-Flash-0731`, representative of the
  * whole DeepSeek family DeepInfra hosts):
  *
  *  - The endpoint is plain OpenAI format: the server owns all DeepSeek
@@ -140,7 +140,7 @@ function findAssistantWireMessage(messages: readonly unknown[] | undefined): Ass
 	);
 }
 
-describe("DeepInfra reasoning wire contract (oh-my-pi#9522)", () => {
+describe("DeepInfra reasoning wire contract (oh-my-rox#9522)", () => {
 	it("resolves the DeepSeek replay contract on the deepinfra host", () => {
 		const compat = deepinfraDeepseekModel().compat;
 		// Plain OpenAI dialect — the server owns DeepSeek-specific encoding.

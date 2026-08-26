@@ -1,14 +1,14 @@
 # @oh-my-pi/pi-utils
 
-Shared utilities for [oh-my-pi](https://github.com/can1357/oh-my-pi) packages. Zero ceremony, Bun-first.
+Shared utilities for [oh-my-rox](https://github.com/can1357/oh-my-pi) packages. Zero ceremony, Bun-first.
 
 ## Notable modules
 
 | Module | Purpose |
 | --- | --- |
-| `logger` | Centralized logger writing to `~/.omp/logs/` with rotation (TUI-safe — never stdout) |
+| `logger` | Centralized logger writing to `~/.omr/logs/` with rotation (TUI-safe — never stdout) |
 | `prompt` | Handlebars-based prompt templating and formatting helpers |
-| `dirs` | Path helpers for omp config directories (`~/.omp`, XDG-aware on Linux) |
+| `dirs` | Path helpers for omp config directories (`~/.omr`, XDG-aware on Linux) |
 | `stream` | `readStream` / `readLines` helpers over `ReadableStream` |
 | `ptree` / `procmgr` | Process trees, `ChildProcess` wrapper, process lifecycle management |
 | `postmortem` | Cleanup callbacks on exit, signals, and fatal exceptions |

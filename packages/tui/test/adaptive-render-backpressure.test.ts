@@ -1,5 +1,5 @@
 /**
- * Regression for oh-my-pi#4145 (TUI busy loop during long-running eval).
+ * Regression for oh-my-rox#4145 (TUI busy loop during long-running eval).
  *
  * When a rendered frame exceeded the 33ms cadence budget, the previous
  * scheduler collapsed the cadence delay to zero and scheduled the next frame

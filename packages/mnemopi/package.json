@@ -2,8 +2,8 @@
   "type": "module",
   "name": "@oh-my-pi/pi-mnemopi",
   "version": "18.0.4",
-  "description": "Local SQLite memory engine for Oh My Pi agents",
-  "homepage": "https://omp.sh",
+  "description": "Local SQLite memory engine for Oh My Rox agents",
+  "homepage": "https://cli.rox.one",
   "author": "Stencil Labs, Inc.",
   "contributors": [
     "Abdias J"

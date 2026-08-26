@@ -5,7 +5,7 @@ import type { SessionInfo } from "./session-listing";
 const PINS_FILENAME = "session-pins.json";
 
 /**
- * Read the global set of pinned session ids (`~/.omp/session-pins.json`). Pins
+ * Read the global set of pinned session ids (`~/.omr/session-pins.json`). Pins
  * are keyed by session id, not file path, so they survive `/move` renames.
  * A missing file yields an empty set; a corrupt one degrades to empty with a
  * warning rather than breaking the resume picker.

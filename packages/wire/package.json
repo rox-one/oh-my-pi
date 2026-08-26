@@ -2,8 +2,8 @@
   "type": "module",
   "name": "@oh-my-pi/pi-wire",
   "version": "18.0.4",
-  "description": "Shared wire protocol types for Oh My Pi packages",
-  "homepage": "https://omp.sh",
+  "description": "Shared wire protocol types for Oh My Rox packages",
+  "homepage": "https://cli.rox.one",
   "author": "Stencil Labs, Inc.",
   "license": "MIT",
   "repository": {

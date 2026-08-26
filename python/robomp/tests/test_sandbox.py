@@ -1533,7 +1533,7 @@ def test_run_git_kills_hung_child(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
 
 
 # ---------------------------------------------------------------------------
-# Partial-clone blob backfill (oh-my-pi#1818)
+# Partial-clone blob backfill (oh-my-rox#1818)
 # ---------------------------------------------------------------------------
 
 
@@ -1610,7 +1610,7 @@ def _missing_object_oids(repo: Path, rev: str) -> list[str]:
 
 
 def test_fetch_ref_backfills_missing_blobs_into_partial_clone(tmp_path: Path) -> None:
-    """Regression for oh-my-pi#1818: ``fetch_ref`` is called immediately before
+    """Regression for oh-my-rox#1818: ``fetch_ref`` is called immediately before
     ``git worktree add origin/<ref>``. On a ``--filter=blob:none`` pool whose
     periodic ``fetch --prune`` inherited that filter, the ref's blobs are
     absent and the worktree-add triggers a promisor lazy fetch that — under

@@ -1,4 +1,4 @@
-//! Regression tests for oh-my-pi issue #8925: a host environment entry whose
+//! Regression tests for oh-my-rox issue #8925: a host environment entry whose
 //! key or value is not valid Unicode must not crash session startup or command
 //! execution.
 //!

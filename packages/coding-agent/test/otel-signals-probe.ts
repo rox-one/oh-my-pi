@@ -122,7 +122,7 @@ const server = Bun.serve({
 const base = `http://localhost:${server.port}`;
 process.env.OTEL_EXPORTER_OTLP_LOGS_ENDPOINT = `${base}/v1/logs`;
 process.env.OTEL_EXPORTER_OTLP_METRICS_ENDPOINT = `${base}/v1/metrics`;
-process.env.OTEL_SERVICE_NAME = "oh-my-pi-signals-probe";
+process.env.OTEL_SERVICE_NAME = "oh-my-rox-signals-probe";
 // Force a short metric export interval so the periodic reader flushes fast.
 process.env.OTEL_METRIC_EXPORT_INTERVAL = "500";
 

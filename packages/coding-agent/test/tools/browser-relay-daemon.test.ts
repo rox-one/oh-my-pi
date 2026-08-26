@@ -80,7 +80,7 @@ process.stdout.write(String(await probeRelayServer(url)));`,
 		const secondProject = path.join(home, "project-b");
 		const firstMarker = path.join(home, "first-ready");
 		const secondMarker = path.join(home, "second-ready");
-		const globalRuntimeDir = path.join(home, ".omp", "run", "daemons", "global", "browser-relay");
+		const globalRuntimeDir = path.join(home, ".omr", "run", "daemons", "global", "browser-relay");
 		const cdpUrl = `http://127.0.0.1:${await findFreeCdpPort()}`;
 		const scriptPath = path.join(home, "consumer.ts");
 		await Promise.all([fs.mkdir(firstProject), fs.mkdir(secondProject)]);
@@ -113,8 +113,8 @@ try {
 					...process.env,
 					HOME: home,
 					USERPROFILE: home,
-					PI_CONFIG_DIR: ".omp",
-					OMP_PROFILE: profile,
+					PI_CONFIG_DIR: ".omr",
+					OMR_PROFILE: profile,
 					OMP_DAEMON_IDLE_GRACE_MS: "200",
 					OMP_TEST_RELAY_URL: cdpUrl,
 					OMP_TEST_READY_MARKER: marker,

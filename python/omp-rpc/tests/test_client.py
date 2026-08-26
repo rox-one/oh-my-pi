@@ -1545,7 +1545,7 @@ class RpcClientTests(unittest.TestCase):
         Consumers must observe the host-tool name on update/end events
         regardless of transport — roboomp's terminal-action detection
         triple-posted PR reviews when end events only said `write`
-        (oh-my-pi#6696). `tool_execution_start` precedes the `host_tool_call`
+        (oh-my-rox#6696). `tool_execution_start` precedes the `host_tool_call`
         frame on the wire and keeps the transport name.
         """
 

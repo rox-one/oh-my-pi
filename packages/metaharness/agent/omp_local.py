@@ -1,4 +1,4 @@
-"""Harbor agent that runs the LOCAL oh-my-pi (`omp`) build inside task containers.
+"""Harbor agent that runs the LOCAL oh-my-rox (`omp`) build inside task containers.
 
 Unlike Harbor's built-in `pi` agent (which `npm i -g @mariozechner/pi-coding-agent`),
 this runs the working tree at `/work/pi`. Install modes (`OMP_BENCH_INSTALL`):
@@ -14,7 +14,7 @@ this runs the working tree at `/work/pi`. Install modes (`OMP_BENCH_INSTALL`):
     external deps + the platform native addon, and run `bun .../dist/cli.js`.
   * binary (`--binary`): a self-contained compiled omp binary is uploaded.
 
-Auth never enters the container: a generated `~/.omp/agent/models.yml` routes the
+Auth never enters the container: a generated `~/.omr/agent/models.yml` routes the
 configured providers' `baseUrl` at the host's pm2 auth-gateway (default
 `http://host.docker.internal:4000`, `transport: pi-native`), so the gateway
 resolves credentials host-side. No provider API keys are passed in.
@@ -322,7 +322,7 @@ class OmpLocal(BaseInstalledAgent):
             else:
                 self._cli = await self._install_local(environment)
 
-        # 3) Auth + model config under $HOME/.omp/agent.
+        # 3) Auth + model config under $HOME/.omr/agent.
         if self._gateway_on:
             # Gateway routing — no provider keys ever enter the container.
             await self._write_models_yaml(environment)
@@ -358,7 +358,7 @@ class OmpLocal(BaseInstalledAgent):
                 "set -e; "
                 f"test -x {q(self._source_bun)} || {{ echo 'omp source mode: bun mount missing' >&2; exit 5; }}; "
                 f"test -f {q(cli)} || {{ echo 'omp source mode: repo mount missing' >&2; exit 5; }}; "
-                f"test -d {q(self._source_dir + '/node_modules/@oh-my-pi')} || "
+                f"test -d {q(self._source_dir + '/node_modules/@oh-my-rox')} || "
                 "{ echo 'omp source mode: linux deps mount missing' >&2; exit 5; }; "
                 f"{q(self._source_bun)} --version"
             ),
@@ -453,8 +453,8 @@ class OmpLocal(BaseInstalledAgent):
         await self.exec_as_agent(
             environment,
             command=(
-                f'mkdir -p "$HOME/.omp/agent"; '
-                f'cp {shlex.quote(staged)} "$HOME/.omp/agent/models.yml"'
+                f'mkdir -p "$HOME/.omr/agent"; '
+                f'cp {shlex.quote(staged)} "$HOME/.omr/agent/models.yml"'
             ),
         )
 
@@ -474,7 +474,7 @@ class OmpLocal(BaseInstalledAgent):
         return "\n".join(lines)
 
     async def _write_config(self, environment: BaseEnvironment) -> None:
-        """Write $HOME/.omp/agent/config.yml: the web_search toggle.
+        """Write $HOME/.omr/agent/config.yml: the web_search toggle.
 
         web_search can't authenticate through the gateway, so it's off by default.
         """
@@ -489,8 +489,8 @@ class OmpLocal(BaseInstalledAgent):
         await self.exec_as_agent(
             environment,
             command=(
-                f'mkdir -p "$HOME/.omp/agent"; '
-                f'cp {shlex.quote(_CONFIG_DST)} "$HOME/.omp/agent/config.yml"'
+                f'mkdir -p "$HOME/.omr/agent"; '
+                f'cp {shlex.quote(_CONFIG_DST)} "$HOME/.omr/agent/config.yml"'
             ),
         )
 

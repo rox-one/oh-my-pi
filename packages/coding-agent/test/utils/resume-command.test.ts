@@ -27,7 +27,7 @@ describe("resumeCommand", () => {
 	});
 
 	it("carries the active profile so the emitted hint is runnable verbatim", () => {
-		// Profile sessions live in ~/.omp/profiles/<name>/agent, so a resume hint
+		// Profile sessions live in ~/.omr/profiles/<name>/agent, so a resume hint
 		// without --profile fails with "Session not found" (issue #9018).
 		setProfile("personal");
 		expect(resumeCommand("abc123")).toBe(`${APP_NAME} --profile personal --resume abc123`);
@@ -39,7 +39,7 @@ describe("resumeCommandForSession", () => {
 	// and restore the exact env, then rebuild dirs from it, so a suite that starts
 	// under a named profile is not left in the default profile with a stale
 	// override for the next test file.
-	const ENV_KEYS = ["PI_CODING_AGENT_DIR", "OMP_PROFILE", "PI_PROFILE"] as const;
+	const ENV_KEYS = ["PI_CODING_AGENT_DIR", "OMR_PROFILE", "PI_PROFILE"] as const;
 	const originalEnv: Record<string, string | undefined> = {};
 	let tempDir: string;
 

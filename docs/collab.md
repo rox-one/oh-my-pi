@@ -15,7 +15,7 @@ prints
 ```
 Collab session started!
  • Join from another terminal: omp join "mgAYTZwEnpRQtca0CTgn-Q.gdJUbTovD94ofDaa8YvhY0-ty16w4fn8PgB6PLnoA30"
- • or any web browser: my.omp.sh/#mgAYTZwEnpRQtca0CTgn-Q.gdJUbTovD94ofDaa8YvhY0-ty16w4fn8PgB6PLnoA30
+ • or any web browser: share.rox.one/#mgAYTZwEnpRQtca0CTgn-Q.gdJUbTovD94ofDaa8YvhY0-ty16w4fn8PgB6PLnoA30
 ```
 
 The browser line is click-to-join (an OSC 8 hyperlink to the full `https://` deep link): the relay serves the web guest client at `/`, and the room id + key ride in the URL fragment. From another omp (any directory, any machine), either form works:
@@ -23,7 +23,7 @@ The browser line is click-to-join (an OSC 8 hyperlink to the full `https://` dee
 Running `/collab` or `/collab view` starts or displays the active hosting session, rendering both the terminal/browser join links and their corresponding QR codes.
 
 ```
-/join my.omp.sh/#mgAYTZwEnpRQtca0CTgn-Q.gdJU…
+/join share.rox.one/#mgAYTZwEnpRQtca0CTgn-Q.gdJU…
 ```
 
 The guest's previous session is restored on `/leave` (or when the host stops).
@@ -45,7 +45,7 @@ The guest's previous session is restored on `/leave` (or when the host stops).
 Accepted by `/join <link>` and `omp join "<link>"`:
 
 ```
-<roomId>.<key>                                                    → default relay (wss://my.omp.sh)
+<roomId>.<key>                                                    → default relay (wss://share.rox.one)
 <roomId>#<key>                                                    → legacy bare form
 host[:port]/r/<roomId>.<key>                                     → custom relay, wss:// inferred
 host[:port]/r/<roomId>#<key>                                     → legacy direct relay form
@@ -104,10 +104,10 @@ Set `collab.webUrl` when the browser UI is hosted separately from the websocket 
 
 | Setting               | Default               | Meaning                                                                                                        |
 | --------------------- | --------------------- | -------------------------------------------------------------------------------------------------------------- |
-| `collab.relayUrl`     | `wss://my.omp.sh`     | Relay used by `/collab` when no relay is passed inline                                                         |
+| `collab.relayUrl`     | `wss://share.rox.one`     | Relay used by `/collab` when no relay is passed inline                                                         |
 | `collab.webUrl`       | empty                 | Browser UI URL for `/collab` links; empty derives from relay; explicit `http://` is allowed only for localhost |
 | `collab.displayName`  | OS username           | Name shown to other participants                                                                               |
-| `share.serverUrl`     | `https://my.omp.sh/s` | Share viewer/upload base used by `/share` (links are `<base>/<id>#<key>`)                                      |
+| `share.serverUrl`     | `https://share.rox.one/s` | Share viewer/upload base used by `/share` (links are `<base>/<id>#<key>`)                                      |
 | `share.redactSecrets` | `true`                | Run the secret obfuscator over `/share` snapshots before upload                                                |
 
 ## Self-hosting the relay
@@ -128,7 +128,7 @@ The relay is a small content-blind Go service. It keeps no state beyond live con
 Hub topology — the host is authoritative, guests never peer:
 
 1. `welcome` + `snapshot-chunk` frames — initial state and transcript. The transcript is byte-bounded into chunks so each arrival resets the guest's progress timeout; oversized replicated entries are shrunk before transmission.
-2. `entry` frames — durable session entries, broadcast pre-blob-externalization so images stay inline (guests cannot resolve host blob refs). Guests append them with ids preserved to a replica session file under `~/.omp/collab/<roomId>.jsonl` and into the agent's message array, which is why `/dump` and context estimates work.
+2. `entry` frames — durable session entries, broadcast pre-blob-externalization so images stay inline (guests cannot resolve host blob refs). Guests append them with ids preserved to a replica session file under `~/.omr/collab/<roomId>.jsonl` and into the agent's message array, which is why `/dump` and context estimates work.
 3. `event` frames — live agent events, fed straight into the guest's normal event controller; rendering is events-only to prevent double-render.
 4. `state` frames — debounced footer snapshots: streaming flag, the host's full model object and thinking level (applied to the guest's replica agent state, so model display and context-window math are native), host context numbers, and participants.
 5. `bus` frames — mirrored task-subagent lifecycle/progress EventBus traffic, republished on the guest's local bus so the subagent HUD and status-line count work natively.

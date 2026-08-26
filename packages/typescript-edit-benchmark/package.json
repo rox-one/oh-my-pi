@@ -4,7 +4,7 @@
   "name": "@oh-my-pi/typescript-edit-benchmark",
   "version": "0.0.1",
   "description": "Edit benchmark suite using TypeScript source code mutations",
-  "homepage": "https://omp.sh",
+  "homepage": "https://cli.rox.one",
   "author": "Stencil Labs, Inc.",
   "license": "MIT",
   "repository": {

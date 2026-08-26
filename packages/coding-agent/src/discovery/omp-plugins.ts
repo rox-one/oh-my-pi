@@ -6,7 +6,7 @@
  * sibling directories — `skills/`, `hooks/pre|post/`, `tools/`, `commands/`,
  * `rules/`, `prompts/`, and `.mcp.json` — are picked up by omp's standard
  * discovery surfaces. The native `omp` provider in `builtin.ts` only walks
- * `.omp/` and `~/.omp/agent/`, so without this provider those sub-trees are
+ * `.omp/` and `~/.omr/agent/`, so without this provider those sub-trees are
  * silently ignored.
  *
  * Provider priority is set below the native `omp` provider (100) so an

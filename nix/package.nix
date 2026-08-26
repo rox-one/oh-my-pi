@@ -249,10 +249,10 @@ stdenv.mkDerivation {
 
   meta = {
     description = "Terminal-based coding agent with multi-model support";
-    homepage = "https://omp.sh";
+    homepage = "https://cli.rox.one";
     changelog = "https://github.com/can1357/oh-my-pi/releases/tag/v${packageJson.version}";
     license = lib.licenses.mit;
-    mainProgram = "omp";
+    mainProgram = "omr";
     platforms = [
       "aarch64-darwin"
       "aarch64-linux"

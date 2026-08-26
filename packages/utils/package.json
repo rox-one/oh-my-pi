@@ -3,7 +3,7 @@
   "name": "@oh-my-pi/pi-utils",
   "version": "18.0.4",
   "description": "Shared utilities for pi packages",
-  "homepage": "https://omp.sh",
+  "homepage": "https://cli.rox.one",
   "author": "Stencil Labs, Inc.",
   "license": "MIT",
   "repository": {

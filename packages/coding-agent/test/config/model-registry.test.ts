@@ -38,7 +38,7 @@ describe("ModelRegistry", () => {
 		tmpDir = mkdtempSync(path.join(os.tmpdir(), "omp-reg-"));
 		// Construct with an explicit modelsPath inside the temp dir so the
 		// constructor's #loadModels read returns "not-found" rather than
-		// touching the host's ~/.omp/agent/models.yaml. isBunTestRuntime()
+		// touching the host's ~/.omr/agent/models.yaml. isBunTestRuntime()
 		// auto-stubs #fetch in the constructor.
 		registry = new ModelRegistry(createStubAuthStorage(), path.join(tmpDir, "models.yaml"));
 	});

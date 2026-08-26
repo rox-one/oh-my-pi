@@ -21,7 +21,7 @@ describe("discoverAdvisorConfigs", () => {
 	beforeEach(async () => {
 		tmp = await fsp.mkdtemp(path.join(os.tmpdir(), "omp-advisor-config-"));
 		await fsp.mkdir(path.join(tmp, ".git"));
-		// Empty agent dir so the user-level search path can't pick up a real ~/.omp/WATCHDOG.yml.
+		// Empty agent dir so the user-level search path can't pick up a real ~/.omr/WATCHDOG.yml.
 		agentDir = await fsp.mkdtemp(path.join(os.tmpdir(), "omp-advisor-agentdir-"));
 	});
 

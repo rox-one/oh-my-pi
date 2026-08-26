@@ -67,7 +67,7 @@ export async function collectConfigCandidates(
 
 	const candidates = new Set<string>();
 
-	// 1. User level: ~/.omp/<F> (or active profile agent dir)
+	// 1. User level: ~/.omr/<F> (or active profile agent dir)
 	if (resolvedAgentDir) {
 		for (const filename of filenames) {
 			const userPath = path.resolve(resolvedAgentDir, filename);
@@ -80,7 +80,7 @@ export async function collectConfigCandidates(
 	let current = cwd;
 	while (true) {
 		for (const filename of filenames) {
-			candidates.add(path.resolve(current, ".omp", filename));
+			candidates.add(path.resolve(current, ".omr", filename));
 			candidates.add(path.resolve(current, filename));
 		}
 		if (current === (repoRoot ?? home)) break;
@@ -96,9 +96,9 @@ export async function collectConfigCandidates(
 			const parent = path.dirname(candidate);
 			const baseName = parent.split(path.sep).pop() ?? "";
 			const isUser = userPaths.has(candidate);
-			const ownerDir = baseName === ".omp" ? path.dirname(parent) : parent;
+			const ownerDir = baseName === ".omr" ? path.dirname(parent) : parent;
 			const ownerBaseName = ownerDir.split(path.sep).pop() ?? "";
-			if (isUser || !ownerBaseName.startsWith(".") || baseName === ".omp") {
+			if (isUser || !ownerBaseName.startsWith(".") || baseName === ".omr") {
 				const relative = path.relative(cwd, ownerDir);
 				const depth = relative === "" ? 0 : relative.split(path.sep).filter(Boolean).length;
 				items.push({ path: candidate, content, level: isUser ? "user" : "project", depth });

@@ -2,7 +2,7 @@
  * Regression tests for top-level `RULES.md` sticky rules.
  *
  * `RULES.md` (singular, top-level) MUST be loaded as a sticky always-apply rule
- * from both `~/.omp/agent/RULES.md` (user) and the nearest `.omp/RULES.md`
+ * from both `~/.omr/agent/RULES.md` (user) and the nearest `.omp/RULES.md`
  * (project, walked up from cwd to repoRoot).
  */
 import { afterEach, beforeEach, expect, test } from "bun:test";
@@ -51,7 +51,7 @@ beforeEach(() => {
 	fs.mkdirSync(home, { recursive: true });
 	fs.mkdirSync(project, { recursive: true });
 	fs.mkdirSync(path.join(project, ".git"), { recursive: true });
-	setAgentDir(path.join(home, ".omp", "agent"));
+	setAgentDir(path.join(home, ".omr", "agent"));
 });
 
 afterEach(() => {
@@ -65,9 +65,9 @@ afterEach(() => {
 	removeSyncWithRetries(tempDir);
 });
 
-test("user ~/.omp/agent/RULES.md becomes an alwaysApply rule", async () => {
+test("user ~/.omr/agent/RULES.md becomes an alwaysApply rule", async () => {
 	writeFile(
-		path.join(home, ".omp", "agent", "RULES.md"),
+		path.join(home, ".omr", "agent", "RULES.md"),
 		"**CRITICAL**: You _MUST_ use beads task tracker for any project\n",
 	);
 
@@ -80,7 +80,7 @@ test("user ~/.omp/agent/RULES.md becomes an alwaysApply rule", async () => {
 });
 
 test("project .omp/RULES.md becomes an alwaysApply rule", async () => {
-	writeFile(path.join(project, ".omp", "RULES.md"), "# Project rule\nAlways say hi.\n");
+	writeFile(path.join(project, ".omr", "RULES.md"), "# Project rule\nAlways say hi.\n");
 
 	const rules = await loadNativeRules({ cwd: project, home, repoRoot: project });
 
@@ -93,19 +93,19 @@ test("project .omp/RULES.md becomes an alwaysApply rule", async () => {
 test("project RULES.md is found walking up from a sub-package cwd", async () => {
 	const subPkg = path.join(project, "packages", "app");
 	fs.mkdirSync(subPkg, { recursive: true });
-	writeFile(path.join(project, ".omp", "RULES.md"), "# Repo-wide sticky rule\n");
+	writeFile(path.join(project, ".omr", "RULES.md"), "# Repo-wide sticky rule\n");
 
 	const rules = await loadNativeRules({ cwd: subPkg, home, repoRoot: project });
 
 	const projectRule = rules.find(r => r._source.level === "project" && r.name === "RULES@project");
 	expect(projectRule).toBeDefined();
 	expect(projectRule?.alwaysApply).toBe(true);
-	expect(projectRule?.path).toBe(path.join(project, ".omp", "RULES.md"));
+	expect(projectRule?.path).toBe(path.join(project, ".omr", "RULES.md"));
 });
 
 test("user and project sticky RULES.md both survive public capability dedup", async () => {
-	const userRulesPath = path.join(home, ".omp", "agent", "RULES.md");
-	const projectRulesPath = path.join(project, ".omp", "RULES.md");
+	const userRulesPath = path.join(home, ".omr", "agent", "RULES.md");
+	const projectRulesPath = path.join(project, ".omr", "RULES.md");
 	const userRuleText = "User sticky rule: keep the personal safety checklist active.\n";
 	const projectRuleText = "Project sticky rule: require repo-local release notes.\n";
 	writeFile(userRulesPath, userRuleText);
@@ -140,7 +140,7 @@ test("user and project sticky RULES.md both survive public capability dedup", as
 });
 
 test("alwaysApply is forced even when frontmatter says false", async () => {
-	writeFile(path.join(home, ".omp", "agent", "RULES.md"), "---\nalwaysApply: false\n---\nStick around anyway.\n");
+	writeFile(path.join(home, ".omr", "agent", "RULES.md"), "---\nalwaysApply: false\n---\nStick around anyway.\n");
 
 	const rules = await loadNativeRules({ cwd: project, home, repoRoot: project });
 
@@ -151,7 +151,7 @@ test("alwaysApply is forced even when frontmatter says false", async () => {
 
 test("absent RULES.md does not produce a rule", async () => {
 	// No RULES.md anywhere — only a sibling .omp/rules/ to make sure the directory exists.
-	writeFile(path.join(home, ".omp", "agent", "rules", "other.md"), "# Unrelated rule\n");
+	writeFile(path.join(home, ".omr", "agent", "rules", "other.md"), "# Unrelated rule\n");
 
 	const rules = await loadNativeRules({ cwd: project, home, repoRoot: project });
 

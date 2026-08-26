@@ -130,7 +130,7 @@ describe("Tavily web search provider", () => {
 		};
 
 		const response = await searchTavily({
-			...makeParams("Oh My Pi omp latest release notes advisor"),
+			...makeParams("Oh My Rox omp latest release notes advisor"),
 			numSearchResults: 5,
 			recency: "month",
 			fetch: fetchMock,
@@ -138,12 +138,12 @@ describe("Tavily web search provider", () => {
 
 		expect(requestBodies).toHaveLength(2);
 		expect(requestBodies[0]).toMatchObject({
-			query: "Oh My Pi omp latest release notes advisor",
+			query: "Oh My Rox omp latest release notes advisor",
 			max_results: 5,
 			time_range: "month",
 		});
 		expect(requestBodies[1]).toMatchObject({
-			query: "Oh My Pi omp latest release notes advisor",
+			query: "Oh My Rox omp latest release notes advisor",
 			max_results: 5,
 		});
 		expect(requestBodies[1]).not.toHaveProperty("time_range");

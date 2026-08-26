@@ -4,7 +4,7 @@
 	"name": "@oh-my-pi/pi-metaharness",
 	"version": "0.0.1",
 	"description": "Unified benchmark runners plus Harbor run storage, REST/SSE APIs, and a live web dashboard",
-	"homepage": "https://omp.sh",
+	"homepage": "https://cli.rox.one",
 	"author": "Stencil Labs, Inc.",
 	"license": "MIT",
 	"repository": {

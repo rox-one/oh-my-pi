@@ -102,7 +102,7 @@ for pkg in "${PACKAGES[@]}"; do
     
     # Show what we're publishing
     echo "Dependencies:"
-    jq '.dependencies | to_entries[] | select(.value | startswith("@oh-my-pi") or startswith("workspace"))' package.json 2>/dev/null || true
+    jq '.dependencies | to_entries[] | select(.value | startswith("@oh-my-rox") or startswith("workspace"))' package.json 2>/dev/null || true
     
     # Publish
     npm publish --registry "$REGISTRY"

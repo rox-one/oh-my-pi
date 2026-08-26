@@ -19,12 +19,12 @@ A **plugin** is a directory containing Claude/OMP plugin content such as skills,
 
 **Scopes**: marketplace plugins can be installed at two scopes:
 
-- **user** (default) -- available in all projects, stored in the user plugins data root's `installed_plugins.json` (`~/.omp/plugins/installed_plugins.json` by default)
+- **user** (default) -- available in all projects, stored in the user plugins data root's `installed_plugins.json` (`~/.omr/plugins/installed_plugins.json` by default)
 - **project** -- available only in the active project, stored in the nearest project `.omp/plugins/installed_plugins.json`
 
 Enabled project-scoped installs shadow enabled user-scoped installs of the same plugin. A disabled project install does not shadow the user install.
 
-On Linux and macOS, `omp config init-xdg` creates the XDG data, state, and cache roots; it does not move existing data. Once the relevant roots exist and `XDG_DATA_HOME`, `XDG_STATE_HOME`, and `XDG_CACHE_HOME` are set, new user marketplace/plugin state resolves under `$XDG_DATA_HOME/omp` (including `marketplaces.json` and `plugins/`). The `~/.omp` paths below are the non-XDG defaults.
+On Linux and macOS, `omp config init-xdg` creates the XDG data, state, and cache roots; it does not move existing data. Once the relevant roots exist and `XDG_DATA_HOME`, `XDG_STATE_HOME`, and `XDG_CACHE_HOME` are set, new user marketplace/plugin state resolves under `$XDG_DATA_HOME/omr` (including `marketplaces.json` and `plugins/`). The `~/.omr` paths below are the non-XDG defaults.
 
 ## Commands
 
@@ -221,7 +221,7 @@ Invalid catalog JSON or invalid required top-level fields reject the catalog. An
 ## On-disk layout
 
 ```
-~/.omp/
+~/.omr/
   marketplaces.json              # Registry of added marketplaces
   plugins/
     installed_plugins.json       # User-scoped marketplace plugins (version: 2)
@@ -231,7 +231,7 @@ Invalid catalog JSON or invalid required top-level fields reject the catalog. An
       marketplaces/<name>/       # Cached marketplace clone/catalog
       plugins/<marketplace>___<plugin>___<version>/  # Cached plugin directories
 
-<project>/.omp/
+<project>/.omr/
   plugins/
     installed_plugins.json       # Project-scoped marketplace plugins (version: 2)
     omp-plugins.lock.json         # Project runtime enable/feature state
