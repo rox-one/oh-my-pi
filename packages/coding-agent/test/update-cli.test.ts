@@ -986,7 +986,7 @@ describe("update-cli binary replacement", () => {
 				expectedVersion: "15.1.8",
 				verifyInstalledVersion: async () => ({ ok: false, path: targetPath }),
 			}),
-		).rejects.toThrow("restored previous omp binary");
+		).rejects.toThrow(`restored previous ${APP_NAME} binary`);
 
 		expect(await Bun.file(targetPath).text()).toBe("old binary");
 		expect(await Bun.file(tempPath).exists()).toBe(false);
@@ -1254,9 +1254,7 @@ describe("update-cli script-shim takeover", () => {
 				githubToken: "test-token",
 			}),
 		).rejects.toThrow(
-			new RegExp(
-				`still reports 17\\.2\\.12 \\(expected 18\\.0\\.0\\); restored previous ${APP_NAME} launcher`,
-			),
+			new RegExp(`still reports 17\\.2\\.12 \\(expected 18\\.0\\.0\\); restored previous ${APP_NAME} launcher`),
 		);
 
 		expect(await Bun.file(path.join(dir, `${APP_NAME}.exe`)).exists()).toBe(false);

@@ -104,7 +104,7 @@ describe("get_settings over the RPC server", () => {
 			id: "appearance",
 			label: "Appearance",
 			icon: "tab.appearance",
-			groups: ["Theme", "Status Line", "Display", "Images"],
+			groups: ["Theme", "Composer", "Status Line", "Display", "Images"],
 		});
 
 		// The tab argument reaches the server rather than being dropped.

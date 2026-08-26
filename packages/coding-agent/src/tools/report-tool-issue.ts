@@ -35,7 +35,7 @@ import type { AgentToolResult } from "@oh-my-pi/pi-agent-core";
 import type { FetchImpl } from "@oh-my-pi/pi-ai";
 import type { Component } from "@oh-my-pi/pi-tui";
 import { Text } from "@oh-my-pi/pi-tui";
-import { $env, $flag, getAutoQaDbPath, getInstallId, logger, VERSION } from "@oh-my-pi/pi-utils";
+import { $env, $flag, APP_NAME, getAutoQaDbPath, getInstallId, logger, VERSION } from "@oh-my-pi/pi-utils";
 import type { Settings } from "..";
 import type { Theme } from "../modes/theme/theme";
 import { renderStatusLine, truncateToWidth } from "../tui";
@@ -418,7 +418,7 @@ async function performFlush(db: Database, config: PushConfig, options: FlushOpti
 		if (rows.length === 0) return { pushed: totalPushed, ok: true };
 
 		const body = JSON.stringify({
-			agent: { name: "omp", version: VERSION },
+			agent: { name: APP_NAME, version: VERSION },
 			installId: getInstallId(),
 			// Coarse host fingerprint for triage — `darwin`/`linux`/`win32` +
 			// `arm64`/`x64`. Useful for "is this bug arch-specific?" without

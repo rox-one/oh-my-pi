@@ -46,7 +46,7 @@ describe("sshControlFallbackDir", () => {
 		const a = sshControlFallbackDir(canonicalDir, 501);
 		const b = sshControlFallbackDir(canonicalDir, 501);
 		expect(a).toBe(b);
-		expect(a).toBe("/tmp/omp-5434354bc38f9a50fbbd");
+		expect(a).toBe("/tmp/omp-bd3587789dad9b95315e");
 		expect(Buffer.byteLength(a)).toBe(29);
 		const tempBind = path.join(a, `${"a".repeat(40)}.sock.${"b".repeat(16)}`);
 		expect(Buffer.byteLength(tempBind)).toBe(92);
@@ -75,7 +75,7 @@ describe("resolveSshControlDir", () => {
 	it("relocates to the bounded shared fallback when the canonical dir overflows", () => {
 		const canonicalDir = "/Users/arthur/.omr/profiles/upstream/ssh-control";
 		const choice = resolveSshControlDir({ canonicalDir, platform: "darwin", uid: 501, tmpBase: "/tmp" });
-		expect(choice).toEqual({ dir: "/tmp/omp-5434354bc38f9a50fbbd", shared: true });
+		expect(choice).toEqual({ dir: "/tmp/omp-bd3587789dad9b95315e", shared: true });
 		expect(controlPathFitsBudget(choice.dir, "darwin")).toBe(true);
 	});
 

@@ -211,7 +211,7 @@ describe.skipIf(SKIP)("handleGitHubGist", () => {
 describe("parseGitHubUrl — Actions", () => {
 	it("classifies a workflow run URL", () => {
 		const gh = parseGitHubUrl("https://github.com/can1357/oh-my-pi/actions/runs/27070071296");
-		expect(gh).toEqual({ type: "actions-run", owner: "can1357", repo: "oh-my-rox", runId: 27070071296 });
+		expect(gh).toEqual({ type: "actions-run", owner: "can1357", repo: "oh-my-pi", runId: 27070071296 });
 	});
 
 	it("classifies a job URL using the web-form singular `job` segment", () => {
@@ -219,7 +219,7 @@ describe("parseGitHubUrl — Actions", () => {
 		expect(gh).toEqual({
 			type: "actions-job",
 			owner: "can1357",
-			repo: "oh-my-rox",
+			repo: "oh-my-pi",
 			runId: 27070071296,
 			jobId: 79897931171,
 		});
@@ -251,7 +251,7 @@ describe("parseGitHubUrl — commit", () => {
 		expect(gh).toEqual({
 			type: "commit",
 			owner: "can1357",
-			repo: "oh-my-rox",
+			repo: "oh-my-pi",
 			ref: "c1a1cb6149e73b345919dd4cf629b0d9ac74fb57",
 		});
 	});
@@ -260,7 +260,7 @@ describe("parseGitHubUrl — commit", () => {
 		expect(parseGitHubUrl("https://github.com/can1357/oh-my-pi/commit/c1a1cb6")).toEqual({
 			type: "commit",
 			owner: "can1357",
-			repo: "oh-my-rox",
+			repo: "oh-my-pi",
 			ref: "c1a1cb6",
 		});
 	});
