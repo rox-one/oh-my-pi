@@ -1,7 +1,7 @@
 /**
- * Builtin Provider (.omp)
+ * Builtin Provider (.omr)
  *
- * Primary provider for OMP native configs. Supports all capabilities.
+ * Primary provider for OMR native configs. Supports all capabilities.
  */
 import * as path from "node:path";
 import { getAgentDir, logger, parseFrontmatter, tryParseJson } from "@oh-my-pi/pi-utils";
@@ -37,8 +37,8 @@ import {
 } from "./helpers";
 
 const PROVIDER_ID = "native";
-const DISPLAY_NAME = "OMP";
-const DESCRIPTION = "Native OMP configuration from ~/.omp and .omp/";
+const DISPLAY_NAME = "OMR";
+const DESCRIPTION = "Native OMR configuration from ~/.omr and .omr/";
 const PRIORITY = 100;
 
 const PATHS = SOURCE_PATHS.native;
@@ -281,7 +281,7 @@ registerProvider<SystemPrompt>(systemPromptCapability.id, {
 
 // Skills
 async function loadSkills(ctx: LoadContext): Promise<LoadResult<Skill>> {
-	// Walk up from cwd finding .omp/skills/ in ancestors (closest first)
+	// Walk up from cwd finding .omr/skills/ in ancestors (closest first)
 	const ancestors = getAncestorDirs(ctx.cwd, ctx.repoRoot ?? ctx.home);
 	const projectScans = ancestors.map(({ dir }) =>
 		scanSkillsFromDir(ctx, {
@@ -389,7 +389,7 @@ async function loadRules(ctx: LoadContext): Promise<LoadResult<Rule>> {
 	// https://cli.rox.one/docs/context-files as the file that gets "re-injected near
 	// the current turn so they keep hold across long conversations".
 	// User scope:    ~/.omr/agent/RULES.md
-	// Project scope: nearest .omp/RULES.md walking up from cwd to repoRoot
+	// Project scope: nearest .omr/RULES.md walking up from cwd to repoRoot
 	const userRulesFile = path.join(getAgentDir(), "RULES.md");
 	const userRule = await loadStickyRulesFile(userRulesFile, "user");
 	if (userRule) items.push(userRule);
@@ -940,7 +940,7 @@ async function loadContextFiles(ctx: LoadContext): Promise<LoadResult<ContextFil
 registerProvider<ContextFile>(contextFileCapability.id, {
 	id: PROVIDER_ID,
 	displayName: DISPLAY_NAME,
-	description: "Load AGENTS.md from .omp/ directories",
+	description: "Load AGENTS.md from .omr/ directories",
 	priority: PRIORITY,
 	load: loadContextFiles,
 });
