@@ -444,7 +444,7 @@ export interface ExtensionModelAlias {
 	model?: Model;
 	thinkingLevel?: ConfiguredThinkingLevel;
 	explicitThinkingLevel: boolean;
-	status: "resolved" | "unavailable" | "unresolved";
+	status: "resolved" | "unavailable" | "unresolved" | "reserved";
 	warning?: string;
 }
 export type ExtensionModelAliasResult =
@@ -452,7 +452,7 @@ export type ExtensionModelAliasResult =
 	| {
 			ok: false;
 			alias: string;
-			reason: "unknown_alias" | "unresolved_alias" | "unavailable_alias";
+			reason: "unknown_alias" | "unresolved_alias" | "unavailable_alias" | "reserved_alias";
 	  };
 
 /**

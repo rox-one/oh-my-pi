@@ -721,6 +721,63 @@ describe("ExtensionRunner", () => {
 			const missing = runner.getCommand("not-exists");
 			expect(missing).toBeUndefined();
 		});
+		it("routes pi.setModelAlias through initialized runner actions", async () => {
+			const extCode = `
+				export default function(pi) {
+					pi.registerCommand("select-alias", {
+						description: "Select an alias",
+						handler: async () => {
+							await pi.setModelAlias("slow");
+						},
+					});
+				}
+			`;
+			fs.writeFileSync(path.join(extensionsDir, "select-alias.ts"), extCode);
+
+			const result = await loadTestExtensions();
+			const runner = new ExtensionRunner(
+				result.extensions,
+				result.runtime,
+				tempDir.path(),
+				sessionManager,
+				modelRegistry,
+			);
+			let selected: string | undefined;
+			runner.initialize(
+				{
+					sendMessage: () => {},
+					sendUserMessage: () => {},
+					appendEntry: () => {},
+					setLabel: () => {},
+					getActiveTools: () => [],
+					getAllTools: () => [],
+					setActiveTools: async () => {},
+					getCommands: () => [],
+					setModel: async () => false,
+					setModelAlias: async name => {
+						selected = name;
+						return { ok: false, alias: name, reason: "unknown_alias" };
+					},
+					getThinkingLevel: () => undefined,
+					setThinkingLevel: () => {},
+					getSessionName: () => undefined,
+					setSessionName: async () => {},
+				},
+				{
+					getModel: () => undefined,
+					isIdle: () => true,
+					abort: () => {},
+					hasPendingMessages: () => false,
+					shutdown: () => {},
+					getContextUsage: () => undefined,
+					compact: async () => {},
+					getSystemPrompt: () => [],
+				},
+			);
+
+			await runner.getCommand("select-alias")?.handler("", runner.createCommandContext());
+			expect(selected).toBe("slow");
+		});
 
 		it("prefers later-loaded explicit extensions for conflicting commands", async () => {
 			const deployCommand = (description: string) => `

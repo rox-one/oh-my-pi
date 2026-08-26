@@ -12,14 +12,14 @@ import type { ModelRegistry } from "../../config/model-registry";
 import { getModelMatchPreferences, resolveModelRoleValue } from "../../config/model-resolver";
 import { getKnownRoleIds } from "../../config/model-roles";
 import type { Settings } from "../../config/settings";
+import { EPHEMERAL_MODEL_CHANGE_ROLE } from "../../session/session-entries";
 import type { ExtensionModelAlias, ExtensionModelAliasResult, ExtensionModelQuery } from "./types";
 
 function resolveAlias(
 	role: string,
 	settings: Settings,
-	modelRegistry: ModelRegistry,
 	currentModel: Model<Api> | undefined,
-	availableModels: Model<Api>[],
+	selectableModels: Model<Api>[],
 	allModels: Model<Api>[],
 ): ExtensionModelAlias {
 	const matchPreferences = getModelMatchPreferences(settings);
@@ -31,34 +31,25 @@ function resolveAlias(
 	const defaultFallback =
 		unconfiguredDefault &&
 		!disabledProviders.has(unconfiguredDefault.model.provider) &&
-		modelRegistry.hasConfiguredAuth(unconfiguredDefault.model)
+		selectableModels.some(model => model === unconfiguredDefault.model)
 			? unconfiguredDefault
 			: undefined;
 	const available =
 		defaultFallback ??
-		resolveModelRoleValue(`@${role}`, availableModels, {
-			settings,
-			matchPreferences,
-		});
-	const explicitlyAvailable = available.model
+		(unconfiguredDefault
+			? { model: undefined, thinkingLevel: undefined, explicitThinkingLevel: false, warning: undefined }
+			: resolveModelRoleValue(`@${role}`, selectableModels, { settings, matchPreferences }));
+	const catalog = available.model
 		? available
-		: resolveModelRoleValue(
-				`@${role}`,
-				allModels.filter(model => !disabledProviders.has(model.provider) && modelRegistry.hasConfiguredAuth(model)),
-				{
-					settings,
-					matchPreferences,
-				},
-			);
-	const catalog = explicitlyAvailable.model
-		? explicitlyAvailable
-		: (unconfiguredDefault ??
-			resolveModelRoleValue(`@${role}`, allModels, {
-				settings,
-				matchPreferences,
-			}));
+		: (unconfiguredDefault ?? resolveModelRoleValue(`@${role}`, allModels, { settings, matchPreferences }));
 	const status =
-		available.model || explicitlyAvailable.model ? "resolved" : catalog.model ? "unavailable" : "unresolved";
+		role === EPHEMERAL_MODEL_CHANGE_ROLE
+			? "reserved"
+			: available.model
+				? "resolved"
+				: catalog.model
+					? "unavailable"
+					: "unresolved";
 	const selector = settings.getModelRole(role);
 
 	return {
@@ -90,7 +81,12 @@ export async function setExtensionModelAlias(
 		return {
 			ok: false,
 			alias: name,
-			reason: alias.status === "unavailable" ? "unavailable_alias" : "unresolved_alias",
+			reason:
+				alias.status === "reserved"
+					? "reserved_alias"
+					: alias.status === "unavailable"
+						? "unavailable_alias"
+						: "unresolved_alias",
 		};
 	}
 
@@ -104,8 +100,18 @@ function createExtensionModelAliases(
 ): ExtensionModelAlias[] {
 	const availableModels = modelRegistry.getAvailable();
 	const allModels = modelRegistry.getAll();
+	const disabledProviders = new Set(settings.get("disabledProviders") ?? []);
+	const selectableModels: Model<Api>[] = [];
+	const seen = new Set<string>();
+	for (const model of [...allModels, ...availableModels]) {
+		if (disabledProviders.has(model.provider) || !modelRegistry.hasConfiguredAuth(model)) continue;
+		const key = `${model.provider}/${model.id}`;
+		if (seen.has(key)) continue;
+		seen.add(key);
+		selectableModels.push(model);
+	}
 	return getKnownRoleIds(settings).map(role =>
-		resolveAlias(role, settings, modelRegistry, currentModel, availableModels, allModels),
+		resolveAlias(role, settings, currentModel, selectableModels, allModels),
 	);
 }
 

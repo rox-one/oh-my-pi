@@ -166,6 +166,29 @@ describe("createExtensionModelQuery", () => {
 			model: explicit,
 		});
 	});
+	test("listAliases() preserves pattern order across selectable providers", () => {
+		const explicitFirst = model("grok-4", "Grok 4", "xai-oauth");
+		const normalSecond = claude;
+		const settings = {
+			get: (path: string) => (path === "cycleOrder" ? ["slow"] : path === "modelTags" ? {} : []),
+			getModelRole: (role: string) => (role === "slow" ? "xai-oauth/grok-4, anthropic/claude-opus-4-8" : undefined),
+			getModelRoles: () => ({ slow: "xai-oauth/grok-4, anthropic/claude-opus-4-8" }),
+		} as unknown as Settings;
+		const q = createExtensionModelQuery(
+			{
+				getAvailable: () => [normalSecond],
+				getAll: () => [explicitFirst, normalSecond],
+				hasConfiguredAuth: () => true,
+			} as unknown as ModelRegistry,
+			settings,
+			() => undefined,
+		);
+
+		expect(q.listAliases().find(alias => alias.name === "slow")).toMatchObject({
+			status: "resolved",
+			model: explicitFirst,
+		});
+	});
 	test("listAliases() keeps disabled authenticated providers unavailable", () => {
 		const settings = {
 			get: (path: string) =>
@@ -243,6 +266,24 @@ describe("createExtensionModelQuery", () => {
 			throw new Error("must not switch");
 		});
 		expect(result).toEqual({ ok: false, alias: "default", reason: "unavailable_alias" });
+	});
+
+	test("listAliases() marks the reserved fallback role as unselectable", async () => {
+		const settings = {
+			get: (path: string) => (path === "cycleOrder" ? ["fallback"] : path === "modelTags" ? {} : []),
+			getModelRole: (role: string) => (role === "fallback" ? "anthropic/claude-opus-4-8" : undefined),
+			getModelRoles: () => ({ fallback: "anthropic/claude-opus-4-8" }),
+		} as unknown as Settings;
+		const q = createExtensionModelQuery(registry(), settings, () => undefined);
+		expect(q.listAliases().find(alias => alias.name === "fallback")).toMatchObject({
+			status: "reserved",
+			model: claude,
+		});
+
+		const result = await setExtensionModelAlias("fallback", registry(), settings, undefined, async () => {
+			throw new Error("must not switch");
+		});
+		expect(result).toEqual({ ok: false, alias: "fallback", reason: "reserved_alias" });
 	});
 
 	test("listAliases() returns no aliases without settings", () => {

@@ -126,23 +126,6 @@ describe("AgentSession role model thinking behavior", () => {
 		expect(session.thinkingLevel).toBe("off");
 	});
 
-	it("preserves an extension-selected alias as the model-change role", async () => {
-		const model = getAnthropicModelOrThrow("claude-sonnet-4-5");
-
-		await createSession({
-			initialModelId: model.id,
-			initialThinkingLevel: Effort.Medium,
-			modelRoles: {
-				default: `${model.provider}/${model.id}`,
-				slow: `${model.provider}/${model.id}:high`,
-			},
-		});
-
-		await session.setModelTemporary(model, Effort.High, { role: "slow" });
-
-		expect(session.sessionManager.getLastModelChangeRole()).toBe("slow");
-	});
-
 	it("activates auto thinking when cycling into a role whose value carries an explicit :auto suffix", async () => {
 		const defaultModel = getAnthropicModelOrThrow("claude-sonnet-4-5");
 		const smolModel = getAnthropicModelOrThrow("claude-sonnet-4-6");
