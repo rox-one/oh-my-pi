@@ -201,14 +201,6 @@ describe("openai-responses parseRequest", () => {
 						},
 						{ type: "input_text", text: "Read image file [image/png]" },
 						{ type: "input_image", image_url: "", file_id: "file_image_123", detail: null },
-						{
-							type: "input_file",
-							detail: "high",
-							filename: "",
-							file_data: null,
-							file_id: null,
-							file_url: "https://example.invalid/report.pdf",
-						},
 						{ type: "input_text", text: "done" },
 					],
 				},
@@ -226,7 +218,6 @@ describe("openai-responses parseRequest", () => {
 				mimeType: "application/octet-stream",
 				providerFile: { provider: "openai", id: "file_image_123" },
 			},
-			{ type: "text", text: "[file: https://example.invalid/report.pdf]" },
 			{ type: "text", text: "done" },
 		]);
 	});
@@ -244,6 +235,21 @@ describe("openai-responses parseRequest", () => {
 				],
 			}),
 		).toThrow(/at least one of `image_url` or `file_id`/);
+	});
+
+	it("rejects file blocks in tool outputs instead of flattening their content", () => {
+		expect(() =>
+			parseRequest({
+				model: "gpt-5.6-sol",
+				input: [
+					{
+						type: "function_call_output",
+						call_id: "call_read",
+						output: [{ type: "input_file", filename: "report.pdf", file_data: "opaque" }],
+					},
+				],
+			}),
+		).toThrow(/input_file/);
 	});
 
 	it("concatenates legacy function output text while retaining inline images", () => {
@@ -373,6 +379,64 @@ describe("openai-responses parseRequest", () => {
 		const replayOutput = replayInput.find(item => item.type === "function_call_output");
 		if (replayOutput?.type !== "function_call_output") throw new Error("expected replayed function output");
 		expect(replayOutput.output).toEqual(wireOutput.output);
+	});
+
+	it("round-trips array-valued custom tool outputs without demoting them", () => {
+		const imageData = Buffer.from("custom tool image").toString("base64");
+		const model = buildModel({
+			id: "gpt-5.6-sol",
+			name: "GPT-5.6 Sol",
+			api: "openai-responses",
+			provider: "openai",
+			baseUrl: "https://api.openai.com/v1",
+			reasoning: true,
+			input: ["text", "image"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 1_000_000,
+			maxTokens: 128_000,
+			applyPatchToolType: "freeform",
+		} satisfies ModelSpec<"openai-responses">);
+		const parsed = parseRequest({
+			model: model.id,
+			input: [
+				{
+					type: "custom_tool_call",
+					call_id: "call_patch",
+					name: "apply_patch",
+					input: "*** Begin Patch",
+				},
+				{
+					type: "custom_tool_call_output",
+					call_id: "call_patch",
+					output: [
+						{ type: "input_text", text: "Rendered patch preview" },
+						{ type: "input_image", image_url: `data:image/png;base64,${imageData}`, detail: "high" },
+					],
+				},
+			],
+		});
+
+		const result = parsed.context.messages[1];
+		if (result?.role !== "toolResult") throw new Error("expected custom tool result");
+		expect(result.toolName).toBe("apply_patch");
+		expect(result.content).toEqual([
+			{ type: "text", text: "Rendered patch preview" },
+			{ type: "image", data: imageData, mimeType: "image/png", detail: "high" },
+		]);
+
+		const replay = buildResponsesInput({
+			model,
+			context: parsed.context,
+			strictResponsesPairing: true,
+			supportsImageDetailOriginal: true,
+		});
+		const replayOutput = replay.find(item => item.type === "custom_tool_call_output");
+		if (replayOutput?.type !== "custom_tool_call_output") throw new Error("expected custom tool output");
+		expect(replayOutput.output).toEqual([
+			{ type: "input_text", text: "Rendered patch preview" },
+			{ type: "input_image", detail: "high", image_url: `data:image/png;base64,${imageData}` },
+		]);
+		expect(replay.some(item => item.type === "function_call_output")).toBe(false);
 	});
 
 	it("rejects raw explicit prompt-cache controls instead of silently dropping them", () => {

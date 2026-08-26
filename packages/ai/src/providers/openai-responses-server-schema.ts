@@ -78,9 +78,14 @@ const inputContentBlockSchema = inputTextSchema.or(plainTextSchema).or(inputImag
 
 const outputContentBlockSchema = outputTextSchema.or(plainTextSchema).or(outputRefusalSchema);
 
-// The Responses API defines function output arrays in terms of input content.
-// Keep output text/refusal blocks for compatibility with older Codex clients.
-const functionCallOutputContentBlockSchema = inputContentBlockSchema.or(outputTextSchema).or(outputRefusalSchema);
+// The Responses API defines multimodal function output arrays in terms of
+// input text and image content. Keep output text/refusal blocks for
+// compatibility with older Codex clients.
+const functionCallOutputContentBlockSchema = inputTextSchema
+	.or(plainTextSchema)
+	.or(inputImageBlockSchema)
+	.or(outputTextSchema)
+	.or(outputRefusalSchema);
 
 // ─── Input items ────────────────────────────────────────────────────────────
 
@@ -123,7 +128,7 @@ const functionCallItemSchema = type({
 const functionCallOutputItemSchema = type({
 	type: "'function_call_output'",
 	call_id: "string >= 1",
-	// Function outputs may carry text, image, or file input blocks.
+	// Function outputs may carry text or image input blocks.
 	"output?": type("string").or(functionCallOutputContentBlockSchema.array()),
 });
 

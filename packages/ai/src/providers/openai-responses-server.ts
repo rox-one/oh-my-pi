@@ -349,16 +349,6 @@ function functionOutputContent(output: string | readonly unknown[] | undefined):
 					if (fileId) content.push({ ...referenceImage, providerFile: { provider: "openai", id: fileId } });
 				}
 			}
-			continue;
-		}
-		if (blockType === "input_file") {
-			flushLegacyText();
-			const reference =
-				(asString(raw.filename) || undefined) ??
-				(asString(raw.file_id) || undefined) ??
-				(asString(raw.file_url) || undefined) ??
-				(asString(raw.file_data) ? "inline data" : undefined);
-			if (reference) content.push({ type: "text", text: `[file: ${reference}]` });
 		}
 	}
 	flushLegacyText();

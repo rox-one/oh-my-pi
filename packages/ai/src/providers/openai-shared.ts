@@ -2335,11 +2335,24 @@ export function convertResponsesAssistantMessage<TApi extends Api>(
 	return outputItems;
 }
 
+/**
+ * Responses wire output for a tool result plus its text-only fallback.
+ *
+ * `output` preserves native image blocks for paired function/custom outputs.
+ * `outputText` feeds orphan and unsupported-computer fallback messages, which
+ * cannot carry the native output array.
+ */
 export interface ResponsesToolResultOutputEncoding {
 	output: string | ResponseInputContent[];
 	outputText: string;
 }
 
+/**
+ * Encodes one canonical tool result for OpenAI Responses replay.
+ *
+ * Image-capable models receive an ordered native content array; text-only
+ * models and callers without images receive the compatible string form.
+ */
 export function encodeResponsesToolResultOutput<TApi extends Api>(
 	toolResult: ToolResultMessage,
 	model: Model<TApi>,
