@@ -697,7 +697,7 @@ describe("LiteLLM provider discovery", () => {
 		expect(models?.[0]?.cost).toEqual({ input: 5.5, output: 33, cacheRead: 0.55, cacheWrite: 6.875 });
 	});
 
-	test("preserves explicit zero prices from later rich metadata", async () => {
+	test("ignores zero placeholder prices from later rich metadata", async () => {
 		const fetchMock = vi.fn(async (input: string | URL | Request) => {
 			const url = inputUrl(input);
 			if (url === MODELS_DEV_URL) {
@@ -707,7 +707,7 @@ describe("LiteLLM provider discovery", () => {
 				return Response.json({
 					data: [
 						{
-							model_group: "free-cache",
+							model_group: "placeholder-cache",
 							input_cost_per_token: 0.000_005,
 							output_cost_per_token: 0.000_03,
 							cache_read_input_token_cost: 0.000_000_5,
@@ -720,8 +720,10 @@ describe("LiteLLM provider discovery", () => {
 				return Response.json({
 					data: [
 						{
-							model_name: "free-cache",
+							model_name: "placeholder-cache",
 							model_info: {
+								input_cost_per_token: 0,
+								output_cost_per_token: 0,
 								cache_read_input_token_cost: 0,
 								cache_creation_input_token_cost: 0,
 							},
@@ -738,7 +740,7 @@ describe("LiteLLM provider discovery", () => {
 			fetch: fetchMock,
 		}).fetchDynamicModels?.();
 
-		expect(models?.[0]?.cost).toEqual({ input: 5, output: 30, cacheRead: 0, cacheWrite: 0 });
+		expect(models?.[0]?.cost).toEqual({ input: 5, output: 30, cacheRead: 0.5, cacheWrite: 0 });
 	});
 
 	test("preserves cache prices reported before base prices", async () => {
@@ -754,6 +756,7 @@ describe("LiteLLM provider discovery", () => {
 							model_group: "cache-first",
 							cache_read_input_token_cost: 0.000_000_5,
 							cache_creation_input_token_cost: 0.000_006_25,
+							supports_vision: false,
 						},
 					],
 				});
