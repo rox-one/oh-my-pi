@@ -23,6 +23,7 @@ function resolveAlias(
 	allModels: Model<Api>[],
 ): ExtensionModelAlias {
 	const matchPreferences = getModelMatchPreferences(settings);
+	const disabledProviders = new Set(settings.get("disabledProviders") ?? []);
 	const defaultFallback =
 		role === "default" && !settings.getModelRole("default") && currentModel
 			? { model: currentModel, thinkingLevel: undefined, explicitThinkingLevel: false, warning: undefined }
@@ -37,7 +38,7 @@ function resolveAlias(
 		? available
 		: resolveModelRoleValue(
 				`@${role}`,
-				allModels.filter(model => modelRegistry.hasConfiguredAuth(model)),
+				allModels.filter(model => !disabledProviders.has(model.provider) && modelRegistry.hasConfiguredAuth(model)),
 				{
 					settings,
 					matchPreferences,

@@ -166,6 +166,34 @@ describe("createExtensionModelQuery", () => {
 			model: explicit,
 		});
 	});
+	test("listAliases() keeps disabled authenticated providers unavailable", () => {
+		const settings = {
+			get: (path: string) =>
+				path === "cycleOrder"
+					? ["slow"]
+					: path === "modelTags"
+						? {}
+						: path === "disabledProviders"
+							? ["anthropic"]
+							: [],
+			getModelRole: (role: string) => (role === "slow" ? "anthropic/claude-opus-4-8" : undefined),
+			getModelRoles: () => ({ slow: "anthropic/claude-opus-4-8" }),
+		} as unknown as Settings;
+		const q = createExtensionModelQuery(
+			{
+				getAvailable: () => [],
+				getAll: () => [claude],
+				hasConfiguredAuth: () => true,
+			} as unknown as ModelRegistry,
+			settings,
+			() => undefined,
+		);
+
+		expect(q.listAliases().find(alias => alias.name === "slow")).toMatchObject({
+			status: "unavailable",
+			model: claude,
+		});
+	});
 
 	test("listAliases() returns no aliases without settings", () => {
 		const q = createExtensionModelQuery(registry(), undefined, () => undefined);
