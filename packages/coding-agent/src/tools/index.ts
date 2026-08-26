@@ -275,6 +275,20 @@ export interface ToolSession {
 	toolRegistry?: Map<string, Tool>;
 	/** `xd://` presentation state backed by {@link toolRegistry}. */
 	xdev?: XdevState;
+	/**
+	 * Set when this session's `write` tool was granted only as the `xd://`
+	 * transport: `write xd://<tool>` dispatches mounted devices, but filesystem
+	 * writes are rejected. Granted by {@link createTools} to sessions whose
+	 * explicit tool list includes `read` but omits `write`, so xd:// mounting
+	 * can engage without expanding the write contract.
+	 */
+	deviceOnlyWrite?: boolean;
+	/**
+	 * Prompt-only preview used while a full-write activation rebuilds. It changes
+	 * the advertised schema without relaxing {@link deviceOnlyWrite}; execution
+	 * remains restricted until the activation commits.
+	 */
+	pendingFullWriteDescription?: boolean;
 	/** Agent registry for IRC routing across live sessions. */
 	agentRegistry?: AgentRegistry;
 	/** Idle→parked→revive lifecycle owner; lets the hub kill a non-job-backed agent registration. Default: AgentLifecycleManager.global(). */
@@ -481,6 +495,13 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 		: toolNames && toolNames.length > 0
 			? normalizeToolNames(toolNames)
 			: undefined;
+	// createTools may be called more than once for the same ToolSession. A later
+	// explicit (or full-set) write request is a real grant and must upgrade any
+	// device-only transport left by an earlier read-only call.
+	if (requestedTools === undefined || requestedTools.includes("write")) {
+		session.deviceOnlyWrite = undefined;
+		session.pendingFullWriteDescription = undefined;
+	}
 	const goalEnabled = session.settings.get("goal.enabled");
 	const goalModeActive = !restrictToolNames && goalEnabled && session.getGoalModeState?.()?.enabled === true;
 	const externalThinkingActive =
@@ -705,15 +726,40 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 	const builtInNames = new Set(tools.map(tool => tool.name));
 	for (const tool of tools) toolRegistry.set(tool.name, tool);
 
+	const xdevRequested = !restrictToolNames && session.settings.get("tools.xdev");
+	// xd:// mounting rides the write tool as its execution transport, so a
+	// session whose explicit tool list grants `read` but omits `write` would
+	// allocate no xd:// state and expose every later-registered MCP/extension
+	// tool top-level with its full schema on every request — the opposite of
+	// the intended restriction, and enough to overflow narrow provider context
+	// windows on MCP-heavy sessions. Grant a device-only `write` instead:
+	// `write xd://<tool>` dispatches mounted devices while filesystem writes
+	// stay rejected (enforced by WriteTool via `session.deviceOnlyWrite`). No
+	// capability is expanded: without mounting, those tools were already
+	// presented — and callable — top-level.
+	if (
+		xdevRequested &&
+		requestedTools !== undefined &&
+		!tools.some(tool => tool.name === "write") &&
+		tools.some(tool => tool.name === "read")
+	) {
+		session.deviceOnlyWrite = true;
+		const writeTool = await logger.time("createTools:write:xdev-transport", BUILTIN_TOOLS.write, session);
+		if (writeTool) {
+			const wrapped = wrapToolWithMetaNotice(writeTool);
+			tools.push(wrapped);
+			toolRegistry.set(wrapped.name, wrapped);
+			builtInNames.add(wrapped.name);
+		} else {
+			session.deviceOnlyWrite = undefined;
+		}
+	}
+
 	// Ordinary sessions use xd:// for discoverable built-ins, custom tools, and
 	// MCP tools. Structured children must expose only their host-provided names,
 	// so never allocate a registry that later SDK assembly could populate.
-	// The transport rides read/write, so a session granted no write tool never
-	// allocates xd:// state — its tools are exposed top-level directly instead
-	// of auto-granting a write transport the session was denied.
 	// Explicitly requested built-ins retain their top-level presentation.
-	const xdevEnabled =
-		!restrictToolNames && session.settings.get("tools.xdev") && tools.some(tool => tool.name === "write");
+	const xdevEnabled = xdevRequested && tools.some(tool => tool.name === "write");
 	const mountBuiltinTools = requestedTools === undefined;
 	if (xdevEnabled) {
 		const mountedNames = new Set<string>();
@@ -733,8 +779,6 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 	}
 	// Staged previews from deferrable tools (e.g. ast_edit) resolve through a
 	// `write` to xd://resolve/reject, so retain write whenever one can stage.
-	// xd:// mounting itself never registers write: sessions without a granted
-	// write tool skip mounting entirely (see xdevEnabled above).
 	const xdevMounted = (session.xdev?.mountedNames.size ?? 0) > 0;
 	if (
 		!restrictToolNames &&

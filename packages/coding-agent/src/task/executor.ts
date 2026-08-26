@@ -3317,11 +3317,20 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			if (filteredSubagentTools.length !== subagentToolNames.length) {
 				await awaitAbortable(session.setActiveToolsByName(filteredSubagentTools));
 			}
+			const enabledSubagentTools = session.getEnabledToolNames();
+			// The enabled set includes the synthetic write transport injected for
+			// explicit tool lists that omitted write. `session_init.tools` is later
+			// replayed as an explicit grant during cold revival, so persist write
+			// only when the original agent contract granted it.
+			const persistedSubagentTools =
+				toolNames !== undefined && !toolNames.includes("write")
+					? enabledSubagentTools.filter(name => name !== "write")
+					: enabledSubagentTools;
 
 			session.sessionManager.appendSessionInit({
 				systemPrompt: session.agent.state.systemPrompt.join("\n\n"),
 				task,
-				tools: session.getEnabledToolNames(),
+				tools: persistedSubagentTools,
 				agent: agent.name,
 				modelRole: modelRole ?? resolveExplicitModelRole(modelOverride ?? agent.model, subagentSettings),
 				resolvedModel: progress.resolvedModel,

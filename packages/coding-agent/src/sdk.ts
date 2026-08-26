@@ -2819,12 +2819,6 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			cursorBridgeEditTool ??= createBridgeEditTool(toolSession, extensionRunner);
 			return cursorBridgeEditTool;
 		};
-		// Whether this session granted a file-writing tool. Same capture-early
-		// reasoning, plus `write` may be auto-registered further down as an xdev
-		// transport. The exec bridge answers native `delete` and
-		// resource-download frames that mutate files without running a registry
-		// tool, so it needs the grant as the session actually made it.
-		const cursorCanMutateFiles = editWasGranted || toolRegistry.has("write");
 
 		let writeRegistration: Promise<boolean> | undefined;
 		const ensureWriteRegistered = (): Promise<boolean> => {
@@ -2870,8 +2864,9 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 
 		// Existing staged/device paths need write registered before active-set assembly.
 		// Deferred MCP also registers it now, but refresh activates it only after a server connects.
-		// xd:// mounts never register write: xdev state only exists when the session
-		// already granted a write tool (see createTools), so mounting rides that grant.
+		// xd:// mounts ride the session's write grant: createTools either saw a
+		// granted write tool or registered a device-only transport one for an
+		// explicit-list session that omitted it, so xdev state always implies one.
 		const hasDeferrableTools = Array.from(toolRegistry.values()).some(tool => tool.deferrable === true);
 		const planModeAvailable = settings.get("plan.enabled");
 		if (!restrictToolNames && (hasDeferrableTools || planModeAvailable || deferMCPDiscoveryForUI)) {
@@ -2930,10 +2925,15 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			// it over the registry, so installing it unconditionally would let a
 			// session without `grep` search anyway.
 			createGrepTool: toolRegistry.has("grep") ? createBridgeGrepFactory(toolSession, extensionRunner) : undefined,
-			// The native `delete` and resource-download frames mutate files
-			// without running a registry tool, so this grant is the only thing
-			// standing between a restricted session and a workspace write.
-			allowDirectFileMutation: cursorCanMutateFiles,
+			// Native delete and resource-download frames mutate files without a
+			// registry tool. Resolve both the transactional active predicate and
+			// live access mode: Agent.state.tools commits only after prompt rebuilding,
+			// while this predicate revokes before the await and rolls back on failure.
+			allowDirectFileMutation: () =>
+				(editWasGranted && toolSession.isToolActive?.("edit") === true) ||
+				(toolSession.isToolActive?.("write") === true &&
+					toolRegistry.has("write") &&
+					toolSession.deviceOnlyWrite !== true),
 		});
 
 		// Resolve the inline-descriptors setting against the session-start model.
@@ -3061,6 +3061,8 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				),
 				taskIrcEnabled: !restrictToolNames && isIrcEnabled(settings, options.taskDepth ?? 0, options.spawns ?? "*"),
 				autoQaEnabled: !restrictToolNames && isAutoQaEnabled(settings),
+				writeTransportOnly:
+					toolSession.deviceOnlyWrite === true && toolSession.pendingFullWriteDescription !== true,
 				secretsEnabled,
 				workspaceTree: workspaceTreePromise,
 				includeWorkspaceTree,
@@ -3143,7 +3145,9 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			(explicitlyRequestedToolNameSet === undefined || explicitlyRequestedToolNameSet.has("read"));
 		const xdevWriteAvailable =
 			builtInRegistryToolNames.has("write") &&
-			(explicitlyRequestedToolNameSet === undefined || explicitlyRequestedToolNameSet.has("write"));
+			(explicitlyRequestedToolNameSet === undefined ||
+				explicitlyRequestedToolNameSet.has("write") ||
+				toolSession.deviceOnlyWrite === true);
 		const initialRequestedActiveToolNames = options.toolNames
 			? requestedActiveToolNames
 			: requestedActiveToolNames.filter(name => !defaultInactiveToolNames.has(name));
@@ -3203,8 +3207,9 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		// Partition the initial enabled set for the xd:// transport. Tool instances
 		// remain in the canonical map; only presentation names move between layers.
 		// Mounting requires both transport halves in the granted set (`read xd://`
-		// discovers, `write xd://<tool>` executes); a session without either keeps
-		// every tool top-level instead of auto-granting the missing transport.
+		// discovers, `write xd://<tool>` executes); explicit-list sessions granted
+		// `read` without `write` can use the device-only transport registered by
+		// createTools without surfacing it when no device needs it.
 		if (toolSession.xdev) {
 			const topLevelToolNames: string[] = [];
 			const mountedNames: string[] = [];
@@ -3218,7 +3223,13 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			toolSession.xdev.mountedNames.clear();
 			for (const name of mountedNames) toolSession.xdev.mountedNames.add(name);
 			initialToolNames = topLevelToolNames;
-			if (mountedNames.length > 0 && !initialToolNames.includes("write")) initialToolNames.push("write");
+			const deviceTransportNeeded =
+				mountedNames.length > 0 ||
+				initialToolNames.some(name => toolRegistry.get(name)?.deferrable === true) ||
+				toolSession.getPlanModeState?.()?.enabled === true;
+			if (deviceTransportNeeded && xdevWriteAvailable && !initialToolNames.includes("write")) {
+				initialToolNames.push("write");
+			}
 		}
 
 		setSessionActiveToolNames(initialToolNames);
@@ -3469,6 +3480,10 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		// (defaulting to read/grep/glob).
 		const advisorToolSession: ToolSession = {
 			...toolSession,
+			// The primary may carry a dormant xd:// write transport. Advisors use
+			// their own configured tool slate, so a selected write is always full.
+			deviceOnlyWrite: undefined,
+			pendingFullWriteDescription: undefined,
 			get cwd() {
 				return sessionManager.getCwd();
 			},
@@ -3596,6 +3611,13 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			presentationPinnedToolNames: explicitlyRequestedToolNameSet,
 			setActiveToolNames: setSessionActiveToolNames,
 			ensureWriteRegistered,
+			isDeviceOnlyWrite: () => toolSession.deviceOnlyWrite === true,
+			setDeviceOnlyWrite: enabled => {
+				toolSession.deviceOnlyWrite = enabled ? true : undefined;
+			},
+			setPendingFullWriteDescription: enabled => {
+				toolSession.pendingFullWriteDescription = enabled ? true : undefined;
+			},
 			ensureGoalRegistered,
 			getMcpServerInstructions: mcpManager
 				? () => {
@@ -3704,7 +3726,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 						builtInRegistryToolNames.has("read") &&
 						builtInRegistryToolNames.has("write") &&
 						enabled.includes("read") &&
-						enabled.includes("write") &&
+						(enabled.includes("write") || toolSession.deviceOnlyWrite === true) &&
 						isMountableUnderXdev(liveTool);
 					const nextMounted = shouldMount
 						? mounted.includes(name)

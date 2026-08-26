@@ -186,8 +186,14 @@ export interface AgentSessionConfig {
 	mcpManagerToolNames?: Iterable<string>;
 	/** Updates tool-session predicates from the live active tool set. */
 	setActiveToolNames?: (names: Iterable<string>) => void;
-	/** Registers the write transport when runtime xdev mounts first need it. */
+	/** Registers the built-in write transport when it is needed at runtime. */
 	ensureWriteRegistered?: () => Promise<boolean>;
+	/** Reports whether the registered write tool is currently transport-only. */
+	isDeviceOnlyWrite?: () => boolean;
+	/** Switches the registered write tool between transport-only and full access. */
+	setDeviceOnlyWrite?: (enabled: boolean) => void;
+	/** Previews the full-write description without changing execution access. */
+	setPendingFullWriteDescription?: (enabled: boolean) => void;
 	/** Registers the hidden `goal` tool when goal mode is enabled at runtime. */
 	ensureGoalRegistered?: () => Promise<boolean>;
 	/** Current session pre-LLM message transform pipeline. */

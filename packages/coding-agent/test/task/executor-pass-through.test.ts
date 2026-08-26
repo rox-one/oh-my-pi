@@ -236,6 +236,38 @@ describe("runSubprocess parent-discovery pass-through (issue #2190)", () => {
 		expect(appendSessionInit).toHaveBeenCalledWith(expect.objectContaining({ tools: ["eval", "read", "yield"] }));
 	});
 
+	it("omits transport-only write from the persisted cold-revival contract", async () => {
+		const session = yieldEmittingSession();
+		vi.spyOn(session, "getEnabledToolNames").mockReturnValue(["read", "write", "yield"]);
+		const appendSessionInit = vi.spyOn(session.sessionManager, "appendSessionInit");
+		vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(createSessionResult(session));
+
+		const result = await runSubprocess({
+			...baseOptions,
+			id: "transport-only-child",
+			agent: { ...baseAgent, tools: ["read"] },
+		});
+
+		expect(result.exitCode).toBe(0);
+		expect(appendSessionInit).toHaveBeenCalledWith(expect.objectContaining({ tools: ["read", "yield"] }));
+	});
+
+	it("persists write when the original subagent contract grants it", async () => {
+		const session = yieldEmittingSession();
+		vi.spyOn(session, "getEnabledToolNames").mockReturnValue(["read", "write", "yield"]);
+		const appendSessionInit = vi.spyOn(session.sessionManager, "appendSessionInit");
+		vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(createSessionResult(session));
+
+		const result = await runSubprocess({
+			...baseOptions,
+			id: "writable-child",
+			agent: { ...baseAgent, tools: ["read", "write"] },
+		});
+
+		expect(result.exitCode).toBe(0);
+		expect(appendSessionInit).toHaveBeenCalledWith(expect.objectContaining({ tools: ["read", "write", "yield"] }));
+	});
+
 	it("retains inherited MCP proxy tools for normal children", async () => {
 		const session = yieldEmittingSession();
 		const spy = vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(createSessionResult(session));
