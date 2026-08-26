@@ -166,15 +166,6 @@ function isPromptTurnInFlight(turn: PromptTurnState | undefined): turn is Prompt
 	return turn !== undefined && (!turn.settled || turn.cleanup !== undefined);
 }
 
-/**
- * JSON-RPC server-range application code (-32000..-32099) identifying a busy
- * session on the ACP prompt path. Sibling application codes live on the
- * `RequestError` factories (-32000 authRequired, -32002 resourceNotFound); the
- * data payload carries `reason: "session_busy"` so clients can react instead
- * of decoding an opaque -32603 "Internal error".
- */
-const ACP_SESSION_BUSY_ERROR_CODE = -32003;
-
 type ManagedSessionRecord = {
 	session: AgentSession;
 	setToolUIContext: ((uiContext: ExtensionUIContext, hasUI: boolean) => void) | undefined;
@@ -911,7 +902,7 @@ export class AcpAgent implements Agent {
 					record,
 					undefined,
 					error instanceof AgentBusyError
-						? new RequestError(ACP_SESSION_BUSY_ERROR_CODE, error.message, {
+						? RequestError.sessionBusy(error.message, {
 								reason: "session_busy",
 								hint: "steer|followUp|wait",
 							})
