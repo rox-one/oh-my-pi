@@ -96,6 +96,9 @@ const NEVER_ABORTED_SIGNAL = new AbortController().signal;
 function throwUnsupportedServiceTierAction(): never {
 	throw new Error("This extension host does not support service-tier actions");
 }
+function throwUnsupportedModelAliasAction(): never {
+	throw new Error("This extension host does not support model-alias actions");
+}
 
 export function testSetExtensionHandlerTimeoutMs(timeoutMs: number): void {
 	extensionHandlerTimeoutMs = timeoutMs;
@@ -787,7 +790,7 @@ export class ExtensionRunner {
 		};
 		this.runtime.getCommands = actions.getCommands;
 		this.runtime.setModel = actions.setModel;
-		if (actions.setModelAlias) this.runtime.setModelAlias = actions.setModelAlias;
+		this.runtime.setModelAlias = actions.setModelAlias ?? throwUnsupportedModelAliasAction;
 		this.runtime.getThinkingLevel = actions.getThinkingLevel;
 		this.runtime.setThinkingLevel = actions.setThinkingLevel;
 		this.runtime.getServiceTiers = actions.getServiceTiers ?? throwUnsupportedServiceTierAction;

@@ -24,13 +24,15 @@ function resolveAlias(
 ): ExtensionModelAlias {
 	const matchPreferences = getModelMatchPreferences(settings);
 	const disabledProviders = new Set(settings.get("disabledProviders") ?? []);
-	const defaultFallback =
-		role === "default" &&
-		!settings.getModelRole("default") &&
-		currentModel &&
-		!disabledProviders.has(currentModel.provider) &&
-		modelRegistry.hasConfiguredAuth(currentModel)
+	const unconfiguredDefault =
+		role === "default" && !settings.getModelRole("default") && currentModel
 			? { model: currentModel, thinkingLevel: undefined, explicitThinkingLevel: false, warning: undefined }
+			: undefined;
+	const defaultFallback =
+		unconfiguredDefault &&
+		!disabledProviders.has(unconfiguredDefault.model.provider) &&
+		modelRegistry.hasConfiguredAuth(unconfiguredDefault.model)
+			? unconfiguredDefault
 			: undefined;
 	const available =
 		defaultFallback ??
@@ -50,10 +52,11 @@ function resolveAlias(
 			);
 	const catalog = explicitlyAvailable.model
 		? explicitlyAvailable
-		: resolveModelRoleValue(`@${role}`, allModels, {
+		: (unconfiguredDefault ??
+			resolveModelRoleValue(`@${role}`, allModels, {
 				settings,
 				matchPreferences,
-			});
+			}));
 	const status =
 		available.model || explicitlyAvailable.model ? "resolved" : catalog.model ? "unavailable" : "unresolved";
 	const selector = settings.getModelRole(role);
