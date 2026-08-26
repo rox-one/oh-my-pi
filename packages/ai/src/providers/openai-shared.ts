@@ -117,6 +117,46 @@ import type {
 import { transformMessages } from "./transform-messages";
 import { joinTextWithImagePlaceholder, NON_VISION_IMAGE_PLACEHOLDER, partitionVisionContent } from "./vision-guard";
 
+/** Mark the latest stable Responses input prefix for explicit prompt caching. */
+export function markLatestStableResponsesCacheBreakpoint(input: ResponseInput | undefined): boolean {
+	if (!input) return false;
+	let latestInputMessage = -1;
+	for (let i = input.length - 1; i >= 0; i--) {
+		const message = input[i];
+		if (!message || !("role" in message)) continue;
+		if (message.role === "user" || message.role === "developer") {
+			latestInputMessage = i;
+			break;
+		}
+	}
+	if (latestInputMessage <= 0) return false;
+
+	for (let i = latestInputMessage - 1; i >= 0; i--) {
+		const message = input[i];
+		if (
+			message &&
+			"role" in message &&
+			"content" in message &&
+			(message.role === "developer" || message.role === "system") &&
+			typeof message.content === "string" &&
+			message.content.length > 0
+		) {
+			Object.assign(message, {
+				content: [{ type: "input_text", text: message.content, prompt_cache_breakpoint: { mode: "explicit" } }],
+			});
+			return true;
+		}
+		if (!message || !("content" in message) || !Array.isArray(message.content)) continue;
+		for (let j = message.content.length - 1; j >= 0; j--) {
+			const block = message.content[j];
+			if (!block || typeof block !== "object" || !("type" in block)) continue;
+			if (block.type !== "input_text" && block.type !== "input_image" && block.type !== "input_file") continue;
+			Object.assign(block, { prompt_cache_breakpoint: { mode: "explicit" } });
+			return true;
+		}
+	}
+	return false;
+}
 /**
  * Keyless-provider sentinel. Custom providers configured with `auth: none`
  * (models.yml) have no credential, so the coding-agent resolves their API key
@@ -712,6 +752,73 @@ export interface OpenAIExtraBodyOptions {
 	 * `reasoning_effort`; drop `thinking` when the effort field carries the level.
 	 */
 	dropThinkingWhenReasoningEffort?: boolean;
+	/**
+	 * When true, strip every reasoning-control key from `extraBody` before
+	 * merging instead of skipping the merge entirely. `extraBody` is an
+	 * arbitrary record that commonly carries gateway-routing hints and
+	 * controller fields with no relation to reasoning; dropping the whole
+	 * blob on a reasoning-disable would also drop those unrelated fields
+	 * and could misroute the request. Only the known reasoning-control keys
+	 * (`REASONING_ONLY_EXTRA_BODY_KEYS`) are removed — including top-level
+	 * dialect toggles (`enable_thinking`, `reasoning_effort`, `reasoning`)
+	 * that could otherwise re-enable reasoning after the encoder already
+	 * wrote its disabled shape; the rest flows through unchanged.
+	 */
+	reasoningDisabled?: boolean;
+}
+
+/**
+ * Reasoning-control `extraBody` keys that must not survive a reasoning
+ * disable. Covers the no-op reasoning-only fields plus every top-level
+ * dialect toggle `encodeChatCompletionsDisabledReasoning` can write
+ * (`enable_thinking`, `reasoning_effort`, `reasoning`) so a caller-supplied
+ * `extraBody` cannot re-enable reasoning via `Object.assign` after the
+ * encoder already wrote the disabled shape. Stripped from the blob before
+ * merging when `reasoningDisabled` is set; every other key (gateway
+ * routing, controller fields, …) survives. A `Set` with `.has()` avoids the
+ * prototype-lookup hazard of a plain object index (`constructor`,
+ * `toString`, … would otherwise read as inherited truthy members).
+ */
+const REASONING_ONLY_EXTRA_BODY_KEYS = new Set([
+	"thinking",
+	"parse_reasoning",
+	"include_reasoning",
+	"enable_thinking",
+	"reasoning_effort",
+	"reasoning",
+]);
+
+/**
+ * `chat_template_kwargs` can carry the same Qwen reasoning controls as the
+ * top-level request body. When the encoder has disabled reasoning, remove the
+ * nested controls before merging provider config and retain the encoder's
+ * already-written kwargs over any duplicate config values.
+ */
+const REASONING_ONLY_CHAT_TEMPLATE_KWARG_KEYS = new Set(["enable_thinking", "reasoning_effort"]);
+
+function splitReasoningDisabledExtraBody(extraBody: Record<string, unknown>): {
+	values: Record<string, unknown>;
+	chatTemplateKwargs?: Record<string, unknown>;
+} {
+	const values: Record<string, unknown> = {};
+	let chatTemplateKwargs: Record<string, unknown> | undefined;
+	for (const [key, value] of Object.entries(extraBody)) {
+		if (REASONING_ONLY_EXTRA_BODY_KEYS.has(key)) continue;
+		if (key === "chat_template_kwargs") {
+			// Only sanitize object-shaped kwargs; a non-record value (null,
+			// array, primitive) would otherwise land in `values` and clobber
+			// the encoder's disabled `chat_template_kwargs` via `Object.assign`.
+			// Drop it so the encoder shape survives.
+			if (isRecord(value)) {
+				chatTemplateKwargs = Object.fromEntries(
+					Object.entries(value).filter(([kwarg]) => !REASONING_ONLY_CHAT_TEMPLATE_KWARG_KEYS.has(kwarg)),
+				);
+			}
+			continue;
+		}
+		values[key] = value;
+	}
+	return { values, chatTemplateKwargs };
 }
 
 /**
@@ -720,6 +827,9 @@ export interface OpenAIExtraBodyOptions {
  * an explicit per-turn Thinking Off selection cannot be re-enabled by config.
  * When `dropThinkingWhenReasoningEffort` is set and `reasoning_effort` is
  * present, delete the conflicting `thinking` toggle (Fireworks rejects both).
+ * When `reasoningDisabled` is set, strip only the reasoning-control keys
+ * from the blob before merging so unrelated provider-required configuration
+ * (gateway routing, controller fields, …) still reaches the request.
  */
 export function applyOpenAIExtraBody<P extends object>(
 	params: P & { venice_parameters?: Record<string, unknown> },
@@ -728,9 +838,19 @@ export function applyOpenAIExtraBody<P extends object>(
 ): void {
 	if (!extraBody) return;
 	const encodedVeniceParameters = params.venice_parameters;
-	Object.assign(params, extraBody);
+	const { values: mergedExtraBody, chatTemplateKwargs } = options?.reasoningDisabled
+		? splitReasoningDisabledExtraBody(extraBody)
+		: { values: extraBody };
+	Object.assign(params, mergedExtraBody);
+	if (chatTemplateKwargs !== undefined) {
+		const shaped = params as P & { chat_template_kwargs?: Record<string, unknown> };
+		shaped.chat_template_kwargs = {
+			...chatTemplateKwargs,
+			...shaped.chat_template_kwargs,
+		};
+	}
 	if (encodedVeniceParameters?.disable_thinking === true) {
-		const configuredVeniceParameters = extraBody.venice_parameters;
+		const configuredVeniceParameters = mergedExtraBody.venice_parameters;
 		params.venice_parameters = {
 			...(isRecord(configuredVeniceParameters) ? configuredVeniceParameters : {}),
 			...encodedVeniceParameters,
@@ -1697,72 +1817,48 @@ export function convertResponsesInputContent(
 	return normalizedContent.length > 0 ? normalizedContent : undefined;
 }
 
-/**
- * Map freeform custom-tool wire names back to the internal tool name for
- * providers that only accept function_call / function_call_output.
- * Built once per request; `apply_patch` → `edit` is the OMP default.
- */
-function buildCustomToolWireNameMap(tools: readonly Tool[] | undefined): ReadonlyMap<string, string> | undefined {
-	if (!tools?.length) return undefined;
-	const map = new Map<string, string>();
-	for (const tool of tools) {
-		if (tool.customWireName) map.set(tool.customWireName, tool.name);
+interface ResponsesReplayCompatibilityOptions {
+	supportsCustomToolCalls: boolean;
+	tools: readonly Tool[] | undefined;
+}
+
+function resolveReplayCustomToolName(wireName: string, tools: readonly Tool[] | undefined): string {
+	if (tools) {
+		for (const tool of tools) {
+			if (tool.customWireName === wireName) return tool.name;
+		}
 	}
-	return map.size > 0 ? map : undefined;
+	if (wireName === "apply_patch") return "edit";
+	return wireName;
 }
 
-function resolveReplayCustomToolName(wireName: string, wireNameMap: ReadonlyMap<string, string> | undefined): string {
-	return wireNameMap?.get(wireName) ?? (wireName === "apply_patch" ? "edit" : wireName);
-}
-
-/**
- * Downgrade OpenAI-only custom tool items when the target model does not
- * advertise freeform custom tools (`applyPatchToolType === "freeform"`).
- * No-op (returns the same array reference) when freeform is supported.
- */
 function adaptResponsesReplayItemsForModel(
 	input: ResponseInput,
-	supportsCustomToolCalls: boolean,
-	wireNameMap: ReadonlyMap<string, string> | undefined,
-	supportsComputerUse: boolean,
+	options: ResponsesReplayCompatibilityOptions,
 ): ResponseInput {
-	if (supportsCustomToolCalls && supportsComputerUse) return input;
-
 	let changed = false;
 	const adapted: ResponseInput = [];
 	for (const item of input) {
-		if (!supportsCustomToolCalls && item.type === "custom_tool_call") {
+		let next = item;
+		if (!options.supportsCustomToolCalls && item.type === "custom_tool_call") {
 			changed = true;
-			adapted.push({
+			next = {
 				type: "function_call",
 				...(item.id ? { id: item.id } : {}),
 				call_id: item.call_id,
-				name: resolveReplayCustomToolName(item.name, wireNameMap),
+				name: resolveReplayCustomToolName(item.name, options.tools),
 				arguments: JSON.stringify({ input: item.input }),
 				...(item.namespace ? { namespace: item.namespace } : {}),
-			});
-			continue;
-		}
-		if (!supportsCustomToolCalls && item.type === "custom_tool_call_output") {
+			};
+		} else if (!options.supportsCustomToolCalls && item.type === "custom_tool_call_output") {
 			changed = true;
-			adapted.push({
+			next = {
 				type: "function_call_output",
 				call_id: item.call_id,
 				output: item.output,
-			});
-			continue;
+			};
 		}
-		if (!supportsComputerUse && (item.type === "computer_call" || item.type === "computer_call_output")) {
-			changed = true;
-			const callId = responseInputCallId(item) ?? "unknown";
-			adapted.push({
-				type: "message",
-				role: "assistant",
-				content: `[Previous computer ${item.type === "computer_call" ? "call" : "result"}; call_id=${callId}]: ${stringifyJson(item) ?? ""}`,
-			} as ResponseInput[number]);
-			continue;
-		}
-		adapted.push(item);
+		adapted.push(next);
 	}
 	return changed ? adapted : input;
 }
@@ -1815,8 +1911,25 @@ export interface BuildResponsesInputOptions<TApi extends Api> {
  */
 export function escapeReplayedControlTokens(items: ResponseInput): ResponseInput {
 	return items.map(item => {
-		if (item.type === "function_call_output" || item.type === "custom_tool_call_output") {
-			return typeof item.output === "string" ? { ...item, output: escapeHarmonyControlTokens(item.output) } : item;
+		if (item.type === "function_call_output") {
+			return typeof item.output === "string"
+				? { ...item, output: escapeHarmonyControlTokens(item.output) }
+				: {
+						...item,
+						output: item.output.map(part =>
+							part.type === "input_text" ? { ...part, text: escapeHarmonyControlTokens(part.text) } : part,
+						),
+					};
+		}
+		if (item.type === "custom_tool_call_output") {
+			return typeof item.output === "string"
+				? { ...item, output: escapeHarmonyControlTokens(item.output) }
+				: {
+						...item,
+						output: item.output.map(part =>
+							part.type === "input_text" ? { ...part, text: escapeHarmonyControlTokens(part.text) } : part,
+						),
+					};
 		}
 		if (item.type === "function_call") {
 			return typeof item.arguments === "string"
@@ -1870,15 +1983,13 @@ export function buildResponsesInput<TApi extends Api>(options: BuildResponsesInp
 		messages.push({ role: options.systemRole as "system" | "developer", content: systemPrompt });
 	}
 
-	// Compat is resolved by the catalog (e.g. Copilot / xai-oauth reject
-	// `detail: "original"`). Do not re-branch on provider id here.
-	const supportsImageDetailOriginal = options.supportsImageDetailOriginal;
-	// Freeform custom tools (`custom_tool_call`) only when the catalog says so;
-	// same gate as tool conversion (`applyPatchToolType === "freeform"`).
+	const supportsImageDetailOriginal =
+		options.model.provider === "xai-oauth" ? false : options.supportsImageDetailOriginal;
 	const supportsCustomToolCalls = options.model.applyPatchToolType === "freeform";
-	const customToolWireNameMap = supportsCustomToolCalls
-		? undefined
-		: buildCustomToolWireNameMap(options.context.tools);
+	const replayCompatibility: ResponsesReplayCompatibilityOptions = {
+		supportsCustomToolCalls,
+		tools: options.context.tools,
+	};
 	let knownCallIds = new Set<string>();
 	const customCallIds = new Set<string>();
 	const computerCallIds = new Set<string>();
@@ -1914,15 +2025,8 @@ export function buildResponsesInput<TApi extends Api>(options: BuildResponsesInp
 			if (historyItems && shouldReplayPayloadItems) {
 				const sanitizedItems = sanitizeOpenAIResponsesHistoryItemsForReplay(filterReasoning(historyItems), {
 					supportsImageDetailOriginal,
-					supportsComputerUse: options.model.supportsComputerUse === true,
 				});
-				const replayItems = adaptResponsesReplayItemsForModel(
-					sanitizedItems,
-					supportsCustomToolCalls,
-					customToolWireNameMap,
-					options.model.supportsComputerUse === true,
-				);
-				messages.push(...(escapeControlTokens ? escapeReplayedControlTokens(replayItems) : replayItems));
+				messages.push(...adaptResponsesReplayItemsForModel(sanitizedItems, replayCompatibility));
 				knownCallIds = collectKnownCallIds(messages);
 				for (const id of collectCustomCallIds(messages)) customCallIds.add(id);
 				for (const id of collectComputerCallIds(messages)) computerCallIds.add(id);
@@ -1933,7 +2037,6 @@ export function buildResponsesInput<TApi extends Api>(options: BuildResponsesInp
 				msg.content,
 				options.model.input.includes("image"),
 				supportsImageDetailOriginal,
-				escapeControlTokens,
 			);
 			if (!content) continue;
 			const developerText =
@@ -1969,18 +2072,10 @@ export function buildResponsesInput<TApi extends Api>(options: BuildResponsesInp
 			if (historyItems) {
 				const rawSanitizedHistoryItems = sanitizeOpenAIResponsesAssistantHistoryItemsForReplay(
 					filterReasoning(historyItems),
-					{
-						supportsImageDetailOriginal,
-						supportsComputerUse: options.model.supportsComputerUse === true,
-					},
+					{ supportsImageDetailOriginal },
 				);
 				const sanitizedHistoryItems = rawSanitizedHistoryItems
-					? adaptResponsesReplayItemsForModel(
-							rawSanitizedHistoryItems,
-							supportsCustomToolCalls,
-							customToolWireNameMap,
-							options.model.supportsComputerUse === true,
-						)
+					? adaptResponsesReplayItemsForModel(rawSanitizedHistoryItems, replayCompatibility)
 					: undefined;
 				if (nativeReplayEnabled && sanitizedHistoryItems) {
 					// Model-owned replay items can carry reserved control-token
@@ -2014,10 +2109,7 @@ export function buildResponsesInput<TApi extends Api>(options: BuildResponsesInp
 				customCallIds,
 				options.preserveAssistantMessageIds,
 				supportsCustomToolCalls,
-				customToolWireNameMap,
-				computerCallIds,
-				options.requiresReasoningReplayForAllTurns ?? false,
-				options.requiresReasoningReplayForToolCalls ?? false,
+				options.context.tools,
 			);
 			const outputItems = suppressHiddenEmptyFallback
 				? sanitizeOpenAIResponsesAssistantFallbackItemsForReplay(convertedOutputItems)
@@ -2034,7 +2126,6 @@ export function buildResponsesInput<TApi extends Api>(options: BuildResponsesInp
 				knownCallIds,
 				customCallIds,
 				supportsCustomToolCalls,
-				computerCallIds,
 			);
 		}
 		msgIndex++;
@@ -2070,10 +2161,7 @@ export function convertResponsesAssistantMessage<TApi extends Api>(
 	customCallIds?: Set<string>,
 	preserveMessageIds = false,
 	supportsCustomToolCalls = true,
-	customToolWireNameMap?: ReadonlyMap<string, string>,
-	computerCallIds?: Set<string>,
-	requiresReasoningReplayForAllTurns = false,
-	requiresReasoningReplayForToolCalls = false,
+	tools?: readonly Tool[],
 ): ResponseInput {
 	const outputItems: ResponseInput = [];
 	let unsignedTextBlocks = 0;
@@ -2204,14 +2292,14 @@ export function convertResponsesAssistantMessage<TApi extends Api>(
 		}
 		const functionName =
 			block.customWireName && !supportsCustomToolCalls
-				? resolveReplayCustomToolName(block.customWireName, customToolWireNameMap)
+				? resolveReplayCustomToolName(block.customWireName, tools)
 				: block.name;
 		outputItems.push({
 			type: "function_call",
 			...(itemId ? { id: itemId } : {}),
 			call_id: normalized.callId,
 			name: functionName,
-			arguments: stringifyJson(block.arguments) ?? "null",
+			arguments: JSON.stringify(block.arguments),
 		});
 	}
 
@@ -2238,32 +2326,29 @@ export function convertResponsesAssistantMessage<TApi extends Api>(
 	return outputItems;
 }
 
-const syntheticToolImageMessages = new WeakSet<object>();
-
-function insertResponsesToolOutput(messages: ResponseInput, output: ResponseInput[number]): void {
-	let index = messages.length;
-	while (index > 0) {
-		const previous = messages[index - 1];
-		if (typeof previous !== "object" || previous === null || !syntheticToolImageMessages.has(previous)) {
-			break;
-		}
-		index -= 1;
-	}
-	messages.splice(index, 0, output);
+/**
+ * Responses wire output for a tool result plus its text-only fallback.
+ *
+ * `output` preserves native image blocks for paired function/custom outputs.
+ * `outputText` feeds orphan and unsupported-computer fallback messages, which
+ * cannot carry the native output array.
+ */
+export interface ResponsesToolResultOutputEncoding {
+	output: string | ResponseInputContent[];
+	outputText: string;
 }
 
-/** Appends one tool result while keeping consecutive outputs ahead of its synthetic image messages. */
-export function appendResponsesToolResultMessages<TApi extends Api>(
-	messages: ResponseInput,
+/**
+ * Encodes one canonical tool result for OpenAI Responses replay.
+ *
+ * Image-capable models receive an ordered native content array; text-only
+ * models and callers without images receive the compatible string form.
+ */
+export function encodeResponsesToolResultOutput<TApi extends Api>(
 	toolResult: ToolResultMessage,
 	model: Model<TApi>,
-	strictResponsesPairing: boolean,
 	supportsImageDetailOriginal: boolean,
-	knownCallIds: ReadonlySet<string>,
-	customCallIds?: ReadonlySet<string>,
-	supportsCustomToolCalls = true,
-	computerCallIds?: ReadonlySet<string>,
-): void {
+): ResponsesToolResultOutputEncoding {
 	const supportsImages = model.input.includes("image");
 	const textResult = toolResult.content
 		.filter((block): block is TextContent => block.type === "text")
@@ -2271,12 +2356,6 @@ export function appendResponsesToolResultMessages<TApi extends Api>(
 		.join("\n");
 	const hasImages = toolResult.content.some((block): block is ImageContent => block.type === "image");
 	const omittedImages = hasImages && !supportsImages;
-	const normalized = normalizeResponsesToolCallId(toolResult.toolCallId);
-	// "(see attached image)" is only truthful when the result actually carries
-	// images (they ride as a separate user message on the Responses API). A
-	// genuinely empty text result (empty file read, silent tool) must stay
-	// empty — the placeholder sent models chasing an attachment that never
-	// existed.
 	const rawOutput = (
 		omittedImages
 			? joinTextWithImagePlaceholder(textResult, true)
@@ -2286,10 +2365,38 @@ export function appendResponsesToolResultMessages<TApi extends Api>(
 					? "(see attached image)"
 					: ""
 	).toWellFormed();
+	const escapeControlTokens = isHarmonyDialectModel(model);
 	// Harmony-server models reject reserved control-token spellings even as tool
 	// data; escape the transport copy so a grep/read result cannot poison the
 	// session (#6913). Covers every downstream branch that consumes `output`.
-	const output = isHarmonyDialectModel(model) ? escapeHarmonyControlTokens(rawOutput) : rawOutput;
+	const outputText = escapeControlTokens ? escapeHarmonyControlTokens(rawOutput) : rawOutput;
+	const output: string | ResponseInputContent[] =
+		hasImages && supportsImages
+			? toolResult.content.map((block): ResponseInputContent => {
+					if (block.type === "image") return convertResponsesInputImage(block, supportsImageDetailOriginal);
+					const text = block.text.toWellFormed();
+					return {
+						type: "input_text",
+						text: escapeControlTokens ? escapeHarmonyControlTokens(text) : text,
+					};
+				})
+			: outputText;
+	return { output, outputText };
+}
+
+/** Appends one Responses tool result. */
+export function appendResponsesToolResultMessages<TApi extends Api>(
+	messages: ResponseInput,
+	toolResult: ToolResultMessage,
+	model: Model<TApi>,
+	strictResponsesPairing: boolean,
+	supportsImageDetailOriginal: boolean,
+	knownCallIds: ReadonlySet<string>,
+	customCallIds?: ReadonlySet<string>,
+	supportsCustomToolCalls = true,
+): void {
+	const { output, outputText } = encodeResponsesToolResultOutput(toolResult, model, supportsImageDetailOriginal);
+	const normalized = normalizeResponsesToolCallId(toolResult.toolCallId);
 	if (toolResult.providerMetadata?.type === "computer" && model.supportsComputerUse !== true) {
 		messages.push({
 			type: "message",
@@ -2301,7 +2408,7 @@ export function appendResponsesToolResultMessages<TApi extends Api>(
 	if (computerCallIds?.has(normalized.callId)) {
 		if (toolResult.providerMetadata?.type !== "computer") {
 			const limit = 16_000;
-			const noteText = output.length > limit ? `${output.slice(0, limit)}\n...[truncated]` : output;
+			const noteText = outputText.length > limit ? `${outputText.slice(0, limit)}\n...[truncated]` : outputText;
 			messages.push({
 				type: "message",
 				role: "assistant",
@@ -2317,7 +2424,7 @@ export function appendResponsesToolResultMessages<TApi extends Api>(
 			} as ResponseInput[number]);
 			return;
 		}
-		insertResponsesToolOutput(messages, {
+		messages.push({
 			type: "computer_call_output",
 			call_id: normalized.callId,
 			output: structuredCloneJSON(toolResult.providerMetadata.screenshot),
@@ -2330,7 +2437,7 @@ export function appendResponsesToolResultMessages<TApi extends Api>(
 		// silently dropping the result loses information the model needs. Fold it
 		// into an assistant note instead (same shape as repairOrphanResponsesToolOutputs).
 		const limit = 16_000;
-		const noteText = output.length > limit ? `${output.slice(0, limit)}\n...[truncated]` : output;
+		const noteText = outputText.length > limit ? `${outputText.slice(0, limit)}\n...[truncated]` : outputText;
 		messages.push({
 			type: "message",
 			role: "assistant",
@@ -2339,34 +2446,18 @@ export function appendResponsesToolResultMessages<TApi extends Api>(
 		return;
 	}
 	if (supportsCustomToolCalls && customCallIds?.has(normalized.callId)) {
-		insertResponsesToolOutput(messages, {
+		messages.push({
 			type: "custom_tool_call_output",
 			call_id: normalized.callId,
 			output,
 		} as ResponseInput[number]);
 	} else {
-		insertResponsesToolOutput(messages, {
+		messages.push({
 			type: "function_call_output",
 			call_id: normalized.callId,
 			output,
 		});
 	}
-
-	if (!hasImages || !supportsImages) {
-		return;
-	}
-
-	const contentParts: ResponseInputContent[] = [
-		{ type: "input_text", text: "Attached image(s) from tool result:" } satisfies ResponseInputText,
-	];
-	for (const block of toolResult.content) {
-		if (block.type === "image") {
-			contentParts.push(convertResponsesInputImage(block, supportsImageDetailOriginal));
-		}
-	}
-	const imageMessage = { role: "user", content: contentParts } satisfies ResponseInput[number];
-	syntheticToolImageMessages.add(imageMessage);
-	messages.push(imageMessage);
 }
 
 /**
@@ -3532,6 +3623,7 @@ type ReasoningOptions = {
 	reasoning?: string;
 	reasoningSummary?: "auto" | "detailed" | "concise" | null;
 	disableReasoning?: boolean;
+	forceReasoningOff?: boolean;
 	toolChoice?: unknown;
 };
 
@@ -3618,7 +3710,7 @@ export function applyResponsesReasoningParams<P extends ResponseCreateParamsStre
 	includeEncryptedReasoning?: boolean,
 	omitReasoningEffort?: boolean,
 ): void {
-	return applyResponsesCompatPolicy(
+	applyResponsesCompatPolicy(
 		params,
 		resolveOpenAICompatPolicy(model, {
 			endpoint: "responses",
@@ -3628,8 +3720,15 @@ export function applyResponsesReasoningParams<P extends ResponseCreateParamsStre
 			includeEncryptedReasoning,
 			omitReasoningEffort,
 		}),
-		{ reasoningSummary: options?.reasoningSummary, mapEffort },
+		{
+			reasoningSummary: options?.reasoningSummary,
+			mapEffort,
+			forceReasoningOff: options?.forceReasoningOff,
+		},
 	);
+	if (model.reasoningMode && !options?.forceReasoningOff) {
+		params.reasoning = { ...params.reasoning, mode: model.reasoningMode };
+	}
 }
 
 /** Populate `output.usage` from a Responses-API `response.usage` payload. Does not invoke `calculateCost`. */

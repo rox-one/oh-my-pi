@@ -6,6 +6,7 @@ import { clearCustomApis } from "@oh-my-pi/pi-ai/api-registry";
 import { createMockModel, registerMockApi } from "@oh-my-pi/pi-ai/providers/mock";
 import { __providerInFlightForTesting, streamSimple } from "@oh-my-pi/pi-ai/stream";
 import type { Context } from "@oh-my-pi/pi-ai/types";
+import { disableProvider, enableProvider, initializeWithSettings } from "@oh-my-pi/pi-coding-agent/capability";
 import {
 	onAppendOnlyModeChanged,
 	onCodeModeChanged,
@@ -15,7 +16,7 @@ import {
 	type SettingPath,
 	Settings,
 } from "@oh-my-pi/pi-coding-agent/config/settings";
-import * as discovery from "@oh-my-pi/pi-coding-agent/discovery";
+import { getSymbolPresetOverride } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
 import { AUTO_IMAGE_PROVIDER_ORDER } from "@oh-my-pi/pi-coding-agent/tools/image-providers";
 import { SEARCH_PROVIDER_ORDER } from "@oh-my-pi/pi-coding-agent/web/search/types";
@@ -101,6 +102,21 @@ describe("Settings", () => {
 			expect(await Bun.file(getConfigPath()).exists()).toBe(false);
 		});
 
+		it("writes through a symlinked config file without replacing the link", async () => {
+			const targetPath = tempDir.join("dotfiles", "config.yml");
+			fs.mkdirSync(path.dirname(targetPath), { recursive: true });
+			await Bun.write(targetPath, YAML.stringify({ setupVersion: 1 }, null, 2));
+			fs.symlinkSync(targetPath, getConfigPath());
+
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+			settings.set("setupVersion", 2);
+			await settings.flush();
+
+			expect(fs.lstatSync(getConfigPath()).isSymbolicLink()).toBe(true);
+			const savedSettings = YAML.parse(await Bun.file(targetPath).text()) as Record<string, unknown>;
+			expect(savedSettings.setupVersion).toBe(2);
+		});
+
 		it("clones the selected config.yaml path for persisted settings", async () => {
 			const yamlConfigPath = path.join(agentDir, "config.yaml");
 			await Bun.write(yamlConfigPath, YAML.stringify({ setupVersion: 1 }, null, 2));
@@ -126,6 +142,70 @@ describe("Settings", () => {
 			expect(await Bun.file(getConfigPath()).exists()).toBe(true);
 			expect(await Bun.file(yamlConfigPath).exists()).toBe(false);
 			expect((await readSettings()).setupVersion).toBe(1);
+		});
+	});
+
+	describe("project setting scope", () => {
+		it("persists scoped edits to the native project config without modifying the global layer", async () => {
+			const projectConfigPath = path.join(projectDir, ".omp", "config.yml");
+			await Bun.write(
+				projectConfigPath,
+				YAML.stringify({ theme: { dark: "dark-one" }, ask: { enabled: true }, custom: { keep: true } }, null, 2),
+			);
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+
+			expect(settings.hasProjectConfig()).toBe(true);
+			settings.set("theme.dark", "titanium", "project");
+			settings.set("ask.enabled", false, "project");
+			expect(settings.get("theme.dark")).toBe("titanium");
+			expect(settings.get("ask.enabled")).toBe(false);
+			await settings.flush();
+
+			expect(await readSettings()).toEqual({});
+			expect(YAML.parse(await Bun.file(projectConfigPath).text())).toEqual({
+				theme: { dark: "titanium" },
+				ask: { enabled: false },
+				custom: { keep: true },
+			});
+		});
+		it("resolves the global layer independently of a shadowing project override", async () => {
+			await writeSettings({ ask: { enabled: false } });
+			const projectConfigPath = path.join(projectDir, ".omp", "config.yml");
+			await Bun.write(projectConfigPath, YAML.stringify({ ask: { enabled: true } }, null, 2));
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+
+			// Effective view is the project override; the global getter ignores it.
+			expect(settings.get("ask.enabled")).toBe(true);
+			expect(settings.getGlobalValue("ask.enabled")).toBe(false);
+
+			settings.set("ask.enabled", true, "global");
+			expect(settings.getGlobalValue("ask.enabled")).toBe(true);
+			expect(settings.get("ask.enabled")).toBe(true);
+			await settings.flush();
+
+			expect(await readSettings()).toEqual({ ask: { enabled: true } });
+			expect(YAML.parse(await Bun.file(projectConfigPath).text())).toEqual({ ask: { enabled: true } });
+		});
+
+		it("removes a project override and immediately restores the global fallback", async () => {
+			await writeSettings({ ask: { enabled: false } });
+			const projectConfigPath = path.join(projectDir, ".omp", "config.yml");
+			await Bun.write(
+				projectConfigPath,
+				YAML.stringify({ theme: { dark: "dark-one" }, ask: { enabled: true } }, null, 2),
+			);
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+
+			expect(settings.get("ask.enabled")).toBe(true);
+			expect(settings.clearProject("ask.enabled")).toBe(true);
+			expect(settings.get("ask.enabled")).toBe(false);
+			expect(settings.clearProject("ask.enabled")).toBe(false);
+			await settings.flush();
+
+			expect(YAML.parse(await Bun.file(projectConfigPath).text())).toEqual({
+				theme: { dark: "dark-one" },
+			});
+			expect(await readSettings()).toEqual({ ask: { enabled: false } });
 		});
 	});
 
@@ -248,6 +328,58 @@ describe("Settings", () => {
 			expect(fs.readdirSync(agentDir).some(name => name.endsWith(".tmp"))).toBe(false);
 			if (process.platform !== "win32") {
 				expect(fs.statSync(getConfigPath()).mode & 0o777).toBe(0o600);
+			}
+		});
+
+		it("does not publish or retain a transactional batch when its atomic write fails", async () => {
+			await writeSettings({
+				symbolPreset: "unicode",
+				statusLine: { sessionAccent: true },
+			});
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+			const canonicalConfigPath = await fs.promises.realpath(getConfigPath());
+			const originalSymbolPreset = getSymbolPresetOverride();
+			let effectiveSignals = 0;
+			const unsubscribe = onStatusLineSessionAccentChanged(() => {
+				effectiveSignals += 1;
+			});
+			const rename = fs.promises.rename.bind(fs.promises);
+			const renameReached = Promise.withResolvers<void>();
+			const releaseRename = Promise.withResolvers<void>();
+			vi.spyOn(fs.promises, "rename").mockImplementation(async (source, target) => {
+				if (String(source).endsWith(".tmp") && String(target) === canonicalConfigPath) {
+					renameReached.resolve();
+					await releaseRename.promise;
+					throw new FsCodeError("EIO", "injected transactional write failure");
+				}
+				await rename(source, target);
+			});
+
+			try {
+				const transaction = settings.setPersistedBatch([
+					{ path: "symbolPreset", value: "ascii" },
+					{ path: "statusLine.sessionAccent", value: false },
+				]);
+				await renameReached.promise;
+				expect(settings.get("symbolPreset")).toBe("unicode");
+				expect(settings.get("statusLine.sessionAccent")).toBe(true);
+				expect(effectiveSignals).toBe(0);
+				expect(getSymbolPresetOverride()).toBe(originalSymbolPreset);
+
+				releaseRename.resolve();
+				await expect(transaction).rejects.toThrow("injected transactional write failure");
+				expect(settings.get("symbolPreset")).toBe("unicode");
+				expect(settings.get("statusLine.sessionAccent")).toBe(true);
+				expect(effectiveSignals).toBe(0);
+				expect(getSymbolPresetOverride()).toBe(originalSymbolPreset);
+
+				await settings.flush();
+				expect(await readSettings()).toEqual({
+					symbolPreset: "unicode",
+					statusLine: { sessionAccent: true },
+				});
+			} finally {
+				unsubscribe();
 			}
 		});
 
@@ -541,6 +673,11 @@ describe("Settings", () => {
 				unsubscribe();
 			}
 		});
+
+		it("exposes workspace identifier modes", () => {
+			expect(getDefault("workspace.identifier")).toBe("path");
+			expect(getEnumValues("workspace.identifier")).toEqual(["path", "git-remote", "git-root"]);
+		});
 	});
 
 	describe("get()", () => {
@@ -601,6 +738,148 @@ describe("Settings", () => {
 
 			expect(settings.get("enabledModels")).toEqual(["always-model", "other-model"]);
 			expect(settings.get("disabledProviders")).toEqual(["always-provider", "other-provider"]);
+		});
+
+		it("clears stale project settings before provider-filtered reloads", async () => {
+			const otherDir = path.join(tempDir.toString(), "other-project");
+			fs.mkdirSync(getProjectAgentDir(otherDir), { recursive: true });
+			await Bun.write(
+				path.join(getProjectAgentDir(projectDir), "settings.json"),
+				JSON.stringify({ disabledExtensionProviders: ["native"] }),
+			);
+			await Bun.write(
+				path.join(getProjectAgentDir(otherDir), "settings.json"),
+				JSON.stringify({ terminal: { showProgress: true } }),
+			);
+
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+			expect(settings.get("disabledExtensionProviders")).toEqual(["native"]);
+
+			await settings.reloadForCwd(otherDir);
+
+			expect(settings.get("disabledExtensionProviders")).toEqual([]);
+			expect(settings.get("terminal.showProgress")).toBe(true);
+		});
+
+		it("preserves unmatched scoped extension-provider rules when toggling", async () => {
+			const otherDir = path.join(tempDir.toString(), "other-project");
+			await writeSettings({
+				disabledExtensionProviders: [
+					{ pathPrefix: projectDir, providers: ["cursor"] },
+					{ pathPrefix: otherDir, providers: ["windsurf"] },
+				],
+			});
+
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+			initializeWithSettings(settings);
+			enableProvider("cursor");
+			disableProvider("claude");
+			await settings.flush();
+
+			expect((await readSettings()).disabledExtensionProviders).toEqual([
+				{ pathPrefix: projectDir, providers: ["claude"] },
+				{ pathPrefix: otherDir, providers: ["windsurf"] },
+			]);
+
+			await settings.reloadForCwd(otherDir);
+			expect(settings.get("disabledExtensionProviders")).toEqual(["windsurf"]);
+		});
+
+		it("materializes new key from legacy scoped disabledProviders without dropping other-project rules", async () => {
+			const otherDir = path.join(tempDir.toString(), "other-project");
+			await writeSettings({
+				disabledProviders: [
+					{ pathPrefix: projectDir, providers: ["cursor"] },
+					{ pathPrefix: otherDir, providers: ["windsurf"] },
+				],
+			});
+
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+			initializeWithSettings(settings);
+			// First /extensions toggle while scoped to project A must not flatten
+			// the legacy scoped shape and lose project B's rule.
+			disableProvider("claude");
+			await settings.flush();
+
+			expect((await readSettings()).disabledExtensionProviders).toEqual([
+				{ pathPrefix: projectDir, providers: ["cursor", "claude"] },
+				{ pathPrefix: otherDir, providers: ["windsurf"] },
+			]);
+
+			await settings.reloadForCwd(otherDir);
+			expect(settings.get("disabledExtensionProviders")).toEqual(["windsurf"]);
+		});
+
+		it("toggling with a target cwd writes into that workspace's scope, not the active one", async () => {
+			const otherDir = path.join(tempDir.toString(), "other-project");
+			await writeSettings({
+				disabledExtensionProviders: [
+					{ pathPrefix: projectDir, providers: ["cursor"] },
+					{ pathPrefix: otherDir, providers: ["windsurf"] },
+				],
+			});
+
+			// Active session is scoped to projectDir; an ACP toggle targets otherDir.
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+			initializeWithSettings(settings);
+			disableProvider("claude", otherDir);
+			await settings.flush();
+
+			// projectDir's rule is untouched; the change lands in otherDir's scope.
+			expect((await readSettings()).disabledExtensionProviders).toEqual([
+				{ pathPrefix: projectDir, providers: ["cursor"] },
+				{ pathPrefix: otherDir, providers: ["windsurf", "claude"] },
+			]);
+			expect(settings.disabledExtensionProvidersForCwd(otherDir)).toEqual(["windsurf", "claude"]);
+			expect(settings.disabledExtensionProvidersForCwd(projectDir)).toEqual(["cursor"]);
+		});
+
+		it("resolves extension-provider mask against an explicit cwd", async () => {
+			const otherDir = path.join(tempDir.toString(), "other-project");
+			await writeSettings({
+				disabledExtensionProviders: [
+					{ pathPrefix: projectDir, providers: ["cursor"] },
+					{ pathPrefix: otherDir, providers: ["windsurf"] },
+				],
+			});
+
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+			expect(settings.disabledExtensionProvidersForCwd(projectDir)).toEqual(["cursor"]);
+			expect(settings.disabledExtensionProvidersForCwd(otherDir)).toEqual(["windsurf"]);
+		});
+
+		it("does not leak the active project's disabledExtensionProviders into another cwd", async () => {
+			const otherDir = path.join(tempDir.toString(), "other-project");
+			fs.mkdirSync(getProjectAgentDir(otherDir), { recursive: true });
+			// projectDir carries a project-LOCAL rule (only valid inside projectDir).
+			await Bun.write(
+				path.join(getProjectAgentDir(projectDir), "settings.json"),
+				JSON.stringify({ disabledExtensionProviders: ["cursor"] }),
+			);
+
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+			// Active scope sees its own project-local rule.
+			expect(settings.disabledExtensionProvidersForCwd(projectDir)).toEqual(["cursor"]);
+			// A different workspace must NOT inherit projectDir's project-local rule.
+			expect(settings.disabledExtensionProvidersForCwd(otherDir)).toEqual([]);
+		});
+
+		it("honors a target workspace's project-local disabledExtensionProviders via the async resolver", async () => {
+			const otherDir = path.join(tempDir.toString(), "other-project");
+			fs.mkdirSync(getProjectAgentDir(otherDir), { recursive: true });
+			// otherDir has its OWN project-local rule; the active session is in projectDir.
+			await Bun.write(
+				path.join(getProjectAgentDir(otherDir), "settings.json"),
+				JSON.stringify({ disabledExtensionProviders: ["cursor"] }),
+			);
+
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+			// The sync accessor cannot see otherDir's project file from projectDir's scope.
+			expect(settings.disabledExtensionProvidersForCwd(otherDir)).toEqual([]);
+			// The async resolver loads otherDir's project layer and honors its rule.
+			expect(await settings.disabledExtensionProvidersForCwdAsync(otherDir)).toEqual(["cursor"]);
+			// The active scope is unaffected.
+			expect(await settings.disabledExtensionProvidersForCwdAsync(projectDir)).toEqual([]);
 		});
 
 		it("migrates legacy snapcompact system prompt booleans to scoped modes", () => {

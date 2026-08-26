@@ -3,7 +3,7 @@ import { logger } from "@oh-my-pi/pi-utils";
 import { transaction } from "../../db";
 import { toUtcIso } from "../../util/datetime";
 import { generateId } from "../../util/ids";
-import { currentEmbeddingModel, embeddingsDisabled } from "../embeddings";
+import { currentEmbeddingFingerprint, currentEmbeddingModel, embeddingsDisabled } from "../embeddings";
 import { EpisodicGraph } from "../episodic-graph";
 import { countExtractedFactCategories, extractFactCategoriesSafe } from "../extraction";
 import { getMnemopiRuntimeOptions, withMnemopiRuntimeOptions } from "../runtime-options";
@@ -348,29 +348,35 @@ function rowToDict(row: Row): Row {
 const EMBED_REBUILD_BATCH = 128;
 
 /**
- * Reconcile stored embeddings against the active embedding model at store open.
+ * Reconcile stored embeddings against the active embedding *configuration* on
+ * store open.
  *
- * Every `memory_embeddings` row is stamped with the model that produced it (see
- * `runEmbedding` in `helpers.ts`). When the configured embedding model changes,
- * its vector dimension changes too, so the previously-stored vectors are no
- * longer comparable. On a mismatch we wipe every stored vector — the
- * `memory_embeddings` table, the `episodic_memory.binary_vector` column, and the
- * sqlite-vec `vec_episodes` index — then enqueue all live memories for
- * background re-embedding under the new model via `scheduleEmbedding`.
+ * Every `memory_embeddings` row is stamped with `currentEmbeddingFingerprint()`
+ * — model name plus the active input cap — when it is written (see
+ * `runEmbedding` in `helpers.ts`). When the model changes its vector dimension
+ * changes too; when the cap (`MNEMOPI_EMBEDDING_MAX_INPUT_CHARS` /
+ * `embeddings.maxInputChars`) changes, the *text* fed to the embedder changes
+ * via the head/tail clip in `embed()`. Both make previously-stored vectors
+ * stale, so on a fingerprint mismatch we wipe every stored vector — the
+ * `memory_embeddings` table, the `episodic_memory.binary_vector` column, and
+ * the sqlite-vec `vec_episodes` index — then enqueue all live memories for
+ * background re-embedding under the new configuration via `scheduleEmbedding`.
+ * Pre-#3126 rows stamped only with `<model>` mismatch the new
+ * `<model>@chars:<N>` fingerprint and rebuild on first upgraded open, so long
+ * memories embedded before the cap pick up the head/tail representation.
  *
- * Runs once per store open; a fresh store (no embeddings) or an already-current
- * store is a no-op. The destructive wipe is skipped whenever it could not be
- * rebuilt — embeddings disabled via the runtime option OR the
+ * Runs once per store open; a fresh store (no embeddings) or an already-
+ * current store is a no-op. The destructive wipe is skipped whenever it could
+ * not be rebuilt — embeddings disabled via the runtime option OR the
  * `MNEMOPI_NO_EMBEDDINGS` env, or an unresolved (empty) active model — so a
  * stale-but-valid corpus is never destroyed without a replacement. MUST run
- * inside the active runtime-options scope so `currentEmbeddingModel()` /
+ * inside the active runtime-options scope so `currentEmbeddingFingerprint()` /
  * `embeddingsDisabled()` reflect the per-instance configuration.
  */
 export function reconcileEmbeddingModel(beam: BeamMemoryState): void {
 	if (embeddingsDisabled()) return;
-	const active = currentEmbeddingModel().trim();
-	if (active === "") return;
-
+	if (currentEmbeddingModel().trim() === "") return;
+	const active = currentEmbeddingFingerprint();
 	// Re-embed in bounded batches so a corpus-wide rebuild never issues one giant
 	// embedding request; each batch is its own tracked background task.
 	const rebuild = (items: readonly EmbedItem[]): void => {

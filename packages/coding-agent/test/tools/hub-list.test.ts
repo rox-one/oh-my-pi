@@ -65,5 +65,7 @@ describe("hub list", () => {
 		expect(content.text).toContain("Worker");
 		expect(content.text).toContain("parked");
 		expect(registry.get("Worker")?.sessionFile).toBe(workerSessionFile);
+		// `list` is a roster projection, never a job/result projection.
+		expect(Object.keys(result.details).sort()).toEqual(["from", "op", "peers"]);
 	});
 });

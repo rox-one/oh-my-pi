@@ -12,11 +12,11 @@
  * `home` instead of `os.homedir()`. Module-level CLI injection state is
  * reset between cases so they cannot poison each other.
  */
-import { afterEach, beforeEach, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, beforeEach, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { getCapability } from "@oh-my-pi/pi-coding-agent/capability";
+import { getCapability, loadCapability } from "@oh-my-pi/pi-coding-agent/capability";
 import { clearCache } from "@oh-my-pi/pi-coding-agent/capability/fs";
 import { hookCapability } from "@oh-my-pi/pi-coding-agent/capability/hook";
 import { mcpCapability } from "@oh-my-pi/pi-coding-agent/capability/mcp";
@@ -26,6 +26,8 @@ import { skillCapability } from "@oh-my-pi/pi-coding-agent/capability/skill";
 import { slashCommandCapability } from "@oh-my-pi/pi-coding-agent/capability/slash-command";
 import { toolCapability } from "@oh-my-pi/pi-coding-agent/capability/tool";
 import type { LoadContext, Provider } from "@oh-my-pi/pi-coding-agent/capability/types";
+import { getAgentDir, setAgentDir } from "@oh-my-pi/pi-utils";
+import { YAML } from "bun";
 // Register all discovery providers as a side effect.
 import "@oh-my-pi/pi-coding-agent/discovery";
 import {
@@ -43,6 +45,7 @@ let tempDir: string;
 let home: string;
 let project: string;
 let ext: string;
+let originalAgentDir: string;
 
 const originalAgentDirEnv = process.env.PI_CODING_AGENT_DIR;
 const fallbackAgentDir = path.join(getConfigRootDir(), "agent");
@@ -89,6 +92,14 @@ function buildExtensionPackage(packageDir: string, skillName = "my-skill"): void
 	);
 }
 
+beforeAll(() => {
+	originalAgentDir = getAgentDir();
+});
+
+afterAll(() => {
+	setAgentDir(originalAgentDir);
+});
+
 beforeEach(() => {
 	clearCache();
 	clearOmpExtensionCliRoots();
@@ -99,6 +110,9 @@ beforeEach(() => {
 	fs.mkdirSync(home, { recursive: true });
 	fs.mkdirSync(project, { recursive: true });
 	fs.mkdirSync(path.join(project, ".git"), { recursive: true });
+	// Point `getAgentDir()` at the test home so user-scope reads (now sourced
+	// from the canonical agent dir, matching `Settings`) land in the temp tree.
+	setAgentDir(path.join(home, ".omp", "agent"));
 	buildExtensionPackage(ext);
 	setAgentDir(path.join(home, ".omp", "agent"));
 });
@@ -119,9 +133,7 @@ function ctx(): LoadContext {
 	return { cwd: project, home, repoRoot: project };
 }
 
-test("project settings.json#extensions surfaces every sub-directory", async () => {
-	writeFile(path.join(project, ".omp", "settings.json"), JSON.stringify({ extensions: [ext] }));
-
+async function expectExtensionSubDirectoriesLoaded(): Promise<void> {
 	const [skills, commands, rules, prompts, hooks, tools, mcps] = await Promise.all([
 		loadFromPlugin<{ name: string }>(skillCapability.id, ctx()),
 		loadFromPlugin<{ name: string }>(slashCommandCapability.id, ctx()),
@@ -140,6 +152,18 @@ test("project settings.json#extensions surfaces every sub-directory", async () =
 	expect(hooks.some(h => h.name === "edit.sh" && h.type === "post")).toBe(true);
 	expect(tools.map(t => t.name)).toEqual(expect.arrayContaining(["wcount", "deep-tool"]));
 	expect(mcps.find(m => m.name === "lsp")?.command).toBe("lsp-server");
+}
+
+test("project settings.json#extensions surfaces every sub-directory", async () => {
+	writeFile(path.join(project, ".omp", "settings.json"), JSON.stringify({ extensions: [ext] }));
+
+	await expectExtensionSubDirectoriesLoaded();
+});
+
+test("project config.yml#extensions surfaces every sub-directory", async () => {
+	writeFile(path.join(project, ".omp", "config.yml"), YAML.stringify({ extensions: [ext] }, null, 2));
+
+	await expectExtensionSubDirectoriesLoaded();
 });
 
 test("user settings.json#extensions also feeds sub-discovery", async () => {
@@ -147,6 +171,80 @@ test("user settings.json#extensions also feeds sub-discovery", async () => {
 
 	const skills = await loadFromPlugin<{ name: string }>(skillCapability.id, ctx());
 	expect(skills.map(s => s.name)).toContain("my-skill");
+});
+
+test("user config.yml#extensions also feeds sub-discovery", async () => {
+	writeFile(path.join(home, ".omp", "agent", "config.yml"), YAML.stringify({ extensions: [ext] }, null, 2));
+
+	const skills = await loadFromPlugin<{ name: string }>(skillCapability.id, ctx());
+	expect(skills.map(s => s.name)).toContain("my-skill");
+});
+
+test("project config.yml#extensions replaces lower-precedence configured roots", async () => {
+	const userExt = path.join(tempDir, "user-extension");
+	const projectSettingsExt = path.join(tempDir, "project-settings-extension");
+	const projectConfigExt = path.join(tempDir, "project-config-extension");
+	buildExtensionPackage(userExt, "user-skill");
+	buildExtensionPackage(projectSettingsExt, "project-settings-skill");
+	buildExtensionPackage(projectConfigExt, "project-config-skill");
+	writeFile(path.join(home, ".omp", "agent", "config.yml"), YAML.stringify({ extensions: [userExt] }, null, 2));
+	writeFile(path.join(project, ".omp", "settings.json"), JSON.stringify({ extensions: [projectSettingsExt] }));
+	writeFile(path.join(project, ".omp", "config.yml"), YAML.stringify({ extensions: [projectConfigExt] }, null, 2));
+
+	const skills = await loadFromPlugin<{ name: string }>(skillCapability.id, ctx());
+	const skillNames = skills.map(s => s.name);
+	expect(skillNames).toContain("project-config-skill");
+	expect(skillNames).not.toContain("project-settings-skill");
+	expect(skillNames).not.toContain("user-skill");
+});
+
+test("empty project config.yml#extensions suppresses lower-precedence configured roots", async () => {
+	const userExt = path.join(tempDir, "user-extension");
+	buildExtensionPackage(userExt, "user-skill");
+	writeFile(path.join(home, ".omp", "agent", "config.yml"), YAML.stringify({ extensions: [userExt] }, null, 2));
+	writeFile(path.join(project, ".omp", "config.yml"), YAML.stringify({ extensions: [] }, null, 2));
+
+	const skills = await loadFromPlugin<{ name: string }>(skillCapability.id, ctx());
+	expect(skills.map(s => s.name)).not.toContain("user-skill");
+});
+
+test("user config.yml without extensions suppresses legacy user settings.json", async () => {
+	const userSettingsExt = path.join(tempDir, "user-settings-extension");
+	buildExtensionPackage(userSettingsExt, "user-settings-skill");
+	writeFile(path.join(home, ".omp", "agent", "settings.json"), JSON.stringify({ extensions: [userSettingsExt] }));
+	writeFile(path.join(home, ".omp", "agent", "config.yml"), YAML.stringify({ theme: { dark: "default" } }, null, 2));
+
+	const skills = await loadFromPlugin<{ name: string }>(skillCapability.id, ctx());
+	expect(skills.map(s => s.name)).not.toContain("user-settings-skill");
+});
+
+test("user config.yml is sourced from getAgentDir() so PI_CODING_AGENT_DIR redirects sub-discovery", async () => {
+	// Mirrors a user with `PI_CODING_AGENT_DIR` (or `PI_CONFIG_DIR`) pointing the
+	// canonical user config elsewhere than `<home>/.omp/agent`. The discovery
+	// must follow the configured agent dir, not the literal `ctx.home` path.
+	const customAgentDir = path.join(tempDir, "custom-agent");
+	fs.mkdirSync(customAgentDir, { recursive: true });
+	setAgentDir(customAgentDir);
+	writeFile(path.join(customAgentDir, "config.yml"), YAML.stringify({ extensions: [ext] }, null, 2));
+
+	const skills = await loadFromPlugin<{ name: string }>(skillCapability.id, ctx());
+	expect(skills.map(s => s.name)).toContain("my-skill");
+});
+
+test("loadCapability options.agentDir flows into ctx so SDK callers with createAgentSession({ agentDir }) get sibling discovery", async () => {
+	// Mirrors `createAgentSession({ agentDir })` plumbing — the SDK forwards the
+	// session-scoped agent dir to `loadCapability`, which must override the
+	// process-global default for omp-plugins sub-discovery.
+	const customAgentDir = path.join(tempDir, "sdk-agent");
+	fs.mkdirSync(customAgentDir, { recursive: true });
+	writeFile(path.join(customAgentDir, "config.yml"), YAML.stringify({ extensions: [ext] }, null, 2));
+
+	const skills = await loadCapability<{ name: string; _source: { provider: string } }>(skillCapability.id, {
+		cwd: project,
+		agentDir: customAgentDir,
+	});
+	const pluginSkills = skills.items.filter(item => item._source.provider === "omp-plugins");
+	expect(pluginSkills.map(s => s.name)).toContain("my-skill");
 });
 
 test("`--extension` CLI injection is wired through the same provider", async () => {

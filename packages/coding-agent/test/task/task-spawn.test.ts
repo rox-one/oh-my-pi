@@ -19,7 +19,7 @@ import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry
 import { TaskTool } from "@oh-my-pi/pi-coding-agent/task";
 import * as discoveryModule from "@oh-my-pi/pi-coding-agent/task/discovery";
 import * as executorModule from "@oh-my-pi/pi-coding-agent/task/executor";
-import type { AgentDefinition, SingleResult, TaskParams } from "@oh-my-pi/pi-coding-agent/task/types";
+import type { AgentDefinition, SingleResult, TaskParams, TaskToolDetails } from "@oh-my-pi/pi-coding-agent/task/types";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 
 const taskAgent: AgentDefinition = {
@@ -29,12 +29,16 @@ const taskAgent: AgentDefinition = {
 	source: "bundled",
 };
 
-function createSession(options: { manager?: AsyncJobManager; settings?: Record<string, unknown> }): ToolSession {
+function createSession(options: {
+	manager?: AsyncJobManager;
+	settings?: Record<string, unknown>;
+	sessionFile?: string | null;
+}): ToolSession {
 	return {
 		cwd: "/tmp",
 		hasUI: false,
 		settings: Settings.isolated(options.settings ?? {}),
-		getSessionFile: () => null,
+		getSessionFile: () => options.sessionFile ?? null,
 		getSessionSpawns: () => "*",
 		asyncJobManager: options.manager,
 	} as unknown as ToolSession;
@@ -146,6 +150,43 @@ describe("task spawn routing", () => {
 		expect(job!.resultText).toContain("history://Spawnling");
 		expect(runSpy).toHaveBeenCalledTimes(1);
 		expect(runSpy.mock.calls[0]?.[0].modelOverride).toEqual(["openai/gpt-4.1-mini"]);
+	});
+
+	it("registers spawned task jobs with the spawned transcript link target", async () => {
+		vi.spyOn(discoveryModule, "discoverAgents").mockResolvedValue({
+			agents: [taskAgent],
+			projectAgentsDir: null,
+		});
+		const gate = deferred();
+		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => {
+			await gate.promise;
+			return makeResult(options.id ?? "?");
+		});
+
+		const sessionFile = "/tmp/omp-parent-session.jsonl";
+		let currentSessionFile = sessionFile;
+		const manager = createManager();
+		const session = createSession({ manager, sessionFile });
+		session.getSessionFile = () => currentSessionFile;
+		const tool = await TaskTool.create(session);
+
+		const result = await tool.execute("tc-spawn-link", {
+			agent: "task",
+			name: "Linkable",
+			task: "Do the linked thing.",
+		} as TaskParams);
+
+		const jobId = result.details?.async?.jobId;
+		expect(jobId).toBeTruthy();
+		expect(manager.getJob(jobId!)?.linkPath).toBe("/tmp/omp-parent-session/Linkable.jsonl");
+		expect(result.details?.progress?.[0]?.sessionFile).toBe("/tmp/omp-parent-session/Linkable.jsonl");
+
+		currentSessionFile = "/tmp/moved-parent-session.jsonl";
+		gate.resolve();
+		await manager.getJob(jobId!)!.promise;
+		expect((manager.getJob(jobId!)?.latestDetails as TaskToolDetails | undefined)?.progress?.[0]?.sessionFile).toBe(
+			"/tmp/moved-parent-session/Linkable.jsonl",
+		);
 	});
 
 	it("bounds concurrent job bodies with the session spawn semaphore", async () => {

@@ -29,7 +29,6 @@ export interface ImageOptions {
 
 const EMPTY_IDS: readonly number[] = [];
 const EMPTY_TRANSMITS: readonly string[] = [];
-const EMPTY_STALE_EPOCHS: ReadonlyArray<{ imageId: number; lastEpoch: number }> = [];
 const SAVE_CURSOR = "\x1b7";
 const RESTORE_CURSOR = "\x1b8";
 // Direct placements reserve height with leading zero-width rows. Keep them
@@ -563,17 +562,9 @@ export class Image implements Component {
 				// Direct placement: return `rows` lines so TUI accounts for image
 				// height. First (rows-1) lines are empty (TUI clears them); the last
 				// saves the final-row cursor, moves up to the image origin, emits the
-				// image sequence, then restores the final-row cursor. When the block
-				// straddles the viewport top, the renderer rewrites this line to the
-				// visible slice (encodeKittyPlacementLine) from the geometry
-				// registered below.
-				if (this.#imageId != null && this.#budget !== undefined) {
-					this.#budget.registerPlacementGeometry(
-						this.#imageId,
-						this.#dimensions.widthPx,
-						this.#dimensions.heightPx,
-					);
-				}
+				// image sequence, then restores the final-row cursor. Save/restore is
+				// required because CUU clamps at the viewport top when leading rows are
+				// clipped away.
 				lines = [];
 				for (let i = 0; i < result.rows - 1; i++) {
 					lines.push(RESERVED_IMAGE_ROW);

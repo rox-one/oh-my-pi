@@ -45,6 +45,7 @@ interface Harness {
 	main: SessionStub;
 	handledEvents: unknown[];
 	setSessionCalls: Array<[AgentSession, string | undefined]>;
+	reloadTodoSessions: AgentSession[];
 	counts: {
 		clearTransientSessionUi: () => number;
 		resetTranscriptAnchors: () => number;
@@ -57,6 +58,7 @@ function makeHarness(): Harness {
 	const main = makeSessionStub();
 	const handledEvents: unknown[] = [];
 	const setSessionCalls: Array<[AgentSession, string | undefined]> = [];
+	const reloadTodoSessions: AgentSession[] = [];
 	let clearTransientSessionUi = 0;
 	let resetTranscriptAnchors = 0;
 	let renderInitialMessages = 0;
@@ -87,6 +89,9 @@ function makeHarness(): Harness {
 		renderInitialMessages: () => {
 			renderInitialMessages++;
 		},
+		reloadTodos: async (source?: AgentSession) => {
+			reloadTodoSessions.push(source ?? main.session);
+		},
 		updateEditorBorderColor() {},
 		ui: { requestRender() {} },
 		showStatus() {},
@@ -104,6 +109,7 @@ function makeHarness(): Harness {
 		main,
 		handledEvents,
 		setSessionCalls,
+		reloadTodoSessions,
 		counts: {
 			clearTransientSessionUi: () => clearTransientSessionUi,
 			resetTranscriptAnchors: () => resetTranscriptAnchors,
@@ -136,11 +142,31 @@ describe("SessionFocusController", () => {
 		expect(h.counts.clearTransientSessionUi()).toBe(1);
 		expect(h.counts.resetTranscriptAnchors()).toBe(1);
 		expect(h.counts.renderInitialMessages()).toBe(1);
+		expect(h.reloadTodoSessions).toEqual([worker.session]);
 		expect(h.setSessionCalls).toEqual([[worker.session, "Worker"]]);
 
 		const event = { type: "message_start", message: { role: "user" } };
 		await worker.emit(event);
 		expect(h.handledEvents).toEqual([event]);
+	});
+
+	it("re-attaching the main session refreshes the todo HUD so it can't freeze at the pre-focus snapshot (#9571)", async () => {
+		// While a subagent is focused the main session's `todo` completions never
+		// reach the HUD (the event subscription points at the subagent). Returning
+		// to the main session rebuilds the transcript from committed messages but
+		// must also reload the HUD, or it stays stuck on the pre-focus snapshot
+		// (e.g. a `todo init` 0/N) while the transcript shows current progress.
+		const h = makeHarness();
+		const worker = makeSessionStub();
+		registerSub(h.registry, "Worker", worker.session, MAIN_AGENT_ID);
+
+		await h.controller.focusAgent("Worker");
+		expect(h.reloadTodoSessions).toEqual([worker.session]);
+
+		await h.controller.unfocus();
+		expect(h.controller.focusedAgentId).toBeUndefined();
+		expect(h.setSessionCalls.at(-1)).toEqual([h.main.session, undefined]);
+		expect(h.reloadTodoSessions).toEqual([worker.session, h.main.session]);
 	});
 
 	it("mid-turn attach synthesizes agent_start, and an orphaned assistant message_update gets a synthesized message_start", async () => {

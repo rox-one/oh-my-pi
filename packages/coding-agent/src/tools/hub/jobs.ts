@@ -7,13 +7,21 @@
 import type { AgentToolResult } from "@oh-my-pi/pi-agent-core";
 import type { Component } from "@oh-my-pi/pi-tui";
 import { Text } from "@oh-my-pi/pi-tui";
-import type { AsyncJob, AsyncJobManager, AsyncJobType } from "../../async";
+import type { AsyncJob, AsyncJobManager } from "../../async";
 import { settings } from "../../config/settings";
 import type { RenderResultOptions } from "../../extensibility/custom-tools/types";
 import { shimmerEnabled, shimmerText } from "../../modes/theme/shimmer";
 import type { Theme } from "../../modes/theme/theme";
 import { USER_INTERRUPT_LABEL } from "../../session/messages";
-import { Ellipsis, Hasher, type RenderCache, renderStatusLine, renderTreeList, truncateToWidth } from "../../tui";
+import {
+	Ellipsis,
+	fileHyperlink,
+	Hasher,
+	type RenderCache,
+	renderStatusLine,
+	renderTreeList,
+	truncateToWidth,
+} from "../../tui";
 import type { ToolSession } from "..";
 import {
 	formatBadge,
@@ -145,16 +153,33 @@ function describeAgents(agents: AgentActivitySnapshot[]): string[] {
 
 interface TrackedJobLike {
 	id: string;
-	type: AsyncJobType;
+	type: "bash" | "task";
 	status: string;
 	label: string;
 	startTime: number;
+	linkPath?: string;
 	latestDetails?: Record<string, unknown>;
 	resultText?: string;
 	errorText?: string;
 }
 
-export function snapshotJobs(session: ToolSession, jobs: TrackedJobLike[]): JobSnapshot[] {
+type TrackedJobLike = Pick<
+	AsyncJob,
+	| "id"
+	| "type"
+	| "status"
+	| "label"
+	| "startTime"
+	| "latestDetails"
+	| "resultText"
+	| "errorText"
+	| "outputMeta"
+	| "artifactError"
+>;
+
+type JobSnapshotSession = Pick<ToolSession, "asyncJobManager">;
+
+export function snapshotJobs(session: JobSnapshotSession, jobs: TrackedJobLike[]): JobSnapshot[] {
 	const now = Date.now();
 	return jobs.map(j => {
 		const current = session.asyncJobManager?.getJob(j.id);
@@ -180,21 +205,30 @@ export function snapshotJobs(session: ToolSession, jobs: TrackedJobLike[]): JobS
 				}
 			}
 		}
-		return {
+		const snapshot: JobSnapshot = {
 			id: latest.id,
 			type: latest.type,
-			status: latest.status as JobSnapshot["status"],
+			status: latest.status,
 			label: latest.label,
 			durationMs: Math.max(0, now - latest.startTime),
+			...(latest.linkPath ? { linkPath: latest.linkPath } : {}),
 			...(resolvedModel ? { resolvedModel } : {}),
 			...(latest.resultText ? { resultText: latest.resultText } : {}),
 			...(latest.errorText ? { errorText: latest.errorText } : {}),
 		};
+		if (resolvedModel) snapshot.resolvedModel = resolvedModel;
+		if (latest.resultText) snapshot.resultText = latest.resultText;
+		if (latest.errorText) snapshot.errorText = latest.errorText;
+		if (latest.type === "task") {
+			if (latest.outputMeta) snapshot.outputMeta = latest.outputMeta;
+			if (latest.artifactError) snapshot.artifactError = latest.artifactError;
+		}
+		return snapshot;
 	});
 }
 
 export function buildJobResult(
-	session: ToolSession,
+	session: JobSnapshotSession,
 	manager: AsyncJobManager,
 	op: "wait" | "cancel" | "jobs",
 	jobs: TrackedJobLike[],
@@ -210,7 +244,17 @@ export function buildJobResult(
 	});
 	const jobResults = snapshotJobs(session, uniqueJobs);
 
+	// Every settled row still consumes the pending auto-delivery, for `jobs` as
+	// much as for `wait`/`cancel`: observing a settled job IS its delivery, and
+	// re-enqueueing would inject a duplicate `async-result` (issue #5869).
 	manager.acknowledgeDeliveries(jobResults.filter(j => j.status !== "running").map(j => j.id));
+
+	// `wait` and `cancel` name the jobs the caller is blocked on or is killing,
+	// so those hand the body back. `jobs` is a status poll over every owned job:
+	// printing each settled body there duplicated bytes the caller never asked
+	// for, including unrelated eval jobs (issue #9646). Rows carry the size and
+	// the retrieval pointer instead.
+	const deliversResults = op !== "jobs";
 
 	const completed = jobResults.filter(j => j.status !== "running");
 	const running = jobResults.filter(j => j.status === "running");
@@ -226,6 +270,10 @@ export function buildJobResult(
 	if (completed.length > 0) {
 		lines.push(`## Completed (${completed.length})\n`);
 		for (const j of completed) {
+			if (!deliversResults) {
+				lines.push(`- \`${j.id}\` [${j.type}] — ${j.status}: ${j.label}${describeWithheldBody(j)}`);
+				continue;
+			}
 			lines.push(`### ${j.id} [${j.type}] — ${j.status}`);
 			lines.push(`Label: ${j.label}`);
 			if (j.resultText) {
@@ -235,6 +283,12 @@ export function buildJobResult(
 				lines.push(`Error: ${j.errorText}`);
 			}
 			lines.push("");
+		}
+		if (!deliversResults) {
+			lines.push("");
+			lines.push(
+				"Bodies are withheld from this status poll. Read tasks with a verified artifact at `agent://<id>` (`history://<id>` for its transcript); read every other body with `wait` on that id.",
+			);
 		}
 	}
 
@@ -630,8 +684,10 @@ export function jobsRenderResult(
 						);
 						const typeBadge = formatBadge(job.type, statusToColor(job.status), uiTheme);
 						// Task jobs label themselves with their agent id, which is also
-						// the job id — drop the id column instead of stuttering it twice.
-						const idPart = job.label.trim() === job.id ? "" : ` ${uiTheme.fg("muted", job.id)}`;
+						// the job id — link the label instead of rendering the id twice.
+						const idIsLabel = job.label.trim() === job.id;
+						const displayId = job.linkPath ? fileHyperlink(job.linkPath, job.id) : job.id;
+						const idPart = idIsLabel ? "" : ` ${uiTheme.fg("muted", displayId)}`;
 						const rawLabelLines = (job.label || "(no label)").split(/\r?\n/);
 						const maxLabelLines = expanded ? LABEL_LINES_EXPANDED : LABEL_LINES_COLLAPSED;
 						const visibleLabelLines = rawLabelLines
@@ -662,11 +718,13 @@ export function jobsRenderResult(
 						// shimmer band.
 						const live = job.status === "running" && options.spinnerFrame !== undefined;
 						const headRaw = visibleLabelLines[0] ?? "";
-						const headLabel = live
+						const styledHeadLabel = live
 							? shimmerEnabled()
 								? shimmerText(headRaw, uiTheme)
 								: uiTheme.fg("accent", headRaw)
 							: uiTheme.fg("toolOutput", headRaw);
+						const headLabel =
+							idIsLabel && job.linkPath ? fileHyperlink(job.linkPath, styledHeadLabel) : styledHeadLabel;
 						lines.push(
 							`${icon}${idPart} ${typeBadge} ${headLabel}${modelText}${modelText ? uiTheme.sep.dot : " "}${durationText}`,
 						);

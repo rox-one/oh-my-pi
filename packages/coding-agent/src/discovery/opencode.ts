@@ -194,8 +194,9 @@ interface OpenCodeMCPConfig {
 	environment?: Record<string, string>;
 	url?: string;
 	headers?: Record<string, string>;
-	enabled?: boolean;
 	timeout?: number;
+	enabled?: boolean;
+	oauth?: { scope?: string } | false;
 }
 
 function stringArray(value: unknown): string[] | undefined {
@@ -300,15 +301,25 @@ function buildMCPServer(name: string, serverConfig: OpenCodeMCPConfig, source: O
 	} else if (serverConfig.command) {
 		transport = "stdio";
 	}
-
 	const command = normalizeCommand(serverConfig.command, serverConfig.args);
 	const env = stringRecord(serverConfig.environment) ?? stringRecord(serverConfig.env);
+
+	// OpenCode's singular `oauth.scope` is the same space-separated authorization
+	// scope string as the canonical `oauth.scopes`. `oauth: false` carries no
+	// scope, so it maps to no OAuth config at all. An empty `scope` is preserved
+	// rather than dropped: like `oauth.scopes: ""` it suppresses the `scope`
+	// parameter, which is a different request than sending discovered scopes.
+	const scopes =
+		typeof serverConfig.oauth === "object" && typeof serverConfig.oauth?.scope === "string"
+			? serverConfig.oauth.scope.trim()
+			: undefined;
 
 	return {
 		name,
 		command: command.command,
 		args: command.args,
 		env,
+		oauth: scopes === undefined ? undefined : { scopes },
 		url: typeof serverConfig.url === "string" ? serverConfig.url : undefined,
 		headers: serverConfig.headers && typeof serverConfig.headers === "object" ? serverConfig.headers : undefined,
 		enabled: serverConfig.enabled,

@@ -1,6 +1,6 @@
 import { type } from "@oh-my-pi/omptype";
 import type { AgentTool, AgentToolResult } from "@oh-my-pi/pi-agent-core";
-import { sanitizeSkillName, writeManagedSkill } from "../autolearn/managed-skills";
+import { resolveSkillWriteRoot, sanitizeSkillName, writeManagedSkill } from "../autolearn/managed-skills";
 import { isNameClaimedByAuthoredSkill } from "../extensibility/skills";
 import { localBackend } from "../memory-backend/local-backend";
 import learnDescription from "../prompts/tools/learn.md" with { type: "text" };
@@ -80,8 +80,17 @@ export class LearnTool implements AgentTool<typeof learnSchema> {
 			}
 		} else if (backend === "local") {
 			const result = await localBackend.save?.(
-				{ agentDir: this.session.settings.getAgentDir(), cwd: this.session.settings.getCwd() },
-				{ content: params.memory, context: params.context, source: "coding-agent-learn", importance: 0.8 },
+				{
+					agentDir: this.session.settings.getAgentDir(),
+					cwd: this.session.settings.getCwd(),
+					settings: this.session.settings,
+				},
+				{
+					content: params.memory,
+					context: params.context,
+					source: "coding-agent-learn",
+					importance: 0.8,
+				},
 			);
 			if (!result || result.stored === 0) {
 				throw new Error("Lesson was empty after sanitization; nothing stored.");
@@ -121,7 +130,9 @@ export class LearnTool implements AgentTool<typeof learnSchema> {
 				};
 			}
 			try {
-				await writeManagedSkill(params.skill);
+				const location = this.session.settings.get("autolearn.skillLocation");
+				const rootDir = await resolveSkillWriteRoot(this.session.cwd, location, params.skill.name);
+				await writeManagedSkill({ ...params.skill, rootDir });
 			} catch (err) {
 				const reason = err instanceof Error ? err.message : String(err);
 				throw new Error(`${memoryMessage}, but the managed skill could not be written: ${reason}`);

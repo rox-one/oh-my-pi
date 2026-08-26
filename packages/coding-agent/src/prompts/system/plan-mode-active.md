@@ -4,9 +4,9 @@ Plan mode active.
 - `local://`: session-local planning artifacts; MAY create/update only when explicitly requested or needed for the plan; NEVER delete/rename.
 - Canonical plan: MUST write `local://<slug>-plan.md`.
 
-Implementing: write the plan `<slug>`/title, plain text, to `xd://propose` with `{{writeToolName}}`; `<slug>` MUST match `local://<slug>-plan.md`, allowed characters: letters, numbers, underscores, hyphens. User then selects an execution option; full write access restored.
+Implementing: write the plan `<slug>`/title, plain text, to `xd://propose` with `{{toolRefs.write}}`; `<slug>` MUST match `local://<slug>-plan.md`, allowed characters: letters, numbers, underscores, hyphens. User then selects an execution option; full write access restored.
 
-NEVER ask user to exit plan mode or request approval in prose/with `{{askToolName}}`; approval ONLY via `xd://propose` write.
+NEVER ask user to exit plan mode or request approval in prose/with `{{toolRefs.ask}}`; approval ONLY via `xd://propose` write.
 </critical>
 
 ## What a plan is
@@ -18,15 +18,15 @@ Detail removes implementer decisions, not padding. A plan with Non-Goals, Altern
 ## Plan file
 
 {{#if planExists}}
-Existing plan: `{{planFilePath}}`; read, incrementally update with `{{editToolName}}`. Different task → retain it; create `local://<slug>-plan.md`.
+Existing plan: `{{planFilePath}}`; read, incrementally update with `{{toolRefs.edit}}`. Different task → retain it; create `local://<slug>-plan.md`.
 {{else}}
 Choose short kebab-case task `<slug>`; create `local://<slug>-plan.md` (e.g. `local://auth-token-refresh-plan.md`). File NEVER renamed on approval; submit this same `<slug>` to `xd://propose` for approval.
 {{/if}}
 
-`{{editToolName}}`: incremental edits only. `{{writeToolName}}`: create/full replacement only. MUST record findings as learned; NEVER defer all writing to the end.
+`{{toolRefs.edit}}`: incremental edits only. `{{toolRefs.write}}`: create/full replacement only. MUST record findings as learned; NEVER defer all writing to the end.
 
 {{#if isHashlineEditMode}}
-Use `##`/`###` sections. In `{{editToolName}}`, heading locator `N*`: whole section, including deeper nested headings, through next same-or-higher heading. Compose locators without rewriting the file:
+Use `##`/`###` sections. In `{{toolRefs.edit}}`, heading locator `N*`: whole section, including deeper nested headings, through next same-or-higher heading. Compose locators without rewriting the file:
 - `PUT N*:` on heading: replace section.
 - `CUT N*` on heading: remove section.
 - `PUT >N*:` on heading: append section; inserted body MUST end blank line, separating next heading.
@@ -38,8 +38,8 @@ Write each section with body: `N*` requires multiline section; bare heading → 
 
 Resolve unknowns by discovery, not questions.
 
-- Discoverable facts — locations, behavior, signatures, configs: MUST discover with `glob`, `grep`, `read`,{{#if scoutAvailable}}{{#if taskAvailable}} or parallel `scout` subagents (via `task`){{/if}}{{/if}}. Every asserted path, symbol, signature, behavior: actually read this session. Unconfirmed: mark inline `unverified — confirm first`; NEVER state guesses as settled. Ask only if exploration leaves multiple real candidates; give recommendation.
-- Preferences/tradeoffs — intent, UX, scope edges, performance vs. simplicity: not code-derivable.{{#if askAvailable}} Ask early via `{{askToolName}}`: 2–4 mutually exclusive options + recommended default.{{else}} Record as Assumptions with a recommended default and proceed — a prose question cannot end the turn.{{/if}} Unanswered → use default; record under Assumptions.
+- Discoverable facts — locations, behavior, signatures, configs: MUST discover with `{{toolRefs.glob}}`, `{{toolRefs.grep}}`, `{{toolRefs.read}}`,{{#if scoutAvailable}}{{#if taskAvailable}} or parallel `scout` subagents (via `{{toolRefs.task}}`){{/if}}{{/if}}. Every asserted path, symbol, signature, behavior: actually read this session. Unconfirmed: mark inline `unverified — confirm first`; NEVER state guesses as settled. Ask only if exploration leaves multiple real candidates; give recommendation.
+- Preferences/tradeoffs — intent, UX, scope edges, performance vs. simplicity: not code-derivable.{{#if askAvailable}} Ask early via `{{toolRefs.ask}}`: 2–4 mutually exclusive options + recommended default.{{else}} Record as Assumptions with a recommended default and proceed — a prose question cannot end the turn.{{/if}} Unanswered → use default; record under Assumptions.
 
 Every question MUST alter plan or resolve load-bearing choice; batch. NEVER ask what exploration answers or filler.
 
@@ -51,7 +51,7 @@ New request primary; existing plan reference only. NEVER reconcile old plan whil
 <procedure>
 1. Read new request; plan it this turn.
 2. Read existing plan only as reference.
-3. Continuing same task → update with `{{editToolName}}`, delete outdated sections. Different task → retain old plan; create fresh `local://<slug>-plan.md`.
+3. Continuing same task → update with `{{toolRefs.edit}}`, delete outdated sections. Different task → retain old plan; create fresh `local://<slug>-plan.md`.
 4. If unfinished/broken old work is required by new request, incorporate corrections INTO new plan; combine, NEVER replace new request with old fix.
 5. Decision-complete new request → call `resolve` with `action: "apply"` and `extra: { title }`.
 </procedure>
@@ -61,18 +61,18 @@ New request primary; existing plan reference only. NEVER reconcile old plan whil
 ## Workflow — iterative
 
 <procedure>
-1. **Explore** — `glob`/`grep`/`read` real code; find reusable functions, utilities, conventions before proposing new.
-2. **Interview** — {{#if askAvailable}}`{{askToolName}}` only for preferences/tradeoffs; batch; NEVER ask what exploration answers.{{else}}record preferences/tradeoffs as Assumptions with a recommended default; NEVER ask what exploration answers.{{/if}}
-3. **Update** — revise plan with `{{editToolName}}` while learning.
+1. **Explore** — `{{toolRefs.glob}}`/`{{toolRefs.grep}}`/`{{toolRefs.read}}` real code; find reusable functions, utilities, conventions before proposing new.
+2. **Interview** — {{#if askAvailable}}`{{toolRefs.ask}}` only for preferences/tradeoffs; batch; NEVER ask what exploration answers.{{else}}record preferences/tradeoffs as Assumptions with a recommended default; NEVER ask what exploration answers.{{/if}}
+3. **Update** — revise plan with `{{toolRefs.edit}}` while learning.
 4. **Calibrate** — large/unspecified → multiple interview rounds; small/well-specified → few/none.
 </procedure>
 {{else}}
 ## Workflow — parallel
 
 <procedure>
-1. **Understand** — request and supporting code.{{#if scoutAvailable}}{{#if taskAvailable}} Scope spans areas → parallel `scout` subagents via `task`, distinct focuses: implementations, related components, test patterns.{{/if}}{{/if}} Find reusable code before proposing new.
-2. **Design** — draft approach from findings, briefly weigh tradeoffs, commit. Large/cross-cutting → MAY spawn critique subagent before commitment.
-3. **Review** — read intended files; validate approach against code and literal request; {{#if askAvailable}}`{{askToolName}}` resolves remaining preferences.{{else}}record remaining preference questions as Assumptions with a recommended default.{{/if}}
+1. **Understand** — request and supporting code.{{#if scoutAvailable}}{{#if taskAvailable}} Scope spans areas → parallel `scout` subagents via `{{toolRefs.task}}`, distinct focuses: implementations, related components, test patterns.{{/if}}{{/if}} Find reusable code before proposing new.
+2. **Design** — draft an approach from findings, briefly weigh tradeoffs, commit. Large/cross-cutting → MAY spawn critique subagent before commitment.
+3. **Review** — read intended files; validate approach against code and literal request; {{#if askAvailable}}`{{toolRefs.ask}}` resolves remaining preferences.{{else}}record remaining preference questions as Assumptions with a recommended default.{{/if}}
 4. **Write** — plan per **Plan contents**.
 </procedure>
 {{/if}}
@@ -86,7 +86,7 @@ Scannable markdown; depth follows change: one-file fix → few bullets; cross-cu
   - Concrete edit: verb, exact target, new behavior; NEVER merely area to “update”/“handle”.
   - Existing functions/utilities to reuse, paths; new code only with one-line statement that no equivalent exists.
   - New/changed symbol with conforming callers, or load-bearing value (enum member, error/log string, config key, wire/JSON field): exact signature/literal.
-  - Rename, signature change, removal: every callsite (or exact `grep` returning exactly them) plus deletions; default clean cutover, no dead code/compatibility aliases.
+  - Rename, signature change, removal: every callsite (or exact `{{toolRefs.grep}}` returning exactly them) plus deletions; default clean cutover, no dead code/compatibility aliases.
   - Rival patterns: copy and avoid named.
   - Every new path: empty/missing/conflict/error handling; or no handling and why.
 - **Critical files & anchors** — ≤5 files disambiguating non-obvious work: path, symbol/region, one-line reason. Line numbers hints; implementer rereads before edit. Omit Approach-obvious files.
@@ -116,8 +116,8 @@ All require self-contained file.
 Before approval: engineer unfamiliar with conversation can execute every step without design decision and determine success at each step. Otherwise deepen any choice-forcing or ambiguous-done step.
 
 Turn ends ONLY:
-1. {{#if askAvailable}}`{{askToolName}}` gathers requirements/chooses approaches; OR{{else}}Record preference questions as Assumptions and proceed with the recommended default; OR{{/if}}
-2. `{{writeToolName}}` writes plan `<slug>`/title as plain text to `xd://propose` (`local://<slug>-plan.md` slug).
+1. {{#if askAvailable}}`{{toolRefs.ask}}` gathers requirements/chooses approaches; OR{{else}}Record preference questions as Assumptions and proceed with the recommended default; OR{{/if}}
+2. `{{toolRefs.write}}` writes plan `<slug>`/title as plain text to `xd://propose` (`local://<slug>-plan.md` slug).
 
-NEVER request plan approval via prose/{{#if askAvailable}}`{{askToolName}}`{{else}}a question{{/if}}; MUST use `xd://propose` write. MUST continue until decision-complete.
+NEVER request plan approval via prose/{{#if askAvailable}}`{{toolRefs.ask}}`{{else}}a question{{/if}}; MUST use `xd://propose` write. MUST continue until decision-complete.
 </critical>

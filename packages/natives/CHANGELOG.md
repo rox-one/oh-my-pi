@@ -62,6 +62,10 @@
 
 - `enclosingBlockBoundaries` and `blockRangeAt` now reuse a parsed tree-sitter tree when the same source and language were parsed before, and skip subtrees whose line span holds no visible line. Together these cut the block-context work the `read` tool performs on every non-raw read: for an 81KB TypeScript source with a mid-file window, 13.4ms to 4.45ms on a first parse and to 0.149ms once the tree is cached; for a 1.06MB source, 188.1ms to 55.8ms and to 0.440ms. The tree cache is bounded (12 entries, 4MiB of retained source) and verifies content byte-for-byte on every hit, so a hash collision can only cost a re-parse. The subtree skip is proven equivalent by differential comparison against the exhaustive walk across 4827 repository files and 38,616 window comparisons.
 
+### Fixed
+
+- Fixed the native addon failing to load for out-of-tree consumers (custom tools importing `@oh-my-pi/pi-tui`, the `omp stats` worker) when the core `@oh-my-pi/pi-natives` package runs from bun's global install cache. The loader resolved the platform leaf package (`@oh-my-pi/pi-natives-<tag>`) via `require.resolve`, which can't see the leaf when it is laid out as a version-pinned sibling with no enclosing `node_modules`; the loader now falls back to scanning the core package's scope directory for the sibling that holds the addon ([#8901](https://github.com/can1357/oh-my-pi/issues/8901)).
+
 ## [17.3.5] - 2026-08-16
 
 ### Fixed
@@ -179,6 +183,10 @@
 - Fixed accessibility snapshots incorrectly marking a window root as focused based on its app-local AXFocused attribute when another application held global focus; the root annotation now correctly reflects the global window-roster focus flag.
 - Improved coordinate-frame error messages for pointer input before capture, out-of-frame coordinates, and between-display points to clearly explain the capture-frame contract and remedy instead of throwing a generic bounds check.
 - Fixed duplicated characters in AppKit targets on macOS caused by background keyboard events being posted through both CoreGraphics and SkyLight; events are now delivered once via the authenticated SkyLight route.
+- Fixed the accessibility snapshot marking a window root `(focused)` from its app-local `AXFocused` attribute even when another application held global focus; the root annotation now reflects the global window-roster focus flag.
+- Fixed installed CLIs losing desktop capture when the resolved prebuilt addon still exposes the pre-parity `DesktopSession` ABI. That ABI is now adapted behind the current session contract, legacy error codes are translated, and the adapter ships in the published native core package.
+- Clarified coordinate-frame errors: pointer input before any capture, out-of-frame coordinates, and between-display points now name the capture-frame contract and the remedy instead of a bare bounds check.
+- Fixed macOS background keyboard events being posted through both CoreGraphics and SkyLight, which duplicated every typed character in AppKit targets; the authenticated SkyLight route now delivers each event once.
 
 ## [17.2.2] - 2026-07-31
 
@@ -387,6 +395,9 @@
 
 - Fixed an issue where panics in native worker tasks (such as grep, AST parsing, globbing, workspace listing, HTML-to-markdown conversion, fuzzy finding, and clipboard image reading) would abort the host process instead of properly rejecting the returned JavaScript Promise.
 - Fixed a crash on Windows under low memory or commit charge conditions when spawning worker threads for token counting or sorting operations.
+### Fixed
+
+- Fixed native `task::blocking` closures aborting the host process when they panicked (via `.expect(...)` invariants, arithmetic overflow, or third-party panics on adversarial input) instead of rejecting the corresponding JS `Promise`. napi-rs's async-work callback is a plain `extern "C" fn`, so an unwind that escaped `Blocking::compute` was a forced process abort under stabilized C-unwind rules — `grep`, `glob`, `astGrep`, `astMatch`, `astEdit`, `listWorkspace`, `fuzzyFind`, `htmlToMarkdown`, `renderSnapcompactPng`, and `readImageFromClipboard` all shared this exposure. `Blocking::compute` now wraps the user closure in `std::panic::catch_unwind` and surfaces the panic as a `napi::Error` (`GenericFailure`), and the native crash hook treats a panic caught here the same way it already treated uutils panics — logged to the on-disk crash record for diagnosis, kept out of the user-facing stderr crash dump ([#4020](https://github.com/can1357/oh-my-pi/issues/4020)).
 
 ## [16.2.11] - 2026-07-01
 

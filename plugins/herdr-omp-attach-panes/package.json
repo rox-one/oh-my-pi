@@ -1,0 +1,7 @@
+{
+  "name": "herdr-omp-attach-panes",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "omp": { "extensions": ["./herdr-omp-attach-panes.ts"] }
+}

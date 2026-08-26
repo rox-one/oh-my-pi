@@ -3,7 +3,13 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { getAgentDir, MAIN_CONFIG_FILENAMES } from "../src/dirs";
-import { getShellArgs, getShellConfig, resolveWindowsShell } from "../src/procmgr";
+import {
+	detectHostShellQuoteStyle,
+	getShellArgs,
+	getShellConfig,
+	quoteHostShellArg,
+	resolveWindowsShell,
+} from "../src/procmgr";
 
 describe("getShellConfig", () => {
 	it("directs invalid custom shell paths to the canonical config file", () => {
@@ -36,6 +42,47 @@ describe("getShellArgs", () => {
 		expect(getShellArgs("C:\\Windows\\System32\\cmd.exe", {})).toEqual(["/c"]);
 		expect(getShellArgs("/bin/bash", {})).toEqual(["-l", "-c"]);
 		expect(getShellArgs("/bin/bash", { PI_BASH_NO_LOGIN: "1" })).toEqual(["-c"]);
+	});
+});
+
+describe("detectHostShellQuoteStyle", () => {
+	it("uses the nearest recognized Windows shell ancestor", () => {
+		expect(
+			detectHostShellQuoteStyle(
+				["C:\\Program Files\\PowerShell\\7\\pwsh.exe", "C:\\Windows\\explorer.exe"],
+				{},
+				"win32",
+			),
+		).toBe("powershell");
+		expect(
+			detectHostShellQuoteStyle(
+				["C:\\Program Files\\Git\\usr\\bin\\bash.exe", "C:\\Windows\\System32\\cmd.exe"],
+				{},
+				"win32",
+			),
+		).toBe("posix");
+		expect(detectHostShellQuoteStyle(["C:\\Windows\\System32\\cmd.exe"], {}, "win32")).toBe("cmd");
+	});
+
+	it("falls back to inherited shell markers when ancestry is unavailable", () => {
+		expect(detectHostShellQuoteStyle([], { SHELL: "C:\\Program Files\\Git\\bin\\bash.exe" }, "win32")).toBe("posix");
+		expect(detectHostShellQuoteStyle([], { PSModulePath: "C:\\Program Files\\PowerShell\\Modules" }, "win32")).toBe(
+			"powershell",
+		);
+		expect(detectHostShellQuoteStyle([], {}, "win32")).toBe("cmd");
+		expect(detectHostShellQuoteStyle([], {}, "darwin")).toBe("posix");
+	});
+});
+
+describe("quoteHostShellArg", () => {
+	it("uses the detected shell's literal quoting and escaping rules", () => {
+		expect(quoteHostShellArg("/home/u/$draft/a'b.jsonl", "posix")).toBe("'/home/u/$draft/a'\\''b.jsonl'");
+		expect(quoteHostShellArg("C:\\sessions\\$draft\\a'b.jsonl", "powershell")).toBe(
+			"'C:\\sessions\\$draft\\a''b.jsonl'",
+		);
+		expect(quoteHostShellArg("C:\\sessions\\%draft%\\!name!\\s.jsonl", "cmd")).toBe(
+			'"C:\\sessions\\^%draft^%\\^!name^!\\s.jsonl"',
+		);
 	});
 });
 

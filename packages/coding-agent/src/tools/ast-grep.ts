@@ -11,7 +11,7 @@ import { recordFileSnapshot, recordSeenLinesFromBody } from "../edit/file-snapsh
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import type { Theme } from "../modes/theme/theme";
 import astGrepDescription from "../prompts/tools/ast-grep.md" with { type: "text" };
-import { isScoutSpawnable } from "../task/spawn-policy";
+import { canSpawnSubagents, isScoutSpawnable } from "../task/spawn-policy";
 import { Ellipsis, fileHyperlink, renderStatusLine, renderTreeList, truncateToWidth } from "../tui";
 import { resolveFileDisplayMode } from "../utils/file-display-mode";
 import type { ToolSession } from ".";
@@ -152,10 +152,16 @@ export class AstGrepTool implements AgentTool<typeof astGrepSchema, AstGrepToolD
 	readonly label = "AST Grep";
 	readonly summary = "Search code with AST patterns (structural grep)";
 	get description(): string {
+		const spawns = this.session.getSessionSpawns?.() ?? "*";
+		const maxRecursionDepth = this.session.settings.get("task.maxRecursionDepth") ?? 2;
+		const taskDepth = this.session.taskDepth ?? 0;
 		return prompt.render(astGrepDescription, {
+			taskAvailable: canSpawnSubagents(spawns, maxRecursionDepth, taskDepth),
 			scoutAvailable: isScoutSpawnable(
 				this.session.settings.get("task.disabledAgents") as string[] | undefined,
-				this.session.getSessionSpawns?.() ?? "*",
+				spawns,
+				maxRecursionDepth,
+				taskDepth,
 			),
 		});
 	}

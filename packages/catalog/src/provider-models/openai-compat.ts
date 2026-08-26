@@ -982,12 +982,15 @@ const OPENAI_PRO_REASONING_BASE_IDS: Record<string, true> = {
 	"gpt-5.6-terra": true,
 };
 /**
- * Providers whose generated pro aliases this pass owns. `openai-codex` stays in
- * the sweep so stale aliases from earlier snapshots are dropped on regen, but
- * projection is `openai`-only — subscription (Codex) auth does not offer pro
- * reasoning.
+ * Providers whose generated pro aliases this pass owns. Azure OpenAI mirrors
+ * the GPT-5.6 Responses contract, while `openai-codex` stays in the sweep only
+ * so stale aliases from earlier snapshots are dropped on regen.
  */
-const OPENAI_PRO_REASONING_SWEEP_PROVIDERS: Record<string, true> = { openai: true, "openai-codex": true };
+const OPENAI_PRO_REASONING_PROJECTION_PROVIDERS: Record<string, true> = { openai: true, azure: true };
+const OPENAI_PRO_REASONING_SWEEP_PROVIDERS: Record<string, true> = {
+	...OPENAI_PRO_REASONING_PROJECTION_PROVIDERS,
+	"openai-codex": true,
+};
 
 /**
  * A row this generator pass owns: one of the derived `gpt-5.6-*-pro` alias ids
@@ -1005,9 +1008,9 @@ function isGeneratedOpenAIProReasoningAlias(model: ModelSpec<Api>): boolean {
 }
 
 /**
- * Re-derive the generated pro-reasoning aliases (`gpt-5.6-*-pro`) for the
- * first-party `openai` gpt-5.6 rows. Each alias inherits the base row's
- * metadata, requests the base wire id via `requestModelId`, and sets
+ * Re-derive the generated pro-reasoning aliases (`gpt-5.6-*-pro`) for
+ * first-party OpenAI and Azure OpenAI gpt-5.6 rows. Each alias inherits the
+ * base row's metadata, requests the base wire id via `requestModelId`, and sets
  * `reasoningMode: "pro"` so Responses-family request builders emit
  * `reasoning: { mode: "pro" }`. Called by the models.json generator after all
  * sources merge: stale copies of the owned aliases (previous snapshot,
@@ -1020,7 +1023,7 @@ export function projectOpenAIProReasoningAliases(models: readonly ModelSpec<Api>
 	const ids = new Set(kept.map(model => `${model.provider}/${model.id}`));
 	const out = [...kept];
 	for (const model of kept) {
-		if (model.provider !== "openai") continue;
+		if (OPENAI_PRO_REASONING_PROJECTION_PROVIDERS[model.provider] !== true) continue;
 		if (!OPENAI_PRO_REASONING_BASE_IDS[model.id]) continue;
 		const aliasId = `${model.id}-pro`;
 		const aliasKey = `${model.provider}/${aliasId}`;
@@ -1663,8 +1666,8 @@ const XAI_NON_CHAT_PREFIXES = ["grok-imagine-", "grok-stt-", "grok-voice-"] as c
 function withXaiOAuthCompatDefaults(model: ModelSpec<"openai-responses">): ModelSpec<"openai-responses"> {
 	const compat = {
 		...(model.compat ?? {}),
-		includeEncryptedReasoning: model.compat?.includeEncryptedReasoning ?? true,
-		filterReasoningHistory: model.compat?.filterReasoningHistory ?? false,
+		includeEncryptedReasoning: model.compat?.includeEncryptedReasoning ?? false,
+		filterReasoningHistory: model.compat?.filterReasoningHistory ?? true,
 		supportsImageDetailOriginal: model.compat?.supportsImageDetailOriginal ?? false,
 		omitReasoningEffort: model.compat?.omitReasoningEffort ?? !isGrokReasoningEffortCapable(model.id),
 	};
@@ -1731,11 +1734,12 @@ function mergeCuratedIntoModel(
 	const effortCapable = curated.supportsReasoningEffort ?? isGrokReasoningEffortCapable(curated.id);
 	const compat = {
 		...(base.compat ?? {}),
-		includeEncryptedReasoning: base.compat?.includeEncryptedReasoning ?? true,
-		filterReasoningHistory: false,
+		reasoningEffortMap: { ...XAI_REASONING_EFFORT_MAP, ...(base.compat?.reasoningEffortMap ?? {}) },
+		includeEncryptedReasoning: base.compat?.includeEncryptedReasoning ?? false,
+		filterReasoningHistory: base.compat?.filterReasoningHistory ?? true,
 		supportsImageDetailOriginal: base.compat?.supportsImageDetailOriginal ?? false,
-		omitReasoningEffort: !effortCapable,
-		supportsReasoningEffort: effortCapable,
+		omitReasoningEffort: base.compat?.omitReasoningEffort ?? !isGrokReasoningEffortCapable(base.id),
+		...(effort === undefined ? {} : { supportsReasoningEffort: effort }),
 	};
 	if (effortCapable) {
 		compat.reasoningEffortMap = { ...xaiResponsesReasoningEffortMap(curated.id) };
@@ -4927,6 +4931,7 @@ type LiteLLMRichEndpointModel<TApi extends Api> = {
 	hasToolMetadata: boolean;
 	hasSupportedOpenAIParams: boolean;
 	hasCost: boolean;
+	reportedCost: Partial<ModelSpec<Api>["cost"]>;
 };
 type LiteLLMRichEndpointFailure = {
 	endpoint: string;
@@ -5051,30 +5056,36 @@ function getLiteLLMParams(entry: LiteLLMRichModelEntry): LiteLLMRichModelEntry |
 function getLiteLLMMetadataValue(entry: LiteLLMRichModelEntry, key: string): unknown {
 	return entry[key] ?? getLiteLLMModelInfo(entry)?.[key];
 }
-
-/** Per-million USD cost from a `*_per_token` LiteLLM field, or `undefined` when absent/non-positive. */
+/** Per-million USD cost from a positive `*_per_token` LiteLLM field. */
 function getLiteLLMPerMillionCost(entry: LiteLLMRichModelEntry, key: string): number | undefined {
 	const perToken = toNumber(getLiteLLMMetadataValue(entry, key));
 	return perToken !== undefined && perToken > 0 ? perToken * 1_000_000 : undefined;
 }
 
-/**
- * Map LiteLLM's per-token pricing (`input_cost_per_token`, `output_cost_per_token`,
- * cache costs) onto {@link ModelSpec.cost} in $/million tokens. Returns `undefined`
- * when LiteLLM reports neither an input nor an output price so callers keep the
- * bundled reference cost.
- */
-function getLiteLLMCost(entry: LiteLLMRichModelEntry): ModelSpec<Api>["cost"] | undefined {
+/** Map positive LiteLLM per-token prices onto their per-million cost fields. */
+function getLiteLLMReportedCost(entry: LiteLLMRichModelEntry): Partial<ModelSpec<Api>["cost"]> {
 	const input = getLiteLLMPerMillionCost(entry, "input_cost_per_token");
 	const output = getLiteLLMPerMillionCost(entry, "output_cost_per_token");
-	if (input === undefined && output === undefined) {
+	const cacheRead = getLiteLLMPerMillionCost(entry, "cache_read_input_token_cost");
+	const cacheWrite = getLiteLLMPerMillionCost(entry, "cache_creation_input_token_cost");
+	return {
+		...(input !== undefined ? { input } : {}),
+		...(output !== undefined ? { output } : {}),
+		...(cacheRead !== undefined ? { cacheRead } : {}),
+		...(cacheWrite !== undefined ? { cacheWrite } : {}),
+	};
+}
+
+function getLiteLLMCost(entry: LiteLLMRichModelEntry): ModelSpec<Api>["cost"] | undefined {
+	const cost = getLiteLLMReportedCost(entry);
+	if (cost.input === undefined && cost.output === undefined) {
 		return undefined;
 	}
 	return {
-		input: input ?? 0,
-		output: output ?? 0,
-		cacheRead: getLiteLLMPerMillionCost(entry, "cache_read_input_token_cost") ?? 0,
-		cacheWrite: getLiteLLMPerMillionCost(entry, "cache_creation_input_token_cost") ?? 0,
+		input: cost.input ?? 0,
+		output: cost.output ?? 0,
+		cacheRead: cost.cacheRead ?? 0,
+		cacheWrite: cost.cacheWrite ?? 0,
 	};
 }
 
@@ -5274,13 +5285,23 @@ function mergeLiteLLMRichEndpointModels<TApi extends Api>(
 		maxTokens: next.hasMaxTokens ? next.model.maxTokens : existing.model.maxTokens,
 		input: next.supportsVision === true || next.supportsVision === false ? next.model.input : existing.model.input,
 		reasoning: typeof next.supportsReasoning === "boolean" ? next.model.reasoning : existing.model.reasoning,
-		cost: next.hasCost ? next.model.cost : existing.model.cost,
+		cost: { ...existing.model.cost, ...existing.reportedCost, ...next.reportedCost },
 		compat: next.hasSupportedOpenAIParams ? next.model.compat : existing.model.compat,
 	};
 	if (next.hasToolMetadata) {
 		model.supportsTools = next.model.supportsTools;
 	}
-	return { ...next, apiRoute, model };
+	return {
+		...next,
+		apiRoute,
+		model,
+		reportedCost: { ...existing.reportedCost, ...next.reportedCost },
+		hasContextWindow: existing.hasContextWindow || next.hasContextWindow,
+		hasMaxTokens: existing.hasMaxTokens || next.hasMaxTokens,
+		hasToolMetadata: existing.hasToolMetadata || next.hasToolMetadata,
+		hasSupportedOpenAIParams: existing.hasSupportedOpenAIParams || next.hasSupportedOpenAIParams,
+		hasCost: existing.hasCost || next.hasCost,
+	};
 }
 
 async function fetchLiteLLMRichEndpoint<TApi extends Api>(
@@ -5342,6 +5363,7 @@ async function fetchLiteLLMRichEndpoint<TApi extends Api>(
 					supportedOpenAIParams !== undefined,
 				hasSupportedOpenAIParams: supportedOpenAIParams !== undefined,
 				hasCost: getLiteLLMCost(entry) !== undefined,
+				reportedCost: getLiteLLMReportedCost(entry),
 			};
 			const existing = deduped.get(model.id);
 			deduped.set(model.id, existing ? mergeLiteLLMRichEndpointModels(existing, next) : next);
@@ -5403,7 +5425,12 @@ async function fetchLiteLLMRichModelsInternal<TApi extends Api>(
 			for (const entry of deduped.values()) {
 				if (
 					(entry.supportsVision !== true && entry.supportsVision !== false) ||
-					(options.resolveApi !== undefined && entry.apiRoute === "unknown")
+					(options.resolveApi !== undefined && entry.apiRoute === "unknown") ||
+					(Object.keys(entry.reportedCost).length > 0 &&
+						(entry.reportedCost.input === undefined ||
+							entry.reportedCost.output === undefined ||
+							entry.reportedCost.cacheRead === undefined ||
+							entry.reportedCost.cacheWrite === undefined))
 				) {
 					needsMoreMetadata = true;
 					break;
@@ -5440,12 +5467,12 @@ export function litellmModelManagerOptions(config?: LiteLLMModelManagerConfig): 
 	const baseUrl = config?.baseUrl ?? getDefaultModelDiscoveryBaseUrl("litellm")!;
 	return {
 		providerId: "litellm",
-		// rich-v6 invalidates rows cached before OpenAI models moved to Responses.
-		// Earlier versions added bundled reference fallback, continued discovery
-		// past incomplete `/model_group/info`, stripped reseller usage suffixes,
-		// filtered placeholder-only `all-team-models` rows, and mapped rich pricing.
-		// Bump the version whenever the mappers below change, or warm authoritative
-		// caches keep serving pre-change rows for the full TTL.
+		// rich-v7 invalidates rows cached before discovery continued past endpoints
+		// that omitted cache pricing. Earlier versions added bundled reference fallback,
+		// moved OpenAI models to Responses, continued past incomplete vision and API
+		// metadata, stripped reseller usage suffixes, filtered placeholder rows, and
+		// mapped rich pricing. Bump the version whenever these mappers change, or warm
+		// authoritative caches keep serving pre-change rows for the full TTL.
 		cacheProviderId: resolveModelCacheProviderId("litellm", { baseUrl }),
 		// litellm is a local-only proxy and is never bundled in models.json (that
 		// would leak the machine's localhost catalog). Prefer the proxy's richer

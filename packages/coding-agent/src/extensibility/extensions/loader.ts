@@ -32,6 +32,7 @@ import type { FileDeleteFallbackHandler, FileWriteFallbackHandler } from "../../
 import { EventBus } from "../../utils/event-bus";
 import * as TypeBox from "../legacy-typebox";
 import { installLegacyPiSpecifierShim, loadLegacyPiModule } from "../plugins/legacy-pi-compat";
+import { installLegacyPiShimLoopGuard } from "../plugins/legacy-pi-shim-loop-guard";
 import { getAllPluginExtensionPaths } from "../plugins/loader";
 
 import { resolvePath, withHostGuard } from "../utils";
@@ -42,15 +43,22 @@ import type {
 	ExtensionAPI,
 	ExtensionContext,
 	ExtensionFactory,
+	ExtensionModelAliasResult,
 	ExtensionRuntime as IExtensionRuntime,
 	LoadExtensionsResult,
 	MessageRenderer,
+	PreparedExtension,
 	ProviderConfig,
 	RegisteredCommand,
+	StatusLineSegmentRenderer,
 	ToolDefinition,
 	ToolInfo,
 } from "./types";
 
+// Guard first: Bun runs onResolve hooks in registration order, and the loop
+// guard must see shim-originated resolutions before the compat resolver's
+// override map does (issue #8900).
+installLegacyPiShimLoopGuard();
 installLegacyPiSpecifierShim();
 
 type HandlerFn = (...args: unknown[]) => Promise<unknown>;
@@ -104,6 +112,10 @@ export class ExtensionRuntime implements IExtensionRuntime {
 		throw new ExtensionRuntimeNotInitializedError();
 	}
 
+	getToolReference = (_name: string): string => {
+		throw new ExtensionRuntimeNotInitializedError();
+	};
+
 	getAllTools(): ToolInfo[] {
 		throw new ExtensionRuntimeNotInitializedError();
 	}
@@ -117,6 +129,9 @@ export class ExtensionRuntime implements IExtensionRuntime {
 	}
 
 	setModel(): Promise<boolean> {
+		throw new ExtensionRuntimeNotInitializedError();
+	}
+	setModelAlias(): Promise<ExtensionModelAliasResult> {
 		throw new ExtensionRuntimeNotInitializedError();
 	}
 
@@ -151,6 +166,7 @@ export class ExtensionRuntime implements IExtensionRuntime {
  * Action methods delegate to the shared runtime.
  */
 class ConcreteExtensionAPI implements ExtensionAPI, IExtensionRuntime {
+	readonly host = "omp" as const;
 	readonly logger = logger;
 	readonly typebox = TypeBox;
 	readonly arktype = type;
@@ -232,6 +248,10 @@ class ConcreteExtensionAPI implements ExtensionAPI, IExtensionRuntime {
 		this.extension.messageRenderers.set(customType, renderer as MessageRenderer);
 	}
 
+	registerStatusLineSegment(id: string, renderer: StatusLineSegmentRenderer): void {
+		this.extension.statusLineSegments.set(id, renderer);
+	}
+
 	registerAssistantThinkingRenderer(renderer: AssistantThinkingRenderer): void {
 		this.extension.assistantThinkingRenderers.push(renderer);
 	}
@@ -281,6 +301,10 @@ class ConcreteExtensionAPI implements ExtensionAPI, IExtensionRuntime {
 		return this.runtime.getActiveTools();
 	}
 
+	getToolReference(name: string): string {
+		return this.runtime.getToolReference?.(name) ?? name;
+	}
+
 	getAllTools(): ToolInfo[] {
 		return this.runtime.getAllTools();
 	}
@@ -295,6 +319,9 @@ class ConcreteExtensionAPI implements ExtensionAPI, IExtensionRuntime {
 
 	setModel(model: Model): Promise<boolean> {
 		return this.runtime.setModel(model);
+	}
+	setModelAlias(name: string): Promise<ExtensionModelAliasResult> {
+		return this.runtime.setModelAlias!(name);
 	}
 
 	getThinkingLevel(): ThinkingLevel | undefined {
@@ -348,6 +375,7 @@ function createExtension(extensionPath: string, resolvedPath: string): Extension
 		fileDeleteFallbackHandlers: [],
 		messageRenderers: new Map(),
 		composerShapes: new Map(),
+		statusLineSegments: new Map(),
 		commands: new Map(),
 		flags: new Map(),
 		shortcuts: new Map(),
@@ -378,13 +406,7 @@ async function runExtensionFactory(
 	}
 }
 
-interface ImportedExtensionModule {
-	factory: ExtensionFactory | null;
-	resolvedPath: string;
-	error: string | null;
-}
-
-async function importExtensionModule(extensionPath: string, cwd: string): Promise<ImportedExtensionModule> {
+async function importExtensionModule(extensionPath: string, cwd: string): Promise<PreparedExtension> {
 	const resolvedPath = resolvePath(extensionPath, cwd);
 	try {
 		const module = (await withHostGuard(() => loadLegacyPiModule(resolvedPath))) as LoadedExtensionModule;
@@ -392,22 +414,23 @@ async function importExtensionModule(extensionPath: string, cwd: string): Promis
 
 		if (typeof factory !== "function") {
 			return {
+				path: extensionPath,
 				factory: null,
 				resolvedPath,
 				error: `Extension does not export a valid factory function: ${extensionPath}`,
 			};
 		}
 
-		return { factory, resolvedPath, error: null };
+		return { path: extensionPath, factory, resolvedPath, error: null };
 	} catch (err) {
 		const message = err instanceof Error ? err.message : String(err);
-		return { factory: null, resolvedPath, error: `Failed to load extension: ${message}` };
+		return { path: extensionPath, factory: null, resolvedPath, error: `Failed to load extension: ${message}` };
 	}
 }
 
 async function bindExtension(
 	extensionPath: string,
-	imported: ImportedExtensionModule,
+	imported: PreparedExtension,
 	cwd: string,
 	eventBus: EventBus,
 	runtime: IExtensionRuntime,
@@ -453,23 +476,31 @@ export async function loadExtensionFromFactory(
  * (last-wins collisions, shared runtime flag defaults) stay deterministic.
  */
 export async function loadExtensions(paths: string[], cwd: string, eventBus?: EventBus): Promise<LoadExtensionsResult> {
+	const preparedExtensions = await Promise.all(paths.map(extPath => importExtensionModule(extPath, cwd)));
+	return bindPreparedExtensions(preparedExtensions, cwd, eventBus);
+}
+
+/** Bind previously imported extension factories to a fresh session runtime. */
+export async function bindPreparedExtensions(
+	preparedExtensions: readonly PreparedExtension[],
+	cwd: string,
+	eventBus?: EventBus,
+): Promise<LoadExtensionsResult> {
 	const extensions: Extension[] = [];
 	const errors: Array<{ path: string; error: string }> = [];
 	const resolvedEventBus = eventBus ?? new EventBus();
 	const runtime = new ExtensionRuntime();
 
-	const imported = await Promise.all(paths.map(extPath => importExtensionModule(extPath, cwd)));
-
-	for (let i = 0; i < paths.length; i++) {
-		const extPath = paths[i]!;
-		const { extension, error } = await bindExtension(extPath, imported[i]!, cwd, resolvedEventBus, runtime);
+	for (const prepared of preparedExtensions) {
+		const { extension, error } = await bindExtension(prepared.path, prepared, cwd, resolvedEventBus, runtime);
 
 		if (error) {
-			errors.push({ path: extPath, error });
+			errors.push({ path: prepared.path, error });
 			continue;
 		}
 
 		if (extension) {
+			if (options.trusted) extension.trusted = true;
 			extensions.push(extension);
 		}
 	}
@@ -478,6 +509,7 @@ export async function loadExtensions(paths: string[], cwd: string, eventBus?: Ev
 		extensions,
 		errors,
 		runtime,
+		preparedExtensions: [...preparedExtensions],
 	};
 }
 
@@ -630,12 +662,9 @@ async function discoverHooksInPackageRoot(root: string): Promise<string[]> {
  * `.omp`/`.pi` extension capabilities, JS/TS hook factories, the
  * installed-plugin tree, and any configured paths.
  *
- * Subagents reuse the parent's collected paths via the SDK's
- * `preloadedExtensionPaths` option, then call {@link loadExtensions} themselves
- * so each session rebuilds Extension instances bound to its OWN
- * `ExtensionAPI` (cwd, eventBus, runtime). Forwarding the parent's
- * `LoadExtensionsResult` directly would reuse handlers/tools/commands that
- * closed over the parent's `cwd` and event bus.
+ * The root session imports these paths once and forwards prepared factories to
+ * subagents. Each child rebinds fresh Extension instances to its OWN
+ * ExtensionAPI (cwd, eventBus, runtime) without re-evaluating the module graph.
  */
 export interface DiscoverExtensionPathOptions {
 	/** Include ambient native extensions, hooks, and installed plugins. */
@@ -647,9 +676,10 @@ export interface DiscoverExtensionPathOptions {
 export async function discoverExtensionPaths(
 	configuredPaths: string[],
 	cwd: string,
-	disabledExtensionIds?: string[],
-	options: DiscoverExtensionPathOptions = {},
-): Promise<string[]> {
+	eventBus?: EventBus,
+	disabledExtensionIds: string[] = [],
+	agentDir?: string,
+): Promise<LoadExtensionsResult> {
 	const allPaths: string[] = [];
 	const seen = new Set<string>();
 	const disabled = new Set(disabledExtensionIds ?? []);
@@ -672,21 +702,12 @@ export async function discoverExtensionPaths(
 		}
 	};
 
-	const ambient = options.ambient !== false;
-	if (ambient) {
-		// 1. Discover extension modules via capability API (native .omp/.pi only).
-		// Scope the load to the native provider — the extension-module capability
-		// also has claude/codex/gemini/opencode providers, and their items were
-		// discarded here anyway (see #4198). The provider filter skips the walk
-		// entirely instead of running four foreign directory scans and dropping
-		// the results.
-		const discovered = await loadCapability<ExtensionModule>(extensionModuleCapability.id, {
-			...loadOptions,
-			providers: ["native"],
-		});
-		for (const ext of discovered.items) {
-			addPath(ext.path);
-		}
+	// 1. Discover extension modules via capability API (native .omp/.pi only)
+	const discovered = await loadCapability<ExtensionModule>(extensionModuleCapability.id, { cwd, agentDir });
+	for (const ext of discovered.items) {
+		if (ext._source.provider !== "native") continue;
+		if (isDisabledName(ext.name)) continue;
+		addPath(ext.path);
 	}
 
 	// 2. Discover JS/TS hook factories and bind them through the extension

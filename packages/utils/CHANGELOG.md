@@ -2,6 +2,27 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added `RequestError.sessionBusy(message, data)` for the ACP session-busy application error (`-32003`) on the shared JSON-RPC transport.
+
+## [18.0.6] - 2026-08-26
+
+### Added
+
+- Added conventional commit generation with support for dependency, security, configuration, UX, and infrastructure commit types, plus configurable caching and large-diff analysis behavior.
+
+## [18.0.5] - 2026-08-25
+
+### Added
+
+- Added `stableStringifyJson` for deterministic serialization of nested JSON-shaped data.
+
+### Fixed
+
+- Fixed managed Chrome-for-Testing installation failures when extracting the trusted browser download.
+- Keep project-directory state unchanged when changing directories fails.
+
 ## [18.0.4] - 2026-08-24
 
 ### Added
@@ -22,6 +43,9 @@
 - Made malformed advanced-serialization frames from a worker subprocess non-fatal: Bun surfaces an undecodable IPC frame as a process-level `uncaughtException` in the parent (oven-sh/bun#37287), which the postmortem handler treated as fatal and tore down every active session and subagent. The handler now recognizes the decode failure and, keeping the session alive, faults the active advanced-IPC worker subsystems so their clients reject in-flight requests and recycle the subprocess instead of awaiting forever — mirroring the existing ipc-send EPIPE containment. ([#9158](https://github.com/can1357/oh-my-pi/issues/9158))
 
 ## [17.4.1] - 2026-08-21
+### Fixed
+
+- `readJsonl` no longer aborts a stream when a frame contains raw control characters (e.g. unescaped tabs or `\x01` inside a string, which `Bun.JSONL.parseChunk` rejects). The offending record is repaired via `repairJson` and re-parsed; if it still does not parse, it is skipped and streaming resumes at the next line. A partial record at end-of-stream is dropped instead of throwing `"JSONL stream ended unexpectedly"`. This fixes provider turns aborting with `Failed to parse JSONL` on ollama-cloud thinking-model streams.
 
 ### Added
 

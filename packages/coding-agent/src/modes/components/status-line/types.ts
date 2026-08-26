@@ -3,13 +3,14 @@ import type {
 	ContextLineMode,
 	StatusLinePreset,
 	StatusLineSegmentId,
+	StatusLineSegmentRef,
 	StatusLineSeparatorStyle,
 } from "../../../config/settings-schema";
 import type { AgentSession } from "../../../session/agent-session";
 import type { ActiveRepoContext } from "../../../utils/active-repo-context";
 import type { LoopLimitRuntime } from "../../loop-limit";
 
-export type { ContextLineMode, StatusLinePreset, StatusLineSegmentId, StatusLineSeparatorStyle };
+export type { ContextLineMode, StatusLinePreset, StatusLineSegmentId, StatusLineSegmentRef, StatusLineSeparatorStyle };
 
 /** Collab session indicator + (guest-only) host-state override for segments. */
 export interface CollabStatus {
@@ -20,16 +21,19 @@ export interface CollabStatus {
 }
 
 export interface StatusLineSegmentOptions {
+	session?: { length?: number };
 	model?: { showThinkingLevel?: boolean };
 	path?: { abbreviate?: boolean; maxLength?: number; stripWorkPrefix?: boolean };
 	git?: { showBranch?: boolean; showStaged?: boolean; showUnstaged?: boolean; showUntracked?: boolean };
+	token_total?: { breakdown?: boolean };
+	context_pct?: { compact?: boolean };
 	time?: { format?: "12h" | "24h"; showSeconds?: boolean };
 }
 
 export interface StatusLineSettings {
 	preset?: StatusLinePreset;
-	leftSegments?: StatusLineSegmentId[];
-	rightSegments?: StatusLineSegmentId[];
+	leftSegments?: StatusLineSegmentRef[];
+	rightSegments?: StatusLineSegmentRef[];
 	separator?: StatusLineSeparatorStyle;
 	segmentOptions?: StatusLineSegmentOptions;
 	showHookStatus?: boolean;
@@ -113,6 +117,8 @@ export interface SegmentContext {
 	/** Blink phase for the running-speculation pulse; toggled by the component's timer. */
 	speculationBlinkOn: boolean;
 	subagentCount: number;
+	/** Summed subagent cost in USD: live observer progress plus persisted history. */
+	subagentCost: number;
 	/**
 	 * Active processing time accumulated this session, in ms — the union of
 	 * every `agent_start`→`agent_end` window plus the currently-streaming

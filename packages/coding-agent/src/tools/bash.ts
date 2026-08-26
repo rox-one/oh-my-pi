@@ -824,8 +824,9 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 		const jobId = manager.register(
 			"bash",
 			label,
-			async ({ jobId, signal: runSignal, reportProgress }) => {
+			async ({ jobId, signal: runSignal, reportProgress, setLinkPath, getLinkPath }) => {
 				const { path: artifactPath, id: artifactId } = (await this.session.allocateOutputArtifact?.("bash")) ?? {};
+				setLinkPath(artifactPath);
 				const tailBuffer = new TailBuffer(DEFAULT_MAX_BYTES);
 				const wallTimeStart = performance.now();
 				try {
@@ -835,7 +836,7 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 						timeout: options.timeoutMs ?? 0,
 						signal: runSignal,
 						env: options.resolvedEnv,
-						artifactPath,
+						artifactPath: getLinkPath,
 						artifactId,
 						onChunk: chunk => {
 							tailBuffer.append(chunk);
@@ -844,6 +845,7 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 						},
 						onMinimizedSave: originalText => saveBashOriginalArtifact(this.session, originalText),
 					});
+					if (!result.artifactId) setLinkPath(undefined);
 					const wallTimeMs = performance.now() - wallTimeStart;
 					const finalResult = await this.#buildCompletedResult(result, options.timeoutSec, {
 						requestedTimeoutSec: options.requestedTimeoutSec,
@@ -865,6 +867,8 @@ export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSc
 					await reportProgress(finalText, { async: { state: "completed", jobId, type: "bash" } });
 					return finalText;
 				} catch (error) {
+					const linkPath = getLinkPath();
+					if (linkPath && !(await Bun.file(linkPath).exists())) setLinkPath(undefined);
 					const message = error instanceof Error ? error.message : String(error);
 					latestText = message;
 					completion.resolve({ kind: "failed", error });

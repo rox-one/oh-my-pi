@@ -334,6 +334,79 @@ describe("memories runtime", () => {
 		expect(spy.mock.calls[1]?.[2]?.reasoning).toBe(Effort.High);
 	});
 
+	test("clamps stage1 and phase2 reasoning effort against the model's supported range", async () => {
+		// Regression for #1480: memory pipeline hardcoded `Effort.Low`/`Effort.Medium`,
+		// which `requireSupportedEffort` rejects on models whose supported range starts
+		// above `low` (e.g. deepseek-v4-pro → [high, xhigh]). The fix routes both call
+		// sites through `clampThinkingLevelForModel`, lifting the requested effort to
+		// the model's floor instead of throwing.
+		const fx = await createFixture();
+		const constrainedModel: Model = {
+			...fx.model,
+			reasoning: true,
+			thinking: { mode: "effort", minLevel: Effort.High, maxLevel: Effort.XHigh },
+		};
+		fx.session.model = constrainedModel;
+		fx.modelRegistry.find = vi.fn(() => constrainedModel);
+		fx.modelRegistry.getAll = vi.fn(() => [constrainedModel]);
+
+		const rolloutPath = path.join(fx.sessionDir, "thread-constrained.jsonl");
+		const rolloutRows = [
+			{ type: "session", id: "thread-constrained", cwd: fx.agentDir },
+			{ type: "message", message: { role: "user", content: "summarize this rollout" } },
+		];
+		await fs.writeFile(rolloutPath, `${rolloutRows.map(row => JSON.stringify(row)).join("\n")}\n`);
+
+		const spy = vi
+			.spyOn(ai, "completeSimple")
+			.mockResolvedValueOnce({
+				stopReason: "end_turn",
+				content: [
+					{
+						type: "text",
+						text: JSON.stringify({
+							rollout_summary: "Rollout summary",
+							rollout_slug: "thread-constrained",
+							raw_memory: "Raw memory",
+						}),
+					},
+				],
+				usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2 },
+			} as any)
+			.mockResolvedValueOnce({
+				stopReason: "end_turn",
+				content: [
+					{
+						type: "text",
+						text: JSON.stringify({
+							memory_md: "# Memory\n\nBody",
+							memory_summary: "Summary",
+							skills: [],
+						}),
+					},
+				],
+			} as any);
+
+		startMemoryStartupTask({
+			session: fx.session,
+			settings: fx.settings,
+			modelRegistry: fx.modelRegistry,
+			agentDir: fx.agentDir,
+			taskDepth: 0,
+		});
+
+		const memoryRoot = getMemoryRoot(fx.agentDir, fx.session.sessionManager.getCwd());
+		await waitFor(async () => {
+			expect((await fs.readFile(path.join(memoryRoot, "MEMORY.md"), "utf8")).trim()).toBe("# Memory\n\nBody");
+		});
+
+		expect(spy).toHaveBeenCalledTimes(2);
+		// stage1 requested `low`, phase2 requested `medium`; both must clamp up to the
+		// model's floor (`high`) instead of being passed through and throwing.
+		expect(spy.mock.calls[0]?.[2]?.reasoning).toBe(Effort.High);
+		expect(spy.mock.calls[1]?.[2]?.reasoning).toBe(Effort.High);
+	});
+
 	test("phase2 sync prunes stale summaries and preserves raw memory ordering", async () => {
 		const fx = await createFixture();
 		vi.spyOn(ai, "completeSimple").mockResolvedValue({

@@ -1,15 +1,9 @@
 import * as path from "node:path";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage, UsageLimit, UsageReport } from "@oh-my-pi/pi-ai";
-import {
-	type Component,
-	type ComposerStyle,
-	claudeComposerStyle,
-	padding,
-	truncateToWidth,
-	visibleWidth,
-} from "@oh-my-pi/pi-tui";
-import { adjustHsv, formatNumber, getProjectDir } from "@oh-my-pi/pi-utils";
+import { type Component, truncateToWidth, visibleWidth } from "@oh-my-pi/pi-tui";
+import { getProjectDir } from "@oh-my-pi/pi-utils";
+import { $ } from "bun";
 import { settings } from "../../../config/settings";
 import type { AgentSession } from "../../../session/agent-session";
 import type { OAuthAccountIdentity } from "../../../session/auth-storage";
@@ -29,13 +23,13 @@ import {
 } from "../codex-reset-fireworks";
 import { canReuseCachedPr, createPrCacheContext, isSamePrCacheContext, type PrCacheContext } from "./git-utils";
 import { getPreset } from "./presets";
-import { renderSegment, type SegmentContext } from "./segments";
+import { formatCompactContextPercent, renderSegment, type SegmentContext } from "./segments";
 import { getSeparator } from "./separators";
 import type {
 	CollabStatus,
 	EffectiveStatusLineSettings,
-	StatusLineSegmentId,
 	StatusLineSegmentOptions,
+	StatusLineSegmentRef,
 	StatusLineSettings,
 } from "./types";
 
@@ -291,22 +285,32 @@ const EMPTY_MESSAGES: readonly AgentMessage[] = [];
 const STATUS_USAGE_START_DELAY_MS = 0;
 const STATUS_USAGE_REFRESH_TIMEOUT_MS = 2_000;
 
-function isContextSegment(segment: StatusLineSegmentId): boolean {
+function isContextSegment(segment: StatusLineSegmentRef): boolean {
 	return segment === "context_pct" || segment === "context_total";
 }
 
-function hasContextSegment(segments: readonly StatusLineSegmentId[]): boolean {
+function hasContextSegment(segments: readonly StatusLineSegmentRef[]): boolean {
 	return segments.includes("context_pct") || segments.includes("context_total");
 }
+function hasGitSegment(segments: readonly StatusLineSegmentId[]): boolean {
+	return segments.includes("git");
+}
 
-function hasNonContextSegment(segments: readonly StatusLineSegmentId[]): boolean {
+function hasPrSegment(segments: readonly StatusLineSegmentId[]): boolean {
+	return segments.includes("pr");
+}
+function hasGitBackedSegment(segments: readonly StatusLineSegmentId[]): boolean {
+	return hasGitSegment(segments) || hasPrSegment(segments);
+}
+
+function hasNonContextSegment(segments: readonly StatusLineSegmentRef[]): boolean {
 	for (const segment of segments) {
 		if (!isContextSegment(segment)) return true;
 	}
 	return false;
 }
 
-function removeContextSegments(parts: string[], segments: StatusLineSegmentId[]): void {
+function removeContextSegments(parts: string[], segments: StatusLineSegmentRef[]): void {
 	let writeIndex = 0;
 	for (let readIndex = 0; readIndex < segments.length; readIndex++) {
 		const segment = segments[readIndex];
@@ -322,18 +326,18 @@ function removeContextSegments(parts: string[], segments: StatusLineSegmentId[])
 function formatEmbeddedContextPercent(percent: number): string {
 	return `${percent > 0 && percent < 1 ? percent.toFixed(1) : Math.round(percent)}%`;
 }
-function hasGitSegment(segments: readonly StatusLineSegmentId[]): boolean {
+function hasGitSegment(segments: readonly StatusLineSegmentRef[]): boolean {
 	return segments.includes("git");
 }
 
-function hasPrSegment(segments: readonly StatusLineSegmentId[]): boolean {
+function hasPrSegment(segments: readonly StatusLineSegmentRef[]): boolean {
 	return segments.includes("pr");
 }
-function hasPathSegment(segments: readonly StatusLineSegmentId[]): boolean {
+function hasPathSegment(segments: readonly StatusLineSegmentRef[]): boolean {
 	return segments.includes("path");
 }
 
-function hasGitBackedSegment(segments: readonly StatusLineSegmentId[]): boolean {
+function hasGitBackedSegment(segments: readonly StatusLineSegmentRef[]): boolean {
 	return hasGitSegment(segments) || hasPrSegment(segments);
 }
 
@@ -383,6 +387,7 @@ export class StatusLineComponent implements Component {
 	#speculationBlinkOn = true;
 	#hookStatuses: Map<string, string> = new Map();
 	#subagentCount: number = 0;
+	#subagentCost: number = 0;
 	/**
 	 * Active-processing accounting for the `time_spent` segment, keyed per
 	 * {@link AgentSession} so the focus-controller mid-turn attach path
@@ -486,6 +491,15 @@ export class StatusLineComponent implements Component {
 			contextLine: settings.get("statusLine.contextLine"),
 		};
 	}
+	#gitEnabled(): boolean {
+		return settings.get("git.enabled");
+	}
+	#hasGitBackedSegment(): boolean {
+		const effectiveSettings = this.#resolveSettings();
+		return (
+			hasGitBackedSegment(effectiveSettings.leftSegments) || hasGitBackedSegment(effectiveSettings.rightSegments)
+		);
+	}
 
 	#gitEnabled(): boolean {
 		return settings.get("git.enabled");
@@ -561,6 +575,10 @@ export class StatusLineComponent implements Component {
 
 	setSubagentCount(count: number): void {
 		this.#subagentCount = count;
+	}
+
+	setSubagentCost(cost: number): void {
+		this.#subagentCost = cost;
 	}
 
 	/**
@@ -712,15 +730,17 @@ export class StatusLineComponent implements Component {
 			return;
 		}
 
-		const { effectiveGitCwd } = this.#resolveActiveRepoCache();
-		const repository = git.repo.resolveSync(effectiveGitCwd);
-		if (!repository) {
-			// There is no path to watch yet. Cache the negative result only for the
-			// fallback poll interval so a later `git init` becomes visible without
-			// generic invalidations or a render-path probe on every paint.
-			this.#gitWatcherUnavailable = true;
+		if (!this.#gitEnabled() || !this.#hasGitBackedSegment()) {
+			this.#invalidateGitCaches();
 			return;
 		}
+
+		const repository = git.repo.resolveSync(getProjectDir());
+		if (!repository) return;
+
+		const watchPath = git.repo.isReftableSync(repository)
+			? path.join(repository.gitDir, "reftable")
+			: repository.headPath;
 
 		// git swaps HEAD via `HEAD.lock` + atomic rename. That both unlinks the
 		// HEAD inode (freezing a file-bound `fs.watch` after the first switch —
@@ -847,38 +867,11 @@ export class StatusLineComponent implements Component {
 		this.#jjStatusLastFetch = 0;
 		this.#jjCacheGeneration++;
 	}
-
-	/**
-	 * Re-point the status line's VCS watcher and caches at a new cwd/repository.
-	 * Atomically retires the old watcher/listeners, invalidates VCS caches and
-	 * in-flight controllers, then runs watcher setup for the new cwd and requests
-	 * a repaint. Called by {@link InteractiveMode.applyCwdChange} after the
-	 * SessionManager's cwd has moved — the watcher ownership always follows the
-	 * effective cwd/repo, so a stale watcher for the previous repo can never
-	 * invalidate the new one. Generic repaints use {@link invalidate} and must
-	 * never retire the watcher or abort a live resolve.
-	 */
-	applyCwdChange(): void {
-		this.#retireGitWatcher();
-		this.invalidateGitCaches();
-		this.#setupGitWatcher();
-		this.#onBranchChange?.();
-	}
-
-	#resetJjRequests(): void {
-		this.#jjBranchActive?.controller.abort();
-		this.#jjBranchActive = undefined;
-		this.#jjStatusActive?.controller.abort();
-		this.#jjStatusActive = undefined;
-	}
-	#getCurrentBranch(effectiveGitCwd?: string): string | null {
+	#getCurrentBranch(): string | null {
 		if (!this.#gitEnabled()) return null;
 
-		const gitCwd = effectiveGitCwd ?? this.#resolveActiveRepoCache().effectiveGitCwd;
-		const fallbackCacheExpired =
-			this.#gitWatcherUnavailable &&
-			(this.#branchLastFetch === undefined || Date.now() - this.#branchLastFetch >= WATCHER_FAILURE_POLL_TTL_MS);
-		if (this.#cachedBranch !== undefined && this.#cachedBranchCwd === gitCwd && !fallbackCacheExpired) {
+		const cwd = getProjectDir();
+		if (this.#cachedBranch !== undefined && this.#cachedBranchCwd === cwd) {
 			return this.#cachedBranch;
 		}
 
@@ -978,14 +971,9 @@ export class StatusLineComponent implements Component {
 		return branch === this.#defaultBranch;
 	}
 
-	#getGitStatus(effectiveGitCwd?: string): { staged: number; unstaged: number; untracked: number } | null {
+	#getGitStatus(): { staged: number; unstaged: number; untracked: number } | null {
 		if (!this.#gitEnabled()) return null;
-
-		const gitCwd = effectiveGitCwd ?? this.#resolveActiveRepoCache().effectiveGitCwd;
-		if (this.#gitStatusInFlightCwd !== undefined) {
-			return this.#cachedGitStatusCwd === gitCwd ? this.#cachedGitStatus : null;
-		}
-		if (this.#cachedGitStatusCwd === gitCwd && Date.now() - this.#gitStatusLastFetch < 1000) {
+		if (this.#gitStatusInFlight || Date.now() - this.#gitStatusLastFetch < 1000) {
 			return this.#cachedGitStatus;
 		}
 
@@ -1014,102 +1002,10 @@ export class StatusLineComponent implements Component {
 		return this.#cachedGitStatusCwd === gitCwd ? this.#cachedGitStatus : null;
 	}
 
-	// Resolve (and cache per cwd) the jj workspace root, resetting both jj caches
-	// on a cwd change so a directory switch refetches label + status.
-	#jjRootFor(cwd: string): string | null {
-		if (this.#jjRoot === undefined || this.#jjRootCwd !== cwd) {
-			this.#jjRootCwd = cwd;
-			this.#jjRoot = jj.repo.rootSync(cwd);
-			this.#cachedJjBranch = null;
-			this.#jjBranchLastFetch = 0;
-			this.#cachedJjStatus = null;
-			this.#jjStatusLastFetch = 0;
-			this.#jjCacheGeneration++;
-		}
-		return this.#jjRoot;
-	}
-
-	// jj working-copy bookmark label (nearest bookmark, change-id fallback), shown
-	// in the `git` segment where git HEAD is detached/absent under jj. Throttled,
-	// cached, and repaints on resolve.
-	#getJjBranch(effectiveGitCwd?: string): string | null {
-		const cwd = effectiveGitCwd ?? this.#resolveActiveRepoCache().effectiveGitCwd;
-		const root = this.#jjRootFor(cwd);
-		if (!root) return null;
-		if (this.#jjBranchActive || Date.now() - this.#jjBranchLastFetch < JJ_REFRESH_TTL_MS) {
-			return this.#cachedJjBranch;
-		}
-		const request: JjResolveRequest = {
-			id: ++this.#jjResolveSeq,
-			controller: new AbortController(),
-		};
-		this.#jjBranchActive = request;
-		const generation = this.#jjCacheGeneration;
-		(async () => {
-			let next: string | null = null;
-			try {
-				next = await jj.workingCopy.label(root, {
-					signal: request.controller.signal,
-					timeoutMs: jj.JJ_COMMAND_TIMEOUT_MS,
-				});
-			} finally {
-				if (this.#jjBranchActive?.id === request.id) this.#jjBranchActive = undefined;
-				// Advance the throttle only if no reset raced this query; a reset
-				// leaves LastFetch at 0 so the current root refetches instead of
-				// being throttled on a superseded result.
-				if (this.#jjCacheGeneration === generation) this.#jjBranchLastFetch = Date.now();
-			}
-			// Drop a result whose caches were reset mid-flight — a repo switch OR a
-			// same-root HEAD/bookmark move — so a superseded label never lands in
-			// the live cache.
-			if (this.#jjCacheGeneration !== generation || this.#disposed) return;
-			const changed = next !== this.#cachedJjBranch;
-			this.#cachedJjBranch = next;
-			if (changed) this.#onBranchChange?.();
-		})();
-		return this.#cachedJjBranch;
-	}
-
-	// jj working-copy status counts (`@` vs its parent), used in place of git
-	// status in a jj repo where `git status` has no `.git` to read. Throttled,
-	// cached, and repaints on resolve like #getJjBranch.
-	#getJjStatus(effectiveGitCwd?: string): { staged: number; unstaged: number; untracked: number } | null {
-		const cwd = effectiveGitCwd ?? this.#resolveActiveRepoCache().effectiveGitCwd;
-		const root = this.#jjRootFor(cwd);
-		if (!root) return null;
-		if (this.#jjStatusActive || Date.now() - this.#jjStatusLastFetch < JJ_REFRESH_TTL_MS) {
-			return this.#cachedJjStatus;
-		}
-		const request: JjResolveRequest = {
-			id: ++this.#jjResolveSeq,
-			controller: new AbortController(),
-		};
-		this.#jjStatusActive = request;
-		const generation = this.#jjCacheGeneration;
-		(async () => {
-			let next: { staged: number; unstaged: number; untracked: number } | null = null;
-			try {
-				next = await jj.status.summary(root, {
-					signal: request.controller.signal,
-					timeoutMs: jj.JJ_COMMAND_TIMEOUT_MS,
-				});
-			} finally {
-				if (this.#jjStatusActive?.id === request.id) this.#jjStatusActive = undefined;
-				if (this.#jjCacheGeneration === generation) this.#jjStatusLastFetch = Date.now();
-			}
-			if (this.#jjCacheGeneration !== generation || this.#disposed) return;
-			const prev = this.#cachedJjStatus;
-			this.#cachedJjStatus = next;
-			if (JSON.stringify(prev) !== JSON.stringify(next)) this.#onBranchChange?.();
-		})();
-		return this.#cachedJjStatus;
-	}
-
-	#lookupPr(effectiveGitCwd?: string): { number: number; url: string } | null {
+	#lookupPr(): { number: number; url: string } | null {
 		if (!this.#gitEnabled()) return null;
 
-		const gitCwd = effectiveGitCwd ?? this.#resolveActiveRepoCache().effectiveGitCwd;
-		const branch = this.#getCurrentBranch(gitCwd);
+		const branch = this.#getCurrentBranch();
 		const currentContext = branch ? createPrCacheContext(branch, this.#cachedBranchRepoId ?? null) : null;
 
 		if (canReuseCachedPr(this.#cachedPr, this.#cachedPrContext, currentContext)) {
@@ -1655,10 +1551,9 @@ export class StatusLineComponent implements Component {
 	#buildSegmentContext(
 		width: number,
 		segmentOptions: StatusLineSettings["segmentOptions"],
-		includePath: boolean,
+		includeContext: boolean,
 		includeGit: boolean,
 		includePr: boolean,
-		previewTitle?: string,
 	): SegmentContext {
 		const state = this.session.state;
 
@@ -1697,31 +1592,10 @@ export class StatusLineComponent implements Component {
 			contextPercent = collabState.contextUsage.percent ?? contextPercent;
 		}
 
-		const shouldResolveActiveRepo = this.#gitEnabled() && (includePath || includeGit || includePr);
-		const projectDir = getProjectDir();
-		const activeRepoCache = shouldResolveActiveRepo
-			? this.#resolveActiveRepoCache()
-			: { projectDir, activeRepo: null, effectiveGitCwd: projectDir, worktree: null };
-		let gitBranch = includeGit || includePr ? this.#getCurrentBranch(activeRepoCache.effectiveGitCwd) : null;
-		// A jj repo has no git branch to read: git HEAD is detached (colocated) or
-		// absent. A pending reftable resolve owns this cwd as an explicit Git repo,
-		// so it must not be mistaken for an absent Git checkout and fall through to
-		// an ancestor jj workspace.
-		const gitHeadResolvePending = this.#branchResolveActive?.cwd === activeRepoCache.effectiveGitCwd;
-		const gitHeadIsJjLike =
-			!this.#cachedBranchHasGitRepository &&
-			!gitHeadResolvePending &&
-			(gitBranch === "detached" || gitBranch === null);
-		if (includeGit && gitHeadIsJjLike) {
-			gitBranch = this.#getJjBranch(activeRepoCache.effectiveGitCwd) ?? gitBranch;
-		}
-		const gitStatus = includeGit
-			? ((gitHeadIsJjLike ? this.#getJjStatus(activeRepoCache.effectiveGitCwd) : null) ??
-				this.#getGitStatus(activeRepoCache.effectiveGitCwd))
-			: null;
-		const gitPr = includePr ? this.#lookupPr(activeRepoCache.effectiveGitCwd) : null;
-		const compactionSpeculation = this.session.compactionSpeculation ?? "idle";
-		this.#syncSpeculationBlink(compactionSpeculation);
+		const gitBranch = includeGit || includePr ? this.#getCurrentBranch() : null;
+		const gitStatus = includeGit ? this.#getGitStatus() : null;
+		const gitPr = includePr ? this.#lookupPr() : null;
+
 		return {
 			session: this.session,
 			focusedAgentId: this.#focusedAgentId,
@@ -1748,6 +1622,7 @@ export class StatusLineComponent implements Component {
 			compactionSpeculation,
 			speculationBlinkOn: this.#speculationBlinkOn,
 			subagentCount: this.#subagentCount,
+			subagentCost: this.#subagentCost,
 			activeMs: this.getActiveMs(),
 			git: {
 				branch: gitBranch,
@@ -1825,9 +1700,8 @@ export class StatusLineComponent implements Component {
 		previewTitle?: string,
 	): string {
 		const effectiveSettings = this.#resolveSettings();
-		const plain = layout !== "box";
-		const includePath =
-			hasPathSegment(effectiveSettings.leftSegments) || hasPathSegment(effectiveSettings.rightSegments);
+		const includeContext =
+			hasContextSegment(effectiveSettings.leftSegments) || hasContextSegment(effectiveSettings.rightSegments);
 		const gitEnabled = this.#gitEnabled();
 		const includeGit =
 			gitEnabled &&
@@ -1837,14 +1711,11 @@ export class StatusLineComponent implements Component {
 		const ctx = this.#buildSegmentContext(
 			width,
 			effectiveSettings.segmentOptions,
-			includePath,
+			includeContext,
 			includeGit,
 			includePr,
-			previewTitle,
 		);
-		const separatorDef = plain
-			? { left: "·", right: "·" }
-			: getSeparator(effectiveSettings.separator ?? "powerline-thin", theme);
+		const separatorDef = getSeparator(effectiveSettings.separator ?? "powerline-thin", theme);
 
 		// `transparent` reuses the empty-string sentinel (`\x1b[49m`) so the bar
 		// inherits the terminal's default background, matching custom themes that
@@ -1864,7 +1735,7 @@ export class StatusLineComponent implements Component {
 
 		// Collect visible segment contents
 		const leftParts: string[] = [];
-		const leftSegIds: StatusLineSegmentId[] = [];
+		const leftSegIds: StatusLineSegmentRef[] = [];
 		const leftSegmentIds = layout === "plain-right" ? [] : effectiveSettings.leftSegments;
 		for (const segId of leftSegmentIds) {
 			if (subagentBadge && segId === "subagents") continue;
@@ -1876,7 +1747,7 @@ export class StatusLineComponent implements Component {
 		}
 
 		const rightParts: string[] = [];
-		const rightSegIds: StatusLineSegmentId[] = [];
+		const rightSegIds: StatusLineSegmentRef[] = [];
 		const rightSegmentIds = layout === "plain-left" ? [] : effectiveSettings.rightSegments;
 		for (const segId of rightSegmentIds) {
 			if (subagentBadge && segId === "subagents") continue;
@@ -1895,6 +1766,10 @@ export class StatusLineComponent implements Component {
 			ctx.contextWindow > 0 &&
 			(hasContextSegment(leftSegIds) || hasContextSegment(rightSegIds)) &&
 			(hasNonContextSegment(leftSegIds) || hasNonContextSegment(rightSegIds));
+		const embedCompactContext =
+			embedContext &&
+			ctx.options.context_pct?.compact === true &&
+			(leftSegIds.includes("context_pct") || rightSegIds.includes("context_pct"));
 		if (embedContext) {
 			removeContextSegments(leftParts, leftSegIds);
 			removeContextSegments(rightParts, rightSegIds);
@@ -2043,7 +1918,11 @@ export class StatusLineComponent implements Component {
 		// `session_name`, emptying the default preset's right group) the gauge
 		// runs to the border edge instead of disappearing, so embedded context
 		// labels don't fall back to a context chip until the session is titled.
-		return leftGroup + this.#buildContextGaugeFill(gapWidth, ctx, effectiveSettings, embedContext) + rightGroup;
+		return (
+			leftGroup +
+			this.#buildContextGaugeFill(gapWidth, ctx, effectiveSettings, embedContext, embedCompactContext) +
+			rightGroup
+		);
 	}
 
 	/**
@@ -2061,6 +1940,7 @@ export class StatusLineComponent implements Component {
 		ctx: SegmentContext,
 		effectiveSettings: EffectiveStatusLineSettings,
 		embedContext: boolean,
+		embedCompactContext: boolean,
 	): string {
 		const sessionName =
 			effectiveSettings.sessionAccent !== false ? this.session.sessionManager?.getSessionName() : undefined;
@@ -2086,18 +1966,25 @@ export class StatusLineComponent implements Component {
 		// past the window label — `──200K─120%` with the percent in error color.
 		const percentOverflow = pct > 100;
 		if (embedContext) {
-			const candidatePercent = formatEmbeddedContextPercent(percentOverflow ? pct : clampedPct);
-			const candidateWindow = formatNumber(ctx.contextWindow);
-			if (gapWidth >= candidatePercent.length + candidateWindow.length + 4) {
+			const candidatePercent = embedCompactContext
+				? `ctx:${formatCompactContextPercent(percentOverflow ? pct : clampedPct)}`
+				: formatEmbeddedContextPercent(percentOverflow ? pct : clampedPct);
+			const candidateWindow = embedCompactContext ? "" : formatNumber(ctx.contextWindow);
+			const labelPadding = embedCompactContext ? 2 : candidateWindow.length + 4;
+			if (gapWidth >= candidatePercent.length + labelPadding) {
 				percentLabel = candidatePercent;
-				windowLabel = candidateWindow;
-				if (percentOverflow) {
-					percentStart = gapWidth - percentLabel.length;
-					windowStart = percentStart - 1 - windowLabel.length;
+				if (embedCompactContext) {
+					if (percentOverflow) percentStart = gapWidth - percentLabel.length;
 				} else {
-					windowStart = gapWidth - windowLabel.length - 1;
+					windowLabel = candidateWindow;
+					if (percentOverflow) {
+						percentStart = gapWidth - percentLabel.length;
+						windowStart = percentStart - 1 - windowLabel.length;
+					} else {
+						windowStart = gapWidth - windowLabel.length - 1;
+					}
+					scaleWidth = windowStart;
 				}
-				scaleWidth = windowStart;
 			}
 		}
 
@@ -2142,6 +2029,14 @@ export class StatusLineComponent implements Component {
 					percentStart = right;
 					break;
 				}
+			}
+			// Every candidate slot collides with a boundary marker (narrow gauge,
+			// marker sits in the only legal range). The context percentage is the
+			// primary readout, so keep it visible and let it overwrite the marker
+			// cell — the render loop already draws the percent label ahead of the
+			// speculation/threshold glyphs — rather than showing no percentage.
+			if (percentStart < 0 && maxStart >= 1) {
+				percentStart = preferredStart;
 			}
 		}
 
@@ -2205,38 +2100,6 @@ export class StatusLineComponent implements Component {
 		return {
 			content,
 			width: visibleWidth(content),
-			revision: this.#renderRevision,
-		};
-	}
-	/**
-	 * Standalone bar placement derived from the composer style. `bottomBar`
-	 * `"full"` renders both groups on the bottom bar (pi/borderless/field/rail);
-	 * `"left"` renders just the left group there — the right group attaches to
-	 * the editor's top rule via {@link getStandaloneTopBorder} (claude/rule);
-	 * `"none"` returns the bar to the box composer's embedded top border.
-	 * `bottomBarGap` inserts a blank spacer row above the bar for styles whose
-	 * editor has no bottom chrome.
-	 */
-	setComposerStyle(style: Pick<ComposerStyle, "bottomBar" | "bottomBarGap">): void {
-		this.#standalone = style.bottomBar === "none" ? false : style.bottomBar === "left" ? "left-only" : "full";
-		this.#standaloneGap = style.bottomBarGap;
-	}
-
-	/** While true, the standalone bar yields its row to the editor's autocomplete menu. */
-	setAutocompleteActiveProbe(probe: (() => boolean) | undefined): void {
-		this.#autocompleteActiveProbe = probe;
-	}
-
-	/** Plain right-group content for the claude composer's top rule. */
-	getStandaloneTopBorder(width: number, previewTitle?: string): { content: string; width: number; revision: number } {
-		let content = this.#buildStatusLine(width, "plain-right", previewTitle);
-		if (this.#focusedAgentId && content) {
-			content = `\x1b[2m${content.replaceAll("\x1b[0m", "\x1b[0m\x1b[2m")}\x1b[22m`;
-		}
-		return {
-			content,
-			width: visibleWidth(content),
-			revision: this.#renderRevision,
 		};
 	}
 

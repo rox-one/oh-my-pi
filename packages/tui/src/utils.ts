@@ -15,6 +15,8 @@ export { Ellipsis } from "@oh-my-pi/pi-natives";
 export { DEFAULT_TAB_WIDTH } from "@oh-my-pi/pi-utils";
 
 export type HangulCompatibilityJamoWidth = "platform" | "unicode" | 1 | 2;
+/** Ellipsis selector accepted by {@link truncateToWidth}. */
+export type TruncateEllipsisKind = Ellipsis | string | null;
 
 let hangulCompatibilityJamoWidth: HangulCompatibilityJamoWidth = "platform";
 
@@ -90,6 +92,44 @@ export function resetHangulCompatibilityJamoWidthForTests(): void {
 	nativeSetHangulCompatJamoWidthOverride(0);
 }
 
+/**
+ * Glyphs that Warp's terminal renders at 1 cell but `Bun.stringWidth` (under
+ * {@link STRING_WIDTH_OPTS}) reports wider. These appear on the default editor
+ * top-border status line; without correction the renderer treats the row as
+ * over-wide and truncates the trailing fill (and the right corner) before
+ * Warp ever sees it. See https://github.com/can1357/oh-my-pi/issues/3885.
+ *
+ * The override is TS-only: native `truncateToWidth` / `sliceWithWidth` /
+ * `wrapTextWithAnsi` keep their UAX#11 view of these glyphs, since they are
+ * only ever measured (not cut) on the top-border path the bug actually hit.
+ */
+const WARP_NARROW_STATUS_GLYPHS: readonly string[] = Object.freeze([
+	"\u{2B22}", // ⬢ BLACK HEXAGON
+	"\u{25D5}", // ◕ CIRCLE WITH ALL BUT UPPER LEFT QUADRANT BLACK
+	"\u{2442}", // ⑂ OCR BRANCH BANK IDENTIFICATION
+	"\u{1F4BE}", // 💾 FLOPPY DISK
+	"\u{25EB}", // ◫ WHITE SQUARE WITH VERTICAL BISECTING LINE
+	"\u{27F2}", // ⟲ ANTICLOCKWISE GAPPED CIRCLE ARROW
+	"\u{23F1}", // ⏱ STOPWATCH
+]);
+
+let warpNarrowStatusGlyphsActive = false;
+
+/** Toggle the Warp narrow-glyph width correction. Returns `true` when state changed. */
+export function setWarpNarrowStatusGlyphsActive(active: boolean): boolean {
+	const changed = warpNarrowStatusGlyphsActive !== active;
+	warpNarrowStatusGlyphsActive = active;
+	return changed;
+}
+
+export function getWarpNarrowStatusGlyphsActive(): boolean {
+	return warpNarrowStatusGlyphsActive;
+}
+
+export function resetWarpNarrowStatusGlyphsForTests(): void {
+	warpNarrowStatusGlyphsActive = false;
+}
+
 export type TextSizingScale = 1 | 2 | 3;
 export type TextSizingVerticalAlign = "top" | "bottom" | "center";
 export type TextSizingHorizontalAlign = "left" | "right" | "center";
@@ -154,10 +194,19 @@ export function sliceWithWidth(line: string, startCol: number, length: number, s
 	return nativeSliceWithWidth(line, startCol, length, strict ?? null, DEFAULT_TAB_WIDTH);
 }
 
+function normalizeTruncateEllipsisKind(ellipsisKind: TruncateEllipsisKind | undefined): Ellipsis {
+	if (ellipsisKind === "" || ellipsisKind === "omit") return Ellipsis.Omit;
+	if (ellipsisKind === "..." || ellipsisKind === "ascii") return Ellipsis.Ascii;
+	if (ellipsisKind === null || ellipsisKind === undefined || typeof ellipsisKind === "string") {
+		return Ellipsis.Unicode;
+	}
+	return ellipsisKind;
+}
+
 export function truncateToWidth(
 	text: string,
 	maxWidth: number,
-	ellipsisKind?: Ellipsis | null | "",
+	ellipsisKind?: TruncateEllipsisKind,
 	pad?: boolean | null,
 ): string {
 	maxWidth = Math.max(0, maxWidth | 0);
@@ -169,7 +218,7 @@ export function truncateToWidth(
 	return nativeTruncateToWidth(
 		text,
 		maxWidth,
-		(typeof ellipsisKind === "string" ? Ellipsis.Omit : ellipsisKind) ?? Ellipsis.Unicode,
+		normalizeTruncateEllipsisKind(ellipsisKind),
 		pad ?? false,
 		DEFAULT_TAB_WIDTH,
 	);
@@ -287,17 +336,25 @@ function correctHangulCompatibilityJamoWidth(
 	return target === 1 ? width - compatibilityJamoCount : width - fillerCount * HANGUL_COMPAT_JAMO_BUN_WIDTH;
 }
 
-// Terminal redraws re-measure the same visible lines every frame, usually as
-// the same string objects (JSC caches their hashes, so repeat lookups are
-// O(1) — cheaper than even the ASCII fast scan). Strings longer than the
-// length gate skip the cache entirely: hashing them costs as much as measuring
-// them, and retaining them would pin large render buffers. Worst-case
-// retention is MAX * MAX_LEN UTF-16 units (~2 MiB); cleared when the width
-// configuration epoch changes.
-const VISIBLE_WIDTH_CACHE_MAX = 2048;
-const VISIBLE_WIDTH_CACHE_MAX_LEN = 512;
-const visibleWidthCache = new Map<string, number>();
-let visibleWidthCacheEpoch = widthConfigEpoch;
+// Cost (cells to subtract) per occurrence of each Warp-narrow glyph: Bun width
+// minus 1. Computed once at module init; glyphs already 1 cell drop out so
+// `correctWarpNarrowStatusGlyphWidth` only iterates the genuinely wider ones.
+const WARP_NARROW_STATUS_GLYPH_COSTS: ReadonlyArray<readonly [string, number]> = Object.freeze(
+	WARP_NARROW_STATUS_GLYPHS.map(glyph => [glyph, Bun.stringWidth(glyph, STRING_WIDTH_OPTS) - 1] as const).filter(
+		([, cost]) => cost > 0,
+	),
+);
+
+function correctWarpNarrowStatusGlyphWidth(width: number, str: string): number {
+	if (!warpNarrowStatusGlyphsActive || WARP_NARROW_STATUS_GLYPH_COSTS.length === 0) return width;
+	let delta = 0;
+	for (const [glyph, cost] of WARP_NARROW_STATUS_GLYPH_COSTS) {
+		for (let index = str.indexOf(glyph); index !== -1; index = str.indexOf(glyph, index + glyph.length)) {
+			delta += cost;
+		}
+	}
+	return delta === 0 ? width : Math.max(0, width - delta);
+}
 
 /**
  * Visible width of a string in terminal columns, excluding ANSI/OSC escapes.
@@ -315,18 +372,8 @@ export function visibleWidth(str: string): number {
 			visibleWidthCache.clear();
 			visibleWidthCacheEpoch = widthConfigEpoch;
 		}
-		const cached = visibleWidthCache.get(str);
-		if (cached !== undefined) return cached;
-	}
-
-	// This regex compiles to a native ASCII scan, cheaper than Bun's width
-	// scanner for the overwhelmingly common source-code path.
-	if (PRINTABLE_ASCII_REGEX.test(str)) {
-		if (cacheable) {
-			if (visibleWidthCache.size >= VISIBLE_WIDTH_CACHE_MAX) visibleWidthCache.clear();
-			visibleWidthCache.set(str, str.length);
-		}
-		return str.length;
+		if (tabCount > 0) width += tabCount * DEFAULT_TAB_WIDTH;
+		return correctWarpNarrowStatusGlyphWidth(correctHangulCompatibilityJamoWidth(width, str), str);
 	}
 
 	let tabCount = 0;
@@ -368,39 +415,7 @@ export function visibleWidth(str: string): number {
 		}
 	}
 
-	width = correctHangulCompatibilityJamoWidth(width, compatibilityJamoCount, fillerCount);
-	if (cacheable) {
-		if (visibleWidthCache.size >= VISIBLE_WIDTH_CACHE_MAX) visibleWidthCache.clear();
-		visibleWidthCache.set(str, width);
-	}
-	return width;
-}
-
-/**
- * Scaled spans must bypass wrapping/padding and, when scaled up, reserve the
- * terminal rows their multicell glyphs flow into.
- */
-export function isOsc66Line(line: string): boolean {
-	return line.includes(OSC66_PREFIX);
-}
-
-/**
- * Largest `s=` scale among the OSC 66 spans in a line (1 when none is scaled).
- * A scale-`s` heading occupies `s` terminal rows, so the `s - 1` blank rows
- * beneath it are the glyph's lower half and must never be erased or overdrawn.
- */
-export function osc66MaxScale(line: string): number {
-	if (!line.includes(OSC66_PREFIX)) return 1;
-	let max = 1;
-	OSC66_SPAN_REGEX.lastIndex = 0;
-	for (let m = OSC66_SPAN_REGEX.exec(line); m !== null; m = OSC66_SPAN_REGEX.exec(line)) {
-		for (const part of m[1].split(":")) {
-			if (part.indexOf("=") !== 1 || part[0] !== "s") continue;
-			const value = Number.parseInt(part.slice(2), 10);
-			if (Number.isFinite(value) && value > max && value <= 7) max = value;
-		}
-	}
-	return max;
+	return correctWarpNarrowStatusGlyphWidth(correctHangulCompatibilityJamoWidth(width, str), str);
 }
 
 const THAI_LAO_AM_GLOBAL_REGEX = /[\u0e33\u0eb3]/g;

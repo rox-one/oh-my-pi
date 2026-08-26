@@ -410,6 +410,13 @@ export class AssistantMessageComponent extends Container {
 	isTranscriptBlockFinalized(): boolean {
 		return this.#transcriptBlockFinalized;
 	}
+	/** Keep completed assistant prose represented when active-block overflow forces emergency rendering. */
+	isTranscriptBlockEmergencyVisible(): boolean {
+		if (!this.#transcriptBlockFinalized || !this.#lastMessage) return false;
+		return this.#lastMessage.content.some(
+			content => content.type === "text" && canonicalizeMessage(content.text).length > 0,
+		);
+	}
 
 	getTranscriptBlockVersion(): number {
 		return this.#blockVersion;

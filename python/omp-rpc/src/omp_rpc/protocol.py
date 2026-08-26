@@ -18,6 +18,26 @@ ThinkingLevel: TypeAlias = Literal[
 StreamingBehavior: TypeAlias = Literal["steer", "followUp"]
 SteeringMode: TypeAlias = Literal["all", "one-at-a-time"]
 InterruptMode: TypeAlias = Literal["immediate", "wait"]
+SessionActivityPhase: TypeAlias = Literal["provider", "maintenance", "idle"]
+SessionCatalogScope: TypeAlias = Literal["cwd", "all"]
+AdvisorRuntimeStatus: TypeAlias = Literal[
+    "running", "paused", "quota_exhausted", "error", "no_model"
+]
+RpcOperationCommand: TypeAlias = Literal["prompt", "abort_and_prompt"]
+RpcOperationCancellationReason: TypeAlias = Literal[
+    "user", "replaced", "session_transition", "client_disconnected"
+]
+RpcOperationCancellationCode: TypeAlias = Literal[
+    "cancelled_by_client",
+    "replaced_by_prompt",
+    "session_changed",
+    "client_disconnected",
+]
+RpcCommandScope: TypeAlias = str
+RpcCommandExecution: TypeAlias = str
+RpcCommandAvailability: TypeAlias = str
+RpcCommandConcurrencyClass: TypeAlias = str
+RpcCommandConfirmation: TypeAlias = Literal["none", "required"]
 StopReason: TypeAlias = Literal["stop", "length", "toolUse", "error", "aborted"]
 NotifyType: TypeAlias = Literal["info", "warning", "error"]
 WidgetPlacement: TypeAlias = Literal["aboveEditor", "belowEditor"]
@@ -72,6 +92,12 @@ _EFFORT_VALUES: Final[frozenset[str]] = frozenset(
 _THINKING_LEVEL_VALUES: Final[frozenset[str]] = _EFFORT_VALUES | frozenset({"off"})
 _STEERING_MODE_VALUES: Final[frozenset[str]] = frozenset({"all", "one-at-a-time"})
 _INTERRUPT_MODE_VALUES: Final[frozenset[str]] = frozenset({"immediate", "wait"})
+_SESSION_ACTIVITY_PHASE_VALUES: Final[frozenset[str]] = frozenset(
+    {"provider", "maintenance", "idle"}
+)
+_ADVISOR_RUNTIME_STATUS_VALUES: Final[frozenset[str]] = frozenset(
+    {"running", "paused", "quota_exhausted", "error", "no_model"}
+)
 _STOP_REASON_VALUES: Final[frozenset[str]] = frozenset(
     {"stop", "length", "toolUse", "error", "aborted"}
 )
@@ -829,10 +855,24 @@ class ContextUsage:
 
 
 @dataclass(slots=True, frozen=True)
+class AdvisorRuntimeState:
+    name: str
+    status: AdvisorRuntimeStatus
+
+
+@dataclass(slots=True, frozen=True)
+class AdvisorState:
+    configured: bool
+    active: bool
+    advisors: tuple[AdvisorRuntimeState, ...]
+
+
+@dataclass(slots=True, frozen=True)
 class SessionState:
     model: ModelInfo | None
     thinking_level: ThinkingLevel | None
     is_streaming: bool
+    activity_phase: SessionActivityPhase
     is_compacting: bool
     steering_mode: SteeringMode
     follow_up_mode: SteeringMode
@@ -850,6 +890,7 @@ class SessionState:
     fast_mode_active: bool = False
     tokens_per_second: float | None = None
     context_usage: ContextUsage | None = None
+    advisor: AdvisorState | None = None
 
 
 @dataclass(slots=True, frozen=True)
@@ -934,12 +975,229 @@ class SessionStats:
 
 
 @dataclass(slots=True, frozen=True)
+class SessionCatalogEntry:
+    path: str
+    id: str
+    cwd: str
+    created_at: str
+    updated_at: str
+    message_count: int
+    size: int
+    title: str | None = None
+    parent_session_path: str | None = None
+    status: str | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class SessionCatalogPage:
+    sessions: tuple[SessionCatalogEntry, ...]
+    total: int
+    next_cursor: str | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class SessionWorkspace:
+    cwd: str
+    directories: tuple[str, ...]
+
+
+@dataclass(slots=True, frozen=True)
+class SessionInfoResult:
+    session: SessionCatalogEntry
+    workspace: SessionWorkspace
+    active: bool
+
+
+@dataclass(slots=True, frozen=True)
+class SessionWorkspaceRoot:
+    cwd: str
+    count: int
+    latest: str
+    exists: bool
+
+
+@dataclass(slots=True, frozen=True)
+class ResumeSessionResult:
+    cancelled: bool
+    session_file: str | None
+    cwd: str
+    cwd_changed: bool
+
+
+@dataclass(slots=True, frozen=True)
+class ForkSessionResult:
+    cancelled: bool
+    session_file: str | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class RenameSessionResult:
+    renamed: bool
+    active: bool
+
+
+@dataclass(slots=True, frozen=True)
+class DeleteSessionError:
+    code: Literal["delete_failed"]
+    message: str
+
+
+@dataclass(slots=True, frozen=True)
+class DeleteSessionResult:
+    deleted: bool
+    cancelled: bool
+    was_active: bool
+    new_session_started: bool
+    delete_error: DeleteSessionError | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class SettingsChange:
+    path: str
+    value: JsonValue
+
+
+@dataclass(slots=True, frozen=True)
+class SettingSnapshotEntry:
+    path: str
+    type: str
+    default: JsonValue | None
+    value: JsonValue | None
+    redacted: bool
+    configured: bool | None
+    values: tuple[str, ...] | None
+    description: str | None
+    ui: JsonObject | None
+
+
+@dataclass(slots=True, frozen=True)
+class SettingsTabSnapshot:
+    id: str
+    label: str
+    icon: str
+    groups: tuple[str, ...]
+
+
+@dataclass(slots=True, frozen=True)
+class SettingsSnapshot:
+    tabs: tuple[SettingsTabSnapshot, ...]
+    settings: tuple[SettingSnapshotEntry, ...]
+
+
+@dataclass(slots=True, frozen=True)
+class SettingsUpdateEvent:
+    type: Literal["settings_update"] = "settings_update"
+
+
+@dataclass(slots=True, frozen=True)
+class RpcCapabilityDisabledReason:
+    code: str
+    message: str
+
+
+@dataclass(slots=True, frozen=True)
+class RpcCommandCapability:
+    id: str
+    name: str
+    version: int
+    scope: RpcCommandScope
+    execution: RpcCommandExecution
+    availability: RpcCommandAvailability
+    confirmation: RpcCommandConfirmation
+    required_features: tuple[str, ...]
+    input_schema: JsonObject | None = None
+    output_schema: JsonObject | None = None
+    concurrency_class: RpcCommandConcurrencyClass | None = None
+    disabled_reason: RpcCapabilityDisabledReason | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class RpcCapabilityManifest:
+    application_api_version: int
+    commands: tuple[RpcCommandCapability, ...]
+    events: tuple[str, ...]
+    extension_ui_methods: tuple[str, ...]
+    host_protocols: tuple[str, ...]
+
+
+@dataclass(slots=True, frozen=True)
 class ReadyEvent:
     protocol_version: int | None = None
     supported_protocol_versions: tuple[int, ...] | None = None
     max_frame_bytes: int | None = None
     max_reassembled_frame_bytes: int | None = None
+    capabilities: RpcCapabilityManifest | None = None
     type: Literal["ready"] = "ready"
+
+
+@dataclass(slots=True, frozen=True)
+class OperationStartedEvent:
+    operation_id: str
+    command: RpcOperationCommand
+    started_at: float
+    request_id: str | None = None
+    type: Literal["operation_started"] = "operation_started"
+
+
+@dataclass(slots=True, frozen=True)
+class OperationCompletedEvent:
+    operation_id: str
+    command: RpcOperationCommand
+    agent_invoked: bool
+    settled_at: float
+    request_id: str | None = None
+    type: Literal["operation_completed"] = "operation_completed"
+
+
+@dataclass(slots=True, frozen=True)
+class OperationFailedEvent:
+    operation_id: str
+    command: RpcOperationCommand
+    error: str
+    settled_at: float
+    request_id: str | None = None
+    code: str | None = None
+    type: Literal["operation_failed"] = "operation_failed"
+
+
+@dataclass(slots=True, frozen=True)
+class OperationCancelledEvent:
+    operation_id: str
+    command: RpcOperationCommand
+    reason: RpcOperationCancellationReason
+    code: RpcOperationCancellationCode
+    settled_at: float
+    request_id: str | None = None
+    type: Literal["operation_cancelled"] = "operation_cancelled"
+
+
+RpcOperationTerminalEvent: TypeAlias = (
+    OperationCompletedEvent | OperationFailedEvent | OperationCancelledEvent
+)
+RpcOperationEvent: TypeAlias = OperationStartedEvent | RpcOperationTerminalEvent
+
+
+@dataclass(slots=True, frozen=True)
+class ActiveOperation:
+    operation_id: str
+    command: RpcOperationCommand
+    status: Literal["accepted", "started"]
+    accepted_at: float
+    request_id: str | None = None
+    started_at: float | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class OperationsSnapshot:
+    active: tuple[ActiveOperation, ...]
+    recent: tuple[RpcOperationTerminalEvent, ...]
+
+
+@dataclass(slots=True, frozen=True)
+class CancelOperationResult:
+    operation_id: str
+    status: Literal["cancelled", "completed", "failed", "not_found"]
+    terminal: RpcOperationTerminalEvent | None = None
 
 
 @dataclass(slots=True, frozen=True)
@@ -1166,8 +1424,10 @@ RpcAgentEvent: TypeAlias = (
 
 RpcNotification: TypeAlias = (
     ReadyEvent
+    | RpcOperationEvent
     | ExtensionUiRequest
     | ExtensionError
+    | SettingsUpdateEvent
     | RpcAgentEvent
     | UnknownNotification
 )
@@ -1378,6 +1638,51 @@ def parse_todo_phases(payload: JsonValue | None) -> tuple[TodoPhase, ...]:
     return tuple(parse_todo_phase(cast(JsonObject, item)) for item in payload)
 
 
+def parse_advisor_state(payload: object) -> AdvisorState | None:
+    if not isinstance(payload, dict):
+        return None
+    configured = payload.get("configured")
+    active = payload.get("active")
+    raw_advisors = payload.get("advisors")
+    if (
+        not isinstance(configured, bool)
+        or not isinstance(active, bool)
+        or not isinstance(raw_advisors, list)
+    ):
+        return None
+    advisors: list[AdvisorRuntimeState] = []
+    for item in raw_advisors:
+        if not isinstance(item, dict):
+            return None
+        name = item.get("name")
+        status = item.get("status")
+        if (
+            not isinstance(name, str)
+            or not isinstance(status, str)
+            or status not in _ADVISOR_RUNTIME_STATUS_VALUES
+        ):
+            return None
+        advisors.append(
+            AdvisorRuntimeState(name=name, status=cast(AdvisorRuntimeStatus, status))
+        )
+    return AdvisorState(configured=configured, active=active, advisors=tuple(advisors))
+
+
+def _parse_session_activity_phase(payload: JsonObject) -> SessionActivityPhase:
+    if "activityPhase" not in payload:
+        # Legacy isStreaming conflates provider work with prompt settlement.
+        # Preserve terminal idle, but never claim provider activity without the
+        # authoritative field.
+        return "maintenance" if bool(payload.get("isStreaming", False)) else "idle"
+    value = payload["activityPhase"]
+    if isinstance(value, str) and value in _SESSION_ACTIVITY_PHASE_VALUES:
+        return cast(SessionActivityPhase, value)
+    # Present null, invalid values, and future phases are conservatively treated
+    # as non-idle maintenance so an additive or malformed server response cannot
+    # make an older client report terminal idle.
+    return "maintenance"
+
+
 def parse_session_state(payload: JsonObject) -> SessionState:
     dump_tools = tuple(
         parse_tool_descriptor(_clone_json_object(item, field="dumpTools[]"))
@@ -1394,6 +1699,7 @@ def parse_session_state(payload: JsonObject) -> SessionState:
             ),
         ),
         is_streaming=bool(payload.get("isStreaming", False)),
+        activity_phase=_parse_session_activity_phase(payload),
         is_compacting=bool(payload.get("isCompacting", False)),
         steering_mode=cast(
             SteeringMode,
@@ -1438,6 +1744,7 @@ def parse_session_state(payload: JsonObject) -> SessionState:
                 payload.get("contextUsage"), field="sessionState.contextUsage"
             )
         ),
+        advisor=parse_advisor_state(payload.get("advisor")),
     )
 
 
@@ -1459,6 +1766,140 @@ def parse_fast_mode_result(payload: JsonObject) -> FastModeResult:
     return FastModeResult(
         enabled=_require_bool(payload, "enabled"),
         active=_require_bool(payload, "active"),
+    )
+
+
+def parse_settings_snapshot(payload: JsonObject) -> SettingsSnapshot:
+    raw_tabs = payload.get("tabs")
+    raw_settings = payload.get("settings")
+    if not isinstance(raw_tabs, list):
+        raise ValueError("settings.tabs must be a list")
+    if not isinstance(raw_settings, list):
+        raise ValueError("settings.settings must be a list")
+
+    tabs: list[SettingsTabSnapshot] = []
+    for index, raw_tab in enumerate(raw_tabs):
+        tab = _clone_json_object(raw_tab, field=f"settings.tabs[{index}]")
+        tabs.append(
+            SettingsTabSnapshot(
+                id=_require_str(tab, "id"),
+                label=_require_str(tab, "label"),
+                icon=_require_str(tab, "icon"),
+                groups=_optional_str_list(tab, "groups") or (),
+            )
+        )
+
+    entries: list[SettingSnapshotEntry] = []
+    for index, raw_entry in enumerate(raw_settings):
+        entry = _clone_json_object(raw_entry, field=f"settings.settings[{index}]")
+        raw_values = entry.get("values")
+        values = None
+        if raw_values is not None:
+            if not isinstance(raw_values, list) or any(
+                not isinstance(item, str) for item in raw_values
+            ):
+                raise ValueError(f"settings.settings[{index}].values must be strings")
+            values = tuple(raw_values)
+        configured = entry.get("configured")
+        if configured is not None and not isinstance(configured, bool):
+            raise ValueError(f"settings.settings[{index}].configured must be a boolean")
+        entries.append(
+            SettingSnapshotEntry(
+                path=_require_str(entry, "path"),
+                type=_require_str(entry, "type"),
+                default=cast(JsonValue | None, entry.get("default")),
+                value=cast(JsonValue | None, entry.get("value")),
+                redacted=entry.get("redacted") is True,
+                configured=cast(bool | None, configured),
+                values=values,
+                description=_optional_str(entry, "description"),
+                ui=_optional_json_object(
+                    entry.get("ui"), field=f"settings.settings[{index}].ui"
+                ),
+            )
+        )
+    return SettingsSnapshot(tabs=tuple(tabs), settings=tuple(entries))
+
+
+def parse_rpc_capability_manifest(payload: JsonObject) -> RpcCapabilityManifest:
+    raw_api_version = payload.get("applicationApiVersion")
+    if not isinstance(raw_api_version, int) or isinstance(raw_api_version, bool):
+        raise ValueError("capabilities.applicationApiVersion must be an integer")
+
+    def string_tuple(value: object, *, field: str) -> tuple[str, ...]:
+        if not isinstance(value, list):
+            raise ValueError(f"{field} must be a list")
+        result: list[str] = []
+        for index, item in enumerate(value):
+            if not isinstance(item, str):
+                raise ValueError(f"{field}[{index}] must be a string")
+            result.append(item)
+        return tuple(result)
+
+    raw_commands = payload.get("commands")
+    if not isinstance(raw_commands, list):
+        raise ValueError("capabilities.commands must be a list")
+    commands: list[RpcCommandCapability] = []
+    for index, raw_command in enumerate(raw_commands):
+        field = f"capabilities.commands[{index}]"
+        command = _clone_json_object(raw_command, field=field)
+        version = command.get("version")
+        if not isinstance(version, int) or isinstance(version, bool):
+            raise ValueError(f"{field}.version must be an integer")
+
+        raw_disabled_reason = command.get("disabledReason")
+        disabled_reason = None
+        if raw_disabled_reason is not None:
+            reason = _clone_json_object(
+                raw_disabled_reason, field=f"{field}.disabledReason"
+            )
+            disabled_reason = RpcCapabilityDisabledReason(
+                code=_require_str(reason, "code"),
+                message=_require_str(reason, "message"),
+            )
+
+        commands.append(
+            RpcCommandCapability(
+                id=_require_str(command, "id"),
+                name=_require_str(command, "name"),
+                version=version,
+                scope=_require_str(command, "scope"),
+                execution=_require_str(command, "execution"),
+                availability=_require_str(command, "availability"),
+                confirmation=cast(
+                    RpcCommandConfirmation,
+                    _require_literal(
+                        command.get("confirmation", "none"),
+                        frozenset({"none", "required"}),
+                        field=f"{field}.confirmation",
+                    ),
+                ),
+                required_features=string_tuple(
+                    command.get("requiredFeatures"),
+                    field=f"{field}.requiredFeatures",
+                ),
+                input_schema=_optional_json_object(
+                    command.get("inputSchema"), field=f"{field}.inputSchema"
+                ),
+                output_schema=_optional_json_object(
+                    command.get("outputSchema"), field=f"{field}.outputSchema"
+                ),
+                concurrency_class=_optional_str(command, "concurrencyClass"),
+                disabled_reason=disabled_reason,
+            )
+        )
+
+    return RpcCapabilityManifest(
+        application_api_version=raw_api_version,
+        commands=tuple(commands),
+        events=string_tuple(payload.get("events"), field="capabilities.events"),
+        extension_ui_methods=string_tuple(
+            payload.get("extensionUiMethods"),
+            field="capabilities.extensionUiMethods",
+        ),
+        host_protocols=string_tuple(
+            payload.get("hostProtocols"), field="capabilities.hostProtocols"
+        ),
     )
 
 
@@ -1549,6 +1990,129 @@ def parse_session_stats(payload: JsonObject) -> SessionStats:
     )
 
 
+def parse_session_catalog_entry(payload: JsonObject) -> SessionCatalogEntry:
+    return SessionCatalogEntry(
+        path=_require_str(payload, "path"),
+        id=_require_str(payload, "id"),
+        cwd=_require_str(payload, "cwd"),
+        title=_optional_str(payload, "title"),
+        parent_session_path=_optional_str(payload, "parentSessionPath"),
+        created_at=_require_str(payload, "createdAt"),
+        updated_at=_require_str(payload, "updatedAt"),
+        message_count=int(payload.get("messageCount", 0)),
+        size=int(payload.get("size", 0)),
+        status=_optional_str(payload, "status"),
+    )
+
+
+def parse_session_catalog_page(payload: JsonObject) -> SessionCatalogPage:
+    raw_sessions = payload.get("sessions")
+    if not isinstance(raw_sessions, list):
+        raise ValueError("sessions must be an array")
+    raw_total = payload.get("total")
+    if not isinstance(raw_total, int) or isinstance(raw_total, bool) or raw_total < 0:
+        raise ValueError("total must be a non-negative integer")
+    return SessionCatalogPage(
+        sessions=tuple(
+            parse_session_catalog_entry(cast(JsonObject, item))
+            for item in raw_sessions
+            if isinstance(item, dict)
+        ),
+        total=raw_total,
+        next_cursor=_optional_str(payload, "nextCursor"),
+    )
+
+
+def parse_session_info_result(payload: JsonObject) -> SessionInfoResult:
+    raw_session = payload.get("session")
+    raw_workspace = payload.get("workspace")
+    if not isinstance(raw_session, dict) or not isinstance(raw_workspace, dict):
+        raise ValueError(
+            "session info response must contain session and workspace objects"
+        )
+    raw_directories = raw_workspace.get("directories")
+    if not isinstance(raw_directories, list) or not all(
+        isinstance(item, str) for item in raw_directories
+    ):
+        raise ValueError("workspace.directories must be an array of strings")
+    return SessionInfoResult(
+        session=parse_session_catalog_entry(cast(JsonObject, raw_session)),
+        workspace=SessionWorkspace(
+            cwd=_require_str(cast(JsonObject, raw_workspace), "cwd"),
+            directories=tuple(cast(list[str], raw_directories)),
+        ),
+        active=_require_bool(payload, "active"),
+    )
+
+
+def parse_session_workspace_roots(
+    payload: JsonObject,
+) -> tuple[SessionWorkspaceRoot, ...]:
+    raw_roots = payload.get("roots")
+    if not isinstance(raw_roots, list):
+        raise ValueError("roots must be an array")
+    roots: list[SessionWorkspaceRoot] = []
+    for item in raw_roots:
+        if not isinstance(item, dict):
+            raise ValueError("roots[] must be an object")
+        root = cast(JsonObject, item)
+        roots.append(
+            SessionWorkspaceRoot(
+                cwd=_require_str(root, "cwd"),
+                count=int(root.get("count", 0)),
+                latest=_require_str(root, "latest"),
+                exists=_require_bool(root, "exists"),
+            )
+        )
+    return tuple(roots)
+
+
+def parse_resume_session_result(payload: JsonObject) -> ResumeSessionResult:
+    return ResumeSessionResult(
+        cancelled=_require_bool(payload, "cancelled"),
+        session_file=_optional_str(payload, "sessionFile"),
+        cwd=_require_str(payload, "cwd"),
+        cwd_changed=_require_bool(payload, "cwdChanged"),
+    )
+
+
+def parse_fork_session_result(payload: JsonObject) -> ForkSessionResult:
+    return ForkSessionResult(
+        cancelled=_require_bool(payload, "cancelled"),
+        session_file=_optional_str(payload, "sessionFile"),
+    )
+
+
+def parse_rename_session_result(payload: JsonObject) -> RenameSessionResult:
+    return RenameSessionResult(
+        renamed=_require_bool(payload, "renamed"),
+        active=_require_bool(payload, "active"),
+    )
+
+
+def parse_delete_session_result(payload: JsonObject) -> DeleteSessionResult:
+    raw_error = payload.get("deleteError")
+    delete_error: DeleteSessionError | None = None
+    if raw_error is not None:
+        if not isinstance(raw_error, dict):
+            raise ValueError("deleteError must be an object")
+        error = cast(JsonObject, raw_error)
+        code = _require_literal(
+            error.get("code"), frozenset({"delete_failed"}), field="deleteError.code"
+        )
+        delete_error = DeleteSessionError(
+            code=cast(Literal["delete_failed"], code),
+            message=_require_str(error, "message"),
+        )
+    return DeleteSessionResult(
+        deleted=_require_bool(payload, "deleted"),
+        cancelled=_require_bool(payload, "cancelled"),
+        was_active=_require_bool(payload, "wasActive"),
+        new_session_started=_require_bool(payload, "newSessionStarted"),
+        delete_error=delete_error,
+    )
+
+
 def parse_context_usage(payload: JsonObject | None) -> ContextUsage | None:
     if payload is None:
         return None
@@ -1632,6 +2196,14 @@ def parse_notification(payload: JsonObject) -> RpcNotification:
             ):
                 raise ValueError("ready.supportedProtocolVersions must be integers")
             supported_versions = tuple(raw_versions)
+        raw_capabilities = payload.get("capabilities")
+        capabilities = (
+            parse_rpc_capability_manifest(
+                _clone_json_object(raw_capabilities, field="ready.capabilities")
+            )
+            if raw_capabilities is not None
+            else None
+        )
         return ReadyEvent(
             protocol_version=_optional_int(payload, "protocolVersion"),
             supported_protocol_versions=supported_versions,
@@ -1639,11 +2211,99 @@ def parse_notification(payload: JsonObject) -> RpcNotification:
             max_reassembled_frame_bytes=_optional_int(
                 payload, "maxReassembledFrameBytes"
             ),
+            capabilities=capabilities,
         )
     if event_type == "extension_ui_request":
         return parse_extension_ui_request(payload)
     if event_type == "extension_error":
         return parse_extension_error(payload)
+    if event_type == "settings_update":
+        return SettingsUpdateEvent()
+    if event_type in {
+        "operation_started",
+        "operation_completed",
+        "operation_failed",
+        "operation_cancelled",
+    }:
+        operation_id = _require_str(payload, "operationId")
+        command = cast(
+            RpcOperationCommand,
+            _require_literal(
+                payload.get("command"),
+                frozenset({"prompt", "abort_and_prompt"}),
+                field=f"{event_type}.command",
+            ),
+        )
+        request_id = _optional_str(payload, "requestId")
+        if event_type == "operation_started":
+            started_at = _optional_float(payload, "startedAt")
+            if started_at is None:
+                raise ValueError("operation_started.startedAt must be a number")
+            return OperationStartedEvent(
+                operation_id=operation_id,
+                request_id=request_id,
+                command=command,
+                started_at=started_at,
+            )
+        settled_at = _optional_float(payload, "settledAt")
+        if settled_at is None:
+            raise ValueError(f"{event_type}.settledAt must be a number")
+        if event_type == "operation_completed":
+            agent_invoked = _optional_bool(payload, "agentInvoked")
+            if agent_invoked is None:
+                raise ValueError("operation_completed.agentInvoked must be a boolean")
+            return OperationCompletedEvent(
+                operation_id=operation_id,
+                request_id=request_id,
+                command=command,
+                agent_invoked=agent_invoked,
+                settled_at=settled_at,
+            )
+        if event_type == "operation_failed":
+            return OperationFailedEvent(
+                operation_id=operation_id,
+                request_id=request_id,
+                command=command,
+                error=_require_str(payload, "error"),
+                code=_optional_str(payload, "code"),
+                settled_at=settled_at,
+            )
+        return OperationCancelledEvent(
+            operation_id=operation_id,
+            request_id=request_id,
+            command=command,
+            reason=cast(
+                RpcOperationCancellationReason,
+                _require_literal(
+                    payload.get("reason"),
+                    frozenset(
+                        {
+                            "user",
+                            "replaced",
+                            "session_transition",
+                            "client_disconnected",
+                        }
+                    ),
+                    field="operation_cancelled.reason",
+                ),
+            ),
+            code=cast(
+                RpcOperationCancellationCode,
+                _require_literal(
+                    payload.get("code"),
+                    frozenset(
+                        {
+                            "cancelled_by_client",
+                            "replaced_by_prompt",
+                            "session_changed",
+                            "client_disconnected",
+                        }
+                    ),
+                    field="operation_cancelled.code",
+                ),
+            ),
+            settled_at=settled_at,
+        )
     if event_type == "agent_start":
         return AgentStartEvent()
     if event_type == "agent_end":

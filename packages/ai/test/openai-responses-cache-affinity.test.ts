@@ -1,8 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
-import {
-	type AzureOpenAIResponsesOptions,
-	streamAzureOpenAIResponses,
-} from "@oh-my-pi/pi-ai/providers/azure-openai-responses";
+import { streamAzureOpenAIResponses } from "@oh-my-pi/pi-ai/providers/azure-openai-responses";
 import {
 	buildParams,
 	type OpenAIResponsesOptions,
@@ -456,7 +453,7 @@ describe("OpenAI Responses explicit prompt cache policy", () => {
 		}
 	});
 
-	it("rejects explicit policy through streamSimple before sending unsupported Responses requests", () => {
+	it("rejects explicit policy for unsupported OpenAI Responses models", () => {
 		const unsupportedModel: Model<"openai-responses"> = {
 			...openAI56ResponsesModel,
 			id: "gpt-5.5",
@@ -482,32 +479,73 @@ describe("OpenAI Responses explicit prompt cache policy", () => {
 		expect(() => streamSimple(unsupportedModel, context, options)).toThrow(
 			"OpenAI explicit prompt caching is unsupported",
 		);
-		expect(() => streamSimple(azureOpenAI56ResponsesModel, context, options)).toThrow(
-			"OpenAI explicit prompt caching is unsupported",
-		);
 		expect(fetchMock).not.toHaveBeenCalled();
 	});
 
-	it("rejects explicit policy through typed and direct Azure Responses dispatch", () => {
-		const fetchMock: FetchImpl = vi.fn(async () => {
-			throw new Error("Unsupported Azure Responses requests must not reach fetch");
+	it("sends Azure explicit policy with a stable-prefix breakpoint", async () => {
+		let body: Record<string, unknown> | undefined;
+		const fetchMock: FetchImpl = vi.fn(async (_input, init) => {
+			body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+			return createSseResponse([{ type: "response.completed", response: { status: "completed" } }]);
 		});
-		const context: Context = {
-			messages: [{ role: "user", content: [{ type: "text", text: "prompt" }], timestamp: 0 }],
-		};
-		const options: AzureOpenAIResponsesOptions = {
+
+		await streamModel(azureOpenAI56ResponsesModel, historicalContext, {
 			apiKey: "test-key",
+			sessionId: "session-key",
 			promptCache: { mode: "explicit" },
 			fetch: fetchMock,
-		};
+		}).result();
 
-		expect(() => streamModel(azureOpenAI56ResponsesModel, context, options)).toThrow(
-			"OpenAI explicit prompt caching is unsupported",
-		);
-		expect(() => streamAzureOpenAIResponses(azureOpenAI56ResponsesModel, context, options)).toThrow(
-			"OpenAI explicit prompt caching is unsupported",
-		);
-		expect(fetchMock).not.toHaveBeenCalled();
+		expect(body?.prompt_cache_key).toBe("session-key");
+		expect(body?.prompt_cache_options).toEqual({ mode: "explicit", ttl: "30m" });
+		const input = body?.input;
+		if (!Array.isArray(input)) throw new Error("Expected Responses input");
+		expect(input[0]).toMatchObject({
+			content: [{ prompt_cache_breakpoint: { mode: "explicit" } }],
+		});
+		expect(input[1]).not.toMatchObject({
+			content: [{ prompt_cache_breakpoint: expect.anything() }],
+		});
+	});
+	it("omits Azure explicit breakpoints when opted out", async () => {
+		let body: Record<string, unknown> | undefined;
+		const fetchMock: FetchImpl = vi.fn(async (_input, init) => {
+			body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+			return createSseResponse([{ type: "response.completed", response: { status: "completed" } }]);
+		});
+
+		await streamModel(azureOpenAI56ResponsesModel, historicalContext, {
+			apiKey: "test-key",
+			promptCache: { mode: "explicit", breakpoint: "none" },
+			fetch: fetchMock,
+		}).result();
+
+		expect(body?.prompt_cache_options).toEqual({ mode: "explicit", ttl: "30m" });
+		expect(JSON.stringify(body?.input)).not.toContain("prompt_cache_breakpoint");
+	});
+
+	it("sends the implicit 30-minute cache policy for Azure Responses", async () => {
+		let body: Record<string, unknown> | undefined;
+		const fetchMock: FetchImpl = vi.fn(async (_input, init) => {
+			body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+			return createSseResponse([{ type: "response.completed", response: { status: "completed" } }]);
+		});
+
+		await streamAzureOpenAIResponses(
+			azureOpenAI56ResponsesModel,
+			{
+				messages: [{ role: "user", content: [{ type: "text", text: "prompt" }], timestamp: 0 }],
+			},
+			{
+				apiKey: "test-key",
+				sessionId: "session-key",
+				promptCache: { mode: "implicit" },
+				fetch: fetchMock,
+			},
+		).result();
+
+		expect(body?.prompt_cache_key).toBe("session-key");
+		expect(body?.prompt_cache_options).toEqual({ mode: "implicit", ttl: "30m" });
 	});
 
 	it("defers explicit policy validation to the gateway-resolved model for pi-native transport", async () => {

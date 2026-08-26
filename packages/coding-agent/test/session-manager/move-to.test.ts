@@ -6,6 +6,7 @@ import * as path from "node:path";
 import type { SessionHeader } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import { loadEntriesFromFile } from "@oh-my-pi/pi-coding-agent/session/session-loader";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { rebasePathWithinRoot } from "@oh-my-pi/pi-coding-agent/session/session-paths";
 import { stripOuterDoubleQuotes } from "@oh-my-pi/pi-coding-agent/tools/path-utils";
 import { getConfigRootDir, setAgentDir } from "@oh-my-pi/pi-utils";
 
@@ -219,6 +220,46 @@ describe("SessionManager.moveTo", () => {
 		const entries = await loadEntriesFromFile(newFile);
 		const header = getHeader(entries);
 		expect(header?.cwd).toBe(path.resolve(cwdB));
+	});
+
+	it("rebases persisted resource targets with the moved artifact tree", async () => {
+		const session = SessionManager.create(cwdA);
+		const oldFile = session.getSessionFile()!;
+		const oldArtifactsDir = oldFile.slice(0, -6);
+		const transcript = path.join(oldArtifactsDir, "ReviewBot.jsonl");
+		const output = path.join(oldArtifactsDir, "raw-output.txt");
+		const external = path.join(testAgentDir, "outside.txt");
+		session.appendCustomMessageEntry("async-result", "done", true, {
+			jobs: [{ linkPath: output, outputPath: output, patchPath: path.join(oldArtifactsDir, "change.diff") }],
+			progress: [{ sessionFile: transcript }],
+			outputPaths: [output, external],
+			unrelated: { linkPath: external, constructor: output },
+		});
+		session.appendMessage(makeAssistantMessage());
+		await session.flush();
+
+		await session.moveTo(cwdB);
+
+		const newFile = session.getSessionFile()!;
+		const newArtifactsDir = newFile.slice(0, -6);
+		const entries = await loadEntriesFromFile(newFile);
+		const message = entries.find(entry => entry.type === "custom_message" && entry.customType === "async-result") as
+			| {
+					details?: {
+						jobs?: Array<{ linkPath?: string; outputPath?: string; patchPath?: string }>;
+						progress?: Array<{ sessionFile?: string }>;
+						outputPaths?: string[];
+						unrelated?: { linkPath?: string; constructor?: string };
+					};
+			  }
+			| undefined;
+		expect(message?.details?.jobs?.[0]?.linkPath).toBe(path.join(newArtifactsDir, "raw-output.txt"));
+		expect(message?.details?.jobs?.[0]?.outputPath).toBe(path.join(newArtifactsDir, "raw-output.txt"));
+		expect(message?.details?.jobs?.[0]?.patchPath).toBe(path.join(newArtifactsDir, "change.diff"));
+		expect(message?.details?.progress?.[0]?.sessionFile).toBe(path.join(newArtifactsDir, "ReviewBot.jsonl"));
+		expect(message?.details?.outputPaths).toEqual([path.join(newArtifactsDir, "raw-output.txt"), external]);
+		expect(message?.details?.unrelated?.linkPath).toBe(external);
+		expect(message?.details?.unrelated?.constructor).toBe(output);
 	});
 
 	it("moves artifact dir independently when session file does not exist", async () => {
@@ -484,5 +525,60 @@ describe("SessionManager.moveTo", () => {
 					entry.message.content === "during move crash window",
 			),
 		).toBe(true);
+	});
+
+	it("rebases live writer targets immediately before renaming the artifact tree", async () => {
+		const session = SessionManager.create(cwdA);
+		const { path: artifactPath } = await session.allocateArtifactPath("bash");
+		if (!artifactPath) throw new Error("Expected artifact path");
+		await Bun.write(artifactPath, "before move");
+		const oldArtifactsDir = path.dirname(artifactPath);
+		let writerTarget = artifactPath;
+		let callbackCount = 0;
+
+		await session.moveTo(cwdB, undefined, {
+			rebaseLiveArtifactResources: (oldRoot, newRoot) => {
+				callbackCount++;
+				expect(oldRoot).toBe(oldArtifactsDir);
+				expect(fs.existsSync(oldRoot)).toBe(true);
+				expect(fs.existsSync(newRoot)).toBe(false);
+				writerTarget = rebasePathWithinRoot(writerTarget, oldRoot, newRoot);
+			},
+		});
+
+		expect(callbackCount).toBe(1);
+		expect(writerTarget).toBe(path.join(session.getArtifactsDir()!, path.basename(artifactPath)));
+		expect(fs.readFileSync(writerTarget, "utf8")).toBe("before move");
+		expect(fs.existsSync(oldArtifactsDir)).toBe(false);
+	});
+
+	it("rebinds an adopted artifact manager with its moved parent tree", async () => {
+		const parent = SessionManager.create(cwdA);
+		parent.appendMessage({ role: "user", content: "hello", timestamp: 1 });
+		parent.appendMessage(makeAssistantMessage());
+		await parent.flush();
+		const artifactManager = parent.getArtifactManager();
+		if (!artifactManager) throw new Error("Expected parent artifact manager");
+		const oldArtifactsDir = artifactManager.dir;
+
+		const child = SessionManager.create(cwdA);
+		child.adoptArtifactManager(artifactManager);
+
+		await parent.moveTo(cwdB);
+		const newArtifactsDir = parent.getArtifactsDir();
+		if (!newArtifactsDir) throw new Error("Expected moved artifact directory");
+		expect(child.getArtifactsDir()).toBe(newArtifactsDir);
+
+		// `saveArtifact` yields the artifact id; resolve it through the shared
+		// manager to prove the write landed under the moved tree.
+		const savedId = await child.saveArtifact("after move", "bash");
+		if (!savedId) throw new Error("Expected saved artifact");
+		const savedPath = await artifactManager.getPath(savedId);
+		if (!savedPath) throw new Error("Expected saved artifact path");
+		expect(path.dirname(savedPath)).toBe(newArtifactsDir);
+		expect(fs.existsSync(oldArtifactsDir)).toBe(false);
+		expect(fs.readFileSync(savedPath, "utf8")).toBe("after move");
+		await child.close();
+		await parent.close();
 	});
 });

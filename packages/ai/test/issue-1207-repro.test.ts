@@ -1,7 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import { type } from "@oh-my-pi/omptype";
 import { streamOpenAICompletions } from "@oh-my-pi/pi-ai/providers/openai-completions";
-import type { Context, Model, ModelSpec, Tool } from "@oh-my-pi/pi-ai/types";
+import type { AssistantMessage, Context, Message, Model, ModelSpec, Tool, Usage } from "@oh-my-pi/pi-ai/types";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { Effort } from "@oh-my-pi/pi-catalog/effort";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
@@ -12,9 +12,21 @@ const echoTool: Tool = {
 	parameters: type({ text: "string" }),
 };
 
-function contextWithTools(tools: Tool[] = [echoTool]): Context {
+const emptyUsage: Usage = {
+	input: 0,
+	output: 0,
+	cacheRead: 0,
+	cacheWrite: 0,
+	totalTokens: 0,
+	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+};
+
+function contextWithTools(
+	tools: Tool[] = [echoTool],
+	messages: Message[] = [{ role: "user", content: "call tool", timestamp: Date.now() }],
+): Context {
 	return {
-		messages: [{ role: "user", content: "call tool", timestamp: Date.now() }],
+		messages,
 		tools,
 	};
 }
@@ -25,21 +37,16 @@ function abortedSignal(): AbortSignal {
 	return controller.signal;
 }
 
-interface CaptureOptions {
-	tools?: Tool[];
-	reasoning?: Effort;
-	disableReasoning?: boolean;
-}
-
 async function capturePayload(
 	model: Model<"openai-completions">,
-	options: CaptureOptions = {},
+	tools?: Tool[],
+	options: { disableReasoning?: boolean; messages?: Message[]; sendReasoning?: boolean } = {},
 ): Promise<Record<string, unknown>> {
 	const { promise, resolve } = Promise.withResolvers<unknown>();
-	streamOpenAICompletions(model, contextWithTools(options.tools), {
+	streamOpenAICompletions(model, contextWithTools(tools, options.messages), {
 		apiKey: "test-key",
 		signal: abortedSignal(),
-		reasoning: options.disableReasoning ? undefined : (options.reasoning ?? Effort.High),
+		reasoning: options.sendReasoning === false ? undefined : "minimal",
 		disableReasoning: options.disableReasoning,
 		toolChoice: "auto",
 		maxTokens: 123,
@@ -65,12 +72,33 @@ function customDeepseekFlash(legacyThinkingExtraBody = false): Model<"openai-com
 	} as ModelSpec<"openai-completions">);
 }
 
-describe("issue #1207 — DeepSeek V4 keeps reasoning with tools", () => {
+function assistantToolCall(model: Model<"openai-completions">): AssistantMessage {
+	return {
+		role: "assistant",
+		content: [
+			{
+				type: "toolCall",
+				id: "call_echo",
+				name: "echo",
+				arguments: { text: "inspect" },
+			},
+		],
+		api: model.api,
+		provider: model.provider,
+		model: model.id,
+		usage: emptyUsage,
+		stopReason: "toolUse",
+		timestamp: Date.now(),
+	};
+}
+
+describe("issue #1207 / #2690 — DeepSeek V4 reasoning with tools", () => {
 	it("detects the documented direct DeepSeek V4 compat shape", () => {
 		const model = getBundledModel("deepseek", "deepseek-v4-flash") as Model<"openai-completions">;
 		const compat = model.compat;
 
 		expect(compat.supportsToolChoice).toBe(false);
+		expect(compat.disableReasoningWhenToolsPresent).toBe(true);
 		expect(compat.maxTokensField).toBe("max_tokens");
 		expect(compat.extraBody).toBeUndefined();
 		expect(compat.reasoningDisableMode).toBe("zai-thinking-disabled");
@@ -85,33 +113,69 @@ describe("issue #1207 — DeepSeek V4 keeps reasoning with tools", () => {
 		const model = customDeepseekFlash();
 
 		expect(model.compat.supportsToolChoice).toBe(false);
-		// The stale user `xhigh` alias targets a tier the wire-exact
-		// [low, high, max] flash ladder does not expose, so it is filtered out.
-		expect(model.thinking?.efforts).toEqual([Effort.Low, Effort.High, Effort.Max]);
-		expect(model.thinking?.effortMap).toBeUndefined();
+		expect(model.compat.disableReasoningWhenToolsPresent).toBe(true);
+		expect(model.thinking?.effortMap).toMatchObject({
+			minimal: "high",
+			low: "high",
+			medium: "high",
+			xhigh: "max",
+		});
 	});
 
-	it("omits tool_choice but preserves documented reasoning when tools are present", async () => {
+	it("omits tool_choice and disables reasoning when direct DeepSeek tools are present", async () => {
 		const body = await capturePayload(customDeepseekFlash());
 
 		expect(body.tools).toBeDefined();
 		expect(body.tool_choice).toBeUndefined();
-		expect(body.reasoning_effort).toBe("high");
-		expect(body.thinking).toEqual({ type: "enabled" });
+		expect(body.reasoning_effort).toBeUndefined();
+		expect(body.thinking).toBeUndefined();
 		expect(body.max_tokens).toBe(123);
 		expect(body.max_completion_tokens).toBeUndefined();
 	});
 
-	it("disables thinking for bundled and legacy cached model definitions", async () => {
-		const bundled = getBundledModel("deepseek", "deepseek-v4-flash") as Model<"openai-completions">;
-		const legacyCached = customDeepseekFlash(true);
+	it("omits fallback reasoning_effort when disabled direct DeepSeek tools have no explicit reasoning", async () => {
+		const body = await capturePayload(customDeepseekFlash(), [echoTool], {
+			disableReasoning: true,
+			sendReasoning: false,
+		});
 
-		for (const model of [bundled, legacyCached]) {
-			const body = await capturePayload(model, { disableReasoning: true });
-			expect(model.compat.extraBody).toBeUndefined();
-			expect(body.reasoning_effort).toBeUndefined();
-			expect(body.thinking).toEqual({ type: "disabled" });
-		}
+		expect(body.tools).toBeDefined();
+		expect(body.reasoning_effort).toBeUndefined();
+		expect(body.thinking).toBeUndefined();
+	});
+
+	it("omits reasoning_content replay when direct DeepSeek tools disable reasoning", async () => {
+		const model = customDeepseekFlash();
+		const body = await capturePayload(model, [echoTool], {
+			messages: [
+				assistantToolCall(model),
+				{
+					role: "toolResult",
+					toolCallId: "call_echo",
+					toolName: "echo",
+					content: [{ type: "text", text: "done" }],
+					isError: false,
+					timestamp: Date.now(),
+				},
+				{ role: "user", content: "continue", timestamp: Date.now() },
+			],
+		});
+		const messages = body.messages as Array<Record<string, unknown>>;
+		const assistant = messages.find(message => message.role === "assistant");
+
+		expect(assistant).toBeDefined();
+		expect(Reflect.get(assistant as object, "reasoning_content")).toBeUndefined();
+		expect(body.reasoning_effort).toBeUndefined();
+		expect(body.thinking).toBeUndefined();
+	});
+
+	it("honors explicit disableReasoning by suppressing the direct DeepSeek thinking toggle", async () => {
+		const body = await capturePayload(customDeepseekFlash(), [], { disableReasoning: true });
+
+		expect(body.tools).toBeUndefined();
+		expect(body.reasoning_effort).toBeUndefined();
+		expect(body.thinking).toBeUndefined();
+		expect(body.max_tokens).toBe(123);
 	});
 
 	it("does not mix Fireworks DeepSeek effort with the native thinking toggle", async () => {

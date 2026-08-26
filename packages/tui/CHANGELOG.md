@@ -86,6 +86,9 @@
 ### Fixed
 
 - Fixed TUI freezing during large repaints on slow or occluded terminals by moving stdout writes to an off-thread writer.
+### Added
+
+- Added `Editor.setTheme()` so an adopted editor can switch from its lightweight startup theme to the configured interactive theme without replacing the editor or losing its draft.
 
 ## [17.4.4] - 2026-08-22
 
@@ -185,6 +188,9 @@
 - Fixed prompt autocomplete to support Windows drive-absolute paths (e.g., C:/ or C:\).
 - Fixed desktop notifications in systemd, tmux, or SSH-attached Linux sessions when DBUS_SESSION_BUS_ADDRESS is unset.
 - Fixed an issue where Shift+letter and shifted symbol inputs (such as capital letters, ?, and !) were silently dropped on Windows and WSL terminals using ConPTY (e.g., WezTerm).
+### Fixed
+
+- Fixed an explicit appearance refresh (`app.display.reset`) inside tmux leaking DA1 capability bytes into the editor and keeping a stale light/dark theme. The refresh routed both the OSC 11 query and its DA1 sentinel through tmux's passthrough envelope; the outer terminal's DA1 reply then had to round-trip through tmux's input parser, where a fragmented client→tmux response under a low `escape-time` was misdecoded as a key press and the remaining capability bytes surfaced as pane input. The refresh is now two-staged: tmux's OSC 11 cache is refreshed with a passthrough query alone (no DA1), then read back via a direct pane-local probe after a bounded settle delay ([#7800](https://github.com/can1357/oh-my-pi/issues/7800)).
 
 ## [17.2.9] - 2026-08-05
 
@@ -229,6 +235,9 @@
 - Fixed high CPU usage in the Loader spinner during idle waits by optimizing text wrapping and caching during frame updates.
 - Fixed hash-prefixed UUIDs in prose being misclassified as 8-digit CSS colors and receiving spurious swatches.
 - Fixed unbounded memory growth and potential host freezes when a PTY consumer stalls by capping the pending stdout backlog and treating undrained consumers as a disconnect.
+### Fixed
+
+- Fixed the `Loader` spinner pegging a CPU core during idle waits: advancing the braille glyph baked it into the underlying `Text` via `setText`, invalidating the wrap cache every 80 ms tick so `wrapTextWithAnsi` and per-line width measurement re-ran over the whole message. The wrapped text now carries a stable representative for each frame display width and only the visible glyph is swapped at render time, so same-width frames reuse the wrap/width pipeline while custom themes with mixed-width frames remain correctly wrapped ([#6940](https://github.com/can1357/oh-my-pi/issues/6940)).
 
 ## [17.1.8] - 2026-07-28
 
@@ -471,6 +480,9 @@
 - Fixed mid-prompt skill autocomplete so Tab and Enter accept the highlighted `/skill:<name>` suggestion and Backspace dismisses the popup immediately after removing the triggering slash ([#4619](https://github.com/can1357/oh-my-pi/issues/4619)).
 - Fixed submitted slash-command arguments treating `@` file-reference tokens as prompt-composer autocomplete triggers when the command does not define argument completions. ([#4600](https://github.com/can1357/oh-my-pi/issues/4600))
 - Fixed box-drawing tree lines (`├── item` — directory layouts, decision trees) in prose shearing apart when they wrap: continuation rows now hang under the node text with ancestor rails carried through (`├` → `│`, `└` → blank) instead of restarting at column 0. Applies to prose paragraphs (including inside blockquotes) only when a line with a branch-connector prefix (`├──`, `└─`, …) actually overflows; fitting lines, non-tree prose, and code blocks render byte-for-byte as before.
+### Fixed
+
+- Fixed slash-command Tab completion opening file suggestions after completing a no-arg command such as `/settings` ([#4767](https://github.com/can1357/oh-my-pi/issues/4767)).
 
 ## [16.3.10] - 2026-07-06
 
@@ -553,6 +565,9 @@
 ### Added
 
 - Added `Editor.submit()` to allow programmatic composer submission, enabling integration with speech input and other automated flows.
+### Added
+
+- Added `setWarpNarrowStatusGlyphsActive` runtime override and per-glyph correction in `visibleWidth`, enabled automatically on `TERM_PROGRAM=WarpTerminal`. Brings TS-side cell-width measurements in line with Warp's narrower rendering for the status-line glyph set used by the editor top border ([#3885](https://github.com/can1357/oh-my-pi/issues/3885)).
 
 ## [16.2.7] - 2026-06-30
 
@@ -590,6 +605,9 @@
 
 - Recognized Warp (`TERM_PROGRAM=WarpTerminal`) as a first-class terminal, enabling Kitty inline images on macOS/Linux while keeping Warp's unsafe OSC 8 hyperlinks and Windows Kitty graphics disabled ([#3471](https://github.com/can1357/oh-my-pi/issues/3471)).
 - Kept queued interrupt keys ahead of ordinary repaints so a slow long-transcript frame cannot consume the Ctrl+C/Esc double-press window before the second key is handled.
+### Fixed
+
+- Fixed `truncateToWidth` crashing when plugins pass legacy string ellipsis arguments such as `"..."` or `"…"`; the wrapper now maps them before calling the native enum API ([#3492](https://github.com/can1357/oh-my-pi/issues/3492)).
 
 ## [16.1.19] - 2026-06-25
 
@@ -1227,6 +1245,9 @@
 - Deferred eager live scrollback rebuilds on POSIX terminals where xterm ED3 (`CSI 3 J`, erase saved lines) can disturb scrolled-up readers during streaming, while keeping direct user-input and checkpoint rebuilds explicit ([#1682](https://github.com/can1357/oh-my-pi/issues/1682)).
 - Fixed TUI shutdown placing the parent shell prompt one row below short rendered content instead of directly on the next line ([#1620](https://github.com/can1357/oh-my-pi/issues/1620)).
 - Stopped painting inline color swatches for 4-digit hex runs in Markdown rendering. The `#RGBA` CSS form collides with hashline `#TAG` snapshot tags (4 hex digits, e.g. `#6C5E`), which were sprouting spurious RGB swatches in prose and codespans. Only `#RGB`, `#RRGGBB`, and `#RRGGBBAA` qualify now.
+### Fixed
+
+- Fixed scrolled-up readers being yanked to the top of scrollback during streaming on POSIX terminals that reset the viewport on ED3 (WezTerm, kitty, ghostty, alacritty). `TUI.setEagerNativeScrollbackRebuild(true)` — which the coding agent enables for the full duration of every streaming event — promoted the eager opt-in into `allowUnknownViewportMutation`, bypassing the 15.7.3 unknown-viewport deferral and routing offscreen structural mutations through `historyRebuild` → `\x1b[2J\x1b[H\x1b[3J`. These terminals honor ECMA-48 ED3 by repositioning the viewport to the top of the (now-erased) scrollback, so the rebuild yanked the reader. The eager flag now defers on those hosts (detected via `WEZTERM_PANE` / `KITTY_WINDOW_ID` / `GHOSTTY_RESOURCES_DIR` / `ALACRITTY_WINDOW_ID` or `TERM_PROGRAM`); the destructive rebuild lands at the next checkpoint (`refreshNativeScrollbackIfDirty` on prompt submit) where the user's keystroke has pinned the viewport back to the bottom. Autocomplete/IME paths that opt in via `requestRender(..., { allowUnknownViewportMutation: true })` are unaffected. Other POSIX terminals keep the eager rebuild. ([#1682](https://github.com/can1357/oh-my-pi/issues/1682))
 
 ## [15.7.6] - 2026-06-01
 

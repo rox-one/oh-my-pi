@@ -8,6 +8,7 @@
  */
 import { runExtensionCompact, runExtensionSetModel } from "../extensibility/extensions/compact-handler";
 import { getSessionSlashCommands } from "../extensibility/extensions/get-commands-handler";
+import { setExtensionModelAlias } from "../extensibility/extensions/model-api";
 import type { ExtensionError, ExtensionMode, ExtensionUIContext } from "../extensibility/extensions/types";
 import type { AgentSession } from "../session/agent-session";
 import { USER_INTERRUPT_LABEL } from "../session/messages";
@@ -87,10 +88,19 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 				session.sessionManager.appendLabelChange(targetId, label);
 			},
 			getActiveTools: () => session.getEnabledToolNames(),
+			getToolReference: name => session.getToolReference(name),
 			getAllTools: () => session.getAllToolInfos(),
 			setActiveTools: (toolNames: string[]) => session.setActiveToolsByName(toolNames),
 			getCommands: () => getSessionSlashCommands(session),
 			setModel: model => runExtensionSetModel(session, model),
+			setModelAlias: name =>
+				setExtensionModelAlias(
+					name,
+					session.modelRegistry,
+					session.settings,
+					session.model,
+					(model, thinkingLevel, options) => session.setModelTemporary(model, thinkingLevel, options),
+				),
 			getThinkingLevel: () => session.thinkingLevel,
 			setThinkingLevel: level => session.setThinkingLevel(level),
 			getServiceTiers: () => session.serviceTierByFamily,

@@ -20,6 +20,8 @@ export interface LoadMCPConfigsOptions {
 	filterExa?: boolean;
 	/** Whether to filter out browser MCP servers when builtin browser tool is enabled (default: false) */
 	filterBrowser?: boolean;
+	/** Active agent directory propagated to {@link LoadOptions.agentDir}. */
+	agentDir?: string;
 }
 
 /** Result of loading MCP configs */
@@ -101,13 +103,8 @@ export async function loadAllMCPConfigs(cwd: string, options?: LoadMCPConfigsOpt
 	const filterExa = options?.filterExa ?? true;
 	const filterBrowser = options?.filterBrowser ?? false;
 
-	// Load user-level disable/force-enable lists. The denylist always wins; the
-	// allowlist overrides a non-writable source config's `enabled: false`.
-	const userPath = getMCPConfigPath("user", cwd);
-	const [disabledServers, forcedEnabled] = await Promise.all([
-		readDisabledServers(userPath).then(list => new Set(list)),
-		readEnabledServers(userPath).then(list => new Set(list)),
-	]);
+	// Load MCP servers via capability system
+	const result = await loadCapability<MCPServer>(mcpCapability.id, { cwd, agentDir: options?.agentDir });
 
 	// Scope exclusions drop entries entirely BEFORE deduplication: with project
 	// config disabled, a project entry must not shadow anything.

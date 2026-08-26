@@ -11,15 +11,23 @@ function createMoveContext(sourceDir: string, settingsFlush?: () => Promise<void
 	const present = vi.fn();
 	const applyCwdChange = vi.fn(async (cwd: string) => {
 		expect(state.cwd).toBe(cwd);
+		return true;
 	});
 	const moveSession = vi.fn(async (cwd: string) => {
 		state.cwd = cwd;
 		state.movedTo = cwd;
 	});
+	const sessionDir = `${sourceDir}/.sessions`;
+	const captureState = vi.fn(() => ({ cwd: state.cwd, sessionDir, movedTo: state.movedTo }));
+	const restoreState = vi.fn((snapshot: { cwd: string }) => {
+		state.cwd = snapshot.cwd;
+	});
 	const ctx = {
 		session: { isStreaming: false, moveSession },
 		sessionManager: {
 			getCwd: () => state.cwd,
+			captureState,
+			restoreState,
 			dropSession: vi.fn(async () => {}),
 		},
 		settings: {
@@ -35,7 +43,7 @@ function createMoveContext(sourceDir: string, settingsFlush?: () => Promise<void
 		ui: { requestRender: vi.fn() },
 		present,
 	} as unknown as InteractiveModeContext;
-	return { ctx, state, present };
+	return { ctx, state, present, captureState, restoreState, sessionDir };
 }
 
 describe("CommandController /move", () => {
@@ -62,6 +70,29 @@ describe("CommandController /move", () => {
 			expect(ctx.ui.requestRender).toHaveBeenCalledWith();
 			expect(present).toHaveBeenCalled();
 			expect(ctx.showError).not.toHaveBeenCalled();
+		} finally {
+			await fs.rm(sourceDir, { recursive: true, force: true });
+			await fs.rm(targetDir, { recursive: true, force: true });
+		}
+	});
+
+	it("restores captured manager state when cwd application fails", async () => {
+		const sourceDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-move-source-"));
+		const targetDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-move-target-"));
+		try {
+			const { ctx, state, captureState, restoreState, sessionDir } = createMoveContext(sourceDir);
+			ctx.applyCwdChange = vi.fn(async () => false);
+			const controller = new CommandController(ctx);
+
+			await controller.handleMoveCommand(targetDir);
+
+			expect(ctx.session.moveSession).toHaveBeenCalledTimes(2);
+			expect(ctx.session.moveSession).toHaveBeenNthCalledWith(2, sourceDir, sessionDir);
+			expect(restoreState).toHaveBeenCalledWith(captureState.mock.results[0]?.value);
+			expect(state.cwd).toBe(sourceDir);
+			expect(ctx.updateEditorBorderColor).not.toHaveBeenCalled();
+			expect(ctx.reloadTodos).not.toHaveBeenCalled();
+			expect(ctx.ui.requestRender).not.toHaveBeenCalled();
 		} finally {
 			await fs.rm(sourceDir, { recursive: true, force: true });
 			await fs.rm(targetDir, { recursive: true, force: true });

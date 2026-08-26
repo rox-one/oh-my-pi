@@ -277,48 +277,12 @@ export class MnemopiSessionState {
 		return this.scoped.retain;
 	}
 
-	/**
-	 * Read counterpart to {@link editScopedMemory}: fetch a memory row by id
-	 * from any bank this session recalls from (retain, recall, global). First
-	 * hit wins in the same order {@link editScopedMemory} would touch, so the
-	 * shape matches what an `update`/`forget`/`invalidate` on the same id will
-	 * see. Returns `null` when the id is not found anywhere in scope.
-	 *
-	 * Backs the coding-agent `memory://<id>` URL so agents can inspect the
-	 * FULL content of a recall preview (recall clips content — see
-	 * {@link RecallResult.truncated}) before issuing a wholesale
-	 * `memory_edit update` that would otherwise overwrite unseen bytes
-	 * (issue #4443).
-	 */
-	getScopedMemory(id: string): MnemopiScopedMemoryHit | null {
-		const targets = dedupeScopedTargets([
-			this.scoped.retain,
-			...this.scoped.recall,
-			...(this.scoped.global ? [this.scoped.global] : []),
-		]);
-		for (const target of targets) {
-			const raw = target.memory.get(id) as MnemopiStoredMemoryRow | null;
-			if (!raw) continue;
-			const store: MnemopiMemoryStore =
-				raw.memory_store === "episodic" || raw.memory_store === "fact" ? raw.memory_store : "working";
-			return {
-				bank: target.bank,
-				store,
-				row: {
-					id: typeof raw.id === "string" ? raw.id : id,
-					content: typeof raw.content === "string" ? raw.content : "",
-					source: typeof raw.source === "string" ? raw.source : null,
-					timestamp: typeof raw.timestamp === "string" ? raw.timestamp : null,
-					importance: typeof raw.importance === "number" ? raw.importance : null,
-					veracity: typeof raw.veracity === "string" ? raw.veracity : null,
-					created_at: typeof raw.created_at === "string" ? raw.created_at : null,
-					session_id: typeof raw.session_id === "string" ? raw.session_id : null,
-					memory_type: typeof raw.memory_type === "string" ? raw.memory_type : null,
-					metadata: raw.metadata ?? raw.metadata_json ?? null,
-				},
-			};
+	/** Flushes pending extractions and consolidation for each bank owned by this session. */
+	async drainScopedBanks(): Promise<void> {
+		for (const memory of this.scoped.owned) {
+			await memory.flushExtractions();
+			memory.sleepAllSessions(false);
 		}
-		return null;
 	}
 
 	editScopedMemory(

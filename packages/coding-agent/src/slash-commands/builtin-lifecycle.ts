@@ -152,12 +152,6 @@ export const BUILTIN_LIFECYCLE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> =
 				try {
 					await runtime.session.compact(parsed.instructions, parsed.mode ? { mode: parsed.mode } : undefined);
 				} catch (err) {
-					// RPC `abort` and ACP `session/cancel` propagate their explicit
-					// USER_INTERRUPT_LABEL through the compaction abort signal. The client
-					// already saw the interrupt it sent; emitting anything here would
-					// append an out-of-turn chunk. Other cancellations (including an
-					// extension veto) remain visible.
-					if (err instanceof CompactionCancelledError && err.cause === USER_INTERRUPT_LABEL) return;
 					// Compaction precondition failures (no model, already compacted, too
 					// small) and provider errors propagate as plain Errors; surface them
 					// via runtime.output so they don't fail the ACP prompt turn.
@@ -173,9 +167,10 @@ export const BUILTIN_LIFECYCLE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> =
 					await runtime.output("Compaction complete.");
 				}
 			};
-			// Provider-backed: background-dispatch under RPC so the serialized command
-			// queue stays free for `abort` (SlashCommandRuntime.runCommandInBackground).
-			// ACP/TUI have no such hook and keep the inline await.
+			// `/compact` is provider-backed: it calls the model to summarize. RPC's
+			// prompt API must return immediately so its serialized command queue stays
+			// free for `abort` — the same contract `/handoff` uses. Hosts that omit the
+			// hook (ACP, TUI) keep the inline await.
 			if (runtime.runCommandInBackground) {
 				runtime.runCommandInBackground(runCompact);
 				return commandConsumed();
@@ -568,12 +563,23 @@ export const BUILTIN_LIFECYCLE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> =
 			} catch (err) {
 				return usage(`Failed to save pending settings: ${errorMessage(err)}`, runtime);
 			}
+			const previousState = runtime.sessionManager.captureState();
 			try {
 				await runtime.session.moveSession(resolvedPath);
 			} catch (err) {
 				return usage(`Move failed: ${errorMessage(err)}`, runtime);
 			}
-			setProjectDir(resolvedPath);
+			try {
+				setProjectDir(resolvedPath);
+			} catch (err) {
+				try {
+					await runtime.session.moveSession(previousState.cwd, previousState.sessionDir);
+					runtime.sessionManager.restoreState(previousState);
+				} catch (rollbackError) {
+					return usage(`Move failed and rollback failed: ${errorMessage(rollbackError)}`, runtime);
+				}
+				return usage(`Move failed: ${errorMessage(err)}`, runtime);
+			}
 			await runtime.settings.reloadForCwd(resolvedPath);
 			applyProviderGlobalsFromSettings(runtime.settings);
 			// Reload plugin/capability caches so the next prompt sees commands and

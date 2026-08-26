@@ -16,11 +16,11 @@ import { EVAL_CONCURRENCY_BRIDGE_NAME } from "../src/eval/concurrency-bridge";
 import { createAgentSession } from "../src/sdk";
 import { AgentSession } from "../src/session/agent-session";
 import type { ToolNamespacesInfo } from "../src/session/code-mode";
-import { buildToolNamespacesInfo, resolveCodeMode } from "../src/session/code-mode";
+import { buildToolNamespacesInfo, formatCodeModeToolReference, resolveCodeMode } from "../src/session/code-mode";
 import { SessionManager } from "../src/session/session-manager";
 import { generateCodeModeDeclarations } from "../src/tools/eval-format/code-mode-declarations";
 
-const ENABLED = ["eval", "ask", "todo", "yield", "think", "read", "bash", "edit", "mcp__gmail__search"];
+const ENABLED = ["eval", "ask", "todo", "goal", "yield", "think", "read", "bash", "edit", "mcp__gmail__search"];
 
 describe("resolveCodeMode", () => {
 	test("off: inactive regardless of catalog flag", () => {
@@ -43,7 +43,7 @@ describe("resolveCodeMode", () => {
 			evalTransportAvailable: true,
 		});
 		expect(r.active).toBe(true);
-		expect([...r.directToolNames].sort()).toEqual(["ask", "eval", "think", "todo", "yield"]);
+		expect([...r.directToolNames].sort()).toEqual(["ask", "eval", "goal", "think", "todo", "yield"]);
 	});
 	test("auto without flag: inactive", () => {
 		expect(
@@ -146,6 +146,22 @@ describe("resolveCodeMode", () => {
 			evalTransportAvailable: true,
 		});
 		expect([...r.directToolNames]).toEqual(["eval", ...reserved]);
+	});
+});
+
+describe("formatCodeModeToolReference", () => {
+	test("keeps a direct custom wire alias", () => {
+		expect(formatCodeModeToolReference({ name: "edit", wireName: "apply_patch", direct: true })).toBe("apply_patch");
+	});
+
+	test("qualifies a bridged identifier", () => {
+		expect(formatCodeModeToolReference({ name: "read", direct: false })).toBe("tool.read");
+	});
+
+	test("uses a JSON-quoted bracket property for a bridged non-identifier", () => {
+		expect(formatCodeModeToolReference({ name: "mcp__gmail__search-by-id", direct: false })).toBe(
+			'tool["mcp__gmail__search-by-id"]',
+		);
 	});
 });
 
@@ -476,9 +492,10 @@ describe("Code Mode session reconciliation", () => {
 
 		await session.prompt("implement the parser");
 
-		const messages = promptSpy.mock.calls[0]?.[0] as unknown as Array<{ customType?: string }>;
+		const messages = promptSpy.mock.calls[0]?.[0] as unknown as Array<{ customType?: string; content?: string }>;
+		const eagerTask = messages.find(message => message.customType === "eager-task-prelude");
 		expect(session.getActiveToolNames()).toEqual(["eval"]);
-		expect(messages.some(message => message.customType === "eager-task-prelude")).toBe(true);
+		expect(eagerTask?.content).toContain("`tool.task`");
 	});
 
 	test("bridge-enabled task retains orchestration notices", async () => {
@@ -493,11 +510,40 @@ describe("Code Mode session reconciliation", () => {
 
 		await session.prompt("please orchestrate and workflowz this");
 
-		const messages = promptSpy.mock.calls[0]?.[0] as unknown as Array<{ customType?: string }>;
+		const messages = promptSpy.mock.calls[0]?.[0] as unknown as Array<{ customType?: string; content?: string }>;
+		const orchestration = messages.find(message => message.customType === "orchestrate-notice");
 		expect(messages.map(message => message.customType).filter(Boolean)).toEqual([
 			"orchestrate-notice",
 			"workflow-notice",
 		]);
+		expect(orchestration?.content).toContain("`tool.task` dispatch");
+	});
+
+	test("bridge-enabled Vibe tools use bridge references", async () => {
+		const vibeNames = ["vibe_spawn", "vibe_send", "vibe_wait", "vibe_kill", "vibe_list"];
+		const { session } = createSession(
+			Settings.isolated({ "providers.openai-codex.codeMode": "auto" }),
+			undefined,
+			undefined,
+			[tool("todo"), ...vibeNames.map(name => tool(name))],
+		);
+		await session.setActiveToolsByName(["eval", "read", "todo", ...vibeNames]);
+		session.setVibeModeState({ enabled: true });
+		await session.sendVibeModeContext();
+
+		const message = session.state.messages.find(entry => {
+			if (typeof entry !== "object" || entry === null || !("customType" in entry)) return false;
+			return entry.customType === "vibe-mode-context";
+		});
+		const content =
+			message && typeof message === "object" && "content" in message && typeof message.content === "string"
+				? message.content
+				: "";
+		expect(content).toContain("`tool.read`");
+		expect(content).toContain("`todo`");
+		expect(content).toContain("`tool.vibe_spawn`");
+		expect(content).toContain("`tool.vibe_wait`");
+		expect(content).not.toContain("`vibe_spawn`");
 	});
 
 	test("prompt refresh preserves the full Code Mode tool predicate", async () => {
@@ -543,14 +589,15 @@ describe("Code Mode session reconciliation", () => {
 			return String((planMessage as { content?: string })?.content);
 		}
 
-		// The contract is invariance: demoting `task` off the direct surface is a
-		// transport change, so the guidance must match a session where `task` is
-		// directly callable, and must differ from one that cannot delegate at all.
+		// Demoting `task` changes its model-facing syntax while preserving the
+		// capability and delegation guidance.
 		const demoted = await planPrompt("on", [tool("task")], ["eval", "task"]);
 		const direct = await planPrompt("off", [tool("task")], ["eval", "task"]);
 		const unavailable = await planPrompt("on", [], ["eval"]);
 
-		expect(demoted).toBe(direct);
+		expect(demoted).toContain("via `tool.task`");
+		expect(demoted).not.toContain("via `task`");
+		expect(direct).toContain("via `task`");
 		expect(demoted).not.toBe(unavailable);
 	});
 });
@@ -589,7 +636,7 @@ describe("Code Mode session startup", () => {
 			agentDir: registryDir,
 			modelRegistry,
 			sessionManager: SessionManager.inMemory(),
-			settings: Settings.isolated({ "providers.openai-codex.codeMode": "auto" }),
+			settings: Settings.isolated(),
 			model: codeModel,
 			disableExtensionDiscovery: true,
 			skills: [],
@@ -605,6 +652,10 @@ describe("Code Mode session startup", () => {
 		expect(active).toContain("eval");
 		expect(active).not.toContain("read");
 		expect(active).not.toContain("bash");
+		expect(session.agent.state.tools.map(tool => tool.name)).not.toContain("read");
+		const renderedPrompt = session.agent.state.systemPrompt.join("\n\n");
+		expect(renderedPrompt).toContain("`tool.read`");
+		expect(renderedPrompt).not.toContain("- Read: `read`");
 		// Demoted tools stay enabled and bridge-reachable instead of vanishing.
 		expect(session.getEnabledToolNames()).toContain("read");
 		expect(session.getToolForEvalBridge("read")?.name).toBe("read");

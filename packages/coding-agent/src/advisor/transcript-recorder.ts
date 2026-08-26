@@ -1,10 +1,11 @@
-import * as fs from "node:fs/promises";
+import * as fs from "node:fs";
 import * as path from "node:path";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { Message, UserMessage } from "@oh-my-pi/pi-ai";
 import { logger } from "@oh-my-pi/pi-utils";
 import { visitEntriesFromFileStream } from "../session/session-loader";
 import { SessionManager } from "../session/session-manager";
+import { fingerprintMessage } from "./message-fingerprint";
 
 /**
  * Reserved transcript stem for advisor session files. Chosen so it cannot
@@ -33,56 +34,94 @@ export function isAdvisorTranscriptName(name: string): boolean {
 	);
 }
 
+/** Controls resume-time advisor transcript cost restoration. */
+export interface LoadAdvisorTranscriptCostsOptions {
+	/**
+	 * Runs synchronously after every transcript's byte length has been captured
+	 * and before parsing begins. Callers use this boundary to snapshot in-memory
+	 * costs; later appends are excluded from the disk totals.
+	 */
+	onSnapshot?: () => void;
+}
+
+interface AdvisorTranscriptCostFileSnapshot {
+	file: string;
+	slug: string;
+	maxBytes: number;
+}
+
 /**
- * Sum the advisor spend already persisted next to a primary session transcript,
+ * Sum advisor spend already persisted next to a primary session transcript,
  * keyed by advisor slug.
  *
- * The ledger a session keeps in memory only covers the current process, so a
- * resumed session would report zero until the next advisor turn. The recorded
- * transcripts are the durable copy of exactly the same finalized messages, so
- * they are read back through the shared loader - no lock, no writer, and no
- * second parser to keep in step with the session format.
+ * Each transcript is read only through the byte length captured before
+ * `onSnapshot` runs. This fixed prefix lets resume reconcile the persisted
+ * total with advisor turns billed while the asynchronous scan is running,
+ * without either dropping or double-counting those concurrent turns.
  *
  * Only the session's own advisors count: subagent advisors write to
  * `<session>/<SubId>/__advisor.jsonl`, and their spend belongs to the subagent,
  * not to this roster. Hence the scan stays at the top level of the directory.
  */
-export async function loadAdvisorTranscriptCosts(sessionFile: string | undefined): Promise<Map<string, number>> {
+export async function loadAdvisorTranscriptCosts(
+	sessionFile: string | undefined,
+	options: LoadAdvisorTranscriptCostsOptions = {},
+): Promise<Map<string, number>> {
+	const snapshots: AdvisorTranscriptCostFileSnapshot[] = [];
+	if (sessionFile?.endsWith(JSONL_SUFFIX)) {
+		const directory = sessionFile.slice(0, -JSONL_SUFFIX.length);
+		let dirents: fs.Dirent[] = [];
+		try {
+			dirents = fs.readdirSync(directory, { withFileTypes: true });
+		} catch {}
+		for (const dirent of dirents) {
+			if (!dirent.isFile() || !isAdvisorTranscriptName(dirent.name)) continue;
+			const file = path.join(directory, dirent.name);
+			try {
+				snapshots.push({
+					file,
+					slug:
+						dirent.name === ADVISOR_TRANSCRIPT_FILENAME
+							? ""
+							: dirent.name.slice(`${ADVISOR_TRANSCRIPT_STEM}.`.length, -JSONL_SUFFIX.length),
+					maxBytes: fs.statSync(file).size,
+				});
+			} catch {}
+		}
+	}
+	options.onSnapshot?.();
+
 	const costs = new Map<string, number>();
-	if (!sessionFile?.endsWith(JSONL_SUFFIX)) return costs;
-	const directory = sessionFile.slice(0, -JSONL_SUFFIX.length);
-	const dirents = await fs.readdir(directory, { withFileTypes: true }).catch(() => []);
-	for (const dirent of dirents) {
-		if (!dirent.isFile() || !isAdvisorTranscriptName(dirent.name)) continue;
-		const slug =
-			dirent.name === ADVISOR_TRANSCRIPT_FILENAME
-				? ""
-				: dirent.name.slice(`${ADVISOR_TRANSCRIPT_STEM}.`.length, -JSONL_SUFFIX.length);
+	for (const snapshot of snapshots) {
 		let total = 0;
 		let validHeader: boolean | undefined;
 		try {
-			await visitEntriesFromFileStream(path.join(directory, dirent.name), entry => {
-				const isObject = typeof entry === "object" && entry !== null;
-				if (validHeader === undefined) {
-					validHeader = isObject && entry.type === "session" && typeof entry.id === "string";
-					return;
-				}
-				// A syntactically valid but non-object entry (e.g. a bare `null`
-				// line) must cost only itself, not crash entry.type access and
-				// discard everything accumulated for this transcript.
-				if (!validHeader || !isObject || entry.type !== "message") return;
-				const message = entry.message;
-				if (!message || typeof message !== "object" || message.role !== "assistant") return;
-				// One malformed usage block must cost that entry only, not the
-				// whole transcript's total.
-				const total_ = message.usage?.cost?.total;
-				if (typeof total_ === "number" && Number.isFinite(total_)) total += total_;
-			});
+			await visitEntriesFromFileStream(
+				snapshot.file,
+				entry => {
+					const isObject = typeof entry === "object" && entry !== null;
+					if (validHeader === undefined) {
+						validHeader = isObject && entry.type === "session" && typeof entry.id === "string";
+						return;
+					}
+					// A syntactically valid but non-object entry (e.g. a bare
+					// `null` line) must cost only itself, not crash entry.type
+					// access and discard everything accumulated for this transcript.
+					if (!validHeader || !isObject || entry.type !== "message") return;
+					const message = entry.message;
+					if (!message || typeof message !== "object" || message.role !== "assistant") return;
+					// One malformed usage block must cost that entry only, not the
+					// whole transcript's total.
+					const total_ = message.usage?.cost?.total;
+					if (typeof total_ === "number" && Number.isFinite(total_)) total += total_;
+				},
+				{ maxBytes: snapshot.maxBytes },
+			);
 		} catch (err) {
-			logger.debug("advisor transcript cost read failed", { file: dirent.name, err: String(err) });
+			logger.debug("advisor transcript cost read failed", { file: path.basename(snapshot.file), err: String(err) });
 			continue;
 		}
-		if (total > 0) costs.set(slug, total);
+		if (total > 0) costs.set(snapshot.slug, total);
 	}
 	return costs;
 }
@@ -114,6 +153,21 @@ export class AdvisorTranscriptRecorder {
 	#filename: string;
 	/** Serializes the async open/close against synchronous appends so records land in order. */
 	#queue: Promise<void>;
+	/**
+	 * Ordered fingerprints of user "session update" deltas persisted since the
+	 * last committed advisor turn. The advisor re-delivers the identical batch on
+	 * every retry/overflow/refusal loop (issue #9553), and {@link #rollbackFailedTurn}
+	 * only cleans the agent's in-memory state — the recorder already wrote the
+	 * attempt. Matching a re-delivery positionally against this window skips the
+	 * duplicate while still persisting genuinely new content, including two
+	 * distinct deltas that happen to render identically (a repeated prompt, or two
+	 * tool runs with the same output).
+	 */
+	#replayWindow: bigint[] = [];
+	/** Cursor into {@link #replayWindow}; reset at each delivery attempt via {@link beginTurn}. */
+	#replayCursor = 0;
+	/** Target file {@link #replayWindow} belongs to; a switch starts a fresh window. */
+	#windowFile: string | undefined;
 
 	/**
 	 * @param filename Transcript filename within the session dir. Defaults to
@@ -163,6 +217,35 @@ export class AdvisorTranscriptRecorder {
 		const sessionFile = this.resolveSessionFile();
 		if (!sessionFile?.endsWith(JSONL_SUFFIX)) return;
 		const file = path.join(sessionFile.slice(0, -JSONL_SUFFIX.length), this.#filename);
+		// A new target file starts a fresh replay window: positions from the prior
+		// session's turns must never suppress the new file's first delta.
+		if (file !== this.#windowFile) {
+			this.#windowFile = file;
+			this.#replayWindow = [];
+			this.#replayCursor = 0;
+		}
+		// Skip a re-delivered user delta: on retry/overflow/refusal the advisor
+		// re-sends the identical batch in the same order, so a positional match
+		// against this turn's window is a replay that adds only bytes. New content
+		// — including a delta that renders like an earlier one — diverges from the
+		// window and is persisted. Assistant/tool turns are billed work: always
+		// written, so cost attribution and the Hub transcript stay intact.
+		if (message.role === "user") {
+			const fingerprint = fingerprintMessage(message);
+			if (fingerprint !== undefined) {
+				if (this.#replayCursor < this.#replayWindow.length) {
+					if (this.#replayWindow[this.#replayCursor] === fingerprint) {
+						this.#replayCursor++;
+						return;
+					}
+					// Divergent retry (e.g. reasoning stripped after a refusal): the
+					// window no longer matches, so drop its stale tail and record anew.
+					this.#replayWindow.length = this.#replayCursor;
+				}
+				this.#replayWindow.push(fingerprint);
+				this.#replayCursor = this.#replayWindow.length;
+			}
+		}
 		const cwd = this.resolveCwd();
 		this.#enqueue(async () => {
 			if (file !== this.#file) {
@@ -175,6 +258,25 @@ export class AdvisorTranscriptRecorder {
 			}
 			this.#manager?.appendMessage(persisted);
 		});
+	}
+
+	/**
+	 * Mark the start of one advisor delivery attempt. Rewinds the replay cursor so
+	 * a retry that re-sends the same batch matches this turn's window positionally
+	 * and is skipped, while the window itself (persisted-since-commit) is retained.
+	 */
+	beginTurn(): void {
+		this.#replayCursor = 0;
+	}
+
+	/**
+	 * Mark an advisor turn as committed (its output landed). Clears the replay
+	 * window so the next turn's deltas are recorded even when they render like a
+	 * committed one — only re-deliveries of an *uncommitted* turn are replays.
+	 */
+	commitTurn(): void {
+		this.#replayWindow = [];
+		this.#replayCursor = 0;
 	}
 
 	/** Flush pending writes (best-effort). */

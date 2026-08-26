@@ -187,7 +187,7 @@ describe("terminal image rendering", () => {
 		expect((result?.sequence ?? "").startsWith("\x1bP")).toBe(true);
 	});
 
-	it("moves back up before multi-row direct Kitty output and restores the cursor below it", () => {
+	it("Image component restores direct-placement cursor with save/restore", () => {
 		terminal.imageProtocol = ImageProtocol.Kitty;
 		const image = new Image(
 			BASE64_DUMMY,
@@ -200,38 +200,15 @@ describe("terminal image rendering", () => {
 		const lines = image.render(20);
 		const imageLine = lines.at(-1) ?? "";
 
-		expect(lines).toHaveLength(3);
-		expect(lines.slice(0, -1)).toEqual(["\x1b[0m", "\x1b[0m"]);
-		expect(imageLine.startsWith("\x1b7\x1b[2A")).toBe(true);
-		expect(imageLine).toContain("\x1b_Ga=T");
-		expect(imageLine).toContain("C=1");
-		expect(imageLine).toContain("c=3");
-		expect(imageLine).toContain("r=3");
-		expect(imageLine.endsWith("\x1b8")).toBe(true);
-	});
-
-	it("does not emit cursor movement around single-row direct Kitty output", () => {
-		terminal.imageProtocol = ImageProtocol.Kitty;
-		const image = new Image(
-			BASE64_DUMMY,
-			"image/png",
-			{ fallbackColor: text => text },
-			{ maxWidthCells: 10, maxHeightCells: 1 },
-			SQUARE_DIMENSIONS,
-		);
-
-		const lines = image.render(20);
-		const imageLine = lines.at(-1) ?? "";
-
-		expect(lines).toHaveLength(1);
-		expect(imageLine.startsWith("\x1b_Ga=T")).toBe(true);
-		expect(imageLine).toContain("C=1");
-		expect(imageLine).toContain("c=1");
-		expect(imageLine).toContain("r=1");
-		expect(imageLine.endsWith("\x1b\\")).toBe(true);
-		expect(imageLine).not.toContain("\x1b[0A");
-		expect(imageLine).not.toContain("\x1b[0B");
-		expect(imageLine).not.toMatch(/\x1b\[\d+[AB]/);
+		expect(lines[0]).toBe("\x1b[0m");
+		expect(lines).toHaveLength(2);
+		const clippedTopLine = lines[1] ?? "";
+		expect(clippedTopLine.startsWith("\x1b7\x1b[1A")).toBe(true);
+		expect(clippedTopLine).toContain("C=1");
+		expect(clippedTopLine).toContain("c=2");
+		expect(clippedTopLine).toContain("r=2");
+		expect(clippedTopLine).not.toContain("\x1b[1B");
+		expect(clippedTopLine.endsWith("\x1b8")).toBe(true);
 	});
 });
 

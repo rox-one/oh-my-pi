@@ -4,6 +4,7 @@ import * as path from "node:path";
 import type { MnemopiOptions } from "@oh-my-pi/pi-mnemopi";
 import { getMemoriesDir, logger } from "@oh-my-pi/pi-utils";
 import type { Settings } from "../config/settings";
+import { resolveWorkspaceStorageIdentity, type WorkspaceIdentifierMode } from "../utils/workspace-storage-identifier";
 
 export type MnemopiLlmMode = "none" | "smol" | "remote";
 
@@ -44,12 +45,13 @@ export function loadMnemopiConfig(settings: Settings, agentDir: string): Mnemopi
 	const configuredDbPath = settings.get("mnemopi.dbPath");
 	const cwd = settings.getCwd();
 	const scoping = settings.get("mnemopi.scoping");
-	const dbPath = configuredDbPath?.trim()
-		? configuredDbPath
-		: path.join(getMemoriesDir(agentDir), "mnemopi", "mnemopi.db");
-	const scope = computeMnemopiBankScope(settings.get("mnemopi.bank"), cwd, scoping);
+	const configuredBank = settings.get("mnemopi.bank");
+	const dbPath = configuredDbPath ?? path.join(getMemoriesDir(agentDir), "mnemopi", "mnemopi.db");
+	const scope = computeMnemopiBankScope(configuredBank, cwd, scoping, settings.get("workspace.identifier"));
 	const recallBanks =
-		scoping === "global" ? scope.recallBanks : extendRecallWithLegacyBanks(scope.recallBanks, dbPath, cwd);
+		scoping === "global"
+			? scope.recallBanks
+			: extendRecallWithLegacyBanks(scope.recallBanks, dbPath, cwd, configuredBank);
 	const llmMode = settings.get("mnemopi.llmMode");
 	const embeddingOverride = settings.get("mnemopi.embeddingModel");
 	const embeddingVariant = settings.get("mnemopi.embeddingVariant");
@@ -129,8 +131,9 @@ export function computeMnemopiBankScope(
 	configured: string | undefined,
 	cwd: string,
 	scoping: MnemopiScoping,
+	mode: WorkspaceIdentifierMode = "path",
 ): MnemopiBankScope {
-	const project = projectBank(configured, cwd);
+	const project = projectBank(configured, cwd, mode);
 	const globalBank = sharedBank(configured);
 	switch (scoping) {
 		case "global":
@@ -165,17 +168,17 @@ function sharedBank(configured: string | undefined): string {
 }
 
 /**
- * Derive the per-project bank id from `cwd` alone.
+ * Derive the per-project bank id from the selected workspace identity.
  *
- * Earlier versions resolved the enclosing git root before hashing, which
- * made the bank id unstable: removing or adding a `.git` anywhere above the
- * cwd repointed the same conversation directory to a different bank and
- * fragmented memories (#2412). The git lookup is gone here; the rescue path
- * for already-fragmented installs lives in {@link extendRecallWithLegacyBanks}.
+ * The default `path` mode still hashes the resolved cwd only, preserving the
+ * #2412 stability contract: adding or removing a `.git` marker above cwd must
+ * not repoint the same conversation directory to a different bank. Git modes
+ * explicitly opt into stable Git identities; the rescue path for old
+ * path-derived banks remains in {@link extendRecallWithLegacyBanks}.
  */
-function projectBank(configured: string | undefined, cwd: string): string {
-	const projectRoot = path.resolve(cwd || ".");
-	const project = projectBankSegment(projectRoot);
+function projectBank(configured: string | undefined, cwd: string, mode: WorkspaceIdentifierMode): string {
+	const identity = resolveWorkspaceStorageIdentity(cwd, mode, path.resolve(cwd || "."));
+	const project = projectBankSegment(identity.key);
 	const base = sanitizeBankName(configured);
 	return limitBankName(base ? `${base}-${project}` : project);
 }
@@ -192,6 +195,10 @@ function projectBankSegment(projectRoot: string): string {
  * previous, less-stable bank derivation (#2412) without recalling mixed-cwd
  * legacy banks wholesale under per-project isolation.
  *
+ * When `mnemopi.bank` is configured, rescue is confined to that configured
+ * namespace (`<base>` and `<base>-*`) so two explicit bank namespaces for the
+ * same cwd cannot recall each other's legacy banks.
+ *
  * Robust by design: a missing banks directory, unreadable bank dir, or
  * corrupt SQLite file is silently skipped. Scanning is capped at
  * {@link LEGACY_BANK_SCAN_LIMIT} to bound startup cost.
@@ -200,6 +207,7 @@ export function extendRecallWithLegacyBanks(
 	resolved: readonly string[],
 	dbPath: string,
 	cwd: string,
+	configured?: string,
 ): readonly string[] {
 	const banksDir = path.join(path.dirname(dbPath), "banks");
 	const cwdAbs = path.resolve(cwd || ".");
@@ -210,16 +218,28 @@ export function extendRecallWithLegacyBanks(
 		return resolved;
 	}
 	const have = new Set(resolved);
+	const configuredBase = configuredBankNamespace(configured);
 	const extras: string[] = [];
 	let scanned = 0;
 	for (const entry of entries) {
-		if (!entry.isDirectory() || have.has(entry.name)) continue;
+		if (!entry.isDirectory() || have.has(entry.name) || !isInConfiguredBankNamespace(entry.name, configuredBase))
+			continue;
 		if (scanned >= LEGACY_BANK_SCAN_LIMIT) break;
 		scanned++;
 		const candidate = path.join(banksDir, entry.name, "mnemopi.db");
 		if (bankOnlyHasCwd(candidate, cwdAbs)) extras.push(entry.name);
 	}
 	return extras.length === 0 ? resolved : [...resolved, ...extras];
+}
+
+function configuredBankNamespace(configured: string | undefined): string | undefined {
+	if (configured === undefined || configured.trim() === "") return undefined;
+	return sharedBank(configured);
+}
+
+function isInConfiguredBankNamespace(candidate: string, configuredBase: string | undefined): boolean {
+	if (configuredBase === undefined) return true;
+	return candidate === configuredBase || candidate.startsWith(`${configuredBase}-`);
 }
 
 function bankOnlyHasCwd(dbPath: string, cwd: string): boolean {

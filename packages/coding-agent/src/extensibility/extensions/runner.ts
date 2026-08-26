@@ -24,6 +24,10 @@ import type { BranchHandler, NavigateTreeHandler, NewSessionHandler } from "../s
 import { ManagedTimers } from "./managed-timers";
 import { createExtensionModelQuery } from "./model-api";
 import type {
+	AdvisorContextContribution,
+	AdvisorContextEvent,
+	AdvisorContextEventResult,
+	AdvisorContextPolicyAttribution,
 	AfterProviderResponseEvent,
 	AssistantThinkingRenderer,
 	BeforeAgentStartEvent,
@@ -64,6 +68,8 @@ import type {
 	SessionCompactingResult,
 	SessionStopEvent,
 	SessionStopEventResult,
+	StatusLineSegmentContext,
+	StatusLineSegmentResult,
 	ToolCallEvent,
 	ToolCallEventResult,
 	ToolRegistrationListener,
@@ -85,9 +91,13 @@ export type ExtensionErrorListener = (error: ExtensionError) => void;
 
 export const EXTENSION_HANDLER_TIMEOUT_MS = 30_000;
 let extensionHandlerTimeoutMs = EXTENSION_HANDLER_TIMEOUT_MS;
+const NEVER_ABORTED_SIGNAL = new AbortController().signal;
 
 function throwUnsupportedServiceTierAction(): never {
 	throw new Error("This extension host does not support service-tier actions");
+}
+function throwUnsupportedModelAliasAction(): never {
+	throw new Error("This extension host does not support model-alias actions");
 }
 
 export function testSetExtensionHandlerTimeoutMs(timeoutMs: number): void {
@@ -224,6 +234,11 @@ function createHandlerContext(
 		enumerable: true,
 		configurable: true,
 	});
+	Object.defineProperty(scoped, "signal", {
+		value: handlerSignal,
+		enumerable: true,
+		configurable: true,
+	});
 	return scoped;
 }
 
@@ -325,6 +340,73 @@ const MAX_PENDING_CREDENTIAL_DISABLED = 32;
  * spills, but it does so consistently at both ends. Drop-oldest under pressure.
  */
 const MAX_PENDING_MCP_NOTIFICATIONS = 100;
+const MAX_ADVISOR_CONTEXT_CONTRIBUTIONS = 8;
+const MAX_ADVISOR_CONTEXT_CHARS = 8_000;
+const MAX_ADVISOR_CONTEXT_POLICIES = 16;
+const MAX_ADVISOR_ATTRIBUTION_CHARS = 256;
+const MAX_ADVISOR_SOURCE_CHARS = 80;
+const MAX_ADVISOR_POLICY_TEXT_CHARS = 2_000;
+const MAX_ADVISOR_CONTEXT_COLLECTION_MS = 2_000;
+const VISIBLE_POLICY_CONTROL_CHARACTERS = /[\p{Cc}\p{Cf}]/u;
+
+function boundedAdvisorPolicyAttributions(value: unknown): AdvisorContextPolicyAttribution[] {
+	if (!Array.isArray(value)) return [];
+	const policies: AdvisorContextPolicyAttribution[] = [];
+	for (const item of value) {
+		if (!item || typeof item !== "object") continue;
+		const candidate = item as Record<string, unknown>;
+		const rawAttribution = typeof candidate.attribution === "string" ? candidate.attribution : "";
+		const attribution = rawAttribution.trim();
+		const source = typeof candidate.source === "string" ? candidate.source.trim() : "";
+		const condition = typeof candidate.condition === "string" ? candidate.condition.trim() : "";
+		const behavior = typeof candidate.behavior === "string" ? candidate.behavior.trim() : "";
+		if (!attribution || attribution !== rawAttribution || attribution.length > MAX_ADVISOR_ATTRIBUTION_CHARS)
+			continue;
+		if (
+			/\s|[\p{Cc}\p{Cf}]/u.test(attribution) ||
+			!source ||
+			source.length > MAX_ADVISOR_SOURCE_CHARS ||
+			VISIBLE_POLICY_CONTROL_CHARACTERS.test(source) ||
+			!condition ||
+			condition.length > MAX_ADVISOR_POLICY_TEXT_CHARS ||
+			VISIBLE_POLICY_CONTROL_CHARACTERS.test(condition) ||
+			!behavior ||
+			behavior.length > MAX_ADVISOR_POLICY_TEXT_CHARS ||
+			VISIBLE_POLICY_CONTROL_CHARACTERS.test(behavior)
+		)
+			continue;
+		policies.push({ attribution, source, condition, behavior });
+		if (policies.length >= MAX_ADVISOR_CONTEXT_POLICIES) break;
+	}
+	return policies;
+}
+
+function buildAdvisorContextContribution(
+	result: AdvisorContextEventResult | undefined,
+	trusted: boolean,
+): AdvisorContextContribution | undefined {
+	const validatedPolicies = trusted ? boundedAdvisorPolicyAttributions(result?.policies) : [];
+	let policies: AdvisorContextPolicyAttribution[] = [];
+	let policyContext = "";
+	for (const policy of validatedPolicies) {
+		const nextPolicies = [...policies, policy];
+		const nextContext = `OMP core-validated current-review policies:\n${JSON.stringify({ policies: nextPolicies })}`;
+		if (nextContext.length > MAX_ADVISOR_CONTEXT_CHARS) continue;
+		policies = nextPolicies;
+		policyContext = nextContext;
+	}
+
+	const rawContext = typeof result?.context === "string" ? result.context : "";
+	if (!policyContext && !rawContext.trim()) return undefined;
+	if (!policyContext) return { context: rawContext.slice(0, MAX_ADVISOR_CONTEXT_CHARS), policies };
+
+	const separator = rawContext.trim() ? "\n\n" : "";
+	const remaining = MAX_ADVISOR_CONTEXT_CHARS - policyContext.length - separator.length;
+	return {
+		context: `${policyContext}${separator}${remaining > 0 ? rawContext.slice(0, remaining) : ""}`,
+		policies,
+	};
+}
 
 /**
  * Events handled by the generic emit() method.
@@ -335,6 +417,7 @@ type RunnerEmitEvent = Exclude<
 	| ToolCallEvent
 	| ToolResultEvent
 	| UserBashEvent
+	| AdvisorContextEvent
 	| ContextEvent
 	| BeforeProviderRequestEvent
 	| AfterProviderResponseEvent
@@ -405,6 +488,7 @@ const noOpUIContext: ExtensionUIContext = {
 	notify: () => {},
 	onTerminalInput: () => () => {},
 	setStatus: () => {},
+	refreshStatusLine: () => {},
 	setWorkingMessage: () => {},
 	setWidget: () => {},
 	setFooter: () => {},
@@ -430,7 +514,49 @@ const noOpUIContext: ExtensionUIContext = {
 interface ToolRegistrationScope {
 	pending: Set<Promise<void>>;
 	signal?: AbortSignal;
+
 	closed: boolean;
+}
+
+function isStatusLineSegmentResult(value: unknown): value is StatusLineSegmentResult {
+	try {
+		if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+		const result = value as { content?: unknown; visible?: unknown };
+		return typeof result.content === "string" && typeof result.visible === "boolean";
+	} catch {
+		return false;
+	}
+}
+
+function invisibleStatusLineSegment(): StatusLineSegmentResult {
+	return { content: "", visible: false };
+}
+
+/** Matches only CSI SGR sequences (`\x1b[<params>m`), the styling extensions are documented to emit. */
+const ANSI_SGR_RE = /\x1b\[[0-9;]*m/g;
+
+/**
+ * Neutralizes newlines, tabs, and other C0/C1 control characters in
+ * extension-supplied segment content, without touching CSI SGR styling
+ * escapes. Built-in segments already funnel their text through
+ * `sanitizeStatusText`, which strips ANSI entirely; extension content must
+ * keep its ANSI styling, so control characters are mapped to spaces in place
+ * instead of relying on that stricter sanitizer. This protects the
+ * single-line status bar layout (`component.ts`) from a segment whose
+ * content contains a literal newline or tab.
+ */
+function sanitizeExtensionSegmentContent(content: string): string {
+	if (!content) return content;
+	let sanitized = "";
+	let lastIndex = 0;
+	for (const match of content.matchAll(ANSI_SGR_RE)) {
+		const index = match.index ?? 0;
+		sanitized += content.slice(lastIndex, index).replace(/[\u0000-\u001f\u007f-\u009f]/g, " ");
+		sanitized += match[0];
+		lastIndex = index + match[0].length;
+	}
+	sanitized += content.slice(lastIndex).replace(/[\u0000-\u001f\u007f-\u009f]/g, " ");
+	return sanitized;
 }
 
 export class ExtensionRunner {
@@ -655,6 +781,7 @@ export class ExtensionRunner {
 		this.runtime.sendUserMessage = actions.sendUserMessage;
 		this.runtime.appendEntry = actions.appendEntry;
 		this.runtime.getActiveTools = actions.getActiveTools;
+		this.runtime.getToolReference = actions.getToolReference ?? (name => name);
 		this.runtime.getAllTools = actions.getAllTools;
 		this.runtime.setActiveTools = async toolNames => {
 			const registrationBarrier = this.#toolRegistrationBarrier;
@@ -663,6 +790,7 @@ export class ExtensionRunner {
 		};
 		this.runtime.getCommands = actions.getCommands;
 		this.runtime.setModel = actions.setModel;
+		this.runtime.setModelAlias = actions.setModelAlias ?? throwUnsupportedModelAliasAction;
 		this.runtime.getThinkingLevel = actions.getThinkingLevel;
 		this.runtime.setThinkingLevel = actions.setThinkingLevel;
 		this.runtime.getServiceTiers = actions.getServiceTiers ?? throwUnsupportedServiceTierAction;
@@ -1093,6 +1221,86 @@ export class ExtensionRunner {
 		return undefined;
 	}
 
+	/**
+	 * Render a status-line segment through every extension wrapper registered for
+	 * `id`, around the supplied built-in or invisible base renderer.
+	 *
+	 * Extensions are composed in load order so the newest extension is the
+	 * outermost wrapper. Each wrapper receives a memoized `next()` callback;
+	 * malformed or throwing wrappers are skipped in favor of the result beneath
+	 * them.
+	 */
+	renderStatusLineSegment(
+		id: string,
+		ctx: StatusLineSegmentContext,
+		segmentTheme: Theme,
+		renderBase: () => StatusLineSegmentResult,
+	): StatusLineSegmentResult {
+		const safeBase = (): StatusLineSegmentResult => {
+			try {
+				const result = renderBase();
+				if (isStatusLineSegmentResult(result)) return result;
+				logger.warn("Extension status-line segment base renderer returned an invalid result", { id });
+			} catch (error) {
+				logger.warn("Extension status-line segment base renderer threw", {
+					id,
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
+			return invisibleStatusLineSegment();
+		};
+
+		let render: () => StatusLineSegmentResult = safeBase;
+		for (const extension of this.extensions) {
+			const renderer = extension.statusLineSegments.get(id);
+			if (!renderer) continue;
+
+			const nextRenderer = render;
+			render = (): StatusLineSegmentResult => {
+				let nextCalled = false;
+				let nextResult: StatusLineSegmentResult | undefined;
+				const next = (): StatusLineSegmentResult => {
+					if (!nextCalled) {
+						nextCalled = true;
+						nextResult = nextRenderer();
+					}
+					return nextResult ?? invisibleStatusLineSegment();
+				};
+
+				try {
+					const result = renderer(ctx, next, segmentTheme);
+					if (isStatusLineSegmentResult(result)) return result;
+					logger.warn("Extension status-line segment renderer returned an invalid result", {
+						id,
+						extensionPath: extension.path,
+					});
+				} catch (error) {
+					logger.warn("Extension status-line segment renderer threw; falling through", {
+						id,
+						extensionPath: extension.path,
+						error: error instanceof Error ? error.message : String(error),
+					});
+				}
+				return next();
+			};
+		}
+
+		try {
+			const result = render();
+			return { ...result, content: sanitizeExtensionSegmentContent(result.content) };
+		} catch (error) {
+			logger.warn("Extension status-line segment rendering failed", {
+				id,
+				error: error instanceof Error ? error.message : String(error),
+			});
+			return invisibleStatusLineSegment();
+		}
+	}
+
+	hasStatusLineSegment(id: string): boolean {
+		return this.extensions.some(extension => extension.statusLineSegments.has(id));
+	}
+
 	getAssistantThinkingRenderers(): AssistantThinkingRenderer[] {
 		return this.extensions.flatMap(ext => ext.assistantThinkingRenderers);
 	}
@@ -1157,6 +1365,7 @@ export class ExtensionRunner {
 		return {
 			ui: this.#uiContext,
 			mode: this.#mode,
+			signal: delegation?.signal ?? NEVER_ABORTED_SIGNAL,
 			getContextUsage: () => this.#getContextUsageFn(),
 			compact: instructionsOrOptions => this.#compactFn(instructionsOrOptions),
 			getAsyncJobSnapshot: () => this.#getAsyncJobSnapshotFn(),
@@ -1493,6 +1702,48 @@ export class ExtensionRunner {
 			return { block: true, reason: `Tool execution was cancelled while an extension handler was pending` };
 		}
 		return result;
+	}
+
+	async emitAdvisorContext(event: AdvisorContextEvent, signal?: AbortSignal): Promise<AdvisorContextContribution[]> {
+		if (!this.hasHandlers("advisor_context")) return [];
+		const deadline = Date.now() + MAX_ADVISOR_CONTEXT_COLLECTION_MS;
+		const contributions: AdvisorContextContribution[] = [];
+		let ctx: ExtensionContext | undefined;
+		for (const ext of this.extensions) {
+			const handlers = ext.handlers.get("advisor_context");
+			if (!handlers?.length) continue;
+			ctx ??= this.createContext();
+			for (const handler of handlers) {
+				if (signal?.aborted) return [];
+				let remainingMs = deadline - Date.now();
+				if (remainingMs <= 0) return contributions;
+				let isolatedEvent: AdvisorContextEvent;
+				try {
+					isolatedEvent = structuredClone(event);
+				} catch (error) {
+					logger.warn("Advisor context updates could not be detached; extension context omitted", {
+						error: error instanceof Error ? error.message : String(error),
+					});
+					return [];
+				}
+				remainingMs = deadline - Date.now();
+				if (remainingMs <= 0) return contributions;
+				const result = (await this.#runHandlerWithTimeout(
+					handler,
+					isolatedEvent,
+					ctx,
+					ext,
+					remainingMs,
+					undefined,
+					signal,
+				)) as AdvisorContextEventResult | undefined;
+				const contribution = buildAdvisorContextContribution(result, ext.trusted === true);
+				if (!contribution) continue;
+				contributions.push(contribution);
+				if (contributions.length >= MAX_ADVISOR_CONTEXT_CONTRIBUTIONS) return contributions;
+			}
+		}
+		return contributions;
 	}
 
 	async emitUserBash(event: UserBashEvent): Promise<UserBashEventResult | undefined> {

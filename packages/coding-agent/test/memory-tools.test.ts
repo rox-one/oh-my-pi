@@ -692,7 +692,34 @@ describe("Mnemopi backend lifecycle", () => {
 		await childState?.dispose();
 	});
 
-	it("flushes extractions and closes every owned bank on session shutdown (#2320)", async () => {
+	it("flushes project and global Mnemopi banks during enqueue in per-project-tagged mode", async () => {
+		const config = makeMnemopiConfig({
+			scoping: "per-project-tagged",
+			bank: "project-alpha",
+			globalBank: "default",
+			retainBank: "project-alpha",
+			recallBanks: ["project-alpha", "default"],
+		});
+		const state = registerMnemopiState(config, { cwd: "/work/project-alpha" });
+		const session = state.session;
+		setMnemopiSessionState(session, state);
+		const retainFlush = vi.spyOn(state.memory, "flushExtractions").mockResolvedValue();
+		const retainSleep = vi.spyOn(state.memory, "sleepAllSessions").mockReturnValue({ status: "noop" } as never);
+		const globalFlush = vi.spyOn(state.globalMemory!, "flushExtractions").mockResolvedValue();
+		const globalSleep = vi
+			.spyOn(state.globalMemory!, "sleepAllSessions")
+			.mockReturnValue({ status: "noop" } as never);
+		vi.spyOn(state, "forceRetainCurrentSession").mockResolvedValue();
+
+		await mnemopiBackend.enqueue(path.dirname(config.dbPath), "/work/project-alpha", session);
+
+		expect(retainFlush).toHaveBeenCalledTimes(1);
+		expect(globalFlush).toHaveBeenCalledTimes(1);
+		expect(retainSleep).toHaveBeenCalledWith(false);
+		expect(globalSleep).toHaveBeenCalledWith(false);
+	});
+
+	it("clears every scoped Mnemopi database for per-project-tagged mode", async () => {
 		const config = makeMnemopiConfig({
 			scoping: "per-project-tagged",
 			bank: "project-alpha",

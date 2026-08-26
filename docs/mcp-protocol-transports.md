@@ -104,6 +104,14 @@ Client emits JSON-RPC notifications via `transport.notify(...)`.
 
 Server-initiated notifications are surfaced through transport `onNotification`; `MCPManager` consumes known MCP list/update notifications and can forward all notifications through its own callback.
 
+### URL elicitation requests and completion
+
+`connectToServer()` advertises `capabilities.elicitation.url` unconditionally during `initialize`. A server-to-client `elicitation/create` request is parsed as URL mode only (`mode: "url"`, non-empty `elicitationId`, string `url`/`message`, HTTPS URL without embedded credentials). The transport-level callback receives exactly `(request)`; the client/connection-level callback preserves `(serverName, request)`. If no handler is installed, the client returns `{ action: "decline" }`. Form-mode requests are not handled by the URL path and receive the normal unsupported-method response.
+
+Tool calls can return the MCP URL-elicitation-required error (`-32042`) with a validated `elicitations` array in `MCPRequestError.data`. The manager deduplicates in-flight consent prompts by server name and elicitation id. After an accepted prompt, completion is optional: when the manager has a completion waiter it waits for `notifications/elicitation/complete`, including notifications that arrived before the waiter; the wait has a bounded configurable deadline and observes caller cancellation. The tool bridge performs at most one follow-up call, so repeated elicitation requirements, decline, cancel, timeout, or abort are surfaced without an unbounded retry loop.
+
+Server-request responses are JSON-RPC envelopes. Arbitrary thrown values contribute only a safe code/message; structured `data` is serialized back only for `MCPRequestError`, whose data is explicitly protocol-owned. URL values are redacted from transport logs. Elicitation payloads may be held transiently in bounded in-memory completion and listener buffers; they are not written to durable persistence.
+
 ## Stdio transport internals
 
 ## Lifecycle and state transitions

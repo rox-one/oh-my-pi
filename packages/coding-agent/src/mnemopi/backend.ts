@@ -184,7 +184,11 @@ export const mnemopiBackend: MemoryBackend = {
 				await Promise.all([loadMnemopi(), loadMnemopiCore()]);
 				state = await installMnemopiState(session, config);
 			}
-			await state?.consolidate({ full: true });
+			await state?.forceRetainCurrentSession();
+			// Drain background extraction scheduled by the final retain for every
+			// scoped bank before the process can exit, otherwise last-turn facts
+			// in the project or global bank are lost.
+			await state?.drainScopedBanks();
 		} catch (error) {
 			logger.warn("Mnemopi: enqueue failed.", { error: String(error) });
 		}

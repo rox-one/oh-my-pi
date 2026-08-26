@@ -102,6 +102,8 @@ export interface StructuredSubagentRequest {
 	blockedAgent?: string;
 	/** Preserve a completed temporary artifacts directory for an agent:// handle. */
 	retainArtifacts?: boolean;
+	/** Transfers a published temporary lease to the caller's bounded lifecycle owner. */
+	onRetainedArtifactLease?: (release: () => Promise<void>) => void;
 	/** Task UI agents keep live registry references; eval one-shots normally do not. */
 	keepAlive?: boolean;
 	/** Task subagents share their parent's eval kernel; eval bridge children must not. */
@@ -342,7 +344,9 @@ interface ArtifactLease {
 	sessionFile: string | null;
 	artifactsDir: string;
 	temporary: boolean;
-	unregister: (() => void) | undefined;
+	/** Scope encoded in a temporary artifact URI so identical agent IDs stay unambiguous. */
+	uriScope?: string;
+	release?: () => Promise<void>;
 }
 
 async function leaseArtifacts(
@@ -353,14 +357,23 @@ async function leaseArtifacts(
 	if (sessionFile) {
 		const artifactsDir = sessionFile.slice(0, -6);
 		await fs.mkdir(artifactsDir, { recursive: true });
-		return { sessionFile, artifactsDir, temporary: false, unregister: undefined };
+		return { sessionFile, artifactsDir, temporary: false };
 	}
+	const uriScope = Snowflake.next();
 	const artifactsDir = path.join(
 		os.tmpdir(),
-		`${invocationKind === "eval" ? "omp-eval-agent" : "omp-task"}-${Snowflake.next()}`,
+		`${invocationKind === "eval" ? "omp-eval-agent" : "omp-task"}-${uriScope}`,
 	);
 	await fs.mkdir(artifactsDir, { recursive: true });
-	return { sessionFile: null, artifactsDir, temporary: true, unregister: registerArtifactsDir(artifactsDir) };
+	const unregister = registerArtifactsDir(artifactsDir, uriScope);
+	let released = false;
+	const release = async (): Promise<void> => {
+		if (released) return;
+		released = true;
+		unregister();
+		await fs.rm(artifactsDir, { recursive: true, force: true });
+	};
+	return { sessionFile: null, artifactsDir, temporary: true, uriScope, release };
 }
 
 function resolveAutoloadSkills(session: ToolSession, agent: AgentDefinition) {
@@ -440,6 +453,7 @@ function buildExecutorOptions(
 		promptTemplates: session.promptTemplates,
 		rules: session.rules,
 		preloadedExtensionPaths: restrictToolNames ? [] : session.extensionPaths,
+		preloadedPreparedExtensions: restrictToolNames ? [] : session.preparedExtensions,
 		preloadedCustomToolPaths: restrictToolNames ? [] : session.customToolPaths,
 		localProtocolOptions,
 		parentArtifactManager: session.getArtifactManager?.() ?? undefined,
@@ -523,6 +537,38 @@ async function isolationRecoveryHint(result: SingleResult, artifactsDir: string)
 	return hints.length > 0 ? ` ${hints.join(" ")}` : "";
 }
 
+function hasRecoveryFiles(result: SingleResult): boolean {
+	return result.patchPath !== undefined || (result.nestedPatches?.length ?? 0) > 0;
+}
+
+/** Move manual-recovery files out of the temporary result-artifact lease. */
+async function promoteRecoveryArtifacts(
+	session: ToolSession,
+	temporaryArtifactsDir: string,
+	result: SingleResult,
+): Promise<string | undefined> {
+	try {
+		let durableArtifactsDir = session.getArtifactsDir?.();
+		if (!durableArtifactsDir) {
+			await session.sessionManager?.ensureOnDisk();
+			durableArtifactsDir = session.getArtifactsDir?.() ?? session.getSessionFile()?.slice(0, -6);
+		}
+		if (!durableArtifactsDir || path.resolve(durableArtifactsDir) === path.resolve(temporaryArtifactsDir)) {
+			// In-memory SDK sessions have no session-owned artifact directory. Keep recovery files apart from the URI lease.
+			durableArtifactsDir = path.join(os.tmpdir(), `omp-recovery-${path.basename(temporaryArtifactsDir)}`);
+		}
+		await fs.mkdir(durableArtifactsDir, { recursive: true });
+		if (result.patchPath && path.dirname(result.patchPath) === temporaryArtifactsDir) {
+			const destination = path.join(durableArtifactsDir, path.basename(result.patchPath));
+			await fs.rename(result.patchPath, destination);
+			result.patchPath = destination;
+		}
+		return durableArtifactsDir;
+	} catch {
+		return undefined;
+	}
+}
+
 function attachStructuredOutputMetadata(result: SingleResult, schema: StructuredSubagentSchemaResolution): void {
 	if (schema.source === "none") {
 		delete result.structuredOutput;
@@ -553,7 +599,9 @@ export async function runStructuredSubagent(request: StructuredSubagentRequest):
 	let changesApplied: boolean | null = null;
 	let mergeSummary = "";
 	let requiresRecoveryArtifacts = false;
+	let recoveryArtifactsDir: string | undefined;
 	let completedSuccessfully = false;
+	let publishedArtifact = false;
 	let deferredCleanup: Promise<void> | undefined;
 	const onSubprocessResult =
 		request.invocationKind === "eval"
@@ -601,10 +649,13 @@ export async function runStructuredSubagent(request: StructuredSubagentRequest):
 			});
 		}
 		attachStructuredOutputMetadata(result, policy.schema);
-		requiresRecoveryArtifacts =
-			policy.isIsolated &&
-			(result.exitCode !== 0 || result.error !== undefined || result.aborted === true) &&
-			(result.patchPath !== undefined || result.branchName !== undefined || (result.nestedPatches?.length ?? 0) > 0);
+		if (lease.uriScope && result.outputMeta) {
+			result.outputMeta = {
+				...result.outputMeta,
+				uri: `agent://${result.id}?lease=${encodeURIComponent(lease.uriScope)}`,
+			};
+		}
+		publishedArtifact = result.outputMeta !== undefined;
 
 		if (
 			policy.isIsolated &&
@@ -644,13 +695,38 @@ export async function runStructuredSubagent(request: StructuredSubagentRequest):
 			else mergeSummary = "\n\nIsolation: no changes captured.";
 		}
 
+		requiresRecoveryArtifacts ||=
+			policy.isIsolated &&
+			hasRecoveryFiles(result) &&
+			(!policy.applyChanges ||
+				changesApplied === false ||
+				result.exitCode !== 0 ||
+				result.error !== undefined ||
+				result.aborted === true);
+		if (lease.temporary && requiresRecoveryArtifacts) {
+			const previousPatchPath = result.patchPath;
+			recoveryArtifactsDir = await promoteRecoveryArtifacts(request.session, lease.artifactsDir, result);
+			if (previousPatchPath && result.patchPath && previousPatchPath !== result.patchPath) {
+				mergeSummary = mergeSummary.replaceAll(previousPatchPath, result.patchPath);
+			}
+		}
+		if (lease.temporary && publishedArtifact && lease.release) {
+			const release = lease.release;
+			if (request.onRetainedArtifactLease) {
+				request.onRetainedArtifactLease(release);
+			} else {
+				request.session.registerDisposeCallback?.(() => {
+					void release();
+				});
+			}
+		}
 		completedSuccessfully = result.exitCode === 0 && !result.error && !result.aborted;
 		return {
 			result,
 			policy,
 			mergeSummary,
 			changesApplied,
-			artifactsDir: lease.artifactsDir,
+			artifactsDir: recoveryArtifactsDir ?? lease.artifactsDir,
 			temporaryArtifacts: lease.temporary,
 		};
 	} catch (error) {
@@ -661,22 +737,21 @@ export async function runStructuredSubagent(request: StructuredSubagentRequest):
 			{ cause: error },
 		);
 	} finally {
+		// This lease owns cleanup. Its registered temporary directory must outlive
+		// a verified receipt because `agent://` resolves through that directory.
 		const shouldRetainArtifacts =
+			(lease.temporary && publishedArtifact) ||
 			(request.retainArtifacts && completedSuccessfully) ||
-			(policy.isIsolated && (!policy.applyChanges || changesApplied === false || requiresRecoveryArtifacts));
+			(requiresRecoveryArtifacts && recoveryArtifactsDir === undefined);
 		const shouldCleanup = lease.temporary && !shouldRetainArtifacts;
-		if (shouldCleanup) {
-			const cleanupArtifacts = async (): Promise<void> => {
-				await fs.rm(lease.artifactsDir, { recursive: true, force: true });
-				lease.unregister?.();
-			};
+		if (shouldCleanup && lease.release) {
 			if (deferredCleanup) {
-				trackLateCleanup(deferredCleanup.then(cleanupArtifacts), {
+				trackLateCleanup(deferredCleanup.then(lease.release), {
 					resource: "artifacts",
 					artifactsDir: lease.artifactsDir,
 				});
 			} else {
-				await cleanupArtifacts();
+				await lease.release();
 			}
 		}
 	}

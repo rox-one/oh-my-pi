@@ -55,6 +55,9 @@ import type {
 	MCPServerConnection,
 	MCPToolDefinition,
 	MCPTransport,
+	MCPUrlElicitation,
+	MCPUrlElicitationHandler,
+	MCPUrlElicitationResponse,
 } from "./types";
 import { MCPNotificationMethods } from "./types";
 
@@ -75,6 +78,11 @@ type TrackedPromise<T> = {
 	status: "pending" | "fulfilled" | "rejected";
 	value?: T;
 	reason?: unknown;
+};
+
+type UrlCompletionWaiter = {
+	resolve: () => void;
+	reject: (error: unknown) => void;
 };
 
 const STARTUP_TIMEOUT_MS = 250;
@@ -113,6 +121,8 @@ const RECONNECT_BURST_LIMIT = 5;
  * cleared; subsequent frames deliver directly to attached listeners.
  */
 const NOTIFICATION_BUFFER_CAP = 100;
+const COMPLETED_URL_ELICITATION_TTL_MS = 300_000;
+const COMPLETED_URL_ELICITATION_CAP = NOTIFICATION_BUFFER_CAP;
 
 function trackPromise<T>(promise: Promise<T>): TrackedPromise<T> {
 	const tracked: TrackedPromise<T> = { promise, status: "pending" };
@@ -169,7 +179,6 @@ export interface MCPLoadResult {
 	exaApiKeys: string[];
 }
 
-/** Options for discovering and connecting to MCP servers */
 export interface MCPDiscoverOptions {
 	/** Whether to load project-level config (default: true) */
 	enableProjectConfig?: boolean;
@@ -177,8 +186,10 @@ export interface MCPDiscoverOptions {
 	filterExa?: boolean;
 	/** Whether to filter out browser MCP servers when builtin browser tool is enabled (default: false) */
 	filterBrowser?: boolean;
-	/** Called when MCP server connection state changes. */
-	onStatus?: (event: McpConnectionStatusEvent) => void;
+	/** Called when starting to connect to servers */
+	onConnecting?: (serverNames: string[]) => void;
+	/** Active agent directory propagated to MCP config loading. */
+	agentDir?: string;
 }
 
 /** Handles an MCP `WWW-Authenticate` challenge and returns refreshed config. */
@@ -208,6 +219,11 @@ export class MCPManager {
 	}
 
 	#connections = new Map<string, MCPServerConnection>();
+	#urlElicitationHandler?: MCPUrlElicitationHandler;
+	#urlElicitationPrompts = new Map<string, Promise<MCPUrlElicitationResponse>>();
+	#urlCompletionWaiters = new Map<string, Map<string, Set<UrlCompletionWaiter>>>();
+	#completedUrlElicitations = new Map<string, Map<string, number>>();
+
 	#tools: CustomTool<TSchema, MCPToolDetails>[] = [];
 	#pendingConnections = new Map<string, Promise<MCPServerConnection>>();
 	#pendingToolLoads = new Map<string, Promise<ToolLoadResult>>();
@@ -445,6 +461,19 @@ export class MCPManager {
 		this.#authStorage = authStorage;
 	}
 
+	/** Set the callback used to request user consent for URL-mode elicitations. */
+	setUrlElicitationHandler(handler: MCPUrlElicitationHandler | undefined): void {
+		this.#urlElicitationHandler = handler;
+		for (const connection of this.#connections.values()) {
+			connection.urlElicitationHandler = handler
+				? (serverName, request) => this.#requestUrlElicitation(serverName, request)
+				: undefined;
+			connection.transport.urlElicitationHandler = handler
+				? request => this.#requestUrlElicitation(connection.name, request)
+				: undefined;
+		}
+	}
+
 	/** Set the callback used to complete OAuth after a tool-level auth challenge. */
 	setAuthHandler(handler: MCPAuthHandler | undefined): void {
 		this.#authHandler = handler;
@@ -455,21 +484,13 @@ export class MCPManager {
 	 * Returns tools and any connection errors.
 	 */
 	async discoverAndConnect(options?: MCPDiscoverOptions): Promise<MCPLoadResult> {
-		let loadedConfigs: LoadMCPConfigsResult;
-		try {
-			loadedConfigs = await loadAllMCPConfigs(this.cwd, {
-				enableProjectConfig: options?.enableProjectConfig,
-				filterExa: options?.filterExa,
-				filterBrowser: options?.filterBrowser,
-			});
-		} catch (error) {
-			const message = error instanceof Error ? error.message : String(error);
-			options?.onStatus?.({ type: "failed", serverName: ".mcp.json", error: message });
-			this.#emitConnectionStatus({ type: "failed", serverName: ".mcp.json", error: message });
-			throw error;
-		}
-		const { configs, exaApiKeys, sources } = loadedConfigs;
-		const result = await this.connectServers(configs, sources, options?.onStatus);
+		const { configs, exaApiKeys, sources } = await loadAllMCPConfigs(this.cwd, {
+			enableProjectConfig: options?.enableProjectConfig,
+			filterExa: options?.filterExa,
+			filterBrowser: options?.filterBrowser,
+			agentDir: options?.agentDir,
+		});
+		const result = await this.connectServers(configs, sources, options?.onConnecting);
 		result.exaApiKeys = exaApiKeys;
 		return result;
 	}
@@ -556,9 +577,8 @@ export class MCPManager {
 					onNotification: (method, params) => {
 						this.#handleServerNotification(name, method, params);
 					},
-					onRequest: (method, params) => {
-						return this.#handleServerRequest(method, params);
-					},
+					onRequest: (method, params) => this.#handleServerRequest(method, params),
+					urlElicitationHandler: (serverName, request) => this.#requestUrlElicitation(serverName, request),
 				});
 			})().then(
 				async connection => {
@@ -575,6 +595,11 @@ export class MCPManager {
 						throw new Error(`Server "${name}" was disconnected during initial connection`);
 					}
 
+					connection.urlElicitationHandler = this.#urlElicitationHandler
+						? (serverName, request) => this.#requestUrlElicitation(serverName, request)
+						: undefined;
+					connection.waitForUrlElicitationCompletion = (elicitationId, signal) =>
+						this.#waitForUrlElicitationCompletion(name, elicitationId, signal);
 					this.#pendingConnections.delete(name);
 					this.#connections.set(name, connection);
 					this.#serverConfigs.set(name, config);
@@ -747,6 +772,55 @@ export class MCPManager {
 		sortMCPToolsByName(this.#tools);
 	}
 
+	#requestUrlElicitation(serverName: string, request: MCPUrlElicitation): Promise<MCPUrlElicitationResponse> {
+		const handler = this.#urlElicitationHandler;
+		if (!handler) return Promise.resolve({ action: "decline" });
+		const key = `${serverName}\0${request.elicitationId}`;
+		const existing = this.#urlElicitationPrompts.get(key);
+		if (existing) return existing;
+		const prompt = handler(serverName, request).finally(() => this.#urlElicitationPrompts.delete(key));
+		this.#urlElicitationPrompts.set(key, prompt);
+		return prompt;
+	}
+
+	async #waitForUrlElicitationCompletion(
+		serverName: string,
+		elicitationId: string,
+		signal?: AbortSignal,
+	): Promise<void> {
+		if (signal?.aborted) throw signal.reason instanceof Error ? signal.reason : new Error("Aborted");
+		const completedById = this.#completedUrlElicitations.get(serverName);
+		const completed = completedById?.get(elicitationId);
+		if (completed !== undefined) {
+			completedById!.delete(elicitationId);
+			if (Date.now() - completed <= COMPLETED_URL_ELICITATION_TTL_MS) return;
+			if (completedById!.size === 0) this.#completedUrlElicitations.delete(serverName);
+		}
+		const { promise, resolve, reject } = Promise.withResolvers<void>();
+		let byId = this.#urlCompletionWaiters.get(serverName);
+		if (!byId) {
+			byId = new Map();
+			this.#urlCompletionWaiters.set(serverName, byId);
+		}
+		let waiters = byId.get(elicitationId);
+		if (!waiters) {
+			waiters = new Set();
+			byId.set(elicitationId, waiters);
+		}
+		const waiter: UrlCompletionWaiter = { resolve, reject };
+		waiters.add(waiter);
+		const onAbort = () => reject(signal?.reason instanceof Error ? signal.reason : new Error("Aborted"));
+		signal?.addEventListener("abort", onAbort, { once: true });
+		try {
+			await promise;
+		} finally {
+			signal?.removeEventListener("abort", onAbort);
+			waiters.delete(waiter);
+			if (waiters.size === 0) byId.delete(elicitationId);
+			if (byId.size === 0) this.#urlCompletionWaiters.delete(serverName);
+		}
+	}
+
 	#triggerNotificationRefresh(serverName: string, kind: "tools" | "resources" | "prompts"): Promise<void> {
 		const refresh = (() => {
 			switch (kind) {
@@ -774,6 +848,39 @@ export class MCPManager {
 		const connectionKnown = this.#connections.has(serverName);
 		let refreshPromise: Promise<void> | undefined;
 		switch (method) {
+			case MCPNotificationMethods.ELICITATION_COMPLETE: {
+				const elicitationId =
+					params &&
+					typeof params === "object" &&
+					"elicitationId" in params &&
+					typeof params.elicitationId === "string"
+						? params.elicitationId
+						: undefined;
+				if (elicitationId) {
+					const waiters = this.#urlCompletionWaiters.get(serverName)?.get(elicitationId);
+					if (waiters) {
+						for (const waiter of waiters) waiter.resolve();
+						this.#urlCompletionWaiters.get(serverName)?.delete(elicitationId);
+					} else {
+						let completed = this.#completedUrlElicitations.get(serverName);
+						if (!completed) {
+							completed = new Map();
+							this.#completedUrlElicitations.set(serverName, completed);
+						}
+						const now = Date.now();
+						for (const [id, timestamp] of completed) {
+							if (now - timestamp > COMPLETED_URL_ELICITATION_TTL_MS) completed.delete(id);
+						}
+						completed.set(elicitationId, now);
+						while (completed.size > COMPLETED_URL_ELICITATION_CAP) {
+							const oldest = completed.keys().next().value;
+							if (oldest === undefined) break;
+							completed.delete(oldest);
+						}
+					}
+				}
+				break;
+			}
 			case MCPNotificationMethods.TOOLS_LIST_CHANGED:
 				if (connectionKnown) refreshPromise = this.#triggerNotificationRefresh(serverName, "tools");
 				break;
@@ -939,6 +1046,16 @@ export class MCPManager {
 		);
 	}
 
+	#clearUrlElicitationState(serverName: string): void {
+		this.#completedUrlElicitations.delete(serverName);
+		const byId = this.#urlCompletionWaiters.get(serverName);
+		if (!byId) return;
+		this.#urlCompletionWaiters.delete(serverName);
+		for (const waiters of byId.values()) {
+			for (const waiter of waiters) waiter.reject(new Error(`MCP server "${serverName}" disconnected`));
+		}
+	}
+
 	/**
 	 * Drop a connection from the active map and detach its lifecycle hooks.
 	 *
@@ -949,6 +1066,7 @@ export class MCPManager {
 	 */
 	#detachConnection(name: string, connection: MCPServerConnection): void {
 		connection.transport.onClose = undefined;
+		this.#clearUrlElicitationState(name);
 		if (this.#connections.get(name) === connection) {
 			this.#connections.delete(name);
 		}
@@ -978,6 +1096,7 @@ export class MCPManager {
 		this.#serverConfigs.delete(name);
 		this.#pendingResourceRefresh.delete(name);
 		this.#reconnectHistory.delete(name);
+		this.#clearUrlElicitationState(name);
 
 		const connection = this.#connections.get(name);
 
@@ -1009,6 +1128,8 @@ export class MCPManager {
 		this.#epoch++;
 		const promises = Array.from(this.#connections, ([name, connection]) => this.#discardConnection(name, connection));
 		await Promise.allSettled(promises);
+		this.#completedUrlElicitations.clear();
+		this.#urlCompletionWaiters.clear();
 
 		this.#pendingConnections.clear();
 		this.#pendingToolLoads.clear();
@@ -1194,10 +1315,14 @@ export class MCPManager {
 			onNotification: (method, params) => {
 				this.#handleServerNotification(name, method, params);
 			},
-			onRequest: (method, params) => {
-				return this.#handleServerRequest(method, params);
-			},
+			onRequest: (method, params) => this.#handleServerRequest(method, params),
+			urlElicitationHandler: (serverName, request) => this.#requestUrlElicitation(serverName, request),
 		});
+		connection.urlElicitationHandler = this.#urlElicitationHandler
+			? (serverName, request) => this.#requestUrlElicitation(serverName, request)
+			: undefined;
+		connection.waitForUrlElicitationCompletion = (elicitationId, signal) =>
+			this.#waitForUrlElicitationCompletion(name, elicitationId, signal);
 
 		connection.config = config;
 		if (source) connection._source = source;

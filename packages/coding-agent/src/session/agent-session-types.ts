@@ -32,6 +32,7 @@ import type { ExtensionRunner } from "../extensibility/extensions";
 import type { ContextUsage } from "../extensibility/extensions/types";
 import type { Skill, SkillWarning } from "../extensibility/skills";
 import type { FileSlashCommand } from "../extensibility/slash-commands";
+import type { AgentRegistry } from "../registry/agent-registry";
 import type { SecretObfuscator } from "../secrets/obfuscator";
 import type { ConfiguredThinkingLevel } from "../thinking";
 import type { XdevState } from "../tools/xdev";
@@ -127,10 +128,14 @@ export interface AgentSessionConfig {
 	settings: Settings;
 	/** Whether the session spawn policy permits the read-only `scout` subagent. Defaults to true. */
 	scoutAllowedBySpawnPolicy?: boolean;
+	/** Registry that owns this session and its related agent references. */
+	agentRegistry?: AgentRegistry;
 	/** Whether the caller explicitly requested yolo/auto-approve behavior for this session. */
 	autoApprove?: boolean;
 	/** Models to cycle through with Ctrl+P (from --models flag). */
 	scopedModels?: Array<{ model: Model; thinkingLevel?: ThinkingLevel }>;
+	/** Frozen `--models` scope patterns: when set, the CLI scope never re-resolves on reload; undefined means settings-derived, re-resolved live. */
+	cliModelScope?: readonly string[];
 	/** Initial session thinking selector. */
 	thinkingLevel?: ConfiguredThinkingLevel;
 	/** Hard ceiling on the session's thinking effort (e.g. a task spawn's `task.maxEffort`-capped hint); every later change, including retry-fallback recovery, is re-clamped to it. */
@@ -182,8 +187,14 @@ export interface AgentSessionConfig {
 	mcpManagerToolNames?: Iterable<string>;
 	/** Updates tool-session predicates from the live active tool set. */
 	setActiveToolNames?: (names: Iterable<string>) => void;
-	/** Registers the write transport when runtime xdev mounts first need it. */
+	/** Registers the built-in write transport when it is needed at runtime. */
 	ensureWriteRegistered?: () => Promise<boolean>;
+	/** Reports whether the registered write tool is currently transport-only. */
+	isDeviceOnlyWrite?: () => boolean;
+	/** Switches the registered write tool between transport-only and full access. */
+	setDeviceOnlyWrite?: (enabled: boolean) => void;
+	/** Previews the full-write description without changing execution access. */
+	setPendingFullWriteDescription?: (enabled: boolean) => void;
 	/** Registers the hidden `goal` tool when goal mode is enabled at runtime. */
 	ensureGoalRegistered?: () => Promise<boolean>;
 	/** Current session pre-LLM message transform pipeline. */
@@ -194,8 +205,6 @@ export interface AgentSessionConfig {
 	sideStreamFn?: StreamFn;
 	/** Stream wrapper for advisor requests. */
 	advisorStreamFn?: StreamFn;
-	/** Advisor spend already recorded for the session being opened, restored on resume. */
-	initialAdvisorCosts?: ReadonlyMap<string, number>;
 	/** Prefer websocket transport for OpenAI Codex requests when supported. */
 	preferWebsockets?: boolean;
 	/** Codex saved-reset coordinator; defaults to the process-wide singleton so concurrent sessions can't double-spend. Inject a fresh one in tests. */
@@ -308,6 +317,8 @@ export interface PromptOptions {
 	attribution?: MessageAttribution;
 	/** Skip pre-send compaction checks for this prompt. */
 	skipCompactionCheck?: boolean;
+	/** Stable caller-owned tag attached to the prompt's agent message. */
+	messageTag?: string;
 }
 
 /** Payload for {@link AgentSession.setPromptDropped}: a user prompt cancelled

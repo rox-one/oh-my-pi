@@ -18,6 +18,7 @@ export const CODE_MODE_KEEP_TOOLS: Record<string, true> = {
 	eval: true,
 	ask: true,
 	todo: true,
+	goal: true,
 	yield: true,
 	think: true,
 	__agent__: true,
@@ -54,6 +55,12 @@ export function resolveCodeMode(args: {
 		if (args.enabledToolNames.includes(name)) direct.add(name);
 	}
 	return { active: true, directToolNames: direct };
+}
+
+/** Formats a tool reference as its direct wire alias or an eval bridge expression (`tool.*`/bracket syntax). */
+export function formatCodeModeToolReference(args: { name: string; wireName?: string; direct: boolean }): string {
+	if (args.direct) return args.wireName ?? args.name;
+	return /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(args.name) ? `tool.${args.name}` : `tool[${JSON.stringify(args.name)}]`;
 }
 
 /** codex-rs TurnToolFunctionInfo shape (snake_case on the wire). */

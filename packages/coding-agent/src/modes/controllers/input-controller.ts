@@ -196,12 +196,9 @@ export class InputController {
 	// (>= LEFT_DOUBLE_TAP_MAX_GAP_MS) starts a fresh sequence. See
 	// #detectLeftDoubleTap.
 	#leftTapCount = 0;
-	// Sequential index for `local://paste-N.md` references created by the large-paste
-	// flow. Seeded from 0 and bumped past existing paste files.
-	#pasteCounter = 0;
-	// Visible-chip signature from the last editor change; a difference escapes the
-	// scoped-input render fast path so the attachment chips band repaints.
-	#lastChipsSignature = "";
+	// Sequential index for `local://attachment-N` references created by large-paste and
+	// pasted-file attachments. Seeded from 0 and bumped past existing attachment files.
+	#attachmentCounter = 0;
 
 	#showTinyTitleDownloadProgress(modelKey: string): void {
 		if (!isTinyTitleLocalModelKey(modelKey)) return;
@@ -432,6 +429,13 @@ export class InputController {
 				this.#abortStreamingTurn();
 			} else if (this.ctx.editor.getText().trim()) {
 				// Esc must not destroy an in-progress draft.
+				this.ctx.lastEscapeTime = 0;
+			} else if (vocalizer.isSpeaking()) {
+				// TTS buffers seconds of PCM past the streaming abort, so an Esc
+				// arriving after the model stopped would otherwise fall through to
+				// the double-Esc gesture while Kokoro reads on. Silence first;
+				// tree/branch stays reachable via a second Esc.
+				vocalizer.clear();
 				this.ctx.lastEscapeTime = 0;
 			} else {
 				// Double-interrupt with empty editor triggers /tree, /branch, or nothing based on setting

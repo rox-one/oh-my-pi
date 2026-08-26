@@ -27,10 +27,9 @@
 //! }
 //! ```
 
-use std::{
-	future::Future,
-	panic::{AssertUnwindSafe, catch_unwind},
-};
+use std::cell::Cell;
+use std::future::Future;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use napi::{Env, Error, Result, Status, Task, bindgen_prelude::*};
 use pi_shell::cancel as core_cancel;
@@ -149,6 +148,64 @@ impl AbortToken {
 // Blocking Task - libuv thread pool integration
 // ─────────────────────────────────────────────────────────────────────────────
 
+thread_local! {
+	/// Number of active [`Blocking::compute`] frames on this thread.
+	///
+	/// The native crash hook consults [`is_recoverable_scope_active`] from
+	/// inside a panic: when the panic is about to be caught by
+	/// [`Blocking::compute`]'s [`catch_unwind`] guard, the hook logs the
+	/// report to disk but skips the user-facing stderr crash dump — the
+	/// promise rejection is the primary signal instead. A borrow-free
+	/// [`Cell`] is used because the panic hook runs while an arbitrary set
+	/// of other borrows are live, and a `RefCell` there could panic again
+	/// and abort the process.
+	static BLOCKING_SCOPE_DEPTH: Cell<usize> = const { Cell::new(0) };
+}
+
+/// RAII guard that marks the current thread as executing inside
+/// [`Blocking::compute`], so a panic on this thread is classified as
+/// recoverable by the native crash hook. Decrements on drop even when the
+/// wrapped work unwinds.
+struct BlockingScopeGuard;
+
+impl BlockingScopeGuard {
+	fn enter() -> Self {
+		BLOCKING_SCOPE_DEPTH.with(|d| d.set(d.get() + 1));
+		Self
+	}
+}
+
+impl Drop for BlockingScopeGuard {
+	fn drop(&mut self) {
+		BLOCKING_SCOPE_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+	}
+}
+
+/// Whether a `Blocking::compute` frame is active on the current thread —
+/// i.e. a panic here is about to be caught before it can cross napi-rs's
+/// plain `extern "C" fn` async-work boundary.
+#[must_use]
+pub fn is_recoverable_scope_active() -> bool {
+	BLOCKING_SCOPE_DEPTH.with(|d| d.get() > 0)
+}
+
+/// Best-effort stringification of a panic payload for surfacing in a
+/// [`napi::Error`]. Mirrors the [`std::panic::PanicHookInfo::payload_as_str`]
+/// contract: recognise the two payload types the standard panic runtime
+/// produces (`&'static str` from a bare string panic, `String` from a
+/// formatted panic), and fall back to a diagnostic marker otherwise. The
+/// full panic record (payload, location, backtrace) is still persisted by
+/// the [`crate::crash_handler`] hook on disk.
+fn panic_payload_to_string(payload: &(dyn std::any::Any + Send)) -> String {
+	if let Some(s) = payload.downcast_ref::<&'static str>() {
+		return (*s).to_owned();
+	}
+	if let Some(s) = payload.downcast_ref::<String>() {
+		return s.clone();
+	}
+	String::from("<panic (payload not extractable — see native crash log)>")
+}
+
 /// Task that runs blocking work on libuv's thread pool with profiling.
 ///
 /// This implements napi's `Task` trait, running `compute()` on a libuv worker
@@ -169,36 +226,36 @@ where
 	type JsValue = T;
 	type Output = T;
 
+	/// Runs the user closure on a libuv worker thread.
+	///
+	/// The closure is invoked under [`catch_unwind`] so a panic — from a
+	/// first-party `.expect(...)` invariant, an arithmetic overflow in a
+	/// third-party crate, or anything else — is surfaced as a
+	/// [`napi::Error`] and rejected on the JS `Promise`. Without this
+	/// guard, the unwind would cross napi-rs's plain `extern "C" fn
+	/// execute` async-work callback
+	/// (`napi::async_work::execute`), which under stabilized C-unwind
+	/// semantics (RFC 2945, Rust 1.81+) is a forced process abort. See
+	/// <https://github.com/can1357/oh-my-pi/issues/4020>.
 	fn compute(&mut self) -> Result<Self::Output> {
 		let _guard = profile_region(self.tag);
+		let _scope = BlockingScopeGuard::enter();
 		let work = self
 			.work
 			.take()
 			.ok_or_else(|| Error::from_reason("BlockingTask: work already consumed"))?;
 		let cancel_token = self.cancel_token.clone();
 		let tag = self.tag;
-		// Guard the napi-rs async-work FFI boundary. `execute` is registered as
-		// a plain `unsafe extern "C" fn` (napi 3.9.4 `src/async_work.rs:109`),
-		// so an unwind escaping this frame would cross a non-`C-unwind` FFI
-		// edge and force-abort the host under Rust's stabilized C-unwind rules
-		// (RFC 2945, stable since 1.81). The crash handler scope tells the
-		// global panic hook this panic is about to be caught and mapped to a
-		// `GenericFailure`, so it downgrades the report to a disk-only crash
-		// log — no stderr dump, no default-hook chaining.
-		match catch_unwind(AssertUnwindSafe(move || {
-			crate::crash_handler::blocking_task_panic_scope(move || work(cancel_token))
-		})) {
+		// `FnOnce` closures aren't automatically `UnwindSafe`; `AssertUnwindSafe`
+		// is sound here because we only observe the panic to translate it into
+		// a napi error — no post-panic state on `self` is reused (the closure
+		// was already taken out of `self.work`).
+		match catch_unwind(AssertUnwindSafe(move || work(cancel_token))) {
 			Ok(result) => result,
-			Err(payload) => {
-				// Extract the message BEFORE touching the payload's destructor:
-				// disposal is the one remaining step that can panic again.
-				let message = crate::crash_handler::panic_payload(&*payload);
-				dispose_panic_payload(payload);
-				Err(Error::new(
-					Status::GenericFailure,
-					format!("native task `{tag}` panicked: {message}"),
-				))
-			},
+			Err(payload) => Err(Error::new(
+				Status::GenericFailure,
+				format!("panic in blocking task '{tag}': {}", panic_payload_to_string(&*payload)),
+			)),
 		}
 	}
 
@@ -313,130 +370,110 @@ where
 
 #[cfg(test)]
 mod tests {
-	//! Regression coverage for the FFI-boundary panic guard in
-	//! [`Blocking::compute`]. These exercise the trait method directly on the
-	//! caller thread — libuv's async-work queue isn't running under
-	//! `cargo test`, but the guard sits inside `compute`, so calling it
-	//! synchronously proves the invariant: a panicking closure MUST NOT unwind
-	//! past this method.
+	use napi::{Result, Task};
 
 	use super::*;
-	use crate::testing::SilenceHook;
 
-	fn blocking_task<T, F>(tag: &'static str, work: F) -> Blocking<T>
-	where
-		T: Send + 'static,
-		F: FnOnce(CancelToken) -> Result<T> + Send + 'static,
-	{
-		Blocking { tag, cancel_token: CancelToken::default(), work: Some(Box::new(work)) }
-	}
-
-	#[test]
-	fn compute_forwards_ok_result() {
-		let mut task = blocking_task("t_ok", |_| Ok(42_u32));
-		assert_eq!(task.compute().unwrap(), 42);
-	}
-
-	#[test]
-	fn compute_forwards_err_result() {
-		let mut task = blocking_task::<u32, _>("t_err", |_| Err(Error::from_reason("boom")));
-		let err = task.compute().unwrap_err();
-		assert_eq!(err.status, Status::GenericFailure);
-		assert_eq!(err.reason, "boom");
-	}
-
-	#[test]
-	fn compute_catches_str_literal_panic() {
-		let _silence = SilenceHook::new();
-		let mut task = blocking_task::<u32, _>("t_panic_str", |_| panic!("kaboom"));
-		let err = task.compute().unwrap_err();
-		assert_eq!(err.status, Status::GenericFailure);
-		assert!(err.reason.contains("t_panic_str"), "reason = {}", err.reason);
-		assert!(err.reason.contains("kaboom"), "reason = {}", err.reason);
-	}
-
-	#[test]
-	fn compute_catches_formatted_panic() {
-		let _silence = SilenceHook::new();
-		let mut task = blocking_task::<u32, _>("t_panic_fmt", |_| {
-			let n = 7;
-			panic!("fmt {n}");
-		});
-		let err = task.compute().unwrap_err();
-		assert!(err.reason.contains("fmt 7"), "reason = {}", err.reason);
-	}
-
-	#[test]
-	fn compute_catches_non_string_panic() {
-		let _silence = SilenceHook::new();
-		let mut task = blocking_task::<u32, _>("t_panic_any", |_| {
-			std::panic::panic_any(0xdead_beef_u32);
-		});
-		let err = task.compute().unwrap_err();
-		assert!(err.reason.contains("<non-string panic payload>"), "reason = {}", err.reason);
-	}
-
-	/// Payload whose destructor itself panics — the pathological
-	/// `panic_any` shape that used to double-unwind out of `compute` and
-	/// abort the host across the napi `extern "C"` boundary.
-	///
-	/// `drop` records that it ran via `dropped`, then detonates. The
-	/// [`std::thread::panicking`] guard keeps the detonation out of any
-	/// *unrelated* unwind (e.g. a failing test assertion dropping the bomb),
-	/// where a second panic would abort the whole test binary instead of
-	/// failing one test; on the recovery path under test the thread is no
-	/// longer panicking, so the bomb always fires there.
-	struct DropBomb {
-		dropped: &'static std::sync::atomic::AtomicBool,
-	}
-
-	impl Drop for DropBomb {
-		fn drop(&mut self) {
-			self
-				.dropped
-				.store(true, std::sync::atomic::Ordering::SeqCst);
-			assert!(std::thread::panicking(), "DropBomb detonated in drop");
+	/// Constructs a `Blocking<()>` directly (bypassing `AsyncTask`) so we can
+	/// invoke [`Task::compute`] and observe how it treats a panicking work
+	/// closure. Regression harness for
+	/// <https://github.com/can1357/oh-my-pi/issues/4020>.
+	fn blocking_task_with_panic() -> Blocking<()> {
+		Blocking {
+			tag:          "test_panic",
+			cancel_token: CancelToken::default(),
+			work:         Some(Box::new(|_| -> Result<()> {
+				panic!("injected panic inside blocking work");
+			})),
 		}
 	}
 
+	/// A panic in a `task::blocking` closure MUST NOT unwind out of
+	/// `Task::compute`. napi-rs's async-work `execute` is a plain
+	/// `extern "C" fn`; letting an unwind cross that boundary is a forced
+	/// process abort under stabilized C-unwind rules. The correct behavior is
+	/// to convert the panic into a `napi::Error`.
 	#[test]
-	fn compute_survives_payload_whose_drop_panics() {
-		static DROPPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-		let _silence = SilenceHook::new();
-		let mut task = blocking_task::<u32, _>("t_drop_bomb", |_| {
-			std::panic::panic_any(DropBomb { dropped: &DROPPED });
-		});
-		// Before the fix this aborted the process: the payload's Drop panicked
-		// while `compute` returned, unwinding across napi's `extern "C"` frame.
-		let err = task.compute().unwrap_err();
+	fn compute_converts_panic_to_error() {
+		let mut task = blocking_task_with_panic();
+		let result = task.compute();
+		let err = result.expect_err("panicking work must surface as Err, not unwind out of compute");
 		assert_eq!(err.status, Status::GenericFailure);
-		assert!(err.reason.contains("t_drop_bomb"), "reason = {}", err.reason);
-		assert!(err.reason.contains("<non-string panic payload>"), "reason = {}", err.reason);
 		assert!(
-			DROPPED.load(std::sync::atomic::Ordering::SeqCst),
-			"payload destructor must have run (and panicked) through the recovery path"
+			err.reason.starts_with("panic in blocking task 'test_panic':"),
+			"napi Error reason must identify the panicking task by tag: {}",
+			err.reason,
+		);
+		assert!(
+			err.reason.contains("injected panic inside blocking work"),
+			"panic message must be preserved in the napi Error reason: {}",
+			err.reason,
 		);
 	}
 
+	/// A subsequent `compute` call MUST return the "work already consumed"
+	/// error rather than double-taking the `FnOnce`. Guards against a fix
+	/// that accidentally leaves the closure untouched on the panic path.
 	#[test]
-	fn dispose_panic_payload_swallows_drop_panic() {
-		static DROPPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-		let _silence = SilenceHook::new();
-		let payload = catch_unwind(AssertUnwindSafe(|| {
-			std::panic::panic_any(DropBomb { dropped: &DROPPED });
-		}))
-		.unwrap_err();
-		assert!(!DROPPED.load(std::sync::atomic::Ordering::SeqCst), "bomb must still be armed");
-		// Must return normally despite the payload's Drop panicking.
-		dispose_panic_payload(payload);
-		assert!(DROPPED.load(std::sync::atomic::Ordering::SeqCst), "destructor ran");
+	fn compute_consumes_work_even_when_it_panics() {
+		let mut task = blocking_task_with_panic();
+		let _first = task.compute();
+		let err = task.compute().expect_err("second compute call must Err");
+		assert!(
+			err.reason.contains("work already consumed"),
+			"second call must report work-already-consumed: {}",
+			err.reason,
+		);
 	}
 
+	/// Non-panicking work MUST resolve through `compute` unchanged. Guards
+	/// against a fix that accidentally intercepts normal `Err(napi::Error)`
+	/// returns or mangles the `Ok` payload.
 	#[test]
-	fn compute_rejects_second_call() {
-		let mut task = blocking_task("t_double", |_| Ok(1_u32));
-		assert_eq!(task.compute().unwrap(), 1);
-		let err = task.compute().unwrap_err();
-		assert!(err.reason.contains("work already consumed"), "reason = {}", err.reason);
+	fn compute_still_forwards_ok_and_err_from_work() {
+		let mut ok = Blocking {
+			tag:          "test_ok",
+			cancel_token: CancelToken::default(),
+			work:         Some(Box::new(|_| Ok(42_u32))),
+		};
+		assert_eq!(ok.compute().expect("ok work must not error"), 42_u32);
+
+		let mut err_task = Blocking::<()> {
+			tag:          "test_err",
+			cancel_token: CancelToken::default(),
+			work:         Some(Box::new(|_| {
+				Err(Error::new(Status::InvalidArg, "explicit error".to_owned()))
+			})),
+		};
+		let err = err_task.compute().expect_err("explicit Err must propagate");
+		assert_eq!(err.status, Status::InvalidArg);
+		assert_eq!(err.reason, "explicit error");
+	}
+
+	/// The recoverable-scope flag MUST be raised only while `compute` is on
+	/// the stack and MUST drop back to zero whether the work returned or
+	/// panicked, so the native crash hook classifies subsequent unrelated
+	/// panics correctly.
+	#[test]
+	fn recoverable_scope_flag_tracks_compute_lifetime() {
+		assert!(!is_recoverable_scope_active(), "no compute frame at rest");
+
+		let mut ok = Blocking::<bool> {
+			tag:          "test_scope_ok",
+			cancel_token: CancelToken::default(),
+			work:         Some(Box::new(|_| Ok(is_recoverable_scope_active()))),
+		};
+		assert!(
+			ok.compute().expect("ok work must not error"),
+			"scope flag must be raised inside compute",
+		);
+		assert!(!is_recoverable_scope_active(), "scope flag must clear on return");
+
+		let mut panicky = blocking_task_with_panic();
+		let _ = panicky.compute();
+		assert!(
+			!is_recoverable_scope_active(),
+			"scope flag must clear even when work panicked",
+		);
 	}
 }

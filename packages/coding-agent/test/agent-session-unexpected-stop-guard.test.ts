@@ -145,27 +145,10 @@ afterEach(async () => {
 });
 
 describe("AgentSession unexpected stop guard", () => {
-	it("does not retry or classify when the mode is none", async () => {
-		const spy = vi.spyOn(unexpectedStopClassifier, "classifyUnexpectedStop").mockResolvedValue(true);
-		const { session, mock } = await createHarness(
-			[unexpectedStop("I should apply the same fix to the JS eval worker. Doing that now.")],
-			{
-				"features.unexpectedStopDetection": "none",
-			},
-		);
-
-		await session.prompt("do the thing");
-		await session.waitForIdle();
-
-		expect(spy).not.toHaveBeenCalled();
-		expect(mock.calls).toHaveLength(1);
-		expect(reminderMessages(session.agent.state.messages)).toHaveLength(0);
-	});
-
-	it("defaults to mechanical mode and retries on thinking-only stops without classification", async () => {
+	it("auto-continues clear unexpected stops by default without the model classifier", async () => {
 		const spy = vi.spyOn(unexpectedStopClassifier, "classifyUnexpectedStop").mockResolvedValue(false);
 		const { session, mock } = await createHarness([
-			thinkingOnlyStop("思考中..."),
+			unexpectedStop("I should apply the same fix to the JS eval worker. Doing that now."),
 			{ content: ["done now"], stopReason: "stop" },
 		]);
 
@@ -178,11 +161,12 @@ describe("AgentSession unexpected stop guard", () => {
 		expect(reminderMessages(session.agent.state.messages)).toHaveLength(1);
 	});
 
-	it("does not retry in mechanical mode when text message was delivered", async () => {
+	it("does not classify when the feature is explicitly disabled", async () => {
 		const spy = vi.spyOn(unexpectedStopClassifier, "classifyUnexpectedStop").mockResolvedValue(true);
-		const { session, mock } = await createHarness([
-			unexpectedStop("I should apply the same fix to the JS eval worker. Doing that now."),
-		]);
+		const { session, mock } = await createHarness(
+			[unexpectedStop("I should apply the same fix to the JS eval worker. Doing that now.")],
+			{ "features.unexpectedStopDetection": false },
+		);
 
 		await session.prompt("do the thing");
 		await session.waitForIdle();
@@ -215,10 +199,7 @@ describe("AgentSession unexpected stop guard", () => {
 			return calls === 1;
 		});
 		const { session, mock } = await createHarness(
-			[
-				unexpectedStop("I should apply the same fix to the JS eval worker. Doing that now."),
-				{ content: ["done now"], stopReason: "stop" },
-			],
+			[unexpectedStop("This needs more work before it is done."), { content: ["done now"], stopReason: "stop" }],
 			{
 				"features.unexpectedStopDetection": "smart",
 				"providers.unexpectedStopModel": "online",
@@ -254,13 +235,10 @@ describe("AgentSession unexpected stop guard", () => {
 
 	it("does not continue when the classifier returns false", async () => {
 		const spy = vi.spyOn(unexpectedStopClassifier, "classifyUnexpectedStop").mockResolvedValue(false);
-		const { session, mock } = await createHarness(
-			[unexpectedStop("I should apply the same fix to the JS eval worker. Doing that now.")],
-			{
-				"features.unexpectedStopDetection": "smart",
-				"providers.unexpectedStopModel": "online",
-			},
-		);
+		const { session, mock } = await createHarness([unexpectedStop("This needs more work before it is done.")], {
+			"features.unexpectedStopDetection": true,
+			"providers.unexpectedStopModel": "online",
+		});
 
 		await session.prompt("do the thing");
 		await session.waitForIdle();
@@ -275,10 +253,10 @@ describe("AgentSession unexpected stop guard", () => {
 		const spy = vi.spyOn(unexpectedStopClassifier, "classifyUnexpectedStop").mockResolvedValue(true);
 		const { session, mock } = await createHarness(
 			[
-				unexpectedStop("I should fix this next."),
-				unexpectedStop("I should fix this next."),
-				unexpectedStop("I should fix this next."),
-				unexpectedStop("I should fix this next."),
+				unexpectedStop("This needs more work before it is done."),
+				unexpectedStop("This needs more work before it is done."),
+				unexpectedStop("This needs more work before it is done."),
+				unexpectedStop("This needs more work before it is done."),
 			],
 			{
 				"features.unexpectedStopDetection": "smart",

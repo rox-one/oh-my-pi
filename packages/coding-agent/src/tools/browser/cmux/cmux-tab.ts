@@ -38,7 +38,7 @@ import {
 } from "./rpc";
 import type { CmuxSocketClient } from "./socket-client";
 
-interface ScreenshotOptions {
+export interface ScreenshotOptions {
 	selector?: string;
 	fullPage?: boolean;
 	silent?: boolean;
@@ -50,12 +50,20 @@ interface ObserveOptions {
 	viewportOnly?: boolean;
 }
 
-interface RunContext {
+export interface CmuxRunContext {
 	session: SessionSnapshot;
 	output: RunOutput;
 	screenshots: ScreenshotResult[];
 	signal: AbortSignal;
 	timeoutMs: number;
+}
+
+export interface CmuxRunTarget {
+	readonly page: object;
+	readonly browser: object;
+	setRunContext(context: CmuxRunContext): void;
+	clearRunContext(): void;
+	ensureRuntime(session: SessionSnapshot): JsRuntime;
 }
 
 type WaitUntil = "load" | "domcontentloaded" | "networkidle0" | "networkidle2";
@@ -103,6 +111,61 @@ interface ViewportOptions {
 	width: number;
 	height: number;
 	deviceScaleFactor?: number;
+}
+
+export async function recordCmuxScreenshot(opts: {
+	context: CmuxRunContext;
+	dataBase64: string;
+	mimeType: "image/png" | "image/jpeg";
+	silent?: boolean;
+	captureNotes?: string[];
+}): Promise<string> {
+	const buffer = Buffer.from(opts.dataBase64, "base64");
+	const resized = await resizeImage(
+		{ type: "image", data: opts.dataBase64, mimeType: opts.mimeType },
+		{
+			maxWidth: 1024,
+			maxHeight: 1024,
+			maxBytes: 150 * 1024,
+			jpegQuality: 70,
+			excludeWebP: opts.context.session.excludeWebP,
+		},
+	);
+	const saveFullRes = !!opts.context.session.browserScreenshotDir;
+	const savedBuffer = saveFullRes ? buffer : Buffer.from(resized.buffer);
+	const savedMimeType = saveFullRes ? opts.mimeType : resized.mimeType;
+	const ext = savedMimeType === "image/webp" ? "webp" : savedMimeType === "image/jpeg" ? "jpg" : "png";
+	const dest = opts.context.session.browserScreenshotDir
+		? path.join(
+				opts.context.session.browserScreenshotDir,
+				`screenshot-${new Date().toISOString().replace(/[:.]/g, "-").slice(0, -1)}.${ext}`,
+			)
+		: path.join(os.tmpdir(), `omp-sshots-${Snowflake.next()}.${ext}`);
+	await fs.promises.mkdir(path.dirname(dest), { recursive: true });
+	await Bun.write(dest, savedBuffer);
+	const info: ScreenshotResult = {
+		dest,
+		mimeType: savedMimeType,
+		bytes: savedBuffer.length,
+		width: resized.width,
+		height: resized.height,
+	};
+	opts.context.screenshots.push(info);
+	if (!opts.silent) {
+		const lines = formatScreenshot({
+			saveFullRes,
+			savedMimeType,
+			savedByteLength: savedBuffer.length,
+			dest,
+			resized,
+		});
+		if (opts.captureNotes?.length) {
+			lines.push(`[cmux surface: ${opts.captureNotes.join("; ")}]`);
+		}
+		opts.context.output.push({ type: "text", text: lines.join("\n") });
+		opts.context.output.push({ type: "image", data: resized.data, mimeType: resized.mimeType });
+	}
+	return dest;
 }
 
 const PAGE_SELECTOR_HELPERS = `
@@ -328,7 +391,7 @@ export class CmuxTab {
 	#lastUrl = "about:blank";
 	#lastTitle: string | undefined;
 	#lastViewport: ReadyInfo["viewport"] = DEFAULT_VIEWPORT;
-	#runContext: RunContext | undefined;
+	#runContext: CmuxRunContext | undefined;
 	#runtime: JsRuntime | undefined;
 	readonly #elementRefs = new Map<number, CachedElementRef>();
 	#pageFacade: CmuxPageFacade | undefined;
@@ -394,7 +457,7 @@ export class CmuxTab {
 		};
 	}
 
-	setRunContext(context: RunContext): void {
+	setRunContext(context: CmuxRunContext): void {
 		this.#runContext = context;
 	}
 
@@ -568,53 +631,13 @@ export class CmuxTab {
 			captureNotes.push("fullPage is unavailable on this surface — the image is the viewport only");
 		}
 		const result = await this.#captureScreenshotPng(context.timeoutMs);
-		const buffer = Buffer.from(result.png_base64, "base64");
-		const captureMime = "image/png";
-		const resized = await resizeImage(
-			{ type: "image", data: result.png_base64, mimeType: captureMime },
-			{
-				maxWidth: 1024,
-				maxHeight: 1024,
-				maxBytes: 150 * 1024,
-				jpegQuality: 70,
-				excludeWebP: context.session.excludeWebP,
-			},
-		);
-		const saveFullRes = !!context.session.browserScreenshotDir;
-		const savedBuffer = saveFullRes ? buffer : Buffer.from(resized.buffer);
-		const savedMimeType = saveFullRes ? captureMime : resized.mimeType;
-		const ext = savedMimeType === "image/webp" ? "webp" : savedMimeType === "image/jpeg" ? "jpg" : "png";
-		const dest = context.session.browserScreenshotDir
-			? path.join(
-					context.session.browserScreenshotDir,
-					`screenshot-${new Date().toISOString().replace(/[:.]/g, "-").slice(0, -1)}.${ext}`,
-				)
-			: path.join(os.tmpdir(), `omp-sshots-${Snowflake.next()}.${ext}`);
-		await fs.promises.mkdir(path.dirname(dest), { recursive: true });
-		await Bun.write(dest, savedBuffer);
-		const info: ScreenshotResult = {
-			dest,
-			mimeType: savedMimeType,
-			bytes: savedBuffer.length,
-			width: resized.width,
-			height: resized.height,
-		};
-		context.screenshots.push(info);
-		if (!opts.silent) {
-			const lines = formatScreenshot({
-				saveFullRes,
-				savedMimeType,
-				savedByteLength: savedBuffer.length,
-				dest,
-				resized,
-			});
-			if (captureNotes.length > 0) {
-				lines.push(`[cmux surface: ${captureNotes.join("; ")}]`);
-			}
-			context.output.push({ type: "text", text: lines.join("\n") });
-			context.output.push({ type: "image", data: resized.data, mimeType: resized.mimeType });
-		}
-		return dest;
+		return await recordCmuxScreenshot({
+			context,
+			dataBase64: result.png_base64,
+			mimeType: "image/png",
+			silent: opts.silent,
+			captureNotes,
+		});
 	}
 
 	async waitForUrl(pattern: string | RegExp, opts?: { timeout?: number }): Promise<string> {
@@ -1125,7 +1148,7 @@ export class CmuxTab {
 		};
 	}
 
-	#requireRunContext(operation: string): RunContext {
+	#requireRunContext(operation: string): CmuxRunContext {
 		if (!this.#runContext) {
 			throw new ToolError(`${operation} requires an active cmux browser run`);
 		}
@@ -1371,7 +1394,7 @@ class CmuxBrowserFacade {
 	}
 }
 
-export async function runCmuxCode(tab: CmuxTab, opts: RunCmuxCodeOptions): Promise<RunResultOk> {
+export async function runCmuxCode(tab: CmuxRunTarget, opts: RunCmuxCodeOptions): Promise<RunResultOk> {
 	const runAc = new AbortController();
 	const timeoutSignal = AbortSignal.timeout(opts.timeoutMs);
 	const signal = AbortSignal.any(

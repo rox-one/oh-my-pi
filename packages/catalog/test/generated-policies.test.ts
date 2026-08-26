@@ -263,6 +263,31 @@ describe("generated model policies", () => {
 		]);
 	});
 
+	it("preserves OpenRouter's mandatory provider-authored effort ladder", () => {
+		const models: ModelSpec<Api>[] = [
+			createSpec({
+				id: "stealth/ox-alpha",
+				api: "openrouter",
+				provider: "openrouter",
+				thinking: {
+					mode: "effort",
+					efforts: [Effort.Low, Effort.High, Effort.Max],
+					defaultLevel: Effort.Max,
+					requiresEffort: true,
+				},
+			}),
+		];
+
+		applyGeneratedModelPolicies(models);
+
+		expect(models[0]?.thinking).toEqual({
+			mode: "effort",
+			efforts: [Effort.Low, Effort.High, Effort.Max],
+			defaultLevel: Effort.Max,
+			requiresEffort: true,
+		});
+	});
+
 	it("pins zai glm-5.2 base id to 1M context", () => {
 		const models = [
 			createSpec({

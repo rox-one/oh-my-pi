@@ -1,6 +1,6 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import type { AgentToolResult } from "@oh-my-pi/pi-agent-core";
+import { AgentBusyError, type AgentToolResult } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage, Model } from "@oh-my-pi/pi-ai";
 import { getBlobsDir, isEnoent, logger, type postmortem, VERSION } from "@oh-my-pi/pi-utils";
 import {
@@ -30,6 +30,7 @@ import {
 	PROTOCOL_VERSION,
 	type PromptRequest,
 	type PromptResponse,
+	RequestError,
 	type ResumeSessionRequest,
 	type ResumeSessionResponse,
 	type SessionConfigOption,
@@ -53,17 +54,19 @@ import {
 } from "../../extensibility/extensions";
 import { runExtensionCompact } from "../../extensibility/extensions/compact-handler";
 import { getSessionSlashCommands } from "../../extensibility/extensions/get-commands-handler";
+import { setExtensionModelAlias } from "../../extensibility/extensions/model-api";
 import { buildSkillPromptMessage, parseSkillInvocation } from "../../extensibility/skills";
 import { loadSlashCommands } from "../../extensibility/slash-commands";
 import { resolveLocalUrlToPath } from "../../internal-urls";
 import { MCPManager } from "../../mcp/manager";
-import type { MCPServerConfig } from "../../mcp/types";
+import type { MCPServerConfig, MCPUrlElicitation, MCPUrlElicitationResponse } from "../../mcp/types";
 import { loadAllExtensions } from "../../modes/components/extensions/state-manager";
 import { theme } from "../../modes/theme/theme";
 import { normalizePlanTitle, type PlanApprovalDetails, resolveApprovedPlan } from "../../plan-mode/approved-plan";
 import type { AgentSession, AgentSessionEvent } from "../../session/agent-session";
 import { BlobStore, resolveImageDataSync } from "../../session/blob-store";
 import { isSilentAbort, SKILL_PROMPT_MESSAGE_TYPE, USER_INTERRUPT_LABEL } from "../../session/messages";
+import { listCatalogSessionInfo, listCatalogSessionInfoPage, SessionCatalogError } from "../../session/session-catalog";
 import type { UsageStatistics } from "../../session/session-entries";
 import type { SessionInfo as StoredSessionInfo } from "../../session/session-listing";
 import { SessionManager } from "../../session/session-manager";
@@ -82,6 +85,7 @@ import {
 	TTS_LOCAL_VOICE_OPTIONS,
 } from "../../tts/models";
 import { canonicalizeMessage } from "../../utils/thinking-display";
+import type { WorkspaceIdentifierMode } from "../../utils/workspace-storage-identifier";
 import { createAcpClientBridge } from "./acp-client-bridge";
 import {
 	extractAssistantMessageText,
@@ -175,6 +179,7 @@ type ManagedSessionRecord = {
 	liveMessageId: string | undefined;
 	liveMessageProgress: { textEmitted: boolean; thoughtEmitted: boolean } | undefined;
 	toolArgsById: Map<string, unknown>;
+	planModePreviousTools: string[] | undefined;
 	extensionsConfigured: boolean;
 	// Installed inside `#scheduleBootstrapUpdates` (post-race-guard); released
 	// in `#disposeSessionRecord`. Lives independent of any prompt turn.
@@ -182,6 +187,16 @@ type ManagedSessionRecord = {
 	closedError: PromptLifecycleError | undefined;
 	promptEventHandlers: Set<Promise<void>>;
 	extensionUserMessageTasks: Set<Promise<void>>;
+};
+
+type StoredSessionCwdResolution = {
+	cwd: string;
+	usesStoredCwd: boolean;
+};
+
+type StoredSessionTarget = {
+	cwd: string;
+	path: string;
 };
 
 type ReplayableMessage = {
@@ -572,6 +587,7 @@ export function createAcpExtensionUiContext(
 		},
 		onTerminalInput: () => () => {},
 		setStatus: () => {},
+		refreshStatusLine: () => {},
 		setWorkingMessage: () => {},
 		setWidget: () => {},
 		setFooter: () => {},
@@ -611,6 +627,8 @@ export class AcpAgent implements Agent {
 	#initialSession: AgentSession | undefined;
 	#createSession: CreateAcpSession;
 	#sessions = new Map<string, ManagedSessionRecord>();
+	#planPreviousTools = new WeakMap<AgentSession, string[]>();
+	#modeTransitionTails = new WeakMap<AgentSession, Promise<void>>();
 	#disposePromise: Promise<void> | undefined;
 	#cleanupRegistered = false;
 	#clientCapabilities: ClientCapabilities | undefined;
@@ -717,14 +735,22 @@ export class AcpAgent implements Agent {
 		for (const record of this.#sessions.values()) {
 			await record.session.sessionManager.flush();
 		}
-		const sessions = await this.#listStoredSessions(params.cwd ?? undefined);
-		const offset = this.#parseCursor(params.cursor ?? undefined);
-		const paged = sessions.slice(offset, offset + SESSION_PAGE_SIZE);
-		const nextOffset = offset + paged.length;
-		return {
-			sessions: paged.map(session => this.#toSessionInfo(session)),
-			nextCursor: nextOffset < sessions.length ? String(nextOffset) : undefined,
-		};
+		try {
+			const page = await listCatalogSessionInfoPage({
+				scope: params.cwd ? "cwd" : "all",
+				cwd: params.cwd ?? undefined,
+				cursor: params.cursor ?? undefined,
+				limit: SESSION_PAGE_SIZE,
+			});
+			return {
+				sessions: page.sessions.map(session => this.#toSessionInfo(session)),
+				nextCursor: page.nextCursor,
+			};
+		} catch (error) {
+			if (error instanceof SessionCatalogError && error.code === "invalid_cursor")
+				throw new Error(`Invalid ACP session cursor: ${params.cursor}`);
+			throw error;
+		}
 	}
 
 	async resumeSession(params: ResumeSessionRequest): Promise<ResumeSessionResponse> {
@@ -761,7 +787,7 @@ export class AcpAgent implements Agent {
 
 	async setSessionMode(params: SetSessionModeRequest): Promise<SetSessionModeResponse> {
 		const record = this.#getSessionRecord(params.sessionId);
-		this.#applyModeChange(record.session, params.modeId);
+		await this.#applyModeChange(record.session, params.modeId);
 		await this.#connection.sessionUpdate({
 			sessionId: record.session.sessionId,
 			update: this.#buildCurrentModeUpdate(record.session),
@@ -778,7 +804,7 @@ export class AcpAgent implements Agent {
 
 		switch (params.configId) {
 			case MODE_CONFIG_ID:
-				this.#applyModeChange(record.session, params.value);
+				await this.#applyModeChange(record.session, params.value);
 				break;
 			case MODEL_CONFIG_ID:
 				await this.#setModelById(record.session, params.value);
@@ -869,8 +895,21 @@ export class AcpAgent implements Agent {
 				this.#trackPromptEvent(record, event);
 			});
 
+			// Autonomous turns stream without an owning promptTurn, so the implicit-cancel
+			// guard above cannot fire and a client prompt lands on AgentSession's busy
+			// guard. Type that failure for the wire instead of letting transport.ts wrap
+			// it as a generic -32603 internal error.
 			this.#runPromptOrCommand(record, converted.text, converted.images).catch((error: unknown) => {
-				this.#finishPrompt(record, undefined, error);
+				this.#finishPrompt(
+					record,
+					undefined,
+					error instanceof AgentBusyError
+						? RequestError.sessionBusy(error.message, {
+								reason: "session_busy",
+								hint: "steer|followUp|wait",
+							})
+						: error,
+				);
 			});
 
 			return await pendingPrompt.promise;
@@ -1152,7 +1191,7 @@ export class AcpAgent implements Agent {
 				const cwd = typeof params.cwd === "string" ? (params.cwd as string) : undefined;
 				if (!cwd) throw new Error("cwd required");
 				const limit = typeof params.limit === "number" ? Math.max(1, Math.min(500, params.limit as number)) : 100;
-				const sessions = await SessionManager.list(cwd);
+				const sessions = await this.#listStoredSessions(cwd);
 				const sorted = sessions.sort((l, r) => r.modified.getTime() - l.modified.getTime()).slice(0, limit);
 				return { sessions: sorted.map(s => this.#toSessionInfo(s)) };
 			}
@@ -1175,11 +1214,12 @@ export class AcpAgent implements Agent {
 			case "_omp/extensions/toggle": {
 				const providerId = params.providerId;
 				if (typeof providerId !== "string") throw new Error("providerId required");
+				const cwd = typeof params.cwd === "string" ? (params.cwd as string) : undefined;
 				if (params.enabled === false) {
-					disableProvider(providerId);
+					disableProvider(providerId, cwd);
 					return { enabled: false };
 				}
-				enableProvider(providerId);
+				enableProvider(providerId, cwd);
 				return { enabled: true };
 			}
 			default:
@@ -1227,42 +1267,57 @@ export class AcpAgent implements Agent {
 	}
 
 	async #loadManagedSession(sessionId: string, cwd: string, mcpServers: McpServer[]): Promise<ManagedSessionRecord> {
+		const storedSession = await this.#findStoredSession(sessionId, cwd);
 		const existing = this.#sessions.get(sessionId);
 		if (existing) {
-			this.#assertMatchingCwd(existing.session, cwd);
+			const expectedCwd = storedSession
+				? (await this.#resolveStoredSessionCwd(storedSession, cwd)).cwd
+				: path.resolve(cwd);
+			this.#assertMatchingCwd(existing.session, expectedCwd);
 			await this.#configureMcpServers(existing, mcpServers);
 			return existing;
 		}
 
-		const storedSession = await this.#findStoredSession(sessionId, cwd);
 		if (!storedSession) {
 			throw new Error(`ACP session not found: ${sessionId}`);
 		}
-		return await this.#openStoredSession(storedSession.path, cwd, mcpServers, sessionId);
+		return await this.#openStoredSession(storedSession, cwd, mcpServers, sessionId);
 	}
 
 	async #resumeManagedSession(sessionId: string, cwd: string, mcpServers: McpServer[]): Promise<ManagedSessionRecord> {
+		const storedSession = await this.#findStoredSession(sessionId, cwd);
 		const existing = this.#sessions.get(sessionId);
 		if (existing) {
-			this.#assertMatchingCwd(existing.session, cwd);
+			const expectedCwd = storedSession
+				? (await this.#resolveStoredSessionCwd(storedSession, cwd)).cwd
+				: path.resolve(cwd);
+			this.#assertMatchingCwd(existing.session, expectedCwd);
 			await this.#configureMcpServers(existing, mcpServers);
 			return existing;
 		}
 
-		const storedSession = await this.#findStoredSession(sessionId, cwd);
 		if (!storedSession) {
 			throw new Error(`ACP session not found: ${sessionId}`);
 		}
-		return await this.#openStoredSession(storedSession.path, cwd, mcpServers, sessionId);
+		return await this.#openStoredSession(storedSession, cwd, mcpServers, sessionId);
 	}
 
 	async #forkManagedSession(params: ForkSessionRequest): Promise<ManagedSessionRecord> {
 		const sourcePath = await this.#resolveForkSourceSessionPath(params.sessionId);
-		const { session, setToolUIContext } = normalizeCreatedAcpSession(
-			await this.#createSession(path.resolve(params.cwd), {
-				interactivePrompts: this.#clientCapabilities?.elicitation?.form != null,
-			}),
-		);
+		const loaded = this.#sessions.get(params.sessionId);
+		if (loaded) {
+			this.#assertMatchingCwd(loaded.session, params.cwd);
+		} else {
+			const stored = await this.#findStoredSessionById(params.sessionId);
+			if (!stored) throw new Error(`ACP session not found: ${params.sessionId}`);
+			const requestedCwd = path.resolve(params.cwd);
+			if (path.resolve(stored.cwd) !== requestedCwd) {
+				throw new Error(
+					`ACP session ${params.sessionId} belongs to ${path.resolve(stored.cwd)}, not ${requestedCwd}`,
+				);
+			}
+		}
+		const session = await this.#createSession(path.resolve(params.cwd));
 		try {
 			const success = await session.switchSession(sourcePath);
 			if (!success) {
@@ -1280,18 +1335,15 @@ export class AcpAgent implements Agent {
 	}
 
 	async #openStoredSession(
-		sessionPath: string,
+		storedSession: StoredSessionInfo,
 		cwd: string,
 		mcpServers: McpServer[],
 		sessionId: string,
 	): Promise<ManagedSessionRecord> {
-		const { session, setToolUIContext } = normalizeCreatedAcpSession(
-			await this.#createSession(path.resolve(cwd), {
-				interactivePrompts: this.#clientCapabilities?.elicitation?.form != null,
-			}),
-		);
+		const target = await this.#resolveStoredSessionTarget(storedSession, cwd);
+		const session = await this.#createSession(target.cwd);
 		try {
-			const success = await session.switchSession(sessionPath);
+			const success = await session.switchSession(target.path);
 			if (!success) {
 				throw new Error(`ACP session load was cancelled: ${sessionId}`);
 			}
@@ -1302,12 +1354,64 @@ export class AcpAgent implements Agent {
 		return await this.#registerPreparedSession(session, mcpServers, setToolUIContext);
 	}
 
-	async #registerPreparedSession(
-		session: AgentSession,
-		mcpServers: McpServer[],
-		setToolUIContext: ((uiContext: ExtensionUIContext, hasUI: boolean) => void) | undefined,
-	): Promise<ManagedSessionRecord> {
-		const record = this.#createManagedSessionRecord(session, setToolUIContext);
+	async #resolveStoredSessionTarget(storedSession: StoredSessionInfo, cwd: string): Promise<StoredSessionTarget> {
+		const resolved = await this.#resolveStoredSessionCwd(storedSession, cwd);
+		if (resolved.usesStoredCwd) {
+			return { cwd: resolved.cwd, path: storedSession.path };
+		}
+
+		const workspaceIdentifierMode = await this.#workspaceIdentifierModeForCwd(resolved.cwd);
+		const storedSessionPath = path.resolve(storedSession.path);
+		const storedCwd = storedSession.cwd.trim();
+		const rescopeFromCwd = storedCwd ? path.resolve(storedCwd) : path.dirname(storedSessionPath);
+		const manager = await SessionManager.open(storedSession.path, path.dirname(storedSessionPath), undefined, {
+			initialCwd: rescopeFromCwd,
+			suppressBreadcrumb: true,
+			workspaceIdentifierMode,
+		});
+		const targetSessionDir = SessionManager.getDefaultSessionDir(
+			resolved.cwd,
+			undefined,
+			undefined,
+			workspaceIdentifierMode,
+		);
+		try {
+			await manager.moveTo(resolved.cwd, targetSessionDir);
+			await manager.flush();
+			const sessionPath = manager.getSessionFile();
+			if (!sessionPath) {
+				throw new Error(`ACP session cannot be loaded before it is persisted: ${storedSession.id}`);
+			}
+			return { cwd: resolved.cwd, path: sessionPath };
+		} finally {
+			await manager.close();
+		}
+	}
+
+	async #resolveStoredSessionCwd(storedSession: StoredSessionInfo, cwd: string): Promise<StoredSessionCwdResolution> {
+		const storedCwd = storedSession.cwd.trim();
+		if (storedCwd) {
+			const resolvedStoredCwd = path.resolve(storedCwd);
+			if (await this.#isDirectory(resolvedStoredCwd)) {
+				return { cwd: resolvedStoredCwd, usesStoredCwd: true };
+			}
+		}
+		return { cwd: path.resolve(cwd), usesStoredCwd: false };
+	}
+
+	async #isDirectory(candidate: string): Promise<boolean> {
+		try {
+			return (await fs.stat(candidate)).isDirectory();
+		} catch (error) {
+			if (isEnoent(error)) {
+				return false;
+			}
+			throw error;
+		}
+	}
+
+	async #registerPreparedSession(session: AgentSession, mcpServers: McpServer[]): Promise<ManagedSessionRecord> {
+		const record = this.#createManagedSessionRecord(session);
 		session.setClientBridge(createAcpClientBridge(this.#connection, session.sessionId, this.#clientCapabilities));
 		// `record.lifetimeUnsubscribe` is installed in `#scheduleBootstrapUpdates`
 		// so it shares the bootstrap race guard — see that comment for why.
@@ -1336,6 +1440,7 @@ export class AcpAgent implements Agent {
 			liveMessageId: undefined,
 			liveMessageProgress: undefined,
 			toolArgsById: new Map(),
+			planModePreviousTools: undefined,
 			extensionsConfigured: false,
 			closedError: undefined,
 			promptEventHandlers: new Set(),
@@ -1827,28 +1932,80 @@ export class AcpAgent implements Agent {
 		return session.getPlanModeState()?.enabled ? ACP_PLAN_MODE_ID : ACP_DEFAULT_MODE_ID;
 	}
 
-	#applyModeChange(session: AgentSession, modeId: string): void {
+	async #applyModeChange(session: AgentSession, modeId: string): Promise<void> {
+		const previous = this.#modeTransitionTails.get(session) ?? Promise.resolve();
+		const transition = previous.catch(() => {}).then(() => this.#applyModeChangeSerial(session, modeId));
+		this.#modeTransitionTails.set(session, transition);
+		try {
+			await transition;
+		} finally {
+			if (this.#modeTransitionTails.get(session) === transition) this.#modeTransitionTails.delete(session);
+		}
+	}
+
+	async #applyModeChangeSerial(session: AgentSession, modeId: string): Promise<void> {
 		const availableModes = this.#getAvailableModes(session);
 		if (!availableModes.some(mode => mode.id === modeId)) {
 			throw new Error(`Unsupported ACP mode: ${modeId}`);
 		}
+		const goalMode = session.getGoalModeState();
+		if (modeId === ACP_PLAN_MODE_ID && goalMode && (goalMode.enabled || goalMode.goal.status === "paused")) {
+			throw new Error("Cannot enter plan mode while goal mode is active. Exit goal mode first.");
+		}
 		if (modeId === ACP_PLAN_MODE_ID) {
 			const previous = session.getPlanModeState();
+			const previousTools = session.getEnabledToolNames();
+			if (!this.#planPreviousTools.has(session)) this.#planPreviousTools.set(session, previousTools);
 			session.setPlanModeState({
 				enabled: true,
 				planFilePath: previous?.planFilePath ?? DEFAULT_PLAN_FILE_URL,
 				workflow: previous?.workflow ?? "parallel",
 				reentry: previous !== undefined,
 			});
-			// Mirror `InteractiveMode.#enterPlanMode`: register the plan-proposal
-			// handler that consumes `xd://propose` writes from plan mode. Without
-			// this, proposal dispatch falls through and plan mode has no approval
-			// path (issue #1869).
+			try {
+				await session.setActiveToolsByName(
+					session.hasBuiltInTool("goal") ? previousTools.filter(name => name !== "goal") : previousTools,
+				);
+				const currentGoal = session.getGoalModeState();
+				if (currentGoal && (currentGoal.enabled || currentGoal.goal.status === "paused")) {
+					session.setPlanModeState(previous);
+					if (!previous) this.#planPreviousTools.delete(session);
+					await session.setActiveToolsByName(previousTools);
+					throw new Error("Cannot enter plan mode while goal mode is active. Exit goal mode first.");
+				}
+			} catch (error) {
+				session.setPlanModeState(previous);
+				if (!previous) this.#planPreviousTools.delete(session);
+				throw error;
+			}
 			session.setPlanProposalHandler?.(title => this.#handleAcpPlanProposal(session, title));
 		} else {
+			const previous = session.getPlanModeState();
 			session.setPlanProposalHandler?.(null);
 			session.setPlanModeState(undefined);
+			try {
+				const previousTools = this.#planPreviousTools.get(session);
+				if (previousTools) await session.setActiveToolsByName(previousTools);
+			} catch (error) {
+				session.setPlanModeState(previous);
+				if (previous?.enabled) {
+					session.setPlanProposalHandler?.(title => this.#handleAcpPlanProposal(session, title));
+				}
+				throw error;
+			}
+			this.#planPreviousTools.delete(session);
 		}
+		const restoreToolNames = record.planModePreviousTools ?? session.getEnabledToolNames();
+		session.setPlanModeState(undefined);
+		try {
+			await session.setActiveToolsByName(restoreToolNames);
+		} catch (error) {
+			session.setPlanModeState(previous);
+			session.setPlanProposalHandler?.(previousPlanProposalHandler ?? null);
+			throw error;
+		}
+		record.planModePreviousTools = undefined;
+		session.setPlanProposalHandler?.(null);
 	}
 
 	/**
@@ -1907,8 +2064,7 @@ export class AcpAgent implements Agent {
 		// content as context (the file keeps its agent-chosen name — no rename),
 		// then exit plan mode so the agent regains full tools.
 		session.setPlanReferencePath(planFilePath);
-		session.setPlanProposalHandler?.(null);
-		session.setPlanModeState(undefined);
+		await this.#applyModeChange(session, ACP_DEFAULT_MODE_ID);
 		try {
 			await this.#connection.sessionUpdate({
 				sessionId: session.sessionId,
@@ -2192,9 +2348,27 @@ export class AcpAgent implements Agent {
 		return usage;
 	}
 
+	#activeSettings(cwd?: string): Settings | undefined {
+		if (cwd) {
+			for (const record of this.#sessions.values()) {
+				if (record.session.sessionManager.getCwd() === cwd) {
+					return record.session.settings;
+				}
+			}
+		}
+		const [firstRecord] = this.#sessions.values();
+		return this.#initialSession?.settings ?? firstRecord?.session.settings;
+	}
+
+	async #workspaceIdentifierModeForCwd(cwd: string): Promise<WorkspaceIdentifierMode> {
+		const baseSettings = this.#activeSettings(cwd);
+		if (!baseSettings) return "path";
+		const scopedSettings = await baseSettings.cloneForCwd(cwd);
+		return scopedSettings.get("workspace.identifier");
+	}
+
 	async #listStoredSessions(cwd?: string): Promise<StoredSessionInfo[]> {
-		const sessions = cwd ? await SessionManager.list(cwd) : await SessionManager.listAll();
-		return sessions.sort((left, right) => right.modified.getTime() - left.modified.getTime());
+		return listCatalogSessionInfo(cwd ? { scope: "cwd", cwd } : { scope: "all" });
 	}
 
 	async #findStoredSession(sessionId: string, cwd: string): Promise<StoredSessionInfo | undefined> {
@@ -2214,17 +2388,6 @@ export class AcpAgent implements Agent {
 	async #findStoredSessionById(sessionId: string): Promise<StoredSessionInfo | undefined> {
 		const sessions = await this.#listStoredSessions();
 		return sessions.find(session => session.id === sessionId);
-	}
-
-	#parseCursor(cursor: string | undefined): number {
-		if (!cursor) {
-			return 0;
-		}
-		const parsed = Number.parseInt(cursor, 10);
-		if (!Number.isFinite(parsed) || parsed < 0) {
-			throw new Error(`Invalid ACP session cursor: ${cursor}`);
-		}
-		return parsed;
 	}
 
 	async #replaySessionHistory(record: ManagedSessionRecord): Promise<void> {
@@ -2538,6 +2701,7 @@ export class AcpAgent implements Agent {
 					record.session.sessionManager.appendLabelChange(targetId, label);
 				},
 				getActiveTools: () => record.session.getEnabledToolNames(),
+				getToolReference: name => record.session.getToolReference(name),
 				getAllTools: () => record.session.getAllToolInfos(),
 				setActiveTools: toolNames => record.session.setActiveToolsByName(toolNames),
 				getCommands: () => getSessionSlashCommands(record.session),
@@ -2549,6 +2713,14 @@ export class AcpAgent implements Agent {
 					await record.session.setModel(model);
 					return true;
 				},
+				setModelAlias: name =>
+					setExtensionModelAlias(
+						name,
+						record.session.modelRegistry,
+						record.session.settings,
+						record.session.model,
+						(model, thinkingLevel, options) => record.session.setModelTemporary(model, thinkingLevel, options),
+					),
 				getThinkingLevel: () => record.session.thinkingLevel,
 				setThinkingLevel: level => record.session.setThinkingLevel(level),
 				getServiceTiers: () => record.session.serviceTierByFamily,
@@ -2604,6 +2776,43 @@ export class AcpAgent implements Agent {
 		record.extensionsConfigured = true;
 	}
 
+	async #handleMcpUrlElicitation(
+		record: ManagedSessionRecord,
+		serverName: string,
+		request: MCPUrlElicitation,
+	): Promise<MCPUrlElicitationResponse> {
+		if (this.#clientCapabilities?.elicitation?.url == null) {
+			return { action: "decline" };
+		}
+
+		let host = "unknown host";
+		try {
+			const parsed = new URL(request.url);
+			host = parsed.host || parsed.protocol.replace(/:$/, "") || host;
+		} catch {
+			// Keep malformed URLs out of the consent text; the ACP client still receives the URL field.
+		}
+
+		try {
+			const response = await this.#connection.unstable_createElicitation({
+				mode: "url",
+				sessionId: record.session.sessionId,
+				message: `MCP server "${serverName}" requests authorization at ${host}.\n${request.message}`,
+				url: request.url,
+				elicitationId: request.elicitationId,
+			});
+			if (response.action === "accept") return { action: "accept" };
+			if (response.action === "cancel") return { action: "cancel" };
+			return { action: "decline" };
+		} catch {
+			logger.warn("ACP URL elicitation failed", {
+				serverName,
+				elicitationId: request.elicitationId,
+			});
+			return { action: "decline" };
+		}
+	}
+
 	async #configureMcpServers(record: ManagedSessionRecord, servers: McpServer[]): Promise<void> {
 		if (record.mcpManager) {
 			await record.mcpManager.disconnectAll();
@@ -2620,6 +2829,9 @@ export class AcpAgent implements Agent {
 		}
 
 		const manager = new MCPManager(record.session.sessionManager.getCwd());
+		manager.setUrlElicitationHandler((serverName, request) =>
+			this.#handleMcpUrlElicitation(record, serverName, request),
+		);
 		// MCP servers connect and reconnect independently, so `onToolsChanged` can fire
 		// several times back to back. Each firing is chained onto `record.mcpRefreshChain`
 		// so refreshes apply in order, and each one re-reads `manager.getTools()` at the

@@ -54,13 +54,24 @@ export function createAdvisorMessageCard(
 ): Component {
 	const notes = details?.notes ?? [];
 	const blockers = notes.filter(note => note.severity === "blocker").length;
-	const meta: string[] = [`${notes.length} ${notes.length === 1 ? "note" : "notes"}`];
+	const allPolicy = notes.length > 0 && notes.every(note => note.policy !== undefined);
+	const firstPolicySource = allPolicy ? notes[0]!.policy!.source : undefined;
+	const sharedPolicySource =
+		firstPolicySource && notes.every(note => note.policy?.source === firstPolicySource)
+			? firstPolicySource
+			: undefined;
+	const title = sharedPolicySource ?? "Advisor";
+	const meta: string[] = [
+		allPolicy
+			? `${notes.length} habit violation${notes.length === 1 ? "" : "s"}`
+			: `${notes.length} ${notes.length === 1 ? "note" : "notes"}`,
+	];
 	if (blockers > 0) meta.push(uiTheme.fg("error", `${blockers} blocker${blockers === 1 ? "" : "s"}`));
 
 	return createCachedComponent(
 		getExpanded,
 		(width, expanded) => {
-			const tag = uiTheme.fg("customMessageLabel", uiTheme.bold(`${uiTheme.status.info} Advisor`));
+			const tag = uiTheme.fg("customMessageLabel", uiTheme.bold(`${uiTheme.status.info} ${replaceTabs(title)}`));
 			const lines = [`${tag} ${uiTheme.fg("dim", meta.join(uiTheme.sep.dot))}`];
 			const railGlyph = uiTheme.symbol("advisor.rail");
 			const shown = expanded ? notes : notes.slice(0, COLLAPSED_NOTES);
@@ -70,10 +81,8 @@ export function createAdvisorMessageCard(
 					: "";
 				// Multi-advisor: attribute the note to its source. The implicit
 				// single ("default") advisor renders unlabeled, as before.
-				const who =
-					entry.advisor && entry.advisor !== "default"
-						? `${uiTheme.fg("dim", `[${replaceTabs(entry.advisor)}]`)} `
-						: "";
+				const source = entry.policy && !sharedPolicySource ? entry.policy.source : entry.advisor;
+				const who = source && source !== "default" ? `${uiTheme.fg("dim", `[${replaceTabs(source)}]`)} ` : "";
 				const rail = uiTheme.fg(severityColor(entry.severity), railGlyph);
 				const quoteWidth = visibleWidth(`  ${railGlyph} `);
 				const badgeWidth = visibleWidth(badge);
@@ -81,7 +90,11 @@ export function createAdvisorMessageCard(
 				const w1 = Math.max(10, Math.min(NOTE_LINE_WIDTH, width) - quoteWidth - badgeWidth - whoWidth);
 				const w2 = Math.max(10, Math.min(NOTE_LINE_WIDTH, width) - quoteWidth);
 
-				const paragraphs = entry.note.split("\n").filter(p => p.trim());
+				const paragraphs = entry.policy
+					? expanded
+						? [`When: ${entry.policy.condition}`, `Do: ${entry.policy.behavior}`, `Correction: ${entry.note}`]
+						: [`When: ${entry.policy.condition}`]
+					: entry.note.split("\n").filter(p => p.trim());
 				const bodyLines: string[] = [];
 				for (let i = 0; i < paragraphs.length; i++) {
 					const p = paragraphs[i];

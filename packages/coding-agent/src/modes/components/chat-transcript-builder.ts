@@ -107,7 +107,7 @@ export class ChatTranscriptBuilder {
 	}
 
 	/** Discard all components and rebuild the whole transcript from `entries`. */
-	rebuild(entries: SessionMessageEntry[]): void {
+	rebuild(entries: readonly SessionMessageEntry[]): void {
 		this.reset();
 		for (const entry of entries) this.#appendChatMessage(entry.message);
 		// Flush the trailing turn's usage row only once its tools are materialized
@@ -117,7 +117,7 @@ export class ChatTranscriptBuilder {
 	}
 
 	/** Append newly persisted entries without rebuilding already rendered rows. */
-	append(entries: SessionMessageEntry[]): void {
+	append(entries: readonly SessionMessageEntry[]): void {
 		for (const entry of entries) this.#appendChatMessage(entry.message);
 		if (this.#readArgs.size === 0 && this.#pendingTools.size === 0) this.#flushPendingUsage();
 	}

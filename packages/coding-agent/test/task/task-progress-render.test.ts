@@ -1,4 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+import * as os from "node:os";
+import * as path from "node:path";
+import * as url from "node:url";
 import type { RenderResultOptions } from "@oh-my-pi/pi-agent-core";
 import type { SettingPath, SettingValue } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
@@ -55,6 +58,20 @@ function findRow(component: { render: (w: number) => readonly string[] }, needle
 		.find(line => Bun.stripANSI(line).includes(needle));
 	expect(row).toBeDefined();
 	return row!;
+}
+
+function stripOsc8(text: string): string {
+	return text.replace(/\x1b\]8;[^\x1b\x07]*(?:\x07|\x1b\\)/g, "");
+}
+
+function extractLinkUris(text: string): string[] {
+	return [...text.matchAll(/\x1b\]8;[^;]*;([^\x1b\x07]+)(?:\x1b\\|\x07)/g)].map(match => match[1]!);
+}
+
+function extractLinkTexts(text: string): string[] {
+	return [...text.matchAll(/\x1b\]8;[^;]*;[^\x1b\x07]+\x1b\\([\s\S]*?)\x1b\]8;;\x1b\\/g)].map(match =>
+		Bun.stripANSI(match[1]!),
+	);
 }
 
 describe("task progress rendering", () => {
@@ -303,9 +320,9 @@ describe("task progress rendering", () => {
 		expect(rendered).toContain("Combine the winning patches.");
 	});
 
-	it("pins unfinished tasks below finished ones, finished sorted by runtime asc", async () => {
+	it("orders finished progress before unfinished rows when expanded", async () => {
 		const theme = (await getThemeByName("dark"))!;
-		const options: RenderResultOptions = { expanded: false, isPartial: true, spinnerFrame: 0 };
+		const options: RenderResultOptions = { expanded: true, isPartial: true, spinnerFrame: 0 };
 		const details: TaskToolDetails = {
 			projectAgentsDir: null,
 			results: [],
@@ -357,6 +374,69 @@ describe("task progress rendering", () => {
 		expect(positions).toEqual([...positions].sort((a, b) => a - b));
 	});
 
+	it("links existing task resource labels while preserving visible output", async () => {
+		const theme = (await getThemeByName("dark"))!;
+		const outputPath = path.join(os.tmpdir(), "omp-task-output.txt");
+		const patchPath = path.join(os.tmpdir(), "omp-task.patch");
+		const progressDetails: TaskToolDetails = {
+			projectAgentsDir: null,
+			results: [],
+			totalDurationMs: 0,
+			progress: [
+				runningProgress({
+					id: "Live.Agent",
+					status: "running",
+					sessionFile: path.join(os.tmpdir(), "Live.Agent.jsonl"),
+				}),
+			],
+		};
+		const resultDetails: TaskToolDetails = {
+			projectAgentsDir: null,
+			results: [
+				finishedResult({
+					id: "Done.Agent",
+					outputPath,
+					patchPath,
+				}),
+			],
+			totalDurationMs: 0,
+		};
+		const renderProgress = (): string =>
+			taskToolRenderer
+				.renderResult(
+					{ content: [{ type: "text", text: "" }], details: progressDetails },
+					{ expanded: false, isPartial: true, spinnerFrame: 0 },
+					theme,
+				)
+				.render(120)
+				.join("\n");
+		const renderResult = (): string =>
+			taskToolRenderer
+				.renderResult(
+					{ content: [{ type: "text", text: "" }], details: resultDetails },
+					{ expanded: false, isPartial: false },
+					theme,
+				)
+				.render(120)
+				.join("\n");
+
+		Settings.instance.override("tui.hyperlinks", "always");
+		const linkedProgress = renderProgress();
+		const linkedResult = renderResult();
+		Settings.instance.override("tui.hyperlinks", "off");
+
+		expect(stripOsc8(linkedProgress)).toBe(renderProgress());
+		expect(stripOsc8(linkedResult)).toBe(renderResult());
+		expect(extractLinkUris(linkedProgress)).toContain(
+			url.pathToFileURL(path.join(os.tmpdir(), "Live.Agent.jsonl")).href,
+		);
+		expect(extractLinkTexts(linkedProgress)).toContain("Live>Agent");
+		expect(extractLinkUris(linkedResult)).toContain(url.pathToFileURL(outputPath).href);
+		expect(extractLinkUris(linkedResult)).toContain(url.pathToFileURL(patchPath).href);
+		expect(extractLinkTexts(linkedResult)).toEqual(expect.arrayContaining(["Done>Agent", patchPath]));
+		expect(Bun.stripANSI(stripOsc8(linkedResult))).toContain("Done>Agent");
+	});
+
 	it("folds collapsed progress lists to the live edge with a status summary", async () => {
 		const theme = (await getThemeByName("dark"))!;
 		const details: TaskToolDetails = {
@@ -402,6 +482,51 @@ describe("task progress rendering", () => {
 			expect(expanded).toContain(id);
 		}
 		expect(expanded).not.toContain("more agents");
+	});
+
+	it("folds settled rows even when the live edge fits the collapsed cap", async () => {
+		const theme = (await getThemeByName("dark"))!;
+		const details: TaskToolDetails = {
+			projectAgentsDir: null,
+			results: [],
+			totalDurationMs: 0,
+			progress: [
+				runningProgress({ index: 0, id: "DoneOne", status: "completed", durationMs: 1000 }),
+				runningProgress({ index: 1, id: "FailedOne", status: "failed", durationMs: 2000 }),
+				runningProgress({ index: 2, id: "StillLive", status: "running" }),
+			],
+		};
+
+		const collapsed = Bun.stripANSI(
+			taskToolRenderer
+				.renderResult(
+					{ content: [{ type: "text", text: "" }], details },
+					{ expanded: false, isPartial: true, spinnerFrame: 0 },
+					theme,
+				)
+				.render(120)
+				.join("\n"),
+		);
+		expect(collapsed).toContain("StillLive");
+		expect(collapsed).not.toContain("DoneOne");
+		expect(collapsed).not.toContain("FailedOne");
+		expect(collapsed).toContain("… 2 more agents");
+		expect(collapsed).toContain("1 done");
+		expect(collapsed).toContain("1 failed");
+
+		const expanded = Bun.stripANSI(
+			taskToolRenderer
+				.renderResult(
+					{ content: [{ type: "text", text: "" }], details },
+					{ expanded: true, isPartial: true, spinnerFrame: 0 },
+					theme,
+				)
+				.render(120)
+				.join("\n"),
+		);
+		for (const id of ["DoneOne", "FailedOne", "StillLive"]) {
+			expect(expanded).toContain(id);
+		}
 	});
 
 	it("keeps problem rows visible when the collapsed result list folds", async () => {

@@ -4,6 +4,7 @@ import type { Observation, ObservationEntry } from "../tab-protocol";
 
 export interface CmuxKind {
 	kind: "cmux";
+	backend: "auto" | "gui" | "tui";
 	socketPath: string;
 	password?: string;
 	surface?: string;
@@ -193,6 +194,7 @@ export function resolveCmuxKind(
 	}
 	return {
 		kind: "cmux",
+		backend: "auto",
 		socketPath,
 		password: env.CMUX_SOCKET_PASSWORD || undefined,
 		surface: options?.surface,

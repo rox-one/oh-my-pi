@@ -4,14 +4,8 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { type Skill as CapabilitySkill, skillCapability } from "@oh-my-pi/pi-coding-agent/capability/skill";
 import { getCapability } from "@oh-my-pi/pi-coding-agent/discovery";
-import { getWslWindowsHomeCandidate, runHostProbe } from "@oh-my-pi/pi-coding-agent/discovery/agents";
-import {
-	type LoadSkillsResult,
-	loadSkills,
-	loadSkillsFromDir,
-	parseSkillInvocation,
-	type Skill,
-} from "@oh-my-pi/pi-coding-agent/extensibility/skills";
+import { getWslWindowsHomeCandidate } from "@oh-my-pi/pi-coding-agent/discovery/agents";
+import { loadSkills, loadSkillsFromDir, type Skill } from "@oh-my-pi/pi-coding-agent/extensibility/skills";
 import { removeWithRetries } from "@oh-my-pi/pi-utils";
 
 const fixturesDir = path.resolve(import.meta.dirname, "fixtures/skills");
@@ -261,8 +255,6 @@ describe("skills", () => {
 			const previousWslDistroName = process.env.WSL_DISTRO_NAME;
 			const previousWslInterop = process.env.WSL_INTEROP;
 			const previousUserProfile = process.env.USERPROFILE;
-			const previousPlatform = process.platform;
-			Object.defineProperty(process, "platform", { value: "linux" });
 			process.env.WSL_DISTRO_NAME = "Ubuntu";
 			delete process.env.WSL_INTEROP;
 			process.env.USERPROFILE = tempHostHome;
@@ -285,7 +277,6 @@ describe("skills", () => {
 				else process.env.WSL_INTEROP = previousWslInterop;
 				if (previousUserProfile === undefined) delete process.env.USERPROFILE;
 				else process.env.USERPROFILE = previousUserProfile;
-				Object.defineProperty(process, "platform", { value: previousPlatform });
 				await removeWithRetries(tempHostHome);
 				await removeWithRetries(tempCwd);
 			}
@@ -298,36 +289,7 @@ describe("skills", () => {
 				wslPath: () => undefined,
 			});
 
-			expect(resolved).toBe("/mnt/c/Users/alice");
-		});
-
-		it("resolves the Windows profile through interop when USERPROFILE is not exported (#3779)", () => {
-			const resolved = getWslWindowsHomeCandidate({
-				platform: "linux",
-				env: { WSL_DISTRO_NAME: "Ubuntu" },
-				windowsUserProfile: () => "C:\\Users\\alice",
-				wslPath: () => "/mnt/c/Users/alice",
-			});
-
-			expect(resolved).toBe("/mnt/c/Users/alice");
-		});
-
-		it("kills a host probe that never exits instead of blocking startup (#8402)", () => {
-			// Integration test against real OS timer behavior: the contract is that
-			// runHostProbe's spawnSync `timeout` actually kills a genuinely blocked
-			// child. Injecting a short deadline preserves that native lifecycle
-			// coverage without paying the production discovery budget.
-			const start = performance.now();
-			const result = runHostProbe([process.execPath, "-e", "await Bun.sleep(60_000)"], 25);
-			const elapsed = performance.now() - start;
-			expect(result).toBeUndefined();
-			// Loose bound proves the probe returned via its timeout, not the child.
-			expect(elapsed).toBeLessThan(1_000);
-		});
-
-		it("returns trimmed stdout for a host probe that succeeds (#8402)", () => {
-			const result = runHostProbe([process.execPath, "-e", "process.stdout.write('  host-home  ')"]);
-			expect(result).toBe("host-home");
+			expect(resolved).toBe(path.join("/mnt", "c", "Users", "alice"));
 		});
 
 		it("respects an explicit enableAgentsUser: false (#2401)", async () => {
@@ -684,5 +646,46 @@ describe("parseSkillInvocation", () => {
 			// regex requires `[^\s/]+`, so this falls through with no match.
 			expect(parseSkillInvocation("see /skill:foo/bar")).toBeUndefined();
 		});
+	});
+});
+
+describe("worktree project skills", () => {
+	// `autolearn.skillLocation: "project"` mints into the primary checkout's
+	// .omp/skills; sessions in linked worktrees must still discover them.
+	const git = (cwd: string, args: string[]) => {
+		const proc = Bun.spawnSync(["git", ...args], { cwd, stdout: "pipe", stderr: "pipe" });
+		if (proc.exitCode !== 0) throw new Error(`git ${args[0]} failed: ${proc.stderr.toString()}`);
+	};
+
+	it("discovers primary-checkout .omp/skills from a linked worktree only", async () => {
+		// realpath: git reports resolved paths, macOS tmpdirs sit behind /var.
+		const base = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "omp-wt-skills-")));
+		const main = path.join(base, "repo");
+		const worktree = path.join(base, "repo-wt");
+		const outsider = path.join(base, "outsider");
+		try {
+			await fs.mkdir(main, { recursive: true });
+			git(main, ["init", "-b", "main"]);
+			git(main, ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "--allow-empty", "-m", "init"]);
+			const skillDir = path.join(main, ".omp", "skills", "worktree-scoped");
+			await fs.mkdir(skillDir, { recursive: true });
+			await Bun.write(
+				path.join(skillDir, "SKILL.md"),
+				"---\nname: worktree-scoped\ndescription: scoped to the repo\n---\n\nbody\n",
+			);
+			git(main, ["worktree", "add", worktree, "-b", "wt"]);
+			await fs.mkdir(outsider, { recursive: true });
+			git(outsider, ["init", "-b", "main"]);
+
+			const onlyPiProject = { ...DISABLE_ALL_BUILTIN_SKILLS, enablePiProject: true };
+			const fromWorktree = await loadSkills({ ...onlyPiProject, cwd: worktree });
+			expect(fromWorktree.skills.some(s => s.name === "worktree-scoped")).toBe(true);
+			const fromMain = await loadSkills({ ...onlyPiProject, cwd: main });
+			expect(fromMain.skills.some(s => s.name === "worktree-scoped")).toBe(true);
+			const fromOutside = await loadSkills({ ...onlyPiProject, cwd: outsider });
+			expect(fromOutside.skills.some(s => s.name === "worktree-scoped")).toBe(false);
+		} finally {
+			await removeWithRetries(base);
+		}
 	});
 });

@@ -4,20 +4,20 @@ import type { Component } from "@oh-my-pi/pi-tui";
 import { Text } from "@oh-my-pi/pi-tui";
 import { formatNumber, prompt } from "@oh-my-pi/pi-utils";
 import type { RenderResultOptions } from "../../extensibility/custom-tools/types";
+import { sanitizeStatusText } from "../../modes/shared";
 import type { Theme, ThemeColor } from "../../modes/theme/theme";
 import goalDescription from "../../prompts/tools/goal.md" with { type: "text" };
 import { formatDuration } from "../../slash-commands/helpers/format";
 import type { ToolSession } from "../../tools";
-import { formatErrorDetail, TRUNCATE_LENGTHS } from "../../tools/render-utils";
+import { formatErrorDetail, replaceTabs, TRUNCATE_LENGTHS } from "../../tools/render-utils";
 import { ToolError } from "../../tools/tool-errors";
 import { framedBlock, renderStatusLine, truncateToWidth } from "../../tui";
 import { completionBudgetReport, remainingTokens } from "../runtime";
 import type { Goal, GoalStatus, GoalToolDetails } from "../state";
 
 const goalSchema = type({
-	op: type("'create' | 'get' | 'complete' | 'resume' | 'drop'").describe("goal operation"),
+	op: type("'set' | 'create' | 'get' | 'complete' | 'resume' | 'drop'").describe("goal operation"),
 	"objective?": type("string").describe("goal objective"),
-	"token_budget?": type("number.integer").describe("token budget"),
 });
 
 export type GoalToolInput = typeof goalSchema.infer;
@@ -43,16 +43,15 @@ export function buildGoalToolResponse(
 	};
 }
 
-function validateCreateParams(params: GoalToolInput): { objective: string; tokenBudget?: number } {
+function validateObjectiveParams(params: GoalToolInput, op: "create" | "set"): { objective: string } {
 	const objective = params.objective?.trim();
 	if (!objective) {
-		throw new ToolError("objective is required when op=create");
+		throw new ToolError(`objective is required when op=${op}`);
 	}
-	const tokenBudget = params.token_budget;
-	if (tokenBudget !== undefined && (!Number.isInteger(tokenBudget) || tokenBudget <= 0)) {
-		throw new ToolError("token_budget must be a positive integer when provided");
-	}
-	return { objective, tokenBudget };
+	// The agent sets only the objective and runs until done; token budgets are an
+	// operator concern (`/goal budget`, CLI `--goal-budget`) because the model
+	// cannot estimate token cost reliably.
+	return { objective };
 }
 
 export class GoalTool implements AgentTool<typeof goalSchema, GoalToolDetails> {
@@ -80,15 +79,23 @@ export class GoalTool implements AgentTool<typeof goalSchema, GoalToolDetails> {
 			throw new ToolError("Goal mode is not active.");
 		}
 
+		const startsGoal = params.op === "create" || params.op === "set" || params.op === "resume";
+		const assertCanStart = () => this.#assertCanStartGoal();
+		if (startsGoal) assertCanStart();
+
 		let response: GoalToolResponse;
+
 		if (params.op === "create") {
-			const created = await runtime.createGoal(validateCreateParams(params));
+			const created = await runtime.createGoal(validateObjectiveParams(params, "create"), assertCanStart);
 			response = buildGoalToolResponse(created.goal);
+		} else if (params.op === "set") {
+			const updated = await runtime.setGoal(validateObjectiveParams(params, "set"), assertCanStart);
+			response = buildGoalToolResponse(updated.goal);
 		} else if (params.op === "get") {
 			const state = this.#session.getGoalModeState?.();
 			response = buildGoalToolResponse(state?.goal ?? null);
 		} else if (params.op === "resume") {
-			const resumed = await runtime.resumeGoal();
+			const resumed = await runtime.resumeGoal(assertCanStart);
 			response = buildGoalToolResponse(resumed.goal);
 		} else if (params.op === "drop") {
 			const dropped = await runtime.dropGoal();
@@ -122,10 +129,20 @@ export class GoalTool implements AgentTool<typeof goalSchema, GoalToolDetails> {
 			},
 		};
 	}
+
+	#assertCanStartGoal(): void {
+		if (this.#session.getPlanModeState?.()?.enabled || this.#session.isPlanModePaused?.()) {
+			throw new ToolError("Exit plan mode before starting or resuming a goal.");
+		}
+		if (this.#session.getVibeModeState?.()?.enabled) {
+			throw new ToolError("Exit vibe mode before starting or resuming a goal.");
+		}
+	}
 }
 
 function describeOp(op: string | undefined): string {
 	switch (op) {
+		case "set":
 		case "create":
 			return "set";
 		case "complete":
@@ -158,7 +175,6 @@ function goalBadgeColor(status: GoalStatus): ThemeColor {
 interface GoalRenderArgs {
 	op?: GoalToolInput["op"];
 	objective?: string;
-	token_budget?: number;
 }
 
 export const goalToolRenderer = {
@@ -166,12 +182,9 @@ export const goalToolRenderer = {
 		const description = describeOp(args.op);
 		const meta: string[] = [];
 		const trimmedObjective = args.objective?.trim();
-		if (args.op === "create" && trimmedObjective) {
-			const objective = truncateToWidth(trimmedObjective, TRUNCATE_LENGTHS.TITLE);
+		if ((args.op === "create" || args.op === "set") && trimmedObjective) {
+			const objective = truncateToWidth(replaceTabs(sanitizeStatusText(trimmedObjective)), TRUNCATE_LENGTHS.TITLE);
 			meta.push(uiTheme.italic(uiTheme.fg("muted", `"${objective}"`)));
-		}
-		if (args.op === "create" && args.token_budget !== undefined) {
-			meta.push(`budget ${formatNumber(args.token_budget)}`);
 		}
 		return new Text(renderStatusLine({ icon: "pending", title: "Goal", description, meta }, uiTheme), 0, 0);
 	},
@@ -218,7 +231,10 @@ export const goalToolRenderer = {
 		);
 
 		const lines: string[] = [];
-		const objectiveText = truncateToWidth(goal.objective.trim(), TRUNCATE_LENGTHS.LONG);
+		const objectiveText = truncateToWidth(
+			replaceTabs(sanitizeStatusText(goal.objective.trim())),
+			TRUNCATE_LENGTHS.LONG,
+		);
 		lines.push(uiTheme.italic(uiTheme.fg("muted", `"${objectiveText}"`)));
 
 		const used = formatNumber(goal.tokensUsed);

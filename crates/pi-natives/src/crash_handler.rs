@@ -81,14 +81,19 @@ enum PanicDisposition {
 pub fn install() {
 	INSTALL.call_once(|| {
 		let prev_panic = std::panic::take_hook();
-		std::panic::set_hook(Box::new(move |info| match panic_disposition() {
-			PanicDisposition::LoggedRecoverable => {
-				let report = format_panic_report(info);
-				persist(&report, CrashKind::Panic, false);
-			},
-			PanicDisposition::Fatal => {
-				let report = format_panic_report(info);
-				persist(&report, CrashKind::Panic, true);
+		std::panic::set_hook(Box::new(move |info| {
+			let report = format_panic_report(info);
+			// A panic raised while a recoverable scope is active is caught below
+			// the FFI boundary — either by the uutils dispatcher in
+			// `pi-shell::run_uutil`, which fails the command with a non-zero
+			// exit, or by `task::blocking`'s `catch_unwind` guard in
+			// `crate::task::Blocking::compute`, which rejects the JS promise
+			// with a `napi::Error`. Record it to the log for diagnosis, but
+			// keep the recovered panic out of the user-facing stderr crash dump
+			// and skip the default abort hook.
+			let recoverable = pi_uutils_ctx::is_active() || crate::task::is_recoverable_scope_active();
+			persist(&report, CrashKind::Panic, !recoverable);
+			if !recoverable {
 				prev_panic(info);
 			},
 		}));

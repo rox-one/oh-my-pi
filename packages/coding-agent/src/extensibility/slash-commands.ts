@@ -57,6 +57,8 @@ function parseCommandTemplate(
 export interface LoadSlashCommandsOptions {
 	/** Working directory for project-local commands. Default: getProjectDir() */
 	cwd?: string;
+	/** Active agent directory propagated to {@link LoadOptions.agentDir}. */
+	agentDir?: string;
 }
 
 /**
@@ -64,7 +66,10 @@ export interface LoadSlashCommandsOptions {
  * Loads from all registered providers (builtin, user, project).
  */
 export async function loadSlashCommands(options: LoadSlashCommandsOptions = {}): Promise<FileSlashCommand[]> {
-	const result = await loadCapability<SlashCommand>(slashCommandCapability.id, { cwd: options.cwd });
+	const result = await loadCapability<SlashCommand>(slashCommandCapability.id, {
+		cwd: options.cwd,
+		agentDir: options.agentDir,
+	});
 
 	const fileCommands: FileSlashCommand[] = result.items.map(cmd => {
 		const { description, body } = parseCommandTemplate(cmd.content, {
@@ -110,7 +115,11 @@ export async function loadSlashCommands(options: LoadSlashCommandsOptions = {}):
  * Expand a slash command if it matches a file-based command.
  * Returns the expanded content or the original text if not a slash command.
  */
-export function expandSlashCommand(text: string, fileCommands: FileSlashCommand[]): string {
+export function expandSlashCommand(
+	text: string,
+	fileCommands: FileSlashCommand[],
+	options: { toolRefs?: Readonly<Record<string, string>> } = {},
+): string {
 	if (!text.startsWith("/")) return text;
 
 	const spaceIndex = text.indexOf(" ");
@@ -123,7 +132,12 @@ export function expandSlashCommand(text: string, fileCommands: FileSlashCommand[
 		const argsText = args.join(" ");
 		const usesInlineArgPlaceholders = templateUsesInlineArgPlaceholders(fileCommand.content);
 		const substituted = substituteArgs(fileCommand.content, args);
-		const rendered = prompt.render(substituted, { args, ARGUMENTS: argsText, arguments: argsText });
+		const rendered = prompt.render(substituted, {
+			args,
+			ARGUMENTS: argsText,
+			arguments: argsText,
+			toolRefs: options.toolRefs ?? {},
+		});
 		return appendInlineArgsFallback(rendered, argsText, usesInlineArgPlaceholders);
 	}
 

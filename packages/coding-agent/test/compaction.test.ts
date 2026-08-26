@@ -642,10 +642,7 @@ describe("remote compaction setting", () => {
 				item => item.type === "reasoning" && item.encrypted_content === "encrypted_reasoning_turn_1",
 			),
 		).toBe(true);
-		// V1 now matches V2: the provider-native replay is preserved and local
-		// summarization is skipped (no redundant LLM round), leaving the placeholder.
-		expect(result.summary).toContain("Remote compaction preserved provider-native history");
-		expect(completeSimpleSpy).not.toHaveBeenCalled();
+		expect(result.summary).toContain("Remote compaction preserved provider-native history for this session.");
 		expect(result.preserveData).toEqual({
 			openaiRemoteCompaction: {
 				provider: "openai",

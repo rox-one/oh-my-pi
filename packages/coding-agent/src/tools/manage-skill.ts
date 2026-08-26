@@ -1,9 +1,11 @@
 import * as path from "node:path";
 import { type } from "@oh-my-pi/omptype";
 import type { AgentTool, AgentToolResult } from "@oh-my-pi/pi-agent-core";
+import { CONFIG_DIR_NAME } from "@oh-my-pi/pi-utils";
 import {
 	deleteManagedSkill,
 	getManagedSkillsDir,
+	resolveSkillWriteRoot,
 	sanitizeSkillName,
 	writeManagedSkill,
 } from "../autolearn/managed-skills";
@@ -45,17 +47,20 @@ export class ManageSkillTool implements AgentTool<typeof manageSkillSchema> {
 	readonly loadMode = "essential" as const;
 	readonly summary = "Create, update, or delete an isolated managed skill";
 
-	constructor(private readonly refreshSkills?: () => Promise<void>) {}
+	constructor(private readonly session: ToolSession) {}
 
 	static createIf(session: ToolSession): ManageSkillTool | null {
 		if (!session.settings.get("autolearn.enabled")) return null;
-		return new ManageSkillTool(session.refreshSkills);
+		return new ManageSkillTool(session);
 	}
 
 	async execute(_id: string, params: ManageSkillParams): Promise<AgentToolResult> {
+		const location = this.session.settings.get("autolearn.skillLocation");
+		const rootDir = await resolveSkillWriteRoot(this.session.cwd, location, params.name);
+		const refreshSkills = this.session.refreshSkills;
 		if (params.action === "delete") {
-			await deleteManagedSkill(params.name);
-			await this.refreshSkills?.();
+			await deleteManagedSkill(params.name, rootDir);
+			await refreshSkills?.();
 			return {
 				content: [{ type: "text", text: `Deleted managed skill "${params.name}".` }],
 				details: { action: "delete", name: params.name },
@@ -90,12 +95,14 @@ export class ManageSkillTool implements AgentTool<typeof manageSkillSchema> {
 			name: params.name,
 			description: params.description,
 			body: params.body,
+			rootDir,
 		});
-		await this.refreshSkills?.();
-		const relativePath = path.relative(getManagedSkillsDir(), skillPath);
+		await refreshSkills?.();
+		const relativePath = path.relative(rootDir ?? getManagedSkillsDir(), skillPath);
+		const rootLabel = rootDir ? path.join(CONFIG_DIR_NAME, "skills") : "managed-skills";
 		const verb = params.action === "create" ? "Created" : "Updated";
 		return {
-			content: [{ type: "text", text: `${verb} managed skill "${params.name}" (managed-skills/${relativePath}).` }],
+			content: [{ type: "text", text: `${verb} managed skill "${params.name}" (${rootLabel}/${relativePath}).` }],
 			details: { action: params.action, name: params.name },
 		};
 	}

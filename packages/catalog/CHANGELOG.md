@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed LiteLLM discovery storing zero cache prices when `/model_group/info` omitted them but a later metadata endpoint provided them.
+
 ## [18.0.4] - 2026-08-24
 
 ### Fixed
@@ -15,6 +19,7 @@
 ### Fixed
 
 - Fixed OpenRouter auxiliary requests (e.g. session-title generation) failing with `400 Reasoning is mandatory for this endpoint and cannot be disabled` on mandatory-reasoning models such as `stealth/ox-alpha`. Live discovery now honors the endpoint's `reasoning.mandatory` flag, clamping thinking-off to the lowest supported effort instead of sending `reasoning: { enabled: false }` ([#9415](https://github.com/can1357/oh-my-pi/issues/9415)).
+- Fixed OpenRouter auxiliary requests failing with HTTP 400 for mandatory-reasoning models such as `stealth/ox-alpha` by honoring live discovery metadata ([#9415](https://github.com/can1357/oh-my-pi/issues/9415)).
 
 ## [18.0.1] - 2026-08-23
 
@@ -25,6 +30,7 @@
 
 ### Fixed
 
+- Fixed chat-template reasoning dialects that expose only a binary `enable_thinking` toggle showing a fake multi-tier effort ladder in the picker; the ladder now collapses to one selectable tier when no effort field reaches the wire.
 - Fixed `opencode-go/ox-alpha-free` sending `reasoning_effort: "xhigh"` for the top thinking tier, which the OpenCode Go gateway rejects; the model now uses the gateway's wire-exact `low`/`high`/`max` ladder with mandatory thinking so `--thinking max` reaches the real max tier ([#9349](https://github.com/can1357/oh-my-pi/issues/9349)).
 - Fixed Venice-hosted Qwen models (e.g. `venice/qwen3-6-35b-a3b`) failing with `400 Invalid request parameters`. Reasoning levels now use the accepted OpenAI-style `reasoning_effort` field, while Thinking Off sends Venice's explicit `venice_parameters.disable_thinking` flag ([#9345](https://github.com/can1357/oh-my-pi/issues/9345)).
 - Fixed gateway-first OpenCode Zen and Go models missing context, output, image, and reasoning metadata by enriching live discovery from the current stencil catalog ([#9272](https://github.com/can1357/oh-my-pi/issues/9272)).
@@ -84,6 +90,9 @@
 ### Fixed
 
 - Fixed tool-call turn failures for `opencode-go/muse-spark-1.2` and related variants by ensuring API transport pins apply to live discovery and automatically inferring response routes for gateway-first OpenCode models ([#8957](https://github.com/can1357/oh-my-pi/issues/8957)).
+### Added
+
+- Added Azure OpenAI GPT-5.6 Luna, Sol, and Terra pro-reasoning aliases, projecting each from its base catalog row with the base deployment id and `reasoning.mode: "pro"` marker.
 
 ## [17.3.8] - 2026-08-19
 
@@ -458,6 +467,7 @@
 ### Changed
 
 - Kimi-family models now use MFJS tool schema on all hosts, including proxies like OpenRouter that forward schemas to Moonshot
+- Fixed Moonshot/Kimi models routed through OpenRouter not receiving the Moonshot Flavored JSON Schema (MFJS) tool-schema flavor: `toolSchemaFlavor: "moonshot-mfjs"` now resolves for Kimi ids on the `openrouter` provider (both the chat-completions and Responses transports), so tool parameters get sanitized before hitting Moonshot's stricter validator. ([#5918](https://github.com/can1357/oh-my-pi/issues/5918))
 
 ## [17.0.3] - 2026-07-17
 
@@ -742,6 +752,10 @@
 - Updated the base API URL for the Claude Sonnet 5 model in the Anthropic catalog
 - Updated pricing metrics for DeepSeek R1 and DeepSeek V3 model entries to reflect new rates
 
+### Fixed
+
+- Added `supportsReasoningSummary` identity predicate, letting Codex Responses omit `reasoning.summary` for `gpt-5.3-codex-spark`, which the ChatGPT backend rejects ([#3928](https://github.com/can1357/oh-my-pi/issues/3928)).
+
 ## [16.2.9] - 2026-06-30
 
 ### Added
@@ -997,6 +1011,10 @@
 ### Added
 
 - Added the Umans AI Coding Plan provider catalog with Anthropic-compatible model metadata and dynamic discovery ([#2636](https://github.com/can1357/oh-my-pi/pull/2636) by [@oldschoola](https://github.com/oldschoola)).
+
+### Fixed
+
+- Fixed direct DeepSeek V4 OpenAI-compatible metadata to flag tool-bearing requests as reasoning-disabled, matching the provider backend split used by advisor tool calls. ([#2690](https://github.com/can1357/oh-my-pi/issues/2690))
 
 ## [16.0.0] - 2026-06-15
 

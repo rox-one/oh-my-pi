@@ -8,7 +8,7 @@ import { StatusLineComponent, type StatusLineSettings } from "@oh-my-pi/pi-codin
 import { STATUS_LINE_PRESETS } from "@oh-my-pi/pi-coding-agent/modes/components/status-line/presets";
 import { initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 import * as git from "@oh-my-pi/pi-coding-agent/utils/git";
-import { removeSyncWithRetries, setProjectDir } from "@oh-my-pi/pi-utils";
+import { setProjectDir } from "@oh-my-pi/pi-utils";
 import { beginSettingsTest, restoreSettingsTestState, type SettingsTestState } from "./helpers/settings-test-state";
 
 let settingsState: SettingsTestState | undefined;
@@ -266,15 +266,5 @@ describe("StatusLineComponent effective settings cache", () => {
 			statusSpy.mockRestore();
 			headSpy.mockRestore();
 		}
-	});
-});
-
-describe("StatusLineComponent hook statuses", () => {
-	it("renders every keyed status on a deterministic line", () => {
-		const component = makeComponent({ showHookStatus: true });
-		component.setHookStatus("project-time", "$0.04 (dev)");
-		component.setHookStatus("ponytail", "Ponytail");
-
-		expect(component.render(8)).toEqual(["Ponytail", "$0.04 (…"]);
 	});
 });

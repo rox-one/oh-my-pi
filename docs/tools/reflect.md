@@ -67,11 +67,10 @@ Mnemopi:
   - `per-project` — separate bank id per project label (git primary checkout root basename; cwd basename outside a repo).
   - `per-project-tagged` — shared bank id plus `project:<project label>` filter with `tagsMatch = "any"`.
 - Mnemopi bank scoping:
-  - `global` — reads the shared bank.
-  - `per-project` — reads the bank derived from the absolute cwd basename plus a hash of that cwd.
-  - `per-project-tagged` — reads the cwd-derived project bank and shared bank, then merges results.
-  - Per-project modes may also include safe cwd-matching legacy banks discovered at startup.
-- Session scope: reads cross-session memory data, but does not persist local output. Subagent aliases use the parent's backend scope.
+	- `global` — reads the shared bank.
+	- `per-project` — reads the project bank derived from `workspace.identifier` (`path`, `git-remote`, or `git-root`).
+	- `per-project-tagged` — reads the project bank and shared bank, then merges results.
+- Session scope: reads cross-session memory data, but does not persist local output.
 
 ## Side Effects
 - Network

@@ -34,7 +34,7 @@ import {
 	parseFindingDetails,
 	type SubmitReviewDetails,
 } from "../tools/review";
-import { framedBlock, renderStatusLine } from "../tui";
+import { fileHyperlink, framedBlock, renderStatusLine } from "../tui";
 import { repairDoubleEncodedJsonString } from "./repair-args";
 import { subprocessToolRegistry } from "./subprocess-tool-registry";
 import type { AgentProgress, SingleResult, TaskItem, TaskParams, TaskToolDetails, YieldItem } from "./types";
@@ -301,6 +301,21 @@ export function formatTaskId(id: string): string {
 	const sanitizedId = sanitizeText(id);
 	const segments = sanitizedId.split(".");
 	return segments.length < 2 ? sanitizedId : segments.join(">");
+}
+
+function formatLiveProgressId(progress: AgentProgress): string {
+	const displayId = formatTaskId(progress.id);
+	return progress.sessionFile ? fileHyperlink(progress.sessionFile, displayId) : displayId;
+}
+
+function formatFinalResultId(result: SingleResult): string {
+	const displayId = formatTaskId(result.id);
+	if (!result.outputPath) return displayId;
+	return fileHyperlink(result.outputPath, displayId);
+}
+
+function formatPatchPath(patchPath: string): string {
+	return fileHyperlink(patchPath, patchPath);
 }
 
 const MISSING_YIELD_WARNING_PREFIX = "SYSTEM WARNING: Subagent exited without calling yield tool";
@@ -910,7 +925,7 @@ function renderAgentProgress(
 	// Main status line: id: description [status] · stats · ⟨agent⟩
 	const trimmedDescription = progress.description?.trim();
 	const description = trimmedDescription ? previewLine(sanitizeText(trimmedDescription), 64) : undefined;
-	const displayId = formatTaskId(progress.id);
+	const displayId = formatLiveProgressId(progress);
 	const titlePart = description ? `${theme.bold(displayId)}: ${description}` : displayId;
 	const indent = prefix ? `${prefix} ` : "";
 	let statusLine: string;
@@ -1247,7 +1262,7 @@ function renderAgentResult(
 	// Main status line: id: description [status] · stats · ⟨agent⟩
 	const trimmedDescription = result.description ? sanitizeText(result.description).trim() : undefined;
 	const description = trimmedDescription ? previewLine(trimmedDescription, 64) : undefined;
-	const displayId = formatTaskId(result.id);
+	const displayId = formatFinalResultId(result);
 	const titlePart = description ? `${theme.bold(displayId)}: ${description}` : displayId;
 	let statusLine = `${prefix ? `${prefix} ` : ""}${theme.fg(iconColor, icon)} ${theme.fg(
 		success && !needsWarning ? "text" : "accent",
@@ -1389,7 +1404,7 @@ function renderAgentResult(
 	}
 
 	if (result.patchPath && !aborted && result.exitCode === 0) {
-		lines.push(`${continuePrefix}${theme.fg("dim", `Patch: ${result.patchPath}`)}`);
+		lines.push(`${continuePrefix}${theme.fg("dim", `Patch: ${formatPatchPath(result.patchPath)}`)}`);
 	} else if (result.branchName && !aborted && result.exitCode === 0) {
 		lines.push(`${continuePrefix}${theme.fg("dim", `Branch: ${result.branchName}`)}`);
 	}
@@ -1455,6 +1470,27 @@ function formatHiddenProgressLine(hidden: readonly AgentProgress[], theme: Theme
 			: "";
 	const hint = formatExpandHint(theme, false, true);
 	return `${theme.fg("dim", formatMoreItems(hidden.length, "agent"))}${breakdown}${hint ? ` ${hint}` : ""}`;
+}
+/**
+ * Keep compact live progress focused on unfinished agents. Settled rows remain
+ * available in expanded mode and in the final result, while the live preview
+ * summarizes them above the active edge.
+ */
+function selectCollapsedProgress(ordered: readonly AgentProgress[]): {
+	visible: readonly AgentProgress[];
+	hidden: readonly AgentProgress[];
+} {
+	const live = ordered.filter(progress => progress.status === "pending" || progress.status === "running");
+	if (live.length === 0) return { visible: ordered, hidden: [] };
+
+	const visible = live.slice(Math.max(0, live.length - COLLAPSED_AGENT_LIMIT));
+	if (visible.length === ordered.length) return { visible, hidden: [] };
+
+	const visibleSet = new Set(visible);
+	return {
+		visible,
+		hidden: ordered.filter(progress => !visibleSet.has(progress)),
+	};
 }
 
 /**
@@ -1578,15 +1614,16 @@ export function renderResult(
 			Boolean(details.progress && details.progress.length > 0) && details.results.length === 0;
 		if (shouldRenderProgress && details.progress) {
 			const ordered = orderProgressForDisplay(details.progress);
-			// Collapsed view keeps the live edge: finished rows sort to the top of
-			// the display order, so folding from the top keeps running/pending
-			// agents (and their current-tool lines) visible while one summary line
-			// stands in for everything above it.
-			const visible = expanded ? ordered : ordered.slice(Math.max(0, ordered.length - COLLAPSED_AGENT_LIMIT));
-			if (visible.length < ordered.length) {
-				lines.push(formatHiddenProgressLine(ordered.slice(0, ordered.length - visible.length), theme));
+			// Collapsed live view keeps unfinished rows visible and folds settled
+			// rows into one status summary above them. Expanded mode retains the
+			// complete progress history.
+			const progressDisplay = expanded
+				? { visible: ordered, hidden: [] as AgentProgress[] }
+				: selectCollapsedProgress(ordered);
+			if (progressDisplay.hidden.length > 0) {
+				lines.push(formatHiddenProgressLine(progressDisplay.hidden, theme));
 			}
-			for (const progress of visible) {
+			for (const progress of progressDisplay.visible) {
 				lines.push(
 					...renderAgentProgress(progress, "", "  ", expanded, theme, spinnerFrame, frozen, undefined, 0, nowMs),
 				);
@@ -1613,7 +1650,13 @@ export function renderResult(
 						details.progress.filter(progress => !details.results.some(res => res.id === progress.id)),
 					)
 				: [];
-			for (const progress of supplementalProgress) {
+			const progressDisplay = expanded
+				? { visible: supplementalProgress, hidden: [] as AgentProgress[] }
+				: selectCollapsedProgress(supplementalProgress);
+			if (progressDisplay.hidden.length > 0) {
+				lines.push(formatHiddenProgressLine(progressDisplay.hidden, theme));
+			}
+			for (const progress of progressDisplay.visible) {
 				lines.push(
 					...renderAgentProgress(progress, "", "  ", expanded, theme, spinnerFrame, frozen, undefined, 0, nowMs),
 				);
@@ -1788,10 +1831,14 @@ function renderNestedTaskTree(
 		const inflight = details.progress;
 		if (inflight && inflight.length > 0) {
 			const ordered = orderProgressForDisplay(inflight);
-			const visible = expanded ? ordered : ordered.slice(Math.max(0, ordered.length - COLLAPSED_AGENT_LIMIT));
-			const hiddenCount = ordered.length - visible.length;
-			visible.forEach((prog, index) => {
-				const { prefix, continuePrefix } = nestedMarkers(hiddenCount === 0 && index === visible.length - 1, theme);
+			const progressDisplay = expanded
+				? { visible: ordered, hidden: [] as AgentProgress[] }
+				: selectCollapsedProgress(ordered);
+			progressDisplay.visible.forEach((prog, index) => {
+				const { prefix, continuePrefix } = nestedMarkers(
+					progressDisplay.hidden.length === 0 && index === progressDisplay.visible.length - 1,
+					theme,
+				);
 				lines.push(
 					...renderAgentProgress(
 						prog,
@@ -1807,9 +1854,9 @@ function renderNestedTaskTree(
 					),
 				);
 			});
-			if (hiddenCount > 0) {
+			if (progressDisplay.hidden.length > 0) {
 				const { prefix } = nestedMarkers(true, theme);
-				lines.push(`${prefix} ${theme.fg("dim", formatMoreItems(hiddenCount, "agent"))}`);
+				lines.push(`${prefix} ${formatHiddenProgressLine(progressDisplay.hidden, theme)}`);
 			}
 		}
 		seen.delete(details);

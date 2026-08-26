@@ -30,6 +30,7 @@ import type { ToolPathWithSource } from "../extensibility/custom-tools";
 import type { CustomTool } from "../extensibility/custom-tools/types";
 import { runExtensionCompact, runExtensionSetModel } from "../extensibility/extensions/compact-handler";
 import { getSessionSlashCommands } from "../extensibility/extensions/get-commands-handler";
+import type { PreparedExtension } from "../extensibility/extensions/types";
 import { buildSkillPromptMessage, type Skill } from "../extensibility/skills";
 import type { HindsightSessionState } from "../hindsight/state";
 import type { LocalProtocolOptions } from "../internal-urls";
@@ -62,6 +63,7 @@ import { buildNamedToolChoice } from "../utils/tool-choice";
 import type { WorkspaceTree } from "../workspace-tree";
 import { attributeSubagentError } from "./error-attribution";
 import { generateTaskLabel } from "./label";
+import { type AgentOutputArtifact, writeVerifiedAgentOutput } from "./output-manager";
 import { resolveAgentPrewalkDefault } from "./prewalk";
 import { isReadOnlyAgent } from "./read-only-policy";
 import { subprocessToolRegistry } from "./subprocess-tool-registry";
@@ -369,6 +371,14 @@ export interface ExecutorOptions {
 	 */
 	detached?: boolean;
 	modelOverride?: string | string[];
+	/**
+	 * Worker-attach endpoint paths (socket + token file — paths only) for the
+	 * started lifecycle payload. Forwarded verbatim into
+	 * {@link SubagentLifecyclePayload} so pane launchers can attach without
+	 * deriving the runtime dir from the session file.
+	 */
+	attachSocket?: string;
+	attachTokenFile?: string;
 	/** Explicit pre-expansion model role alias selected for this run. */
 	modelRole?: string;
 	/**
@@ -441,6 +451,8 @@ export interface ExecutorOptions {
 	 * extension against its own `ExtensionAPI` (cwd, eventBus, runtime).
 	 */
 	preloadedExtensionPaths?: string[];
+	/** Parent-imported extension factories rebound to the child runtime. */
+	preloadedPreparedExtensions?: readonly PreparedExtension[];
 	/**
 	 * Parent's discovered custom-tool source paths. Forwarded to skip the
 	 * `.omp/tools/` FS scan in the subagent; the subagent then re-binds each
@@ -493,6 +505,14 @@ export interface ExecutorOptions {
 	 * set this false so disposal unregisters them instead of leaving idle peers.
 	 */
 	keepAlive?: boolean;
+	/**
+	 * Attach-scoped resumability: consultable during a caller-signal abort.
+	 * When it returns true the abort is a pane Ctrl-C user interrupt on a
+	 * revivable worker session (must survive as idle), not a hard kill.
+	 * Wired by the vibe runtime from its pane-abort marker; never set for
+	 * task-tool/kill/terminate aborts.
+	 */
+	revivableAbort?: () => boolean;
 	/** Internal ownership handoff for cleanup that outlives the visible Task result. */
 	onCleanupDeferred?: (completion: Promise<void>) => void;
 	/** Internal cleanup grace override for deterministic lifecycle tests. */
@@ -939,6 +959,14 @@ interface RunMonitorArgs {
 	softRequestBudgetNotice: boolean;
 	/** Wall-clock cap in ms; 0 disables the timer. */
 	maxRuntimeMs: number;
+	/**
+	 * Attach-scoped resumability predicate: when a caller-signal abort arrives
+	 * while this returns true, the run is a pane Ctrl-C user interrupt with a
+	 * revivable session (the vibe worker must survive), not a hard kill. Only
+	 * consultable for `signal` aborts — budget already has its own resumable
+	 * path, and timeout/terminate stays terminal.
+	 */
+	revivableAbort?: () => boolean;
 }
 
 /**
@@ -974,6 +1002,13 @@ interface SubagentRunMonitor {
 	waitForYieldTurnStop(): Promise<void>;
 	/** The abort kind for this run, when an abort was requested. */
 	abortKind(): AbortReason | undefined;
+	/**
+	 * True when this run's abort is attach-scoped revivable (pane Ctrl-C
+	 * user interrupt on a vibe worker): the session must survive as idle
+	 * instead of being tombstoned. Never true for timeout/terminate/budget
+	 * or for a plain caller-signal abort.
+	 */
+	isRevivableAbort(): boolean;
 	terminalError(): string | undefined;
 	/** True when the abort carries a precise external reason (signal / wall-clock / budget). */
 	hasExplicitAbortReason(): boolean;
@@ -1027,6 +1062,7 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 	const progress: AgentProgress = {
 		index,
 		id,
+		sessionFile: args.sessionFile,
 		agent: agent.name,
 		agentSource: agent.source,
 		status: "running",
@@ -1084,6 +1120,8 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 	let consecutiveYieldToolErrors = 0;
 	let lastAssistantSalvageText: string | undefined;
 	let activeSessionAbortPromise: Promise<void> | undefined;
+	/** True once a caller-signal abort was marked attach-scoped revivable. */
+	let revivableAbort = false;
 
 	const abortActiveSession = (): Promise<void> => {
 		const session = activeSession;
@@ -1137,6 +1175,12 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 		}
 		abortSent = true;
 		abortReason = reason;
+		// Attach-scoped resumability: only a caller-signal abort whose owner
+		// explicitly marked it revivable (pane Ctrl-C on a vibe worker) counts;
+		// every other signal/terminate/timeout/budget abort stays as-is.
+		if (reason === "signal" && args.revivableAbort?.()) {
+			revivableAbort = true;
+		}
 		abortController.abort();
 		void abortActiveSession();
 	};
@@ -1196,6 +1240,13 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 			},
 			{ once: true, signal: listenerSignal },
 		);
+		// AbortSignal never re-dispatches to late listeners: a signal already
+		// aborted before this monitor registered (e.g. an attach Ctrl-C landing
+		// while the follow-up turn was still starting) must abort immediately
+		// instead of running the whole turn untouched.
+		if (signal.aborted && !resolved) {
+			requestAbort("signal");
+		}
 	}
 
 	// Wall-clock hard limit. Defense-in-depth for the case where a provider stream
@@ -1816,6 +1867,7 @@ function createSubagentRunMonitor(args: RunMonitorArgs): SubagentRunMonitor {
 		// A soft stop that never escalated still identifies as a budget abort so
 		// the lifecycle can park the agent as resumable instead of killing it.
 		abortKind: () => abortReason ?? (budgetStopRequested ? "budget" : undefined),
+		isRevivableAbort: () => revivableAbort,
 		isAbortedRun: () =>
 			abortReason === "signal" ||
 			abortReason === "shutdown" ||
@@ -2203,20 +2255,24 @@ async function finalizeRunResult(args: FinalizeRunArgs): Promise<SingleResult> {
 		maxLines: MAX_OUTPUT_LINES,
 	});
 
-	// Write output artifact (input and jsonl already written in real-time).
-	// Compute output metadata for agent:// URL integration.
+	// Write output artifact (input and jsonl already written in real-time), then
+	// read it back: `outputPath`/`outputMeta` are set only for bytes proven to be
+	// on disk, so a completed run can never hand the parent a pointer to a file
+	// it cannot read (issue #9646). This runs before the result text reaches the
+	// async delivery queue, so a receipt is always older than its delivery.
 	//
 	// A revival/follow-up turn only (re)writes <id>.md when it produced a real
 	// yield result. A subagent revived to answer a hub message never yields, so
 	// writing here would overwrite the completed run's authoritative artifact with
 	// a missing-yield warning body (issue #9518). The initial run is unaffected
 	// (followUpTurn is unset), preserving the documented missing-yield artifact.
-	let outputMeta: { lineCount: number; charCount: number } | undefined;
+	let outputMeta: AgentOutputArtifact | undefined;
 	let outputPath: string | undefined;
-	if (args.artifactsDir && (!args.followUpTurn || hasYield)) {
-		outputPath = path.join(args.artifactsDir, `${id}.md`);
+	if (args.artifactsDir) {
+		const candidateOutputPath = path.join(args.artifactsDir, `${id}.md`);
 		try {
-			await Bun.write(outputPath, rawOutput);
+			await Bun.write(candidateOutputPath, rawOutput);
+			outputPath = candidateOutputPath;
 			outputMeta = {
 				lineCount: rawOutput.split("\n").length,
 				charCount: rawOutput.length,
@@ -2297,6 +2353,7 @@ async function finalizeRunResult(args: FinalizeRunArgs): Promise<SingleResult> {
 		extractedToolData: progress.extractedToolData,
 		retryFailure: progress.retryFailure,
 		outputMeta,
+		artifactError,
 	};
 }
 
@@ -2447,6 +2504,13 @@ export async function finalizeSubagentLifecycle(args: {
 	aborted: boolean;
 	/** Which watchdog (if any) requested the abort; decides revivability. */
 	abortKind?: AbortReason;
+	/**
+	 * Attach-scoped resumability: when true, a caller-signal abort was a pane
+	 * Ctrl-C user interrupt on a revivable vibe worker (not a kill). Only
+	 * ever true alongside `abortKind === "signal"`; set by the vibe runtime's
+	 * pane-abort marker via the run monitor.
+	 */
+	revivableAbort?: boolean;
 	keepAlive: boolean;
 	isolated: boolean;
 	agentIdleTtlMs: number;
@@ -2487,9 +2551,15 @@ export async function finalizeSubagentLifecycle(args: {
 	// A budget abort leaves a consistent session with its transcript on disk.
 	// Manager shutdown also preserves the transcript, but disposes and unregisters
 	// the process-local session. Caller signals, wall-clock timeouts, and internal
-	// terminations are genuine kills and stay terminal.
+	// terminations are genuine kills and stay terminal. The single exception for
+	// caller signals is the attach-scoped pane Ctrl-C marker (`revivableAbort`):
+	// the vibe worker session is a user interrupt with a revivable adopted
+	// session and must survive as idle.
 	const resumableAbort =
-		args.abortKind === "budget" && args.keepAlive && !args.isolated && args.reviveSession !== null;
+		(args.abortKind === "budget" || args.revivableAbort === true) &&
+		args.keepAlive &&
+		!args.isolated &&
+		args.reviveSession !== null;
 	if (args.aborted && !resumableAbort) {
 		if (ref && ownsRef) {
 			if (args.abortKind === "shutdown") {
@@ -2703,8 +2773,10 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 	// loop dispatches a chat request to the provider — the launch-complete boundary.
 	let firstChatDispatchAt: number | undefined;
 
-	// Check if already aborted
-	if (signal?.aborted) {
+	// Check if already aborted. A revivable (attach pane Ctrl-C) abort is NOT
+	// short-circuited here: the session must still materialize so the normal
+	// lifecycle finalizer can park it (the drive phase stops immediately).
+	if (signal?.aborted && !options.revivableAbort?.()) {
 		return {
 			index,
 			id,
@@ -2836,6 +2908,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 		softRequestBudget,
 		softRequestBudgetNotice,
 		maxRuntimeMs,
+		revivableAbort: options.revivableAbort,
 	});
 	const progress = monitor.progress;
 	let unsubscribe: (() => void) | null = null;
@@ -2873,7 +2946,10 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 		let aborted = false;
 		let abortReasonText: string | undefined;
 		const checkAbort = () => {
-			if (abortSignal.aborted) {
+			// A revivable (attach pane Ctrl-C) abort must NOT short-circuit the
+			// launch: the session materializes and the normal lifecycle
+			// finalizer parks it. The drive phase below still stops at once.
+			if (abortSignal.aborted && !monitor.isRevivableAbort()) {
 				throw new ToolAbortError();
 			}
 		};
@@ -3088,6 +3164,18 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 
 			const { normalized: normalizedOutputSchema } = normalizeSchema(outputSchema);
 
+			const subagentPrompt = prompt.render(subagentSystemPromptTemplate, {
+				agent: agent.systemPrompt,
+				context: options.context?.trim() ?? "",
+				planReference: options.planReference?.content ?? "",
+				planReferencePath: options.planReference?.path ?? "",
+				worktree: worktree ?? "",
+				outputSchema: normalizedOutputSchema,
+				outputSchemaOverridesAgent: options.outputSchemaOverridesAgent === true,
+				ircPeers: ircEnabled ? renderIrcPeerRoster(id) : "",
+				ircSelfId: ircEnabled ? id : "",
+			});
+
 			// Captured by the lifecycle reviver: rebuilding an equivalent session from
 			// the same JSONL file re-invokes createAgentSession with the exact options
 			// of the original run (same agent id, tools, model, system prompt,
@@ -3123,23 +3211,9 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				workspaceTree: options.workspaceTree,
 				rules: options.rules,
 				preloadedExtensionPaths: restrictToolNames ? [] : options.preloadedExtensionPaths,
+				preloadedPreparedExtensions: restrictToolNames ? [] : options.preloadedPreparedExtensions,
 				preloadedCustomToolPaths: restrictToolNames ? [] : options.preloadedCustomToolPaths,
-				systemPrompt: defaultPrompt => {
-					const subagentPrompt = prompt.render(subagentSystemPromptTemplate, {
-						agent: agent.systemPrompt,
-						context: options.context?.trim() ?? "",
-						planReference: options.planReference?.content ?? "",
-						planReferencePath: options.planReference?.path ?? "",
-						worktree: worktree ?? "",
-						outputSchema: normalizedOutputSchema,
-						outputSchemaOverridesAgent: options.outputSchemaOverridesAgent === true,
-						ircPeers: ircEnabled ? renderIrcPeerRoster(id) : "",
-						ircSelfId: ircEnabled ? id : "",
-					});
-					return defaultPrompt.length === 0
-						? [subagentPrompt]
-						: [...defaultPrompt.slice(0, -1), subagentPrompt, defaultPrompt[defaultPrompt.length - 1]];
-				},
+				customSystemPrompt: subagentPrompt,
 				sessionManager: sessionManagerForRun,
 				hasUI: false,
 				prewalk,
@@ -3195,7 +3269,8 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				// (createAgentSession → agent.replaceMessages). Isolated runs are not
 				// resumable (worktree is merged + cleaned) and never get a reviver.
 				reviveSession = async expectedAgentRef => {
-					const reopened = await SessionManager.open(sessionFile, undefined, undefined, {
+					const revivedSessionFile = expectedAgentRef.sessionFile ?? sessionFile;
+					const reopened = await SessionManager.open(revivedSessionFile, undefined, undefined, {
 						suppressBreadcrumb: true,
 					});
 					if (options.parentArtifactManager) {
@@ -3231,6 +3306,8 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					description: options.description,
 					status: "started",
 					sessionFile: subtaskSessionFile,
+					attachSocket: options.attachSocket,
+					attachTokenFile: options.attachTokenFile,
 					index,
 				});
 			}
@@ -3244,11 +3321,20 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			if (filteredSubagentTools.length !== subagentToolNames.length) {
 				await awaitAbortable(session.setActiveToolsByName(filteredSubagentTools));
 			}
+			const enabledSubagentTools = session.getEnabledToolNames();
+			// The enabled set includes the synthetic write transport injected for
+			// explicit tool lists that omitted write. `session_init.tools` is later
+			// replayed as an explicit grant during cold revival, so persist write
+			// only when the original agent contract granted it.
+			const persistedSubagentTools =
+				toolNames !== undefined && !toolNames.includes("write")
+					? enabledSubagentTools.filter(name => name !== "write")
+					: enabledSubagentTools;
 
 			session.sessionManager.appendSessionInit({
 				systemPrompt: session.agent.state.systemPrompt.join("\n\n"),
 				task,
-				tools: session.getEnabledToolNames(),
+				tools: persistedSubagentTools,
 				agent: agent.name,
 				modelRole: modelRole ?? resolveExplicitModelRole(modelOverride ?? agent.model, subagentSettings),
 				resolvedModel: progress.resolvedModel,
@@ -3303,11 +3389,20 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 							session.sessionManager.appendLabelChange(targetId, label);
 						},
 						getActiveTools: () => session.getEnabledToolNames(),
+						getToolReference: name => session.getToolReference(name),
 						getAllTools: () => session.getAllToolInfos(),
 						setActiveTools: (toolNames: string[]) =>
 							session.setActiveToolsByName(toolNames.filter(name => !isParentOwnedTool(name))),
 						getCommands: () => getSessionSlashCommands(session),
 						setModel: model => runExtensionSetModel(session, model),
+						setModelAlias: name =>
+							setExtensionModelAlias(
+								name,
+								session.modelRegistry,
+								session.settings,
+								session.model,
+								(model, thinkingLevel, options) => session.setModelTemporary(model, thinkingLevel, options),
+							),
 						getThinkingLevel: () => session.thinkingLevel,
 						setThinkingLevel: level => session.setThinkingLevel(level),
 						getServiceTiers: () => session.serviceTierByFamily,
@@ -3436,6 +3531,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					session,
 					aborted,
 					abortKind: monitor.abortKind(),
+					revivableAbort: monitor.isRevivableAbort(),
 					keepAlive: options.keepAlive !== false,
 					isolated: worktree !== undefined,
 					agentIdleTtlMs,

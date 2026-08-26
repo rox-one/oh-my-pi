@@ -17,6 +17,7 @@ import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
 import type { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { getProjectAgentDir, TempDir } from "@oh-my-pi/pi-utils";
+import * as advisorModule from "../src/advisor";
 import { createInMemoryAuthStorage } from "./helpers/agent-session-setup";
 
 describe("AgentSession advisor toggle", () => {
@@ -161,6 +162,11 @@ describe("AgentSession advisor toggle", () => {
 		expect(session.isAdvisorActive()).toBe(true);
 		expect(session.isAdvisorEnabled()).toBe(true);
 		expect(session.formatAdvisorStatus()).toContain("Advisor is enabled (anthropic/claude-sonnet-4-5)");
+		expect(session.getAdvisorStateOverview()).toMatchObject({
+			configured: true,
+			active: true,
+			advisors: [{ status: "running" }],
+		});
 	});
 
 	it("explicit enable rebuilds the runtime when the advisor role changes", () => {
@@ -298,6 +304,10 @@ describe("AgentSession advisor toggle", () => {
 		expect(active).toBe(false);
 		expect(session.isAdvisorActive()).toBe(false);
 		expect(session.isAdvisorEnabled()).toBe(false);
+		const advisorState = session.getAdvisorStateOverview();
+		expect(advisorState).toMatchObject({ configured: false, active: false });
+		expect(advisorState.advisors.length).toBeGreaterThan(0);
+		expect(advisorState.advisors.every(advisor => advisor.status === "paused")).toBe(true);
 	});
 
 	it("setAdvisorEnabled reports inactive when the advisor role resolves to no model", () => {
@@ -312,6 +322,11 @@ describe("AgentSession advisor toggle", () => {
 		expect(session.formatAdvisorStatus()).toBe(
 			"Advisor setting is enabled, but no model is assigned to the 'advisor' role.",
 		);
+		expect(session.getAdvisorStateOverview()).toMatchObject({
+			configured: true,
+			active: false,
+			advisors: [{ status: "no_model" }],
+		});
 	});
 
 	it("activates an enabled advisor once background model discovery settles", async () => {
@@ -543,9 +558,52 @@ describe("AgentSession advisor toggle", () => {
 			enableLsp: false,
 		});
 		try {
+			// The scan runs off the critical path now (issue #9553), so await the
+			// backfill signal the session exposes rather than a wall-clock guess.
+			await result.session.advisorCostRestore;
 			expect(result.session.getAdvisorCost()).toBeCloseTo(0.5, 8);
 		} finally {
 			await result.session.dispose();
+		}
+	});
+	it("seeds persisted advisor spend when no turn has been billed yet", () => {
+		enableAdvisor();
+		session.restoreInitialAdvisorCosts(new Map([["", 0.5]]));
+		expect(session.getAdvisorCost()).toBeCloseTo(0.5, 8);
+	});
+	it("adds a turn billed while the resume scan is running to persisted spend", async () => {
+		const restore = Promise.withResolvers<Map<string, number>>();
+		const load = vi.spyOn(advisorModule, "loadAdvisorTranscriptCosts").mockImplementation((_file, options) => {
+			options?.onSnapshot?.();
+			return restore.promise;
+		});
+		try {
+			session.beginInitialAdvisorCostRestore();
+			const advisor = enableAdvisor();
+			appendAdvisorCost(advisor, 0.25, 1);
+			restore.resolve(new Map([["", 0.5]]));
+			await session.advisorCostRestore;
+
+			expect(session.getAdvisorCost()).toBeCloseTo(0.75, 8);
+		} finally {
+			load.mockRestore();
+		}
+	});
+	it("ignores an initial cost restore after the active session changes", async () => {
+		const restore = Promise.withResolvers<Map<string, number>>();
+		const load = vi.spyOn(advisorModule, "loadAdvisorTranscriptCosts").mockImplementation((_file, options) => {
+			options?.onSnapshot?.();
+			return restore.promise;
+		});
+		try {
+			session.beginInitialAdvisorCostRestore();
+			await session.newSession();
+			restore.resolve(new Map([["", 0.5]]));
+			await session.advisorCostRestore;
+
+			expect(session.getAdvisorCost()).toBe(0);
+		} finally {
+			load.mockRestore();
 		}
 	});
 	it("starts a new session with only post-transition advisor cost", async () => {

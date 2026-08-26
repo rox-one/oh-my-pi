@@ -533,6 +533,68 @@ function getOpenAICompletionsProviderSessionState(
 	return created;
 }
 
+function isOpenRouterAnthropicModel(model: Model<"openai-completions">): boolean {
+	return model.provider === "openrouter" && model.id.toLowerCase().startsWith("anthropic/");
+}
+
+/**
+ * Append an OpenRouter routing-variant suffix (e.g. `:nitro`, `:floor`, `:online`, `:exacto`)
+ * to a model id when no explicit variant is already present. A variant is considered
+ * "already present" when `modelId` contains a colon after the last `/` separator —
+ * which covers both user-typed selectors (`anthropic/claude-haiku:nitro`) and catalog
+ * entries that bake the variant in (`deepseek/deepseek-v3.1-terminus:exacto`).
+ *
+ * Exported for unit testing.
+ */
+export function applyOpenRouterRoutingVariant(modelId: string, variant: string | undefined): string {
+	if (!variant) return modelId;
+	const lastSlash = modelId.lastIndexOf("/");
+	const lastColon = modelId.lastIndexOf(":");
+	// Existing `:suffix` after the last path segment — leave the id untouched.
+	if (lastColon > lastSlash) return modelId;
+	return `${modelId}:${variant}`;
+}
+
+function isCompiledGrammarTooLargeStrictError(
+	error: unknown,
+	capturedErrorResponse: CapturedHttpErrorResponse | undefined,
+): boolean {
+	const status = extractHttpStatusFromError(error) ?? capturedErrorResponse?.status;
+	if (status !== 400) return false;
+	const messageParts = [error instanceof Error ? error.message : undefined, capturedErrorResponse?.bodyText]
+		.filter((value): value is string => typeof value === "string" && value.trim().length > 0)
+		.join("\n");
+	return (
+		/invalid_request_error/i.test(messageParts) &&
+		/compiled grammar/i.test(messageParts) &&
+		/too large/i.test(messageParts)
+	);
+}
+
+const THINKING_SPACE_PERIOD_ARTIFACT_REGEX = / \.(?=\s+[A-Z])/g;
+const THINKING_SPACE_PERIOD_ARTIFACT_AT_START_REGEX = /^ ?\.(?=\s+[A-Z])/;
+
+function shouldNormalizeThinkingSpacePeriodArtifacts(model: Model<"openai-completions">): boolean {
+	return (
+		model.provider === "deepseek" ||
+		model.provider === "qwen-portal" ||
+		model.provider === "minimax-code" ||
+		model.provider === "minimax-code-cn" ||
+		/deepseek|qwen|qwq|minimax/i.test(model.id)
+	);
+}
+
+// Some Chinese-origin reasoning models emit a tokenizer/chat-template artifact as
+// a space followed by a period between English sentences inside thinking streams.
+function normalizeThinkingSpacePeriodArtifacts(text: string): string {
+	if (!text.includes(" .")) return text;
+	return text.replace(THINKING_SPACE_PERIOD_ARTIFACT_REGEX, ".");
+}
+
+function startsWithThinkingSpacePeriodArtifact(text: string): boolean {
+	return THINKING_SPACE_PERIOD_ARTIFACT_AT_START_REGEX.test(text);
+}
+
 // DeepSeek models leak chat-template special tokens (e.g. `<｜tool_calls_begin｜>`,
 // `<｜DSML｜tool_calls｜>`) into visible `content` deltas when hosted behind providers
 // (such as NVIDIA NIM) that don't strip them server-side. The structured `tool_calls`
@@ -782,6 +844,8 @@ const streamOpenAICompletionsOnce = (
 			}
 			stream.push({ type: "start", partial: output });
 
+			const parseMiniMaxThinkTags = model.provider === "minimax-code" || model.provider === "minimax-code-cn";
+			const cleanupThinkingSpacePeriodArtifacts = shouldNormalizeThinkingSpacePeriodArtifacts(model);
 			// Some OpenAI-compatible DeepSeek hosts (including NVIDIA NIM and DeepSeek's
 			// native API) leak chat-template tool-call markers in `delta.content` even
 			// though tool calls are also surfaced structurally. Strip the leaked markers
@@ -806,6 +870,8 @@ const streamOpenAICompletionsOnce = (
 				}
 			};
 			let currentBlock: OpenAIStreamBlock | undefined;
+			let hasPendingThinkingSpace = false;
+			let pendingThinkingSpaceSignature: string | undefined;
 			const blockIndex = (block: OpenAIStreamBlock | undefined): number => {
 				if (!block) return Math.max(0, output.content.length - 1);
 				return output.content.indexOf(block);
@@ -847,6 +913,7 @@ const streamOpenAICompletionsOnce = (
 			};
 			const finishCurrentBlock = (block: OpenAIStreamBlock | undefined): void => {
 				if (!block) return;
+				if (block.type === "thinking") flushPendingThinkingSpace();
 				const contentIndex = blockIndex(block);
 				if (contentIndex < 0) return;
 				if (block.type === "text") {
@@ -919,6 +986,14 @@ const streamOpenAICompletionsOnce = (
 				});
 			};
 
+			function flushPendingThinkingSpace(): void {
+				if (!hasPendingThinkingSpace) return;
+				const signature = pendingThinkingSpaceSignature;
+				hasPendingThinkingSpace = false;
+				pendingThinkingSpaceSignature = undefined;
+				appendThinking(output, stream, " ", signature);
+			}
+
 			const appendTextDelta = (text: string): void => {
 				if (!text) return;
 				if (!firstTokenTime) firstTokenTime = performance.now();
@@ -938,18 +1013,30 @@ const streamOpenAICompletionsOnce = (
 				source: "delta" | "cumulative" = "delta",
 			): void => {
 				if (!thinking) return;
-				let emittedThinking = thinking;
-				if (source === "cumulative") {
-					const key = signature ?? "";
-					const lastSnapshot = lastCumulativeReasoningBySignature.get(key) ?? "";
-					if (thinking.startsWith(lastSnapshot)) {
-						emittedThinking = thinking.slice(lastSnapshot.length);
-					}
-					lastCumulativeReasoningBySignature.set(key, thinking);
-					if (!emittedThinking) return;
+				if (!cleanupThinkingSpacePeriodArtifacts) {
+					if (!firstTokenTime) firstTokenTime = Date.now();
+					appendThinking(output, stream, thinking, signature);
+					return;
 				}
-				if (!firstTokenTime) firstTokenTime = performance.now();
-				appendThinking(output, stream, emittedThinking, signature);
+
+				if (hasPendingThinkingSpace) {
+					if (pendingThinkingSpaceSignature === signature && startsWithThinkingSpacePeriodArtifact(thinking)) {
+						hasPendingThinkingSpace = false;
+						pendingThinkingSpaceSignature = undefined;
+					} else {
+						flushPendingThinkingSpace();
+					}
+				}
+
+				let normalized = normalizeThinkingSpacePeriodArtifacts(thinking);
+				if (normalized.endsWith(" ")) {
+					normalized = normalized.slice(0, -1);
+					hasPendingThinkingSpace = true;
+					pendingThinkingSpaceSignature = signature;
+				}
+				if (!normalized) return;
+				if (!firstTokenTime) firstTokenTime = Date.now();
+				appendThinking(output, stream, normalized, signature);
 			};
 
 			let deepseekStripBuffer = "";
@@ -1302,6 +1389,7 @@ const streamOpenAICompletionsOnce = (
 			if (stripDeepseekChatTemplateTokens) {
 				flushDeepseekStripBuffer(true);
 			}
+			flushPendingThinkingSpace();
 
 			// Detect premature stream closure before the normal block-finalization
 			// sweep. Throwing after that sweep would make the error handler emit a
@@ -1469,86 +1557,16 @@ function dropOpenRouterKimiForcedToolReasoning(
 	}
 }
 
-function hasActiveNativeKimiK3Reasoning(
-	model: Model<"openai-completions">,
-	options: OpenAICompletionsOptions | undefined,
-): boolean {
-	if (model.provider !== "kimi-code" || model.id.toLowerCase() !== "k3" || !model.reasoning) return false;
-	if (options?.reasoning === undefined || options.disableReasoning) return false;
-	try {
-		const url = new URL(model.baseUrl);
-		return url.hostname === "api.kimi.com" && (url.pathname === "/coding" || url.pathname.startsWith("/coding/"));
-	} catch {
-		return false;
+/** Flattens assistant text blocks for Chat Completions without merging internal block boundaries. */
+export function flattenOpenAICompletionsAssistantTextBlocks(blocks: readonly TextContent[]): string | null {
+	const nonEmptyTextBlocks = blocks.map(block => block.text.toWellFormed()).filter(text => text.trim().length > 0);
+	if (nonEmptyTextBlocks.length === 0) return null;
+	let text = nonEmptyTextBlocks[0]!;
+	for (const blockText of nonEmptyTextBlocks.slice(1)) {
+		const alreadySeparated = /\s$/u.test(text) || /^\s/u.test(blockText);
+		text += `${alreadySeparated ? "" : "\n\n"}${blockText}`;
 	}
-}
-
-function isChatCompletionsPromptCacheableContentBlock(
-	block: unknown,
-): block is { type: "text" | "image_url" | "input_audio" | "file"; prompt_cache_breakpoint?: { mode: "explicit" } } {
-	if (typeof block !== "object" || block === null || !("type" in block)) return false;
-	return block.type === "text" || block.type === "image_url" || block.type === "input_audio" || block.type === "file";
-}
-
-function markLatestStableChatCompletionsCacheBreakpoint(messages: ChatCompletionMessageParam[]): boolean {
-	let latestInputMessage = -1;
-	for (let i = messages.length - 1; i >= 0; i--) {
-		const message = messages[i];
-		if (message.role === "user" || message.role === "developer") {
-			latestInputMessage = i;
-			break;
-		}
-	}
-	if (latestInputMessage <= 0) return false;
-
-	for (let i = latestInputMessage - 1; i >= 0; i--) {
-		const message = messages[i];
-		if (message.role !== "user" && message.role !== "developer" && message.role !== "system") continue;
-		if (typeof message.content === "string") {
-			messages[i] = {
-				...message,
-				content: [{ type: "text", text: message.content, prompt_cache_breakpoint: { mode: "explicit" } }],
-			};
-			return true;
-		}
-		for (let j = message.content.length - 1; j >= 0; j--) {
-			const block = message.content[j];
-			if (!isChatCompletionsPromptCacheableContentBlock(block)) continue;
-			Object.assign(block, { prompt_cache_breakpoint: { mode: "explicit" } });
-			return true;
-		}
-	}
-	return false;
-}
-
-function applyOpenAIChatCompletionsPromptCachePolicy(
-	params: OpenAICompletionsParams,
-	model: Model<"openai-completions">,
-	options: OpenAICompletionsOptions | undefined,
-): void {
-	const promptCacheKey = getOpenAIPromptCacheKey(options);
-	if (model.provider === "kimi-code" && promptCacheKey !== undefined) {
-		params.prompt_cache_key = promptCacheKey;
-	}
-
-	const promptCache = options?.promptCache;
-	if (!promptCache || resolveCacheRetention(options?.cacheRetention) === "none") return;
-	if (!model.compat.supportsPromptCacheBreakpoints) {
-		if (promptCache.mode === "explicit") {
-			throw new AIError.ConfigurationError(
-				`OpenAI explicit prompt caching is unsupported for ${model.provider}/${model.id}; enable compat.supportsPromptCacheBreakpoints only for a compatible endpoint.`,
-			);
-		}
-		return;
-	}
-
-	params.prompt_cache_key = promptCacheKey;
-	params.prompt_cache_options = {
-		mode: promptCache.mode,
-		ttl: promptCache.ttl ?? model.compat.promptCacheBreakpointTtl,
-	};
-	if (promptCache.mode === "explicit" && promptCache.breakpoint !== "none")
-		markLatestStableChatCompletionsCacheBreakpoint(params.messages);
+	return text;
 }
 
 function buildParams(
@@ -1556,14 +1574,41 @@ function buildParams(
 	context: Context,
 	options: OpenAICompletionsOptions | undefined,
 	toolStrictModeOverride?: ToolStrictModeOverride,
-): {
-	params: OpenAICompletionsParams;
-	toolStrictMode: AppliedToolStrictMode;
-	strictToolsApplied: boolean;
-} {
-	const initialPolicy = resolveOpenAICompatForRequest(model, options);
-	const initialCompat = initialPolicy.compat as ResolvedOpenAICompat;
-	const cacheRetention = resolveCacheRetention(options?.cacheRetention);
+): { params: OpenAICompletionsParams; toolStrictMode: AppliedToolStrictMode; strictToolsApplied: boolean } {
+	let compat = model.compat;
+	const disableReasoningForTools = compat.disableReasoningWhenToolsPresent && (context.tools?.length ?? 0) > 0;
+	const reasoningDisabledForRequest = Boolean(options?.disableReasoning) || disableReasoningForTools;
+	const thinkingEnabledForRequest =
+		Boolean(options?.reasoning) && !reasoningDisabledForRequest && Boolean(model.reasoning);
+	const forcedToolChoiceSuppressesThinking =
+		compat.disableReasoningOnForcedToolChoice &&
+		compat.supportsForcedToolChoice &&
+		isForcedToolChoice(mapToOpenAICompletionsToolChoice(options?.toolChoice));
+	if (reasoningDisabledForRequest && compat.whenReasoningDisabled) {
+		compat = compat.whenReasoningDisabled; // precomputed at model build — pointer swap, no allocation
+	} else if (compat.whenThinking && thinkingEnabledForRequest && !forcedToolChoiceSuppressesThinking) {
+		compat = compat.whenThinking; // precomputed at model build — pointer swap, no allocation
+	}
+	const messages = convertMessages(model, context, compat);
+	maybeAddAnthropicCacheControl(compat, messages);
+	const supportsReasoningParams = compat.supportsReasoningParams;
+
+	// Kimi-family models calculate TPM rate limits from max_tokens (not actual
+	// output) and the official guidance requires sending it on every call —
+	// `compat.alwaysSendMaxTokens` carries that detection.
+	const requestedMaxTokens =
+		options?.maxTokens ?? (compat.alwaysSendMaxTokens ? (model.maxTokens ?? OPENAI_MAX_OUTPUT_TOKENS) : undefined);
+	// OpenRouter fans out to upstreams whose output caps differ from the catalog
+	// value (which tracks the highest-cap provider). A max_tokens above the routed
+	// upstream's cap makes OpenRouter silently skip that provider (e.g. Cerebras
+	// GLM-4.7, ~40k) for a higher-cap one, defeating `provider.order`/`only`. Omit
+	// it for OpenRouter so each upstream self-caps and routing is honored — unless
+	// the model always requires max_tokens (Kimi TPM accounting, see above).
+	const omitMaxTokensForRouting = compat.isOpenRouterHost && !compat.alwaysSendMaxTokens;
+	const effectiveMaxTokens =
+		requestedMaxTokens === undefined || omitMaxTokensForRouting
+			? undefined
+			: Math.min(requestedMaxTokens, model.maxTokens ?? Number.POSITIVE_INFINITY, OPENAI_MAX_OUTPUT_TOKENS);
 
 	const requestModelId = resolveOpenAICompletionsModelId(model, options);
 	const params: OpenAICompletionsParams = {
@@ -1706,8 +1751,66 @@ function buildParams(
 		delete params.tool_choice;
 	}
 
-	if (shouldDropAutoToolChoiceForReasoning(model, initialCompat, params.tool_choice, options)) {
-		delete params.tool_choice;
+	if (supportsReasoningParams && compat.thinkingFormat === "zai" && model.reasoning) {
+		// Z.ai uses binary thinking: { type: "enabled" | "disabled" }
+		// Must explicitly disable since z.ai defaults to thinking enabled.
+		const enabled = options?.reasoning && !reasoningDisabledForRequest;
+		params.thinking = { type: enabled ? "enabled" : "disabled" };
+		if (enabled && compat.thinkingKeep) {
+			params.thinking.keep = compat.thinkingKeep;
+		}
+	} else if (supportsReasoningParams && compat.thinkingFormat === "qwen" && model.reasoning) {
+		params.enable_thinking = !!options?.reasoning && !reasoningDisabledForRequest;
+	} else if (supportsReasoningParams && compat.thinkingFormat === "qwen-chat-template" && model.reasoning) {
+		params.chat_template_kwargs = {
+			enable_thinking: !!options?.reasoning && !reasoningDisabledForRequest,
+		};
+	} else if (supportsReasoningParams && compat.thinkingFormat === "openrouter" && model.reasoning) {
+		// OpenRouter normalizes reasoning across providers via a nested reasoning object.
+		// Without an explicit signal, OpenRouter defaults reasoning models to thinking, which
+		// silently consumes the entire output budget on small `max_tokens` requests (e.g.
+		// title generation). Honor `disableReasoning` to opt out cleanly.
+		const openRouterParams = params as typeof params & {
+			reasoning?: { effort?: string } | { enabled: false };
+		};
+		if (reasoningDisabledForRequest) {
+			openRouterParams.reasoning = { enabled: false };
+		} else if (options?.reasoning) {
+			openRouterParams.reasoning = {
+				effort:
+					compat.reasoningEffortMap?.[options.reasoning] ??
+					model.thinking?.effortMap?.[options.reasoning] ??
+					options.reasoning,
+			};
+		}
+	} else if (
+		supportsReasoningParams &&
+		options?.reasoning &&
+		!reasoningDisabledForRequest &&
+		model.reasoning &&
+		compat.supportsReasoningEffort
+	) {
+		// OpenAI-style reasoning_effort
+		params.reasoning_effort = (compat.reasoningEffortMap?.[options.reasoning] ??
+			model.thinking?.effortMap?.[options.reasoning] ??
+			options.reasoning) as Effort;
+	} else if (
+		supportsReasoningParams &&
+		options?.disableReasoning &&
+		!options?.reasoning &&
+		model.reasoning &&
+		compat.supportsReasoningEffort
+	) {
+		// Generic OpenAI-compatible effort endpoints do not expose a true off
+		// switch. Use the model's lowest supported effort as the closest
+		// transport-level approximation when callers request disabled reasoning.
+		const minEffort = getSupportedEfforts(model)[0];
+		if (minEffort === undefined) {
+			throw new Error(`Model ${model.provider}/${model.id} has no supported reasoning efforts`);
+		}
+		params.reasoning_effort = (compat.reasoningEffortMap?.[minEffort] ??
+			model.thinking?.effortMap?.[minEffort] ??
+			minEffort) as Effort;
 	}
 
 	const finalPolicy = resolveOpenAICompatPolicy(model, {
@@ -1746,6 +1849,7 @@ function buildParams(
 
 	applyOpenAIExtraBody(params, compat.extraBody, {
 		dropThinkingWhenReasoningEffort: compat.dropThinkingWhenReasoningEffort,
+		reasoningDisabled: finalPolicy.reasoning.disabled,
 	});
 	applyOpenAIChatCompletionsPromptCachePolicy(params, model, options);
 
@@ -1990,27 +2094,18 @@ export function convertMessages(
 				content: null,
 			};
 
-			const textBlocks = msg.content.filter(b => b.type === "text") as TextContent[];
-			// Filter out empty text blocks to avoid API validation errors
-			const nonEmptyTextBlocks = textBlocks.filter(b => b.text && b.text.trim().length > 0);
-			if (nonEmptyTextBlocks.length > 0) {
+			const flattenedText = flattenOpenAICompletionsAssistantTextBlocks(
+				msg.content.filter((b): b is TextContent => b.type === "text"),
+			);
+			if (flattenedText !== null) {
 				// Always send assistant content as a plain string. Some OpenAI-compatible
 				// backends mirror array-of-text-block payloads back to the model literally,
-				// causing recursive nested content in subsequent turns.
-				// Join ordinary adjacent text blocks with no separator so bridge
-				// stitching, imported transcripts, and streaming chunks keep their
-				// original byte sequence. Demoted-thinking blocks (kDemotedThinking,
-				// synthesized by transformMessages) are the one exception: bare
-				// Anthropic-dialect reasoning would otherwise glue onto the first word
-				// of the visible answer. Insert a paragraph break after them — only
-				// when another block actually follows, so a trailing demoted block
-				// never ships trailing whitespace.
-				assistantMsg.content = nonEmptyTextBlocks
-					.map((b, i) => {
-						const text = b.text.toWellFormed();
-						return isDemotedThinking(b) && i < nonEmptyTextBlocks.length - 1 ? `${text}\n` : text;
-					})
-					.join("");
+				// causing recursive nested content in subsequent turns. Preserve a hard
+				// boundary between adjacent internal text blocks: cross-provider demotion
+				// can place bare Anthropic reasoning immediately before the assistant's
+				// original visible answer, and concatenating with `""` produces
+				// `reasoningFinal answer`.
+				assistantMsg.content = flattenedText;
 			}
 
 			// Handle thinking blocks

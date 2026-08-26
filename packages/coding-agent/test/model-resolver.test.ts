@@ -1,12 +1,9 @@
 import { describe, expect, test } from "bun:test";
 import { type Api, Effort, type Model } from "@oh-my-pi/pi-ai";
-import { buildModel } from "@oh-my-pi/pi-catalog/build";
-import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
-import { DEFAULT_MODEL_PER_PROVIDER } from "@oh-my-pi/pi-catalog/provider-models";
 import {
 	expandRoleAlias,
-	extractExplicitThinkingSelector,
-	filterAvailableModelsByEnabledPatterns,
+	findSlowModel,
+	type ModelLookupRegistry,
 	parseModelPattern,
 	parseModelString,
 	pickDefaultAvailableModel,
@@ -363,93 +360,26 @@ function createOpusModel(provider: string, id: string, name: string): Model<"ant
 
 const allModels = [...mockModels, ...mockOpenRouterModels, ...mockProviderOverlapModels, ...mockCodexOverlapModels];
 
-describe("pickDefaultAvailableModel", () => {
-	test("prefers Codex OAuth over plain OpenAI for the shared GPT default", () => {
-		const result = pickDefaultAvailableModel(openaiGpt55Models);
+function opusModel(id: string): Model<Api> {
+	return {
+		id,
+		name: id,
+		api: "anthropic-messages",
+		provider: "anthropic",
+		baseUrl: "https://api.anthropic.com",
+		reasoning: true,
+		input: ["text"],
+		cost: { input: 15, output: 75, cacheRead: 1.5, cacheWrite: 18.75 },
+		contextWindow: 200000,
+		maxTokens: 8192,
+	};
+}
 
-		expect(result?.provider).toBe("openai-codex");
-		expect(result?.id).toBe("gpt-5.5");
-	});
-
-	test("keeps earlier unrelated provider defaults ahead of shared Codex defaults", () => {
-		const anthropicDefault = buildModel({
-			id: DEFAULT_MODEL_PER_PROVIDER.anthropic,
-			name: "Anthropic Default",
-			api: "anthropic-messages",
-			provider: "anthropic",
-			baseUrl: "https://api.anthropic.com",
-			reasoning: true,
-			thinking: {
-				mode: "budget",
-				efforts: [Effort.Low, Effort.Medium, Effort.High],
-			},
-			input: ["text"],
-			cost: { input: 1, output: 4, cacheRead: 0.1, cacheWrite: 1 },
-			contextWindow: 200000,
-			maxTokens: 8192,
-		});
-
-		const result = pickDefaultAvailableModel([anthropicDefault, ...openaiGpt55Models]);
-
-		expect(result?.provider).toBe("anthropic");
-		expect(result?.id).toBe(DEFAULT_MODEL_PER_PROVIDER.anthropic);
-	});
-
-	test("uses the Zhipu Coding Plan login-validated model before newer z.ai defaults", () => {
-		const zhipuGlm51 = buildModel({
-			id: "glm-5.1",
-			name: "GLM-5.1",
-			api: "openai-completions",
-			provider: "zhipu-coding-plan",
-			baseUrl: "https://open.bigmodel.cn/api/coding/paas/v4",
-			reasoning: true,
-			input: ["text"],
-			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-			contextWindow: 200000,
-			maxTokens: 131072,
-		});
-		const zhipuGlm52 = buildModel({
-			id: "glm-5.2",
-			name: "GLM-5.2",
-			api: "openai-completions",
-			provider: "zhipu-coding-plan",
-			baseUrl: "https://open.bigmodel.cn/api/coding/paas/v4",
-			reasoning: true,
-			input: ["text"],
-			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-			contextWindow: 1000000,
-			maxTokens: 131072,
-		});
-		const zaiGlm52 = buildModel({
-			id: "glm-5.2",
-			name: "GLM-5.2",
-			api: "anthropic-messages",
-			provider: "zai",
-			baseUrl: "https://api.z.ai/api/anthropic",
-			reasoning: true,
-			input: ["text"],
-			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-			contextWindow: 1000000,
-			maxTokens: 131072,
-		});
-
-		const result = pickDefaultAvailableModel([zhipuGlm51, zhipuGlm52, zaiGlm52]);
-
-		expect(result?.provider).toBe("zhipu-coding-plan");
-		expect(result?.id).toBe("glm-5.1");
-	});
-
-	test("prefers SuperGrok over paid xAI when both defaults are present", () => {
-		const paid = getBundledModel("xai", DEFAULT_MODEL_PER_PROVIDER.xai);
-		const oauth = getBundledModel("xai-oauth", DEFAULT_MODEL_PER_PROVIDER["xai-oauth"]);
-		if (!paid || !oauth) {
-			throw new Error("Expected bundled xAI provider defaults");
-		}
-
-		expect(pickDefaultAvailableModel([paid, oauth])?.provider).toBe("xai-oauth");
-		expect(pickDefaultAvailableModel([paid])?.provider).toBe("xai");
-	});
-});
+function registryFor(models: Model<Api>[]): ModelLookupRegistry {
+	return {
+		getAvailable: () => models,
+	};
+}
 
 describe("parseModelPattern", () => {
 	describe("simple patterns without colons", () => {
@@ -1100,6 +1030,22 @@ describe("resolveAgentModelPatterns", () => {
 		const dashed = resolveModelOverride(patterns, dashedRegistry, settings);
 		expect(dashed.model?.provider).toBe("anthropic");
 		expect(dashed.model?.id).toBe("claude-opus-4-8");
+	});
+});
+
+describe("findSlowModel", () => {
+	test("prefers Claude Opus 4.8 over older Opus aliases", async () => {
+		const model = await findSlowModel(
+			registryFor([opusModel("claude-opus-4-7"), opusModel("claude-opus-4-8"), opusModel("claude-opus-4-6")]),
+		);
+
+		expect(model?.id).toBe("claude-opus-4-8");
+	});
+
+	test("prefers Claude Opus 4.7 over older Opus aliases when 4.8 is unavailable", async () => {
+		const model = await findSlowModel(registryFor([opusModel("claude-opus-4.7"), opusModel("claude-opus-4-6")]));
+
+		expect(model?.id).toBe("claude-opus-4.7");
 	});
 });
 

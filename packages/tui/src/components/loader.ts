@@ -99,7 +99,20 @@ export class Loader extends Text {
 		this.#syncText();
 		this.#requestPaint();
 		const intervalMs = this.messageColorFn.animated === true ? RENDER_INTERVAL_MS : SPINNER_ADVANCE_MS;
-		this.#scheduleTick(intervalMs, intervalMs);
+		this.#intervalId = setInterval(() => {
+			const now = performance.now();
+			const elapsed = now - this.#lastSpinnerTick;
+			const shouldAdvanceSpinner = elapsed >= SPINNER_ADVANCE_MS;
+			if (shouldAdvanceSpinner) {
+				const steps = Math.floor(elapsed / SPINNER_ADVANCE_MS);
+				this.#currentFrame = (this.#currentFrame + steps) % this.#frames.length;
+				this.#lastSpinnerTick += steps * SPINNER_ADVANCE_MS;
+				this.#syncText();
+			}
+			if (shouldAdvanceSpinner || this.#ui?.synchronizedOutput === true) {
+				this.#requestPaint();
+			}
+		}, intervalMs);
 	}
 
 	stop() {
@@ -123,32 +136,6 @@ export class Loader extends Text {
 		this.#requestPaint();
 	}
 
-	#scheduleTick(intervalMs: number, delayMs: number): void {
-		const timer = setTimeout(() => {
-			if (this.#intervalId !== timer) return;
-			const startedAt = performance.now();
-			const elapsed = startedAt - this.#lastSpinnerTick;
-			const shouldAdvanceSpinner = elapsed >= SPINNER_ADVANCE_MS;
-			if (shouldAdvanceSpinner) {
-				const steps = Math.floor(elapsed / SPINNER_ADVANCE_MS);
-				this.#currentFrame = (this.#currentFrame + steps) % this.#frames.length;
-				this.#lastSpinnerTick += steps * SPINNER_ADVANCE_MS;
-				this.#syncText();
-			}
-			if (shouldAdvanceSpinner || this.#ui?.synchronizedOutput === true) {
-				this.#requestPaint();
-			}
-
-			const frameCostMs = performance.now() - startedAt;
-			if (this.#intervalId !== timer) return;
-			const cadenceDelayMs = Math.max(0, intervalMs - frameCostMs);
-			// Idle for nine times the paint cost to keep animation at or below
-			// 10% CPU, even when a slow ConPTY write exceeds the normal cadence.
-			const backpressureDelayMs = frameCostMs * RENDER_BACKPRESSURE_MULTIPLIER;
-			this.#scheduleTick(intervalMs, Math.max(cadenceDelayMs, backpressureDelayMs));
-		}, delayMs);
-		this.#intervalId = timer;
-	}
 	/** Re-wrap the underlying Text only when its message or frame width changes. */
 	#syncText(): boolean {
 		const layoutFrame = this.#layoutFrames[this.#currentFrame];
@@ -159,6 +146,15 @@ export class Loader extends Text {
 	#requestPaint() {
 		if (!this.#ui) {
 			return;
+		}
+		// Direct write: a loader tick changes only this component, so the TUI can
+		// update the already-positioned rows without driving the full
+		// compose/prepare/diff pipeline. Lightweight test stubs may not carry the
+		// newer API; keep their legacy component-scoped path working.
+		if (typeof this.#ui.requestDirectWrite === "function") {
+			this.#ui.requestDirectWrite(this);
+		} else {
+			this.#ui.requestComponentRender(this);
 		}
 		this.#ui.requestComponentRender(this);
 	}

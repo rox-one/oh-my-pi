@@ -105,6 +105,12 @@ export class SessionFocusController {
 		});
 		this.ctx.statusLine.setSession(target, this.#focusedAgentId);
 		await this.ctx.renderInitialMessages({ clearTerminalHistory: true });
+		// Retarget the sticky Todo HUD too. While a subagent is focused the main
+		// session's `todo` completions never reach this controller; returning to
+		// main must therefore reload its current state instead of retaining the
+		// pre-focus snapshot. Passing `target` also restores a focused subagent's
+		// own todos rather than overwriting them with the main session's list.
+		await this.ctx.reloadTodos(target);
 		// Sync the run-state title to the attached target: a streaming target has no
 		// agent_start incoming, so arm the loader/working title manually; an idle
 		// target would otherwise inherit the previous session's stuck spinner, so

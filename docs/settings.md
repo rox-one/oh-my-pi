@@ -373,12 +373,13 @@ The advisor is a second model that reviews each completed turn and can inject ad
 
 See [Advisor and WATCHDOG.md](./advisor-watchdog.md) for runtime behavior, `WATCHDOG.md` discovery, and bounded catch-up semantics.
 
-| Key                   | Type    | Default | Notes                                                                                                                                                |
-| --------------------- | ------- | ------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `advisor.enabled`     | boolean | `false` | Enable the advisor runtime when `modelRoles.advisor` resolves to an available model.                                                                 |
-| `task.agentAdvisor`   | record  | `{}`    | Per-agent subagent advisor: agent name → `"on"` / `"off"` / advisor model pattern. Overrides agent frontmatter `advisor`; configured from the `/agents` hub. |
-| `advisor.syncBacklog` | enum    | `off`   | Bounded advisor catch-up delay: `off`, `1`, `3`, or `5`. The primary waits up to 30 seconds only while advisor backlog is at or above the threshold. |
-| `advisor.immuneTurns` | number  | `3`     | After a `concern`/`blocker` interrupts, route further concerns/blockers as non-interrupting asides for this many completed primary turns.            |
+| Key | Type | Default | Notes |
+|---|---|---|---|
+| `advisor.enabled` | boolean | `false` | Enable the advisor runtime when `modelRoles.advisor` resolves to an available model. |
+| `advisor.subagents` | boolean | `false` | Also enable advisor runtimes for spawned task/eval subagents. |
+| `advisor.syncBacklog` | enum | `off` | Bounded advisor catch-up delay: `off`, `1`, `3`, or `5`. The primary waits up to 30 seconds only while advisor backlog is at or above the threshold. |
+| `advisor.immuneTurns` | number | `3` | After a `concern`/`blocker` interrupts, route further concerns/blockers as non-interrupting asides for this many completed primary turns. |
+| `advisor.lateConcern` | enum | `preserve` | Delivery for a `concern` raised after the agent's final answer: `preserve` keeps it as a passive card, `steer` wakes the agent to act on it like a `blocker`. |
 
 ### Thinking
 
@@ -477,7 +478,7 @@ providers:
 | `retry.fallbackChains`                   | record  | `{}`              | Maps roles, model selectors, or `provider/*` wildcards to ordered fallback selectors. Keys containing `/` are model-oriented and win over roles: `provider/model-id` matches that exact model, `provider/*` matches every model of the provider. A `provider/*` _entry_ keeps the failing model's id and swaps the provider. The `default` chain covers every assigned role without its own chain. Unknown models/providers or malformed chains are reported as config warnings at startup. |
 | `retry.fallbackRevertPolicy`             | enum    | `cooldown-expiry` | `cooldown-expiry` returns to the primary model once its suppression window ends; `never` stays on the fallback until switched manually.                                                                                                                                                                                                                                                                                                                                                     |
 | `providers.anthropic.serverSideFallback` | boolean | `false`           | Opt in to Anthropic's `server-side-fallback-2026-06-01` beta. Only direct `anthropic` provider requests using the `anthropic-messages` API for Claude Fable or Mythos models are eligible. On an Anthropic safety-classifier block, the provider may retry server-side with `claude-opus-4-8`; every other provider, API, and model is unaffected.                                                                                                                                          |
-| `providers.openai-codex.codeMode`           | enum    | `off`             | Codex Code Mode for `code_mode_only` models (GPT-5.6 Sol/Terra/Luna), mirroring codex-rs: the direct tool surface collapses to `eval`/`ask`/`todo` and every other session tool is invoked from `eval` cells via its `tool.<name>()` bridge, collapsing multi-step tool work into one model round trip. `auto` follows the model catalog's `tool_mode` flag; `on` forces it for any Codex model; `off` (default) leaves the full direct surface. The turn metadata carries codex-rs's `tool_namespaces_info` exposure snapshot while active. |
+| `providers.openai-codex.codeMode`           | enum    | `auto`            | Codex Code Mode for `code_mode_only` models (GPT-5.6 Sol/Terra/Luna), mirroring codex-rs: the direct tool surface collapses to `eval`/`ask`/`todo`, with the `goal` control tool retained directly while Goal Mode is active; every other session tool is invoked from `eval` cells via its `tool.<name>()` bridge, collapsing multi-step tool work into one model round trip. `auto` follows the model catalog's `tool_mode` flag by default; `on` forces it for any Codex model; `off` opts out and leaves the full direct surface. The turn metadata carries codex-rs's `tool_namespaces_info` exposure snapshot while active. |
 | `providers.openai-codex.codeModeDirectTools` | array   | `[]`              | Extra tool names to keep directly callable alongside `eval`/`ask`/`todo` when Codex Code Mode is active; entries that are not enabled in the session are ignored. |
 
 When the active model keeps failing (429s, quota walls, provider outages) and `retry.modelFallback` is on, the session picks the chain that owns the failing model, by specificity: an exact `provider/model-id` key, then a `provider/*` wildcard, then the current role's chain, then `default`. If several roles assign the same model, yaml key order does not decide: the live session role wins, and `default` wins over other matching roles when the session is not on those roles. It skips models whose selectors are still cooling down and switches for the rest of the turn. Subagents get their own per-spawn chains when their agent definition lists multiple model patterns — the first resolvable pattern is primary and the rest become its fallbacks; there is no `agent:<name>` key in `fallbackChains`.
@@ -621,24 +622,29 @@ compaction:
   thresholdPercent: -1 # -1 = default reserve-based behavior
   thresholdTokens: -1 # fixed token limit when > 0
 memory:
-  backend: off # off, local, hindsight, mnemopi
+  backend: off               # off, local, hindsight, mnemopi
+
+workspace:
+  identifier: path           # path, git-remote, git-root
 ```
 
-| Key                           | Type    | Default                                  | Notes                                                                                                                                                                                                                                     |
-| ----------------------------- | ------- | ---------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `contextPromotion.enabled`    | boolean | `false`                                  | Promote to the active model's explicit `contextPromotionTarget` on context overflow.                                                                                                                                                      |
-| `compaction.enabled`          | boolean | `true`                                   | Automatic conversation compaction.                                                                                                                                                                                                        |
-| `compaction.midTurnEnabled`   | boolean | `true`                                   | Check thresholds at safe mid-turn tool-loop boundaries before the next provider request.                                                                                                                                                  |
-| `compaction.methodOrder`      | array   | `remote, snapcompact, handoff, shake, soft` | Ordered fallbacks. `remote` uses provider-native OpenAI-compatible server compaction; unavailable or failed methods advance. |
-| `compaction.thresholdPercent` | number  | `-1`                                     | Percent-of-context trigger; `-1` = reserve-based default.                                                                                                                                                                                 |
-| `compaction.thresholdTokens`  | number  | `-1`                                     | Fixed token trigger when `> 0`.                                                                                                                                                                                                           |
-| `compaction.reserveTokens`    | number  | _(unset)_                                | Absolute reserve floor. When unset, the effective reserve is the larger of `16384` and 15% of the context window; if that default would leave no practical small-window budget, it falls back to the 15% reserve.                         |
-| `compaction.keepRecentTokens` | number  | `20000`                                  | Recent tokens always preserved.                                                                                                                                                                                                           |
-| `compaction.autoContinue`     | boolean | `true`                                   | Continue automatically after compaction.                                                                                                                                                                                                  |
-| `memory.backend`              | enum    | `off`                                    | `off`, `local`, `hindsight`, `mnemopi`. Each backend has its own `hindsight.*` / `mnemopi.*` / `memories.*` tuning keys.                                                                                                                  |
+| Key                           | Type    | Default       | Notes                                                                                                                                                                                                                                     |
+| ----------------------------- | ------- | ------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `contextPromotion.enabled`    | boolean | `false`       | Promote to the active model's explicit `contextPromotionTarget` on context overflow.                                                                                                                                                      |
+| `compaction.enabled`          | boolean | `true`        | Automatic conversation compaction.                                                                                                                                                                                                        |
+| `compaction.midTurnEnabled`   | boolean | `true`        | Check thresholds at safe mid-turn tool-loop boundaries before the next provider request.                                                                                                                                                  |
+| `compaction.strategy`         | enum    | `snapcompact` | `context-full`, `handoff`, `shake`, `snapcompact`, `off`.                                                                                                                                                                                 |
+| `compaction.thresholdPercent` | number  | `-1`          | Percent-of-context trigger; `-1` = reserve-based default.                                                                                                                                                                                 |
+| `compaction.thresholdTokens`  | number  | `-1`          | Fixed token trigger when `> 0`.                                                                                                                                                                                                           |
+| `compaction.reserveTokens`    | number  | _(unset)_     | Absolute reserve floor. When unset, the effective reserve is the larger of `16384` and 15% of the context window; if that default would leave no practical small-window budget, it falls back to the 15% reserve.                         |
+| `compaction.keepRecentTokens` | number  | `20000`       | Recent tokens always preserved.                                                                                                                                                                                                           |
+| `compaction.remoteEnabled`    | boolean | `true`        | Allow remote compaction service.                                                                                                                                                                                                          |
+| `compaction.autoContinue`     | boolean | `true`        | Continue automatically after compaction.                                                                                                                                                                                                  |
+| `memory.backend`              | enum    | `off`         | `off`, `local`, `hindsight`, `mnemopi`. Each backend has its own `hindsight.*` / `mnemopi.*` / `memories.*` tuning keys.                                                                                                                  |
 | `autolearn.enabled`           | boolean | `false`       | Experimental: after the agent stops, nudge it to capture lessons to memory and create/enhance isolated managed skills under `~/.omp/agent/managed-skills`. Enables the `manage_skill` tool (and `learn` when a memory backend is active). |
 | `autolearn.autoContinue`      | boolean | `false`       | When `autolearn.enabled`, auto-run one capture turn at stop (uses extra tokens). Off = a passive reminder rides your next turn.                                                                                                           |
-| `autolearn.minToolCalls`      | number  | `5`           | Only nudge after a turn that used at least this many tools.                                                                                                                                                                               |
+| `autolearn.minToolCalls`      | number  | `5`           | Only nudge after a turn that used at least this many tools.
+| `autolearn.skillLocation`     | enum    | `global`      | Where `learn`/`manage_skill` write skills: `global` (`~/.omp/agent/managed-skills`, loads everywhere) or `project` (`<repo>/.omp/skills` at the primary checkout — only sessions in that repo, including linked worktrees, load them). |                                                                                                                                                                               |
 
 `compaction` has additional tuning keys (idle compaction, supersede/drop heuristics) visible in `omp config list`. See [Compaction](./compaction.md) for the full strategy reference.
 
@@ -656,6 +662,9 @@ statusLine:
   separator: powerline-thin
   transparent: false
   showHookStatus: true
+  segmentOptions:
+    session:
+      length: 13
 
 terminal:
   showImages: true
@@ -678,12 +687,31 @@ tui:
 | `statusLine.sessionAccent`  | boolean | `true`           | Tint the editor border with the session color.                            |
 | `statusLine.transparent`    | boolean | `false`          | Use the terminal background for the status line.                          |
 | `statusLine.showHookStatus` | boolean | `true`           | Show hook status messages.                                                |
+| `statusLine.segmentOptions.session.length` | number | `13` | Number of session UUID characters shown by the `session` segment; values below `1` are clamped to `1`. |
 | `terminal.showImages`       | boolean | `true`           | Render images inline (when the terminal supports it).                     |
 | `images.autoResize`         | boolean | `true`           | Resize large images for model compatibility.                              |
 | `images.blockImages`        | boolean | `false`          | Never send images to providers.                                           |
 | `tui.hyperlinks`            | enum    | `auto`           | `off`, `auto`, `always`.                                                  |
 
 For a custom status line, set `statusLine.preset: custom` and configure `statusLine.leftSegments`, `statusLine.rightSegments`, and `statusLine.segmentOptions`.
+
+Example:
+
+```yaml
+statusLine:
+  preset: custom
+  leftSegments: [model, profile, path, git]
+  rightSegments: [token_total, context_pct]
+  segmentOptions:
+    token_total:
+      breakdown: true
+    context_pct:
+      compact: true
+```
+
+- `profile` shows the active named profile as `p:<name>` and stays hidden for the default profile.
+- `segmentOptions.token_total.breakdown: true` renders labeled totals like `in:25K out:5`.
+- `segmentOptions.context_pct.compact: true` renders `ctx:9.1%` instead of the default `<percent>/<window>` form.
 
 ### Interaction
 
@@ -699,6 +727,12 @@ For a custom status line, set `statusLine.preset: custom` and configure `statusL
 | `ask.timeout`          | number  | `0`             | Seconds before an `ask` prompt times out; `0` = no timeout. (Legacy ms values are migrated to seconds.) |
 | `ask.notify`           | enum    | `on`            | `on`, `off`.                                                                                            |
 
+### Startup and updates
+
+| Key | Type | Default | Values |
+|---|---|---|---|
+| `settings.autoRestartOnUpdate` | boolean | `false` | When a persisted interactive session's executable is replaced, let the current turn settle, then resume that session with the new executable. Unsaved editor text is retained. |
+
 ### Providers and services
 
 ```yaml
@@ -706,7 +740,7 @@ providers:
   webSearchOrder: [perplexity, exa, gemini]
   imageOrder: [openai, xai]
   fetch: auto
-  webSearchGeminiModel: gemini-2.5-flash
+  webSearchGeminiModel: gemini-flash-latest
   tinyModel: online
   tinyModelDevice: default
   tinyModelDtype: default
@@ -733,7 +767,7 @@ searxng:
 | ----------------------------------- | ------- | --------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `providers.webSearchOrder`          | array   | `[]`      | Provider IDs in priority order for `web_search` (`perplexity`, `gemini`, `anthropic`, `codex`, `zai`, `exa`, `jina`, `kagi`, `tavily`, `brave`, `kimi`, `parallel`, `synthetic`, `searxng`, …). Duplicates and unknown IDs are ignored; unlisted providers retain their built-in relative order afterward. Empty = built-in order. Replaces the removed `providers.webSearch` enum (a legacy value migrates to the head of this list). |
 | `providers.webSearchTimeoutSeconds` | number  | `60`      | Hard timeout in seconds supplied to each `web_search` provider transport before the automatic chain advances to the next fallback. Use a larger value for slower model-backed providers; values above `300` are capped at five minutes. This is not a whole-chain deadline, and provider-specific upstream or aggregate limits may still be shorter.                                                                                   |
-| `providers.webSearchGeminiModel`    | string  | _(unset)_ | Gemini model ID for Google Search grounding when `web_search` uses Gemini; defaults to `gemini-2.5-flash`, overridden by `GEMINI_SEARCH_MODEL`.                                                                                                                                                                                                                                                                                        |
+| `providers.webSearchGeminiModel`    | string  | _(unset)_ | Gemini model ID for Google Search grounding when `web_search` uses Gemini; defaults to the rolling `gemini-flash-latest` alias, overridden by `GEMINI_SEARCH_MODEL`. Pin an explicit version here for reproducible grounding.                                                                                                                                                    |
 | `providers.imageOrder`              | array   | `[]`      | Image-generation provider IDs in priority order (`openai`, `openai-codex`, `antigravity`, `xai`, `gemini`, `openrouter`). Unlisted providers follow the active session provider and the built-in order. Replaces the removed `providers.image` enum (a legacy value migrates to the head of this list).                                                                                                                                |
 | `providers.fetch`                   | enum    | `auto`    | `auto`, `native`, `trafilatura`, `lynx`, `parallel`, `jina`.                                                                                                                                                                                                                                                                                                                                                                           |
 | `providers.tinyModel`               | enum    | `online`  | `online` or a local model (`lfm2-350m`, `qwen3-0.6b`, `gemma-270m`, `qwen2.5-0.5b`, `lfm2-700m`).                                                                                                                                                                                                                                                                                                                                      |

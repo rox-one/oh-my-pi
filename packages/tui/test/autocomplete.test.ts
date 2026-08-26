@@ -292,6 +292,23 @@ describe("CombinedAutocompleteProvider", () => {
 			}
 		});
 
+		it("does not fall through to file suggestions after a matched no-arg slash command with empty arguments", async () => {
+			const baseDir = fs.mkdtempSync(path.join(os.tmpdir(), "autocomplete-settings-empty-args-"));
+			try {
+				fs.mkdirSync(path.join(baseDir, "alpha"));
+				const provider = new CombinedAutocompleteProvider(
+					[{ name: "settings", description: "Open settings", allowArgs: false }],
+					baseDir,
+				);
+				const line = "/settings ";
+				const result = await provider.getSuggestions([line], 0, line.length);
+
+				expect(result).toBeNull();
+			} finally {
+				fs.rmSync(baseDir, { recursive: true, force: true });
+			}
+		});
+
 		it("returns @ file-reference completions for matched slash commands that reject arguments", async () => {
 			const baseDir = fs.mkdtempSync(path.join(os.tmpdir(), "autocomplete-settings-args-"));
 			try {

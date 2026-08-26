@@ -483,6 +483,45 @@ describe("runSubprocess soft request budget", () => {
 		expect(receipt.error).toMatch(/hard-aborted/);
 		expect(receipt.error).toMatch(new RegExp(`history://${id}`));
 	});
+	it("omits outputPath when the task artifact write fails", async () => {
+		const id = "UnwritableArtifact";
+		const artifactTarget = tempDir.join("not-a-directory");
+		await Bun.write(artifactTarget, "occupied");
+		const handle = createMockSession(({ promptIndex, emit, pushMessage }) => {
+			if (promptIndex !== 1) return;
+			const yieldMessage = {
+				role: "assistant" as const,
+				content: [
+					{
+						type: "toolCall" as const,
+						id: "tool-yield",
+						name: "yield",
+						arguments: { result: { data: { report: "completed despite artifact failure" } } },
+					},
+				],
+				stopReason: "toolUse" as const,
+			};
+			pushMessage(yieldMessage);
+			emit({ type: "message_end", message: yieldMessage } as unknown as AgentSessionEvent);
+			emit({
+				type: "tool_execution_end",
+				toolCallId: "tool-yield",
+				toolName: "yield",
+				result: {
+					content: [{ type: "text", text: "Result submitted." }],
+					details: { status: "success", data: { report: "completed despite artifact failure" } },
+				},
+				isError: false,
+			} as AgentSessionEvent);
+		});
+		mockCreateAgentSession(handle.session);
+		registerRunning(id, handle.session);
+
+		const result = await runSubprocess({ ...baseOptions(id), artifactsDir: artifactTarget });
+
+		expect(result.outputPath).toBeUndefined();
+		expect(await Bun.file(artifactTarget).text()).toBe("occupied");
+	});
 });
 
 describe("resolveSoftRequestBudget", () => {

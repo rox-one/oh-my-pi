@@ -121,7 +121,7 @@ function createHarness(): Harness {
 		resetTranscript: () => ctx.chatContainer.clear(),
 		isBackgrounded: false,
 		initialChatRendered: false,
-		statusLine: { invalidate: vi.fn() },
+		statusLine: { invalidate: vi.fn(), markActivityStart: vi.fn(), markActivityEnd: vi.fn() },
 		updateEditorBorderColor: vi.fn(),
 		settings: { get: () => false },
 		session: sessionMock,

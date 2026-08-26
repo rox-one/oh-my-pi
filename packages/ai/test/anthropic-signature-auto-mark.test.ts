@@ -154,7 +154,7 @@ describe("#4297 anthropic-messages runtime signing auto-mark", () => {
 		vi.restoreAllMocks();
 	});
 
-	it("demotes unsigned thinking, retries, and pins the session on the first signing 400", async () => {
+	it("drops unsigned thinking, retries, and pins the session on the first signing 400", async () => {
 		const providerSessionState = new Map<string, ProviderSessionState>();
 		const capturedPayloads: unknown[] = [];
 		let attempt = 0;
@@ -190,16 +190,22 @@ describe("#4297 anthropic-messages runtime signing auto-mark", () => {
 		expect(firstThinking?.signature).toBe("");
 		expect(firstThinking?.thinking).toBe("Read the file, then summarise.");
 
+		// After auto-mark the runtime clone flips `signingEndpoint: true`, so
+		// `transformMessages` drops the unsigned same-model thinking block
+		// entirely instead of falling through to `renderDemotedThinking` (#4428
+		// review). The retry request carries the original reply text but no
+		// wire trace of the private reasoning.
 		const retryBlocks = extractPriorAssistantBlocks(capturedPayloads[1]);
 		expect(retryBlocks.find(block => block.type === "thinking")).toBeUndefined();
-		const demotedText = retryBlocks.find(block => block.type === "text");
-		expect(demotedText?.text).toContain("Read the file, then summarise.");
+		const retryText = retryBlocks.find(block => block.type === "text");
+		expect(retryText?.text).toBe("The README covers the CLI.");
+		expect(retryBlocks.some(block => block.type === "text" && !!block.text?.includes("Read the file"))).toBe(false);
 
 		expect(readReplayUnsignedThinkingDisabled(providerSessionState)).toBe(true);
 		expect(result.disabledFeatures).toContain("unsigned-thinking-replay");
 	});
 
-	it("pre-demotes unsigned thinking on subsequent turns once the session is pinned", async () => {
+	it("drops unsigned thinking on subsequent turns once the session is pinned", async () => {
 		const providerSessionState = new Map<string, ProviderSessionState>();
 		const capturedPayloads: unknown[] = [];
 		vi.spyOn(AnthropicMessages.prototype, "create").mockImplementation((params: unknown) => {
@@ -229,8 +235,13 @@ describe("#4297 anthropic-messages runtime signing auto-mark", () => {
 		expect(result.stopReason).toBe("stop");
 		expect(capturedPayloads.length).toBe(1);
 		const blocks = extractPriorAssistantBlocks(capturedPayloads[0]);
+		// Pinned session flips `signingEndpoint` in the runtime clone too, so
+		// unsigned same-model thinking is dropped in `transformMessages`
+		// instead of demoted to text by `convertAnthropicMessages` (#4428).
 		expect(blocks.find(block => block.type === "thinking")).toBeUndefined();
-		expect(blocks.find(block => block.type === "text")?.text).toContain("Read the file, then summarise.");
+		const replyText = blocks.find(block => block.type === "text");
+		expect(replyText?.text).toBe("The README covers the CLI.");
+		expect(blocks.some(block => block.type === "text" && !!block.text?.includes("Read the file"))).toBe(false);
 		expect(result.disabledFeatures).toContain("unsigned-thinking-replay");
 	});
 

@@ -1222,6 +1222,22 @@ describe("archive helpers", () => {
 		// the send path will drop.
 		expect(snapcompact.MAX_FRAMES_DEFAULT).toBeLessThanOrEqual(snapcompact.providerImageBudget("anthropic"));
 	});
+
+	it("unknown providers use the model-id cap; named gateways stay the ceiling", () => {
+		expect(snapcompact.providerImageBudget("ramp", "grok-4.6")).toBe(snapcompact.MAX_FRAMES_DEFAULT);
+		expect(snapcompact.providerImageBudget("ramp", "claude-opus-4-6")).toBe(90);
+		expect(snapcompact.providerImageBudget("ramp", "gpt-4o")).toBe(200);
+		expect(snapcompact.providerImageBudget("ramp", "gemini-2.5-pro")).toBe(200);
+		expect(snapcompact.providerImageBudget("ramp", "some-random-model")).toBe(
+			snapcompact.DEFAULT_PROVIDER_IMAGE_BUDGET,
+		);
+		expect(snapcompact.providerImageBudget("ramp", "anthropic-messages")).toBe(
+			snapcompact.DEFAULT_PROVIDER_IMAGE_BUDGET,
+		);
+		expect(snapcompact.providerImageBudget("groq", "grok-4.6")).toBe(snapcompact.DEFAULT_PROVIDER_IMAGE_BUDGET);
+		expect(snapcompact.providerImageBudget("umans", "claude-opus-4-6")).toBe(10);
+		expect(snapcompact.providerImageBudget("openrouter", "grok-4.6")).toBe(snapcompact.MAX_FRAMES_DEFAULT);
+	});
 });
 
 describe("dimStopwords", () => {

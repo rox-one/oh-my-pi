@@ -1,5 +1,6 @@
 import { afterAll, afterEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs/promises";
+import * as os from "node:os";
 import * as path from "node:path";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import { Settings } from "../../src/config/settings";
@@ -1545,24 +1546,33 @@ describe("runEvalAgent isolation", () => {
 		expect(result.text).toContain("apply=false");
 	});
 
-	it("preserves the temp artifacts dir when apply=false so details.patchPath remains valid", async () => {
+	it("moves the apply=false recovery patch out of the temp artifact lease", async () => {
 		mockAgents();
 		mockIsolationContext();
-		const rmSpy = vi.spyOn(fs, "rm").mockResolvedValue(undefined);
-		vi.spyOn(isolationRunner, "runIsolatedSubprocess").mockImplementation(async opts =>
-			singleResult(opts.baseOptions, { output: "captured", patchPath: `/artifacts/${opts.agentId}.patch` }),
-		);
+		let temporaryArtifactsDir: string | undefined;
+		let recoveryDir: string | undefined;
+		try {
+			vi.spyOn(isolationRunner, "runIsolatedSubprocess").mockImplementation(async opts => {
+				if (!opts.baseOptions.artifactsDir) throw new Error("expected temporary artifact directory");
+				temporaryArtifactsDir = opts.baseOptions.artifactsDir;
+				const patchPath = path.join(opts.baseOptions.artifactsDir, `${opts.agentId}.patch`);
+				await Bun.write(patchPath, "durable eval recovery patch");
+				return singleResult(opts.baseOptions, { output: "captured", patchPath });
+			});
 
-		const result = await runEvalAgent(
-			{ prompt: "scout", isolated: true, apply: false },
-			{ session: isolatedSession() },
-		);
-
-		expect(result.details.patchPath).toMatch(/\.patch$/);
-		const removedArtifactsDir = rmSpy.mock.calls.some(
-			([target]) => typeof target === "string" && target.includes("omp-eval-agent-"),
-		);
-		expect(removedArtifactsDir).toBe(false);
+			const result = await runEvalAgent(
+				{ prompt: "scout", isolated: true, apply: false },
+				{ session: isolatedSession() },
+			);
+			const patchPath = result.details.patchPath;
+			if (!patchPath || !temporaryArtifactsDir) throw new Error("expected recovery patch");
+			recoveryDir = path.dirname(patchPath);
+			expect(recoveryDir).toBe(path.join(os.tmpdir(), `omp-recovery-${path.basename(temporaryArtifactsDir)}`));
+			expect(await Bun.file(patchPath).text()).toBe("durable eval recovery patch");
+			await expect(fs.stat(temporaryArtifactsDir)).rejects.toThrow();
+		} finally {
+			if (recoveryDir) await fs.rm(recoveryDir, { recursive: true, force: true });
+		}
 	});
 
 	it("still cleans the temp artifacts dir when apply succeeds", async () => {

@@ -11,6 +11,7 @@ import { checkJuliaKernelAvailability } from "../eval/jl/kernel";
 import { checkPythonKernelAvailability } from "../eval/py/kernel";
 import { checkRubyKernelAvailability } from "../eval/rb/kernel";
 import type { ToolPathWithSource } from "../extensibility/custom-tools";
+import type { PreparedExtension } from "../extensibility/extensions/types";
 import type { Skill } from "../extensibility/skills";
 import type { GoalModeState, GoalRuntime } from "../goals";
 import { GoalTool } from "../goals/tools/goal-tool";
@@ -31,9 +32,11 @@ import type { SessionManager } from "../session/session-manager";
 import type { ToolChoiceQueue } from "../session/tool-choice-queue";
 import { TaskTool } from "../task";
 import type { AgentOutputManager } from "../task/output-manager";
-import { canSpawnAtDepth, type StructuredSubagentSchemaMode } from "../task/types";
+import { canSpawnSubagents } from "../task/spawn-policy";
+import type { StructuredSubagentSchemaMode } from "../task/types";
 import type { EventBus } from "../utils/event-bus";
 import { type InspectImageMode, isInspectImageToolActive } from "../utils/inspect-image-mode";
+import type { VibeModeState } from "../vibe/state";
 import { WebSearchTool } from "../web/search";
 import type { WorkspaceTree } from "../workspace-tree";
 import { AskTool } from "./ask";
@@ -41,7 +44,7 @@ import { AstEditTool } from "./ast-edit";
 import { AstGrepTool } from "./ast-grep";
 import { BashTool } from "./bash";
 import { BrowserTool } from "./browser";
-import { type BuiltinToolName, type HiddenToolName, normalizeToolNames } from "./builtin-names";
+import { type BuiltinToolName, type HiddenToolName, NO_TOOLS_SENTINEL, normalizeToolNames } from "./builtin-names";
 import { type CheckpointState, CheckpointTool, type CompletedRewindState, RewindTool } from "./checkpoint";
 import { ComputerTool } from "./computer";
 import { DebugTool } from "./debug";
@@ -197,6 +200,8 @@ export interface ToolSession {
 	 * (`<inline-N>`) are NOT included — those are session-local.
 	 */
 	extensionPaths?: string[];
+	/** Imported extension factories safe to rebind in child sessions. */
+	preparedExtensions?: PreparedExtension[];
 	/**
 	 * Pre-discovered custom-tool source paths from `.omp/tools/`, `.claude/tools/`,
 	 * plugins, etc. Forwarded to subagents so they skip the FS scan but still
@@ -272,6 +277,20 @@ export interface ToolSession {
 	toolRegistry?: Map<string, Tool>;
 	/** `xd://` presentation state backed by {@link toolRegistry}. */
 	xdev?: XdevState;
+	/**
+	 * Set when this session's `write` tool was granted only as the `xd://`
+	 * transport: `write xd://<tool>` dispatches mounted devices, but filesystem
+	 * writes are rejected. Granted by {@link createTools} to sessions whose
+	 * explicit tool list includes `read` but omits `write`, so xd:// mounting
+	 * can engage without expanding the write contract.
+	 */
+	deviceOnlyWrite?: boolean;
+	/**
+	 * Prompt-only preview used while a full-write activation rebuilds. It changes
+	 * the advertised schema without relaxing {@link deviceOnlyWrite}; execution
+	 * remains restricted until the activation commits.
+	 */
+	pendingFullWriteDescription?: boolean;
 	/** Agent registry for IRC routing across live sessions. */
 	agentRegistry?: AgentRegistry;
 	/** Idle→parked→revive lifecycle owner; lets the hub kill a non-job-backed agent registration. Default: AgentLifecycleManager.global(). */
@@ -323,6 +342,10 @@ export interface ToolSession {
 	settings: Settings;
 	/** Plan mode state (if active) */
 	getPlanModeState?: () => PlanModeState | undefined;
+	/** Whether plan mode is paused (plan stays logically active while `getPlanModeState` is cleared). */
+	isPlanModePaused?: () => boolean;
+	/** Vibe mode state (if active). */
+	getVibeModeState?: () => VibeModeState | undefined;
 	/** Path of the session's active plan reference (e.g. `local://<title>.md`); defaults to `local://PLAN.md`. */
 	getPlanReferencePath?: () => string;
 	/** Goal mode state (if active or paused) */
@@ -478,13 +501,14 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 		: toolNames && toolNames.length > 0
 			? normalizeToolNames(toolNames)
 			: undefined;
-	const goalEnabled = session.settings.get("goal.enabled");
-	const goalModeActive = !restrictToolNames && goalEnabled && session.getGoalModeState?.()?.enabled === true;
-	const externalThinkingActive =
-		session.settings.get("externalThinking") && supportsExternalThinking(session.getActiveModel?.());
-	if (goalModeActive && requestedTools && !requestedTools.includes("goal")) {
-		requestedTools.push("goal");
+	// createTools may be called more than once for the same ToolSession. A later
+	// explicit (or full-set) write request is a real grant and must upgrade any
+	// device-only transport left by an earlier read-only call.
+	if (requestedTools === undefined || requestedTools.includes("write")) {
+		session.deviceOnlyWrite = undefined;
+		session.pendingFullWriteDescription = undefined;
 	}
+	const goalEnabled = session.settings.get("goal.enabled");
 	const backends = resolveEvalBackends(session);
 	const allowPython = backends.python;
 	const allowJs = backends.js;
@@ -555,7 +579,7 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 	// Auto-include AST counterparts when their text-based sibling is present.
 	// Restricted callers own the active list and must not have it widened.
 	if (requestedTools && !restrictToolNames) {
-		if (goalModeActive && !requestedTools.includes("goal")) {
+		if (goalEnabled && !requestedTools.includes(NO_TOOLS_SENTINEL) && !requestedTools.includes("goal")) {
 			requestedTools.push("goal");
 		}
 		if (
@@ -601,16 +625,7 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 	}
 	const allTools: Record<string, ToolFactory> = { ...BUILTIN_TOOLS, ...HIDDEN_TOOLS };
 	const isToolAllowed = (name: string) => {
-		// Never in the default set. Explicitly activatable while goal.enabled and
-		// no goal record exists yet — /guided-goal enables it so the agent can
-		// finish the interview with `goal create`, which turns goal mode on. Once
-		// a goal record exists, only an enabled goal keeps the tool: a completed
-		// (exiting) or paused goal must stop advertising it on the next rebuild.
-		if (name === "goal") {
-			if (!goalEnabled || restrictToolNames) return false;
-			const goalState = session.getGoalModeState?.();
-			return goalState === undefined || goalState.enabled === true || goalState.goal.status === "dropped";
-		}
+		if (name === "goal") return goalEnabled;
 		if (name === "lsp") return enableLsp && session.settings.get("lsp.enabled");
 		if (name === "bash") return session.settings.get("bash.enabled");
 		if (name === "eval") return allowEval;
@@ -636,7 +651,9 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 			);
 		if (name === "hub") {
 			return (
-				!restrictToolNames && session.enableIrc !== false && isIrcEnabled(session.settings, session.taskDepth ?? 0)
+				!restrictToolNames &&
+				session.enableIrc !== false &&
+				isIrcEnabled(session.settings, session.taskDepth ?? 0, session.getSessionSpawns())
 			);
 		}
 		if (name === "retain" || name === "recall" || name === "reflect") {
@@ -656,7 +673,11 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 			);
 		}
 		if (name === "task") {
-			return canSpawnAtDepth(session.settings.get("task.maxRecursionDepth") ?? 2, session.taskDepth ?? 0);
+			return canSpawnSubagents(
+				session.getSessionSpawns(),
+				session.settings.get("task.maxRecursionDepth") ?? 2,
+				session.taskDepth ?? 0,
+			);
 		}
 		return true;
 	};
@@ -674,7 +695,7 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 						.map(([name, factory]) => [name, factory] as const),
 					...(externalThinkingActive ? ([["think", HIDDEN_TOOLS.think]] as const) : []),
 					...(includeYield ? ([["yield", HIDDEN_TOOLS.yield]] as const) : []),
-					...(goalModeActive ? ([["goal", HIDDEN_TOOLS.goal]] as const) : []),
+					...(goalEnabled ? ([["goal", HIDDEN_TOOLS.goal]] as const) : []),
 				];
 
 	const activeToolNames = new Set(baseEntries.map(([name]) => name));
@@ -696,23 +717,49 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 	const builtInNames = new Set(tools.map(tool => tool.name));
 	for (const tool of tools) toolRegistry.set(tool.name, tool);
 
-	// Ordinary sessions use xd:// for discoverable built-ins, custom tools, and
-	// MCP tools. Structured children must expose only their host-provided names,
-	// so never allocate a registry that later SDK assembly could populate.
-	// The transport rides read/write, so a session granted no write tool never
-	// allocates xd:// state — its tools are exposed top-level directly instead
-	// of auto-granting a write transport the session was denied.
-	// Explicitly requested built-ins retain their top-level presentation.
-	const xdevEnabled =
-		!restrictToolNames && session.settings.get("tools.xdev") && tools.some(tool => tool.name === "write");
-	const mountBuiltinTools = requestedTools === undefined;
-	if (xdevEnabled) {
-		const mountedNames = new Set<string>();
-		const kept: Tool[] = [];
-		for (const tool of tools) {
-			const mountable = mountBuiltinTools && isMountableUnderXdev(tool) && tool.name in BUILTIN_TOOLS;
-			if (mountable) mountedNames.add(tool.name);
-			else kept.push(tool);
+	const xdevRequested = !restrictToolNames && session.settings.get("tools.xdev");
+	// xd:// mounting rides the write tool as its execution transport, so a
+	// session whose explicit tool list grants `read` but omits `write` would
+	// allocate no xd:// state and expose every later-registered MCP/extension
+	// tool top-level with its full schema on every request — the opposite of
+	// the intended restriction, and enough to overflow narrow provider context
+	// windows on MCP-heavy sessions. Grant a device-only `write` instead:
+	// `write xd://<tool>` dispatches mounted devices while filesystem writes
+	// stay rejected (enforced by WriteTool via `session.deviceOnlyWrite`). No
+	// capability is expanded: without mounting, those tools were already
+	// presented — and callable — top-level.
+	if (
+		xdevRequested &&
+		requestedTools !== undefined &&
+		!tools.some(tool => tool.name === "write") &&
+		tools.some(tool => tool.name === "read")
+	) {
+		session.deviceOnlyWrite = true;
+		const writeTool = await logger.time("createTools:write:xdev-transport", BUILTIN_TOOLS.write, session);
+		if (writeTool) {
+			const wrapped = wrapToolWithMetaNotice(writeTool);
+			tools.push(wrapped);
+			toolRegistry.set(wrapped.name, wrapped);
+			builtInNames.add(wrapped.name);
+		} else {
+			session.deviceOnlyWrite = undefined;
+		}
+	}
+
+	// Auto-inject report_tool_issue when autoqa is enabled (env or setting).
+	// Injected unconditionally into every agent, regardless of requested tool list.
+	const autoQA = isAutoQaEnabled(session.settings);
+	if (autoQA && !tools.some(t => t.name === "report_tool_issue")) {
+		// Build the provisional enum from tools constructed via BUILTIN_TOOLS /
+		// HIDDEN_TOOLS. `createAgentSession` rebuilds this tool after the complete
+		// registry exists so active OMP-shipped custom tools join the allowlist
+		// without admitting MCP or user-extension tools.
+		const activeBuiltinNames = tools
+			.map(t => t.name)
+			.filter(name => (name in BUILTIN_TOOLS || name in HIDDEN_TOOLS) && name !== "report_tool_issue");
+		const qaTool = createReportToolIssueTool(session, activeBuiltinNames);
+		if (qaTool) {
+			tools.push(wrapToolWithMetaNotice(qaTool));
 		}
 		session.xdev = {
 			tools: toolRegistry,
@@ -724,8 +771,6 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 	}
 	// Staged previews from deferrable tools (e.g. ast_edit) resolve through a
 	// `write` to xd://resolve/reject, so retain write whenever one can stage.
-	// xd:// mounting itself never registers write: sessions without a granted
-	// write tool skip mounting entirely (see xdevEnabled above).
 	const xdevMounted = (session.xdev?.mountedNames.size ?? 0) > 0;
 	if (
 		!restrictToolNames &&

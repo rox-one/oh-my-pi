@@ -32,14 +32,52 @@ import {
 	resolveModelCacheProviderId,
 	resolveOllamaModelCacheProviderId,
 } from "@oh-my-pi/pi-catalog/provider-models";
-import { toModelSpec } from "@oh-my-pi/pi-catalog/provider-models/bundled-references";
-import { collapseBuiltModelVariants } from "@oh-my-pi/pi-catalog/variant-collapse";
-import { getAgentDir, isBunTestRuntime, logger, wrapFetchForExtraCa } from "@oh-my-pi/pi-utils";
-import { resolveProviderModelReference } from "../config/model-resolver";
+import {
+	collapseBuiltModelVariants,
+	getVariantAliasSources,
+	resolveVariantAlias,
+} from "@oh-my-pi/pi-catalog/variant-collapse";
+
+const SPECIAL_MODEL_MANAGER_PROVIDER_IDS: readonly string[] = [
+	"google-antigravity",
+	"google-gemini-cli",
+	"openai-codex",
+];
+
+const STARTUP_MODEL_CACHE_PROVIDER_IDS: readonly string[] = [
+	...PROVIDER_DESCRIPTORS.map(descriptor => descriptor.providerId),
+	...SPECIAL_MODEL_MANAGER_PROVIDER_IDS,
+];
+
+// Sentinels for local-only OAuth tokens — declared inline to avoid loading
+// provider modules at startup. Must match packages/ai/src/registry/llama-cpp.ts,
+// packages/ai/src/registry/lm-studio.ts, and packages/ai/src/registry/vllm.ts.
+const LOCAL_PROVIDER_PLACEHOLDERS = new Set<string>(["llama-cpp-local", "lm-studio-local", "vllm-local"]);
+
+/**
+ * Hard bound for extension-provided fetchDynamicModels to prevent indefinite hangs
+ * during runtime provider discovery. Uses a cancellable manual timer (not AbortSignal.timeout)
+ * so a successful fast path does not leave an armed timeout signal for concurrent GC.
+ */
+const RUNTIME_DYNAMIC_MODEL_FETCH_TIMEOUT_MS = 15_000;
+const BUILT_IN_DISCOVERY_NON_AUTHORITATIVE_RETRY_MS = 5 * 60 * 1000;
+
+import type { ApiKeyResolver, FetchImpl } from "@oh-my-pi/pi-ai";
+import { registerOAuthProvider, unregisterOAuthProvider, unregisterOAuthProviders } from "@oh-my-pi/pi-ai/oauth";
+import type { OAuthCredentials, OAuthLoginCallbacks } from "@oh-my-pi/pi-ai/oauth/types";
+import { setCodexAttestationProvider } from "@oh-my-pi/pi-ai/providers/openai-codex-responses";
+import { getProviderDefinition } from "@oh-my-pi/pi-ai/registry";
+import {
+	getBundledModelReferenceIndex,
+	inheritReferenceThinking,
+	resolveModelReference,
+} from "@oh-my-pi/pi-catalog/identity";
+import { $envExact, isBunTestRuntime, isRecord, logger, wrapFetchForExtraCa } from "@oh-my-pi/pi-utils";
+import { parseModelString, resolveProviderModelReference } from "../config/model-resolver";
 import { generateCodexAttestation } from "../live/attestation";
 import type { AuthStorage } from "../session/auth-storage";
 import { type ApiKeyResolverModel, type ApiKeyResolverOptions, createApiKeyResolver } from "./api-key-resolver";
-import type { ConfigError, ConfigFile } from "./config-file";
+import { ConfigError, type ConfigFile } from "./config-file";
 import {
 	buildCustomModelOverlay,
 	type CustomModelDefinitionLike,
@@ -142,6 +180,286 @@ interface CustomModelsResult {
 	found: boolean;
 }
 
+const commandValueCache = new Map<string, string>();
+// Failed `!command` resolutions (non-zero exit, empty stdout) are negative-cached
+// with a TTL instead of forever: a transient failure (locked password manager,
+// network hiccup) must not disable the key until process restart, but re-running
+// the command on every resolution would restore the execSync storm this cache
+// exists to prevent. One probe per TTL window bounds both.
+const COMMAND_FAILURE_RETRY_MS = 30_000;
+const commandFailureRetryAt = new Map<string, number>();
+
+function isCommandConfigValue(valueConfig: string | undefined): valueConfig is string {
+	return valueConfig?.startsWith("!") === true;
+}
+
+function resolveCommandConfig(command: string): string | undefined {
+	const cached = commandValueCache.get(command);
+	if (cached !== undefined) return cached;
+	const retryAt = commandFailureRetryAt.get(command);
+	if (retryAt !== undefined && Date.now() < retryAt) return undefined;
+	try {
+		const stdout = execSync(command, { encoding: "utf8", timeout: 10_000, windowsHide: true });
+		const trimmed = stdout.trim();
+		if (trimmed.length === 0) {
+			commandFailureRetryAt.set(command, Date.now() + COMMAND_FAILURE_RETRY_MS);
+			return undefined;
+		}
+		commandFailureRetryAt.delete(command);
+		commandValueCache.set(command, trimmed);
+		return trimmed;
+	} catch {
+		commandFailureRetryAt.set(command, Date.now() + COMMAND_FAILURE_RETRY_MS);
+		return undefined;
+	}
+}
+
+interface CommandApiKeyResolution {
+	configured: boolean;
+	value?: string;
+}
+/**
+ * Resolve a models.yml/models.yaml secret/config value to an actual value.
+ * `!cmd` runs a shell command and returns trimmed stdout, otherwise env vars are
+ * checked first and the input falls back to a literal value.
+ */
+function resolveConfigValue(valueConfig: string): string | undefined {
+	if (valueConfig.startsWith("!")) return resolveCommandConfig(valueConfig.slice(1).trim());
+	const envValue = $envExact(valueConfig);
+	if (envValue) return envValue;
+	return valueConfig;
+}
+
+type HeaderSource = Record<string, string> | undefined;
+
+interface HeaderResolutionOptions {
+	authHeader?: boolean;
+	apiKeyConfig?: string;
+}
+
+function materializeConfigHeaderSources(
+	sources: readonly HeaderSource[],
+	options?: HeaderResolutionOptions,
+): Record<string, string> | undefined {
+	const resolved: Record<string, string> = {};
+	for (const source of sources) {
+		if (!source) continue;
+		for (const [key, value] of Object.entries(source)) {
+			const next = resolveConfigValue(value);
+			if (next) resolved[key] = next;
+		}
+	}
+	if (options?.authHeader && options.apiKeyConfig) {
+		const resolvedKey = resolveConfigValue(options.apiKeyConfig);
+		if (resolvedKey) resolved.Authorization = `Bearer ${resolvedKey}`;
+	}
+	return Object.keys(resolved).length > 0 ? resolved : undefined;
+}
+
+function createLiveConfigHeaders(
+	sources: readonly HeaderSource[],
+	options?: HeaderResolutionOptions,
+): Record<string, string> | undefined {
+	const liveSources = sources.filter((source): source is Record<string, string> => source !== undefined);
+	if (liveSources.length === 0 && (!options?.authHeader || !options.apiKeyConfig)) return undefined;
+
+	const localHeaders: Record<string, string> = {};
+	const allSources = [...liveSources, localHeaders];
+	const current = () => materializeConfigHeaderSources(allSources, options) ?? {};
+	return new Proxy(localHeaders, {
+		get(target, property, receiver) {
+			if (typeof property !== "string") return Reflect.get(target, property, receiver);
+			return current()[property];
+		},
+		set(target, property, value) {
+			if (typeof property !== "string" || typeof value !== "string") return false;
+			target[property] = value;
+			return true;
+		},
+		deleteProperty(target, property) {
+			if (typeof property !== "string") return false;
+			delete target[property];
+			return true;
+		},
+		has(_target, property) {
+			if (typeof property !== "string") return false;
+			return Object.hasOwn(current(), property);
+		},
+		ownKeys() {
+			return Reflect.ownKeys(current());
+		},
+		getOwnPropertyDescriptor(_target, property) {
+			if (typeof property !== "string") return undefined;
+			const headers = current();
+			if (!Object.hasOwn(headers, property)) return undefined;
+			return {
+				configurable: true,
+				enumerable: true,
+				value: headers[property],
+				writable: true,
+			};
+		},
+	});
+}
+
+function resolveConfigHeaders(headers: Record<string, string> | undefined): Record<string, string> | undefined {
+	return materializeConfigHeaderSources([headers]);
+}
+
+function resolveConfigRecord(values: Record<string, string> | undefined): Record<string, string> | undefined {
+	if (!values) return undefined;
+	const resolved: Record<string, string> = {};
+	for (const [key, value] of Object.entries(values)) {
+		const next = resolveConfigValue(value);
+		if (next) resolved[key] = next;
+	}
+	return Object.keys(resolved).length > 0 ? resolved : undefined;
+}
+
+function resolveConfiguredOAuth(config: NonNullable<ModelsConfig["providers"]>[string]["oauth"]) {
+	if (!config) return undefined;
+	const clientId = resolveConfigValue(config.clientId);
+	const clientSecret = config.clientSecret ? resolveConfigValue(config.clientSecret) : undefined;
+	if (!clientId) return undefined;
+	return {
+		...config,
+		clientId,
+		clientSecret,
+		authorizationParams: resolveConfigRecord(config.authorizationParams),
+		tokenParams: resolveConfigRecord(config.tokenParams),
+	};
+}
+
+function extractGoogleOAuthToken(value: string | undefined): string | undefined {
+	if (!isAuthenticated(value)) return undefined;
+	try {
+		const parsed = JSON.parse(value) as { token?: unknown };
+		if (Object.hasOwn(parsed, "token")) {
+			if (typeof parsed.token !== "string") {
+				return undefined;
+			}
+			const token = parsed.token.trim();
+			return token.length > 0 ? token : undefined;
+		}
+	} catch {
+		// OAuth values for Google providers are expected to be JSON, but custom setups may already provide raw token.
+	}
+	return value;
+}
+
+function getOAuthCredentialsForProvider(authStorage: AuthStorage, provider: string): OAuthCredential[] {
+	const providerEntry = authStorage.getAll()[provider];
+	if (!providerEntry) {
+		return [];
+	}
+	const entries = Array.isArray(providerEntry) ? providerEntry : [providerEntry];
+	return entries.filter((entry): entry is OAuthCredential => entry.type === "oauth");
+}
+
+/**
+ * Resolve every configured Codex OAuth account for catalog discovery, refreshing
+ * each credential exactly once. Codex `/models` is account-scoped, so discovery
+ * must fetch per account and union the results; resolving a single access token
+ * (as before) hid models available only through a sibling account (#6265).
+ *
+ * Returns `null` when any stored account fails to resolve (e.g. a transient
+ * refresh failure): the Codex manager is authoritative, so unioning only the
+ * accounts that resolved would cache a partial catalog and hide the failed
+ * account's models for the cache TTL. Aborting keeps the previous/bundled
+ * catalog instead.
+ */
+async function resolveCodexDiscoveryAccounts(
+	authStorage: AuthStorage,
+	resolvedAccessToken: string,
+): Promise<OpenAICodexAccount[] | null> {
+	const accesses = await authStorage.getOAuthAccesses("openai-codex");
+	const accounts: OpenAICodexAccount[] = [];
+	for (const access of accesses) {
+		if (!access.ok) return null;
+		accounts.push({ accessToken: access.accessToken, accountId: access.accountId });
+	}
+	if (!accounts.some(account => account.accessToken === resolvedAccessToken)) {
+		const matchingCredential = getOAuthCredentialsForProvider(authStorage, "openai-codex").find(
+			credential => credential.access === resolvedAccessToken,
+		);
+		accounts.push({ accessToken: resolvedAccessToken, accountId: matchingCredential?.accountId });
+	}
+	return accounts;
+}
+
+function mergeCompat<TBase extends object, TOverride extends object>(
+	baseCompat: TBase | null | undefined,
+	overrideCompat: TOverride | null | undefined,
+): (TBase & TOverride) | TBase | TOverride | undefined {
+	if (!baseCompat) return overrideCompat ?? undefined;
+	if (!overrideCompat) return baseCompat;
+
+	const merged: Record<string, unknown> = { ...(baseCompat as Record<string, unknown>) };
+	for (const [key, overrideValue] of Object.entries(overrideCompat)) {
+		const baseValue = (baseCompat as Record<string, unknown>)[key];
+		merged[key] =
+			isRecord(baseValue) && isRecord(overrideValue) ? mergeCompat(baseValue, overrideValue) : overrideValue;
+	}
+	return merged as TBase & TOverride;
+}
+
+function mergeRemoteCompactionConfig(
+	baseConfig: RemoteCompactionConfig<Api> | undefined,
+	overrideConfig: RemoteCompactionConfig<Api> | undefined,
+): RemoteCompactionConfig<Api> | undefined {
+	if (!baseConfig) return overrideConfig;
+	if (!overrideConfig) return baseConfig;
+	return { ...baseConfig, ...overrideConfig };
+}
+
+function mergeProviderRemoteCompactionConfig(
+	modelConfig: RemoteCompactionConfig<Api> | undefined,
+	providerConfig: RemoteCompactionConfig<Api> | undefined,
+): RemoteCompactionConfig<Api> | undefined {
+	return mergeRemoteCompactionConfig(providerConfig, modelConfig);
+}
+
+/**
+ * Project a built model back to spec shape for the model-manager/cache
+ * boundary: sparse compat comes from `compatConfig`, never from the resolved
+ * record.
+ */
+function toModelSpec<TApi extends Api>(model: Model<TApi>): ModelSpec<TApi> {
+	return { ...model, compat: model.compatConfig } as ModelSpec<TApi>;
+}
+
+/**
+ * The patchable subset of `Model` fields shared by `modelOverrides` entries,
+ * custom model definitions, and parsed custom-model overlays. `undefined`
+ * always means "leave the base value alone".
+ */
+interface ModelPatch {
+	name?: string;
+	reasoning?: boolean;
+	thinking?: ThinkingConfig;
+	input?: ("text" | "image")[];
+	supportsTools?: boolean;
+	cost?: Partial<Model<Api>["cost"]>;
+	contextWindow?: number;
+	maxTokens?: number;
+	omitMaxOutputTokens?: boolean;
+	headers?: Record<string, string>;
+	compat?: ModelSpec<Api>["compat"];
+	contextPromotionTarget?: string;
+	compactionModel?: string;
+	remoteCompaction?: RemoteCompactionConfig<Api>;
+	premiumMultiplier?: number;
+}
+
+/**
+ * How a patch treats the base model's transport metadata (headers/compat):
+ * - `merge`: fold the patch into the base's (modelOverrides semantics).
+ * - `replace`: the patch owns transport wholesale — same-id custom definitions
+ *   already folded provider-level headers/compat in during parsing, so bundled
+ *   transport metadata must not be re-merged (see `#mergeCustomModels`).
+ */
+type ModelTransportPolicy = "merge" | "replace";
+
 /**
  * Credential-aware model projection supplied by an extension provider. Receives
  * the fully composed catalog and returns the list the host should serve.
@@ -153,18 +471,6 @@ function getDisabledProviderIdsFromSettings(settingsInstance?: Settings): Set<st
 		return new Set((settingsInstance ?? settings).get("disabledProviders"));
 	} catch {
 		return new Set();
-	}
-}
-
-/**
- * Whether premium long-context windows are enabled. Defaults to true when no
- * settings source is available (SDK embedding, early boot).
- */
-function isExtendedContextEnabledFromSettings(settingsInstance?: Settings): boolean {
-	try {
-		return (settingsInstance ?? settings).get("extendedContext");
-	} catch {
-		return true;
 	}
 }
 
@@ -230,8 +536,10 @@ export class ModelRegistry {
 	// Keyed by provider name; use the same SQLite cache path as builtins.
 	#runtimeModelManagers: Map<string, { options: ModelManagerOptions<Api>; sourceId: string }> = new Map();
 	#ignoreLocalModelConfig: boolean;
+	#allowConfiguredOAuth: boolean;
+	/** Provider IDs this registry currently owns under source `models-config`. */
+	#configuredOAuthIds: string[] = [];
 	#fetch: FetchImpl;
-	#settings: Settings | undefined;
 
 	#resolveCommandBackedApiKey(provider: string, options?: { forceCommandRefresh?: boolean }): CommandApiKeyResolution {
 		const keyConfig = this.#customProviderApiKeys.get(provider);
@@ -280,18 +588,18 @@ export class ModelRegistry {
 			/** Model discovery cache database. Defaults beside an explicit models config. */
 			cacheDbPath?: string;
 			fetch?: FetchImpl;
+			allowConfiguredOAuth?: boolean;
 		},
 	) {
 		this.#ignoreLocalModelConfig = options?.ignoreLocalModelConfig ?? false;
-		this.#settings = options?.settings;
+		this.#allowConfiguredOAuth = options?.allowConfiguredOAuth ?? modelsPath === undefined;
 		this.#fetch =
 			options?.fetch ??
 			(isBunTestRuntime()
 				? () => Promise.reject(new Error("network disabled in model-registry runtime test"))
 				: wrapFetchForExtraCa(fetch));
-		this.#modelsConfigFile = ModelsConfigFile.relocate(modelsPath ?? path.join(getAgentDir(), "models.yml"));
-		this.#cacheDbPath =
-			options?.cacheDbPath ?? (modelsPath ? path.join(path.dirname(modelsPath), "models.db") : undefined);
+		this.#modelsConfigFile = ModelsConfigFile.relocate(modelsPath);
+		this.#cacheDbPath = modelsPath ? path.join(path.dirname(modelsPath), "models.db") : undefined;
 		// Set up fallback resolver for custom provider API keys
 		this.authStorage.setFallbackResolver(provider => {
 			const keyConfig = this.#customProviderApiKeys.get(provider);
@@ -569,9 +877,17 @@ export class ModelRegistry {
 			return;
 		}
 		this.#modelsConfigFile.invalidate();
+		// Snapshot the config-sourced API keys BEFORE the clear so a malformed
+		// models.yml (parse error) can restore them: the last-good provider keys
+		// must survive until the file is repaired, not vanish with the failed parse.
+		const lastGoodConfigApiKeys = new Map(this.#customProviderApiKeys);
 		this.#customProviderApiKeys.clear();
 		this.#keylessProviders.clear();
 		this.#discoverableProviders = [];
+		if (this.#allowConfiguredOAuth) {
+			for (const id of this.#configuredOAuthIds) unregisterOAuthProvider(id);
+			this.#configuredOAuthIds = [];
+		}
 		// Drop config-sourced apiKeys from AuthStorage before reload; entries
 		// removed from models.yml must actually disappear from the resolver, not
 		// linger from the previous parse. The post-load setters below repopulate.
@@ -585,7 +901,7 @@ export class ModelRegistry {
 		this.#modelOverrides.clear();
 		this.#configError = undefined;
 		this.#providerDiscoveryStates.clear();
-		this.#loadModels();
+		this.#loadModels(lastGoodConfigApiKeys);
 	}
 
 	/**
@@ -595,7 +911,17 @@ export class ModelRegistry {
 		return this.#configError;
 	}
 
-	#loadModels() {
+	#loadModels(lastGoodConfigApiKeys?: Map<string, string>) {
+		// Snapshot the last-good custom layer BEFORE reset so a malformed
+		// models.yml (status "error") restores the previous valid catalog instead
+		// of installing the empty custom layer + dropped config keys.
+		const lastGood = {
+			customModels: this.#customModelOverlays,
+			providerOverrides: this.#providerOverrides,
+			modelOverrides: this.#modelOverrides,
+			keylessProviders: this.#keylessProviders,
+			discoverableProviders: this.#discoverableProviders,
+		};
 		this.#resetStaticComposition();
 		// Load custom config first (to know which providers to override).
 		const {
@@ -608,11 +934,29 @@ export class ModelRegistry {
 			error: configError,
 		} = logger.time("modelRegistry:loadCustomModels", () => this.#loadCustomModels());
 		this.#configError = configError;
-		this.#keylessProviders = keylessProviders;
-		this.#discoverableProviders = discoverableProviders;
-		this.#customModelOverlays = customModels;
-		this.#providerOverrides = overrides;
-		this.#modelOverrides = modelOverrides;
+		// On a parse failure keep the last-good custom layer: dropping it loses
+		// every valid custom model/provider until the file is repaired. The error
+		// still surfaces via getError() so the reload reports the failure; the
+		// prior catalog stays live. Config-sourced API keys are restored too.
+		if (configError) {
+			this.#customModelOverlays = lastGood.customModels;
+			this.#providerOverrides = lastGood.providerOverrides;
+			this.#modelOverrides = lastGood.modelOverrides;
+			this.#keylessProviders = lastGood.keylessProviders;
+			this.#discoverableProviders = lastGood.discoverableProviders;
+			for (const [provider, keyConfig] of lastGoodConfigApiKeys ?? []) {
+				this.#installProviderApiKey(provider, keyConfig);
+			}
+			// configuredProviders comes from the failed parse (none), but the
+			// last-good discoverable set is restored above; implicit add over an
+			// empty configured set is a no-op.
+		} else {
+			this.#customModelOverlays = customModels;
+			this.#providerOverrides = overrides;
+			this.#modelOverrides = modelOverrides;
+			this.#keylessProviders = keylessProviders;
+			this.#discoverableProviders = discoverableProviders;
+		}
 
 		this.#addImplicitDiscoverableProviders(configuredProviders);
 		const configuredDiscoveryProviders = new Set(this.#discoverableProviders.map(provider => provider.provider));
@@ -1156,6 +1500,8 @@ export class ModelRegistry {
 		const discoverableProviders: DiscoveryProviderConfig[] = [];
 		const providerEntries = Object.entries(value.providers ?? {});
 		const configuredProviders = new Set(Object.keys(value.providers ?? {}));
+		let oauthError: ConfigError | undefined;
+		const registeredOAuthIds: string[] = [];
 		for (const [providerName, providerConfig] of providerEntries) {
 			const resolvedProviderHeaders = resolveConfigHeaders(providerConfig.headers);
 			// Always set overrides when baseUrl/headers/apiKey/authHeader/compat/disableStrictTools/guardrail*/transport are present
@@ -1191,6 +1537,46 @@ export class ModelRegistry {
 			const authMode = (providerConfig.auth ?? "apiKey") as ProviderAuthMode;
 			if (authMode === "none") {
 				keylessProviders.add(providerName);
+			}
+			if (providerConfig.oauth) {
+				let oauthFailure: Error | undefined;
+				if (getProviderDefinition(providerName)) {
+					oauthFailure = new Error(
+						`Provider ${providerName}: configured OAuth cannot replace a built-in provider.`,
+					);
+				} else if (!this.#allowConfiguredOAuth) {
+					oauthFailure = new Error(
+						`Provider ${providerName}: configured OAuth is supported only in the user models.yml.`,
+					);
+				} else {
+					const existing = getOAuthProvider(providerName);
+					if (existing && existing.sourceId !== "models-config") {
+						oauthFailure = new Error(
+							`Provider ${providerName}: OAuth is already registered by source "${existing.sourceId ?? "unknown"}".`,
+						);
+					}
+				}
+				const oauth = oauthFailure ? undefined : resolveConfiguredOAuth(providerConfig.oauth);
+				if (!oauth && !oauthFailure)
+					oauthFailure = new Error(`Provider ${providerName}: oauth.clientId could not be resolved.`);
+				if (oauthFailure || !oauth) {
+					oauthError = new ConfigError("models", undefined, { err: oauthFailure!, stage: "OAuth" });
+					break;
+				}
+				try {
+					registerOAuthProvider({
+						...createConfiguredOAuthProvider(providerName, { ...oauth, fetch: this.#fetch }),
+						id: providerName,
+						sourceId: "models-config",
+					});
+					registeredOAuthIds.push(providerName);
+				} catch (err) {
+					oauthError = new ConfigError("models", undefined, {
+						err: err instanceof Error ? err : new Error(String(err)),
+						stage: "OAuth",
+					});
+					break;
+				}
 			}
 
 			if (providerConfig.discovery && (providerConfig.api || providerConfig.discovery.type === "proxy")) {
@@ -1230,6 +1616,20 @@ export class ModelRegistry {
 				allModelOverrides.set(providerName, perModel);
 			}
 		}
+		if (oauthError) {
+			for (const id of registeredOAuthIds) unregisterOAuthProvider(id);
+			return {
+				models: [],
+				overrides: new Map(),
+				modelOverrides: new Map(),
+				keylessProviders: new Set(),
+				discoverableProviders: [],
+				configuredProviders: new Set(),
+				error: oauthError,
+				found: true,
+			};
+		}
+		if (this.#allowConfiguredOAuth) this.#configuredOAuthIds = registeredOAuthIds;
 
 		return {
 			models: this.#parseModels(value),
@@ -1526,7 +1926,6 @@ export class ModelRegistry {
 		providerId: string,
 		strategy: ModelRefreshStrategy,
 		cacheProviderId: string,
-		authoritative: boolean,
 	): Promise<string | undefined> {
 		const peekedKey = await this.#peekApiKeyForProvider(providerId);
 		if (isAuthenticated(peekedKey) || strategy === "offline") {
@@ -1536,21 +1935,8 @@ export class ModelRegistry {
 		if (oauthCredentials.length === 0) {
 			return peekedKey;
 		}
-		// Authoritative providers prune bundled models only when their manager is
-		// actually constructed, which needs an authenticated key. A fresh cache does
-		// not let us skip the refresh here: with an expired OAuth token peekedKey is
-		// undefined, the manager is never added, and stale bundled models survive the
-		// full cache TTL. So only take the no-refresh shortcut for non-authoritative
-		// providers, whose bundled models stay visible regardless.
-		if (strategy === "online-if-uncached" && !authoritative) {
-			// Mirror shouldFetchRemoteSources: built-in managers use the catalog's
-			// default TTL, so only refresh when the manager will actually fetch.
-			const cache = readModelCache<Api>(
-				cacheProviderId,
-				BUILT_IN_DISCOVERY_CACHE_TTL_MS,
-				Date.now,
-				this.#cacheDbPath,
-			);
+		if (strategy === "online-if-uncached") {
+			const cache = readModelCache<Api>(cacheProviderId, 24 * 60 * 60 * 1000, Date.now, this.#cacheDbPath);
 			const cacheAgeMs = cache ? Date.now() - cache.updatedAt : Number.POSITIVE_INFINITY;
 			if (cache?.fresh && (cache.authoritative || cacheAgeMs < BUILT_IN_DISCOVERY_NON_AUTHORITATIVE_RETRY_MS)) {
 				return peekedKey;
@@ -1565,20 +1951,6 @@ export class ModelRegistry {
 			});
 			return peekedKey;
 		}
-	}
-
-	/**
-	 * Resolve the GCP project id for Gemini CLI quota discovery from the stored
-	 * OAuth credential matched to the token in use. Used only as a fallback for
-	 * the discovery fast path, where `peekApiKey` returns the bare access token
-	 * (stripping the structured identity); matching strictly by `access` avoids
-	 * attaching an unrelated account's project. Workspace/Standard accounts
-	 * require the id because project-less `loadCodeAssist` cannot resolve one.
-	 */
-	#resolveGeminiCliDiscoveryProjectId(oauthToken: string): string | undefined {
-		const credentials = getOAuthCredentialsForProvider(this.authStorage, "google-gemini-cli");
-		const projectId = credentials.find(credential => credential.access === oauthToken)?.projectId?.trim();
-		return projectId ? projectId : undefined;
 	}
 
 	async #collectBuiltInModelManagerOptions(
@@ -1626,7 +1998,7 @@ export class ModelRegistry {
 					}),
 			},
 		];
-		const disabledProviders = getDisabledProviderIdsFromSettings(this.#settings);
+		const disabledProviders = getDisabledProviderIdsFromSettings();
 		const standardProviderDescriptors = PROVIDER_DESCRIPTORS.filter(descriptor => {
 			if (disabledProviders.has(descriptor.providerId)) return false;
 			if (configuredDiscoveryProviders.has(descriptor.providerId)) return false;
@@ -1639,23 +2011,19 @@ export class ModelRegistry {
 		});
 		const standardProviderKeys = await Promise.all(
 			standardProviderDescriptors.map(descriptor => {
-				const cacheProviderId = this.#resolveStartupModelCacheProviderId(descriptor.providerId);
-				return this.#resolveBuiltInDiscoveryApiKey(
-					descriptor.providerId,
-					strategy,
-					cacheProviderId,
-					descriptor.dynamicModelsAuthoritative ?? false,
-				);
+				const discoveryBaseUrl =
+					this.#runtimeProviderOverrides.get(descriptor.providerId)?.baseUrl ??
+					this.#providerOverrides.get(descriptor.providerId)?.baseUrl ??
+					this.getProviderBaseUrl(descriptor.providerId);
+				const cacheProviderId =
+					descriptor.createModelManagerOptions({ baseUrl: discoveryBaseUrl, fetch: this.#fetch })
+						.cacheProviderId ?? descriptor.providerId;
+				return this.#resolveBuiltInDiscoveryApiKey(descriptor.providerId, strategy, cacheProviderId);
 			}),
 		);
 		const specialKeys = await Promise.all(
 			enabledSpecialProviderDescriptors.map(descriptor =>
-				this.#resolveBuiltInDiscoveryApiKey(
-					descriptor.providerId,
-					strategy,
-					descriptor.providerId,
-					descriptor.authoritative,
-				),
+				this.#resolveBuiltInDiscoveryApiKey(descriptor.providerId, strategy, descriptor.providerId),
 			),
 		);
 		const options: ModelManagerOptions<Api>[] = [];
@@ -2388,7 +2756,7 @@ export class ModelRegistry {
 				} else {
 					this.#invalidateProviderModelCache(providerName);
 				}
-				return;
+				if (!config.fetchDynamicModels) return;
 			}
 
 			// Update the unprojected snapshot, then rerun every whole-catalog
@@ -2409,7 +2777,7 @@ export class ModelRegistry {
 
 			this.#models = this.#applyRuntimeModelModifiers(this.#unprojectedModels);
 			this.#invalidateProviderModelCache(providerName);
-			return;
+			if (!config.fetchDynamicModels) return;
 		}
 
 		if (config.fetchDynamicModels) {

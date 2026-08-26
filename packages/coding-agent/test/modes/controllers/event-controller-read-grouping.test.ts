@@ -81,7 +81,7 @@ function createFixture() {
 	const ctx = {
 		isInitialized: true,
 		init: vi.fn(async () => {}),
-		statusLine: { invalidate: vi.fn() },
+		statusLine: { invalidate: vi.fn(), markActivityStart: vi.fn(), markActivityEnd: vi.fn() },
 		updateEditorTopBorder: vi.fn(),
 		ui: { requestRender: vi.fn(), imageBudget: undefined },
 		chatContainer,
@@ -92,6 +92,7 @@ function createFixture() {
 		toolOutputExpanded: false,
 		hideThinkingBlock: false,
 		setWorkingMessage: vi.fn(),
+		noteDisplayableThinkingContent: vi.fn(() => false),
 		clearTransientSessionUi: () => {},
 		session: sessionMock,
 		sessionManager: { getCwd: () => process.cwd() },

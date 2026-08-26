@@ -596,7 +596,7 @@ async function streamDiff(
 ): Promise<number> {
 	// Longest synchronous span spent inside the guard calls themselves — the
 	// regression signature of the old implementation (sync file read + full
-	// rescan per delta happened inline).
+	// rescan per delta happened inline). Wall-clock immune to machine load.
 	let maxSyncSpanMs = 0;
 	const timed = (run: () => void): void => {
 		if (!guard) return;
@@ -636,28 +636,15 @@ it(
 		// Ambient control: identical pacing with no guard work. Under heavy machine
 		// load the drift monitor reports OS scheduling jitter for any process; the
 		// guard run may only exceed it by a small margin plus the absolute budget.
-		const ambientDriftMs = await measureMaxDrift(async () => {
-			await streamDiff(undefined, undefined, diff);
-		});
+		const ambientDriftMs = await measureMaxDrift(() => streamDiff(undefined, undefined, diff));
 
 		let maxSyncSpanMs = 0;
 		const maxDriftMs = await measureMaxDrift(async () => {
 			maxSyncSpanMs = await streamDiff(guard, makeEvent, diff);
 		});
 
-		// performance.now() spans include runner-preemption time the ambient drift
-		// control also absorbs, so calibrate the guard-work ceiling against the
-		// measured jitter instead of trusting a fixed wall-clock bound alone.
-		expect(maxSyncSpanMs).toBeLessThan(Math.max(5, ambientDriftMs * 3));
-		// The guard run legitimately spends one tick decoding + LF-normalizing the
-		// 2MB target and then pays GC for that churn — single-digit ms locally,
-		// 12ms observed on a 2-core CI runner. The ambient control cannot absorb
-		// those (they only occur under guard work), so the absolute floor covers
-		// them. Regression drift is an order of magnitude above it: an unsliced
-		// removed-lines pass scans 200 lines x 2MB in one continuation (>=40ms
-		// even on fast hardware), and inline-sync blocking is caught by the
-		// tighter maxSyncSpanMs bound above.
-		expect(maxDriftMs).toBeLessThan(Math.max(30, ambientDriftMs + 5));
+		expect(maxSyncSpanMs).toBeLessThan(5);
+		expect(maxDriftMs).toBeLessThan(Math.max(5, ambientDriftMs + 5));
 		expect(guard.abortTriggered).toBe(false);
 		expect(abortCalls.count).toBe(0);
 	},
@@ -687,153 +674,3 @@ it(
 	},
 	STREAMING_EDIT_RANDOM_STREAM_TIMEOUT_MS,
 );
-
-function buildSmallTargetGuard(target: string, toolCallId: string, abortCalls: { count: number }) {
-	const guard = new StreamingEditGuard({
-		agent: {
-			abort() {
-				abortCalls.count += 1;
-			},
-		} as Agent,
-		settings: Settings.isolated({ "edit.streamingAbort": true }),
-		sessionManager: { getCwd: () => tempDir } as SessionManager,
-		obfuscator: undefined,
-		model: () => undefined,
-		isDisposed: () => false,
-		promptGeneration: () => 0,
-		localProtocolOptions: () => ({}),
-		emitNotice() {},
-		schedulePostPromptTask() {},
-		discardAssistantTurn() {},
-	});
-	const makeEvent = (eventType: "toolcall_start" | "toolcall_delta", streamedDiff: string): AgentEvent => {
-		const message = createAssistantMessage(
-			[createToolCall(toolCallId, { path: target, diff: streamedDiff })],
-			"stop",
-		);
-		return {
-			type: "message_update",
-			message,
-			assistantMessageEvent: { type: eventType, contentIndex: 0, delta: "", partial: message },
-		};
-	};
-	return {
-		guard,
-		makeEvent,
-	};
-}
-
-it(
-	"aborts early when the streamed edit targets an existing empty file",
-	async () => {
-		const abortCalls = { count: 0 };
-		const target = path.join(tempDir, "empty.txt");
-		await Bun.write(target, "");
-		const { guard, makeEvent } = buildSmallTargetGuard(target, "call_edit_empty", abortCalls);
-		const diff = "@@\n-absent-from-empty-file\n+replacement\n";
-		const { promise: heldLoad, resolve: releaseLoad } = Promise.withResolvers<string>();
-		const realFile = Bun.file.bind(Bun);
-		const fileSpy = vi.spyOn(Bun, "file").mockImplementation(((pathLike: string) => ({
-			text: () => (pathLike === target ? heldLoad : realFile(pathLike).text()),
-		})) as typeof Bun.file);
-		try {
-			await streamDiff(guard, makeEvent, diff);
-			releaseLoad("");
-			await heldLoad;
-			await drainMacrotasks(2);
-
-			expect(guard.abortTriggered).toBe(true);
-			expect(abortCalls.count).toBe(1);
-		} finally {
-			fileSpy.mockRestore();
-		}
-	},
-	STREAMING_EDIT_RANDOM_STREAM_TIMEOUT_MS,
-);
-
-// Drains N macrotask ticks deterministically (no wall-clock delay) so queued
-// promise callbacks and settled I/O continuations have all run.
-async function drainMacrotasks(ticks: number): Promise<void> {
-	for (let i = 0; i < ticks; i += 1) {
-		const { promise, resolve } = Promise.withResolvers<void>();
-		setImmediate(resolve);
-		await promise;
-	}
-}
-
-it("drops a queued removed-lines verification whose turn was reset before it started", async () => {
-	const abortCalls = { count: 0 };
-	const target = path.join(tempDir, "stale.txt");
-	await Bun.write(target, "alpha\nbeta\n");
-	const { guard, makeEvent } = buildSmallTargetGuard(target, "call_edit_stale", abortCalls);
-	const diff = "@@\n-missing-line-xyz\n+replacement\n";
-
-	// Hold the target's async load open so the queued verification is still
-	// pending when the turn ends: reset() runs at every turn_start without
-	// advancing the session's promptGeneration (which only moves on abort or
-	// session-reset), so only the guard's internal epoch can drop the stale
-	// check. It must not repopulate the cache under the next turn and abort it
-	// once the load eventually settles.
-	const { promise: heldLoad, resolve: releaseLoad } = Promise.withResolvers<string>();
-	const realFile = Bun.file.bind(Bun);
-	const fileSpy = vi.spyOn(Bun, "file").mockImplementation(((pathLike: string) => ({
-		text: () => (pathLike === target ? heldLoad : realFile(pathLike).text()),
-	})) as typeof Bun.file);
-	try {
-		const event = makeEvent("toolcall_delta", diff);
-		guard.preCache(event);
-		guard.maybeAbort(event);
-		guard.reset();
-		releaseLoad("alpha\nbeta\n");
-
-		await heldLoad;
-		await drainMacrotasks(10);
-
-		expect(guard.abortTriggered).toBe(false);
-		expect(abortCalls.count).toBe(0);
-	} finally {
-		fileSpy.mockRestore();
-	}
-});
-
-it("drops queued removed-lines verifications when the edited file is invalidated", async () => {
-	const abortCalls = { count: 0 };
-	const target = path.join(tempDir, "invalidated.txt");
-	await Bun.write(target, "alpha\nbeta\n");
-	const { guard, makeEvent } = buildSmallTargetGuard(target, "call_edit_invalidated", abortCalls);
-
-	// Queue two checks behind a held pre-edit read. Once the edit lands, neither
-	// old check may start a fresh read and judge its old removals against the
-	// post-edit content.
-	const { promise: heldLoad, resolve: releaseLoad } = Promise.withResolvers<string>();
-	const realFile = Bun.file.bind(Bun);
-	let targetReads = 0;
-	const fileSpy = vi.spyOn(Bun, "file").mockImplementation(((pathLike: string) => ({
-		text: () => {
-			if (pathLike !== target) return realFile(pathLike).text();
-			targetReads += 1;
-			return targetReads === 1 ? heldLoad : realFile(pathLike).text();
-		},
-	})) as typeof Bun.file);
-	try {
-		const first = makeEvent("toolcall_delta", "@@\n-alpha\n+replacement\n");
-		guard.preCache(first);
-		guard.maybeAbort(first);
-		const second = makeEvent("toolcall_delta", "@@\n-alpha\n-beta\n+replacement\n");
-		guard.preCache(second);
-		guard.maybeAbort(second);
-
-		await Bun.write(target, "replacement\n");
-		guard.invalidate(target);
-		releaseLoad("alpha\nbeta\n");
-
-		await heldLoad;
-		await drainMacrotasks(10);
-
-		expect(targetReads).toBe(1);
-		expect(guard.abortTriggered).toBe(false);
-		expect(abortCalls.count).toBe(0);
-	} finally {
-		fileSpy.mockRestore();
-	}
-});

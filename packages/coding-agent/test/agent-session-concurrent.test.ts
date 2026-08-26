@@ -83,6 +83,340 @@ describe("AgentSession concurrent prompt guard", () => {
 		AsyncJobManager.resetForTests();
 	});
 
+	async function createSession(settingsOverrides?: Partial<Record<SettingPath, unknown>>) {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		let abortSignal: AbortSignal | undefined;
+
+		// Use a stream function that responds to abort
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: {
+				model,
+				systemPrompt: ["Test"],
+				tools: [],
+			},
+			streamFn: (_model, _context, options) => {
+				abortSignal = options?.signal;
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(() => {
+					stream.push({ type: "start", partial: createAssistantMessage("") });
+					if (abortSignal) {
+						abortSignal.addEventListener(
+							"abort",
+							() => {
+								stream.push({ type: "error", reason: "aborted", error: createAssistantMessage("Aborted") });
+							},
+							{ once: true },
+						);
+					}
+				});
+				return stream;
+			},
+		});
+
+		const sessionManager = SessionManager.inMemory();
+		const settings = Settings.isolated(settingsOverrides);
+		const authStorage = await AuthStorage.create(path.join(tempDir, "testauth.db"));
+		authStorages.push(authStorage);
+		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "models.yml"));
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settings,
+			modelRegistry,
+		});
+
+		return session;
+	}
+
+	async function waitFor(predicate: () => boolean, timeoutMs = 500): Promise<void> {
+		const deadline = Date.now() + timeoutMs;
+		while (Date.now() < deadline) {
+			if (predicate()) return;
+			await Bun.sleep(1);
+		}
+
+		throw new Error("Timed out waiting for condition");
+	}
+
+	it("should throw when prompt() called while streaming", async () => {
+		await createSession();
+
+		// Start first prompt (don't await, it will block until abort)
+		const firstPrompt = session.prompt("First message");
+
+		await waitFor(() => session.isStreaming);
+
+		// Second prompt should reject
+		await expect(session.prompt("Second message")).rejects.toBeInstanceOf(AgentBusyError);
+
+		// Cleanup
+		await session.abort();
+		await firstPrompt.catch(() => {}); // Ignore abort error
+	});
+
+	it("should allow steer() while streaming", async () => {
+		await createSession();
+
+		// Start first prompt
+		const firstPrompt = session.prompt("First message");
+		await waitFor(() => session.isStreaming);
+
+		// steer should work while streaming
+		await session.steer("Steer while streaming");
+		expect(session.queuedMessageCount).toBe(1);
+
+		// Cleanup
+		session.agent.clearAllQueues();
+		await session.abort();
+		await firstPrompt.catch(() => {});
+	});
+
+	it("should allow followUp() while streaming", async () => {
+		await createSession();
+
+		// Start first prompt
+		const firstPrompt = session.prompt("First message");
+		await waitFor(() => session.isStreaming);
+
+		// followUp should work while streaming
+		await session.followUp("Follow-up while streaming");
+		expect(session.queuedMessageCount).toBe(1);
+
+		// Cleanup
+		session.agent.clearAllQueues();
+		await session.abort();
+		await firstPrompt.catch(() => {});
+	});
+
+	it("queues sendUserMessage as steer while streaming without AgentBusyError", async () => {
+		await createSession();
+
+		const firstPrompt = session.prompt("First message");
+		await waitFor(() => session.isStreaming);
+
+		// The first agent loop may dequeue a steer before the assertion runs, so
+		// observe agent.steer itself rather than the residual queue length.
+		const steered: AgentMessage[] = [];
+		const originalSteer = session.agent.steer.bind(session.agent);
+		session.agent.steer = (message: AgentMessage) => {
+			steered.push(message);
+			originalSteer(message);
+		};
+
+		// Extension path: no deliverAs while busy must queue, not throw.
+		await expect(session.sendUserMessage("hello from extension")).resolves.toBeUndefined();
+		expect(steered).toHaveLength(1);
+		const queued = steered[0];
+		expect(queued?.role).toBe("user");
+		if (queued?.role === "user") {
+			expect(queued.content).toEqual([{ type: "text", text: "hello from extension" }]);
+			expect(queued.steering).toBe(true);
+		}
+
+		session.agent.clearAllQueues();
+		await session.abort();
+		await firstPrompt.catch(() => {});
+	});
+
+	it("sendUserMessage without deliverAs preserves prompt-flow keyword notices while streaming", async () => {
+		await createSession({ "magicKeywords.enabled": true, "magicKeywords.ultrathink": true });
+
+		const firstPrompt = session.prompt("First message");
+		await waitFor(() => session.isStreaming);
+
+		try {
+			await session.sendUserMessage("ultrathink fix via extension");
+			const queuedShape = session.agent
+				.peekSteeringQueue()
+				.map(message => (message.role === "custom" ? message.customType : message.role));
+			expect(queuedShape).toEqual(["ultrathink-notice", "user"]);
+			expect(session.getQueuedMessages()).toEqual({
+				steering: ["ultrathink fix via extension"],
+				followUp: [],
+			});
+		} finally {
+			session.agent.clearAllQueues();
+			await session.abort();
+			await firstPrompt.catch(() => {});
+		}
+	});
+
+	it("sendUserMessage without deliverAs starts a normal prompt when idle", async () => {
+		await createSession();
+
+		let rejected: unknown;
+		let settled = false;
+		const turn = session
+			.sendUserMessage("Idle extension message")
+			.catch(error => {
+				rejected = error;
+			})
+			.finally(() => {
+				settled = true;
+			});
+
+		try {
+			await waitFor(() => session.isStreaming || settled);
+			if (rejected) throw rejected;
+
+			expect(session.isStreaming).toBe(true);
+			expect(settled).toBe(false);
+			expect(session.getQueuedMessages()).toEqual({ steering: [], followUp: [] });
+		} finally {
+			await session.abort();
+			await turn;
+		}
+	});
+
+	it("delivers hidden nextTurn stop reactions through the next LLM call without exposing them in the visible queue", async () => {
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		let firstStream: AssistantMessageEventStream | undefined;
+		const callMessages: Message[][] = [];
+
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: {
+				model,
+				systemPrompt: ["Test"],
+				tools: [],
+			},
+			convertToLlm,
+			streamFn: (_model, context) => {
+				callMessages.push([...context.messages]);
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(() => {
+					stream.push({ type: "start", partial: createAssistantMessage("") });
+					if (callMessages.length > 1) {
+						stream.push({ type: "done", reason: "stop", message: createAssistantMessage("Resumed") });
+						return;
+					}
+				});
+				firstStream = stream;
+				return stream;
+			},
+		});
+
+		const sessionManager = SessionManager.inMemory();
+		const settings = Settings.isolated();
+		const authStorage = await AuthStorage.create(path.join(tempDir, "testauth.db"));
+		authStorages.push(authStorage);
+		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "models.yml"));
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settings,
+			modelRegistry,
+		});
+
+		const firstPrompt = session.prompt("First message");
+		await waitFor(() => session.isStreaming && firstStream !== undefined && callMessages.length === 1);
+
+		await session.sendCustomMessage(
+			{
+				customType: "autoresearch-resume",
+				content: "Hidden stop reaction",
+				display: false,
+				attribution: "agent",
+			},
+			{ deliverAs: "nextTurn", triggerTurn: true },
+		);
+
+		expect(session.queuedMessageCount).toBe(0);
+		expect(session.getQueuedMessages()).toEqual({ steering: [], followUp: [] });
+
+		firstStream?.push({ type: "done", reason: "stop", message: createAssistantMessage("Done") });
+		await firstPrompt;
+		await session.waitForIdle();
+
+		expect(callMessages).toHaveLength(2);
+		expect(
+			callMessages[1]?.some(message => {
+				if (typeof message.content === "string") {
+					return message.content.includes("Hidden stop reaction");
+				}
+
+				return message.content.some(
+					content => content.type === "text" && content.text.includes("Hidden stop reaction"),
+				);
+			}),
+		).toBe(true);
+	});
+
+	it("rebases a queued background tan breadcrumb when the session moves", async () => {
+		const cwdA = path.join(tempDir, "cwd-a");
+		const cwdB = path.join(tempDir, "cwd-b");
+		fs.mkdirSync(cwdA, { recursive: true });
+		fs.mkdirSync(cwdB, { recursive: true });
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
+		let firstStream: AssistantMessageEventStream | undefined;
+		const callMessages: Message[][] = [];
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [] },
+			convertToLlm,
+			streamFn: (_model, context) => {
+				callMessages.push([...context.messages]);
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(() => {
+					stream.push({ type: "start", partial: createAssistantMessage("") });
+					if (callMessages.length > 1) {
+						stream.push({ type: "done", reason: "stop", message: createAssistantMessage("Moved") });
+					}
+				});
+				firstStream = stream;
+				return stream;
+			},
+		});
+		const sessionManager = SessionManager.create(cwdA, path.join(tempDir, "sessions-a"));
+		const oldArtifactsDir = sessionManager.getArtifactsDir();
+		if (!oldArtifactsDir) throw new Error("Expected source artifact directory");
+		const cloneFile = path.join(oldArtifactsDir, "TanClone.jsonl");
+		const authStorage = await AuthStorage.create(path.join(tempDir, "testauth.db"));
+		authStorages.push(authStorage);
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settings: Settings.isolated(),
+			modelRegistry: new ModelRegistry(authStorage, path.join(tempDir, "models.yml")),
+		});
+
+		const firstPrompt = session.prompt("First message");
+		await waitFor(() => session.isStreaming && firstStream !== undefined && callMessages.length === 1);
+		await session.sendCustomMessage(
+			{
+				customType: "background-tan-dispatch",
+				content: "Background tan dispatched",
+				display: true,
+				attribution: "user",
+				details: { jobId: "tan-1", work: "review", sessionFile: cloneFile },
+			},
+			{ deliverAs: "nextTurn", triggerTurn: false },
+		);
+		firstStream?.push({ type: "done", reason: "stop", message: createAssistantMessage("Done") });
+		await firstPrompt;
+		await session.waitForIdle();
+
+		await session.moveSession(cwdB, path.join(tempDir, "sessions-b"));
+		await session.prompt("Second message");
+		await session.waitForIdle();
+
+		const queuedTan = session.agent.state.messages.find(
+			message => message.role === "custom" && message.customType === "background-tan-dispatch",
+		);
+		if (queuedTan?.role !== "custom") throw new Error("Expected queued background tan message");
+		const movedArtifactsDir = sessionManager.getArtifactsDir();
+		if (!movedArtifactsDir) throw new Error("Expected moved artifact directory");
+		expect((queuedTan.details as { sessionFile?: string } | undefined)?.sessionFile).toBe(
+			path.join(movedArtifactsDir, "TanClone.jsonl"),
+		);
+	});
+
 	it("continues a main session from session_stop feedback before settling", async () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
 		const mock = createMockModel({

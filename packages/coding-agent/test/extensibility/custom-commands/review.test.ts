@@ -109,6 +109,7 @@ describe("ReviewCommand", () => {
 		onEditorCall?: (call: EditorCall) => void;
 		onSelectCall?: (call: SelectCall) => void;
 		onNotify?: (call: NotifyCall) => void;
+		getToolReference?: (name: string) => string;
 	}): HookCommandContext {
 		const selectResults = [...(options?.selectResults ?? [])];
 		return {
@@ -137,6 +138,7 @@ describe("ReviewCommand", () => {
 					options?.onNotify?.({ message, type });
 				},
 			},
+			getToolReference: options?.getToolReference,
 		} as unknown as HookCommandContext;
 	}
 
@@ -174,6 +176,18 @@ describe("ReviewCommand", () => {
 		expect(result).toBeDefined();
 		const promptText = result!;
 		expect(promptText).toContain("Check authentication boundaries");
+	});
+
+	it("renders the active task transport in custom review prompts", async () => {
+		const command = new ReviewCommand({ cwd: tmpDir } as unknown as CustomCommandAPI);
+		const ctx = createContext({
+			editorValue: "Check authentication boundaries",
+			getToolReference: name => (name === "task" ? "tool.task" : name),
+		});
+
+		const result = await command.execute([], ctx);
+
+		expect(result).toContain("Use `tool.task`:");
 	});
 
 	it("does not submit empty custom review instructions", async () => {

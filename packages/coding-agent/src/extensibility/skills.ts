@@ -120,6 +120,8 @@ export async function loadSkillsFromDir(options: LoadSkillsFromDirOptions): Prom
 export interface LoadSkillsOptions extends SkillsSettings {
 	/** Working directory for project-local skills. Default: getProjectDir() */
 	cwd?: string;
+	/** Active agent directory propagated to {@link LoadOptions.agentDir}. */
+	agentDir?: string;
 }
 
 /**
@@ -129,6 +131,7 @@ export interface LoadSkillsOptions extends SkillsSettings {
 export async function loadSkills(options: LoadSkillsOptions = {}): Promise<LoadSkillsResult> {
 	const {
 		cwd = getProjectDir(),
+		agentDir,
 		enabled = true,
 		enableCodexUser = true,
 		enableClaudeUser = true,
@@ -175,7 +178,7 @@ export async function loadSkills(options: LoadSkillsOptions = {}): Promise<LoadS
 	}
 
 	// Use capability API to load all skills
-	const result = await loadCapability<CapabilitySkill>(skillCapability.id, { cwd, disabledExtensions });
+	const result = await loadCapability<CapabilitySkill>(skillCapability.id, { cwd, agentDir, disabledExtensions });
 
 	const skillMap = new Map<string, Skill>();
 	const realPathSet = new Set<string>();

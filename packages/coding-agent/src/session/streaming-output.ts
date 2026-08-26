@@ -51,7 +51,7 @@ export interface OutputSummary {
 }
 
 export interface OutputSinkOptions {
-	artifactPath?: string;
+	artifactPath?: string | (() => string | undefined);
 	artifactId?: string;
 	/**
 	 * Total inline body budget (bytes). Default DEFAULT_MAX_BYTES. The head
@@ -766,7 +766,7 @@ export class OutputSink {
 	/** Set once the spill file has been closed; guards double-close and post-finalize resurrection. */
 	#finalized = false;
 
-	readonly #artifactPath?: string;
+	readonly #artifactPath?: string | (() => string | undefined);
 	readonly #artifactId?: string;
 	readonly #spillThreshold: number;
 	readonly #headLimit: number;
@@ -887,7 +887,7 @@ export class OutputSink {
 		// Mirror RAW chunk to the artifact file so the on-disk record is the full
 		// uncapped stream. Mirror triggers on: in-memory overflow OR this chunk's
 		// column cap dropped bytes (otherwise we'd lose data) OR file already open.
-		if (this.#artifactPath && (this.#file != null || cappedThisChunk || this.#willOverflow(cappedBytes))) {
+		if (this.#resolveArtifactPath() && (this.#file != null || cappedThisChunk || this.#willOverflow(cappedBytes))) {
 			this.#writeToFile(chunk);
 		}
 
@@ -1108,11 +1108,17 @@ export class OutputSink {
 		}
 	}
 
+	#resolveArtifactPath(): string | undefined {
+		return typeof this.#artifactPath === "function" ? this.#artifactPath() : this.#artifactPath;
+	}
+
 	async #createFileSink(): Promise<void> {
-		if (!this.#artifactPath || this.#fileReady) return;
+		if (this.#fileReady) return;
+		const artifactPath = this.#resolveArtifactPath();
+		if (!artifactPath) return;
 		try {
-			const sink = Bun.file(this.#artifactPath).writer();
-			this.#file = { path: this.#artifactPath, artifactId: this.#artifactId, sink };
+			const sink = Bun.file(artifactPath).writer();
+			this.#file = { path: artifactPath, artifactId: this.#artifactId, sink };
 			this.#fileReady = true;
 
 			// Head-retained bytes precede the rolling tail buffer in the capture.

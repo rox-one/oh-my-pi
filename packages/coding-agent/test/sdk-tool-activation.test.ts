@@ -8,14 +8,15 @@ import type { Model, ToolResultMessage } from "@oh-my-pi/pi-ai";
 import { createMockModel } from "@oh-my-pi/pi-ai/providers/mock";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
-import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { CursorExecHandlers } from "@oh-my-pi/pi-coding-agent/cursor";
 import {
 	EXTENSION_HANDLER_TIMEOUT_MS,
 	testSetExtensionHandlerTimeoutMs,
 } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner";
 import type { MCPManager } from "@oh-my-pi/pi-coding-agent/mcp/manager";
-import { initializeExtensions } from "@oh-my-pi/pi-coding-agent/modes/runtime-init";
+import { InteractiveMode } from "@oh-my-pi/pi-coding-agent/modes/interactive-mode";
+import { initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 import {
 	type CreateAgentSessionOptions,
 	type CustomTool,
@@ -59,6 +60,19 @@ const sdkCustomTool = {
 		return { content: [{ type: "text", text: "sdk custom" }] };
 	},
 } satisfies CustomTool;
+
+const shadowGoalExtension: ExtensionFactory = pi => {
+	pi.registerTool({
+		name: "goal",
+		label: "Shadow Goal",
+		description: "Extension tool sharing the built-in goal tool name.",
+		parameters: type({}),
+		defaultInactive: true,
+		async execute() {
+			return { content: [{ type: "text", text: "shadow goal" }] };
+		},
+	});
+};
 
 describe("createAgentSession defaultInactive tool activation", () => {
 	const tempDirs: string[] = [];
@@ -148,6 +162,68 @@ describe("createAgentSession defaultInactive tool activation", () => {
 			expect(session.getActiveToolNames()).not.toContain("default_inactive_tool");
 			expect(session.systemPrompt.join("\n")).toContain("default_active_tool");
 			expect(session.systemPrompt.join("\n")).not.toContain("default_inactive_tool");
+		} finally {
+			await session.dispose();
+		}
+	});
+
+	it("mounts discoverable tools under xd:// for explicit tool lists omitting write", async () => {
+		const tempDir = makeTempDir();
+
+		const { session } = await createAgentSession({
+			...baseOptions(tempDir),
+			toolNames: ["read", "grep", "glob"],
+			extensions: [toolActivationExtension],
+		});
+
+		try {
+			// The device-only xd:// transport write is surfaced in the active set...
+			expect(session.getActiveToolNames()).toEqual(expect.arrayContaining(["read", "grep", "glob", "write"]));
+			// ...so a discoverable extension tool mounts under xd:// instead of
+			// shipping its full schema top-level on every request.
+			const deviceNames = session.getXdevToolEntries().map(entry => entry.name);
+			expect(deviceNames).toContain("default_active_tool");
+			expect(session.getActiveToolNames()).not.toContain("default_active_tool");
+			expect(session.getActiveToolNames()).not.toContain("default_inactive_tool");
+
+			// The transport write rejects filesystem targets: the grant is xd:// only.
+			const write = session.getToolByName("write");
+			expect(write).toBeDefined();
+			await expect(
+				write!.execute("device-only-fs", { path: path.join(tempDir, "nope.txt"), content: "x" }),
+			).rejects.toThrow("Filesystem writes are not available");
+		} finally {
+			await session.dispose();
+		}
+	});
+
+	it("preserves a deferrable-only write transport across enabled-set reapplication", async () => {
+		const tempDir = makeTempDir();
+		const { session } = await createAgentSession({
+			...baseOptions(tempDir),
+			toolNames: ["read", "ast_edit"],
+		});
+
+		try {
+			expect(session.getActiveToolNames()).toEqual(expect.arrayContaining(["read", "ast_edit", "write"]));
+			expect(session.getMountedXdevToolNames()).toEqual([]);
+			const write = session.getToolByName("write");
+			expect(write).toBeDefined();
+			await expect(
+				write!.execute("deferrable-transport-before", {
+					path: path.join(tempDir, "before.txt"),
+					content: "x",
+				}),
+			).rejects.toThrow("Filesystem writes are not available");
+
+			await session.setActiveToolsByName(session.getEnabledToolNames());
+
+			await expect(
+				write!.execute("deferrable-transport-after", {
+					path: path.join(tempDir, "after.txt"),
+					content: "x",
+				}),
+			).rejects.toThrow("Filesystem writes are not available");
 		} finally {
 			await session.dispose();
 		}
@@ -394,6 +470,48 @@ describe("createAgentSession defaultInactive tool activation", () => {
 			expect(session.getActiveToolNames()).not.toContain("late_active_tool");
 			expect(session.systemPrompt.join("\n")).toContain("late_active_tool");
 			expect(session.systemPrompt.join("\n")).not.toContain("late_inactive_tool");
+		} finally {
+			await session.dispose();
+		}
+	});
+
+	it("mounts late extension tools through a dormant read-only transport", async () => {
+		const tempDir = makeTempDir();
+		const lateDeviceExtension: ExtensionFactory = pi => {
+			pi.on("session_start", async () => {
+				await Promise.resolve();
+				pi.registerTool({
+					name: "late_device_tool",
+					label: "Late Device Tool",
+					description: "Registered after dormant transport startup.",
+					parameters: type({}),
+					async execute() {
+						return { content: [{ type: "text", text: "late device" }] };
+					},
+				});
+			});
+		};
+
+		const { session } = await createAgentSession({
+			...baseOptions(tempDir),
+			extensions: [lateDeviceExtension],
+			toolNames: ["read"],
+		});
+
+		try {
+			expect(session.getActiveToolNames()).not.toContain("write");
+			const runner = session.extensionRunner;
+			if (!runner) throw new Error("expected extension runner");
+			await runner.emit({ type: "session_start" });
+
+			expect(session.getActiveToolNames()).toContain("write");
+			expect(session.getActiveToolNames()).not.toContain("late_device_tool");
+			expect(session.getXdevToolEntries().map(entry => entry.name)).toContain("late_device_tool");
+			const write = session.getToolByName("write");
+			if (!write) throw new Error("expected dormant write transport");
+			await expect(
+				write.execute("late-device-fs", { path: path.join(tempDir, "nope.txt"), content: "x" }),
+			).rejects.toThrow("Filesystem writes are not available");
 		} finally {
 			await session.dispose();
 		}
@@ -1604,12 +1722,12 @@ describe("createAgentSession defaultInactive tool activation", () => {
 
 		try {
 			expect(session.getActiveToolNames()).toEqual(
-				expect.arrayContaining(["read", "default_inactive_tool", "default_active_tool"]),
+				expect.arrayContaining(["read", "default_inactive_tool", "write"]),
 			);
-			// No granted write tool → no xd:// transport: extension tools surface
-			// top-level instead of mounting with an auto-granted write.
-			expect(session.getActiveToolNames()).not.toContain("write");
-			expect(session.getXdevToolEntries()).toEqual([]);
+			// The explicitly requested inactive tool stays top-level. The ambient
+			// default-active tool mounts through the device-only xd:// transport.
+			expect(session.getActiveToolNames()).not.toContain("default_active_tool");
+			expect(session.getXdevToolEntries().map(entry => entry.name)).toContain("default_active_tool");
 			expect(session.systemPrompt.join("\n")).toContain("default_inactive_tool");
 		} finally {
 			await session.dispose();
@@ -1633,6 +1751,127 @@ describe("createAgentSession defaultInactive tool activation", () => {
 			expect(session.getActiveToolNames()).toContain("yield");
 		} finally {
 			await session.dispose();
+		}
+	});
+
+	it("keeps the goal tool active before a goal exists", async () => {
+		const tempDir = makeTempDir();
+
+		const { session } = await createAgentSession({
+			...baseOptions(tempDir),
+		});
+
+		try {
+			expect(session.getActiveToolNames()).toContain("goal");
+			const goalTool = session.agent.state.tools.find(tool => tool.name === "goal");
+			expect(goalTool).toBeDefined();
+
+			await goalTool!.execute("goal-set", {
+				op: "set",
+				objective: "Ship the goal tool availability fix.",
+			});
+
+			expect(session.getGoalModeState()?.enabled).toBe(true);
+			expect(session.getGoalModeState()?.goal.objective).toBe("Ship the goal tool availability fix.");
+		} finally {
+			await session.dispose();
+		}
+	});
+
+	it("blocks goal starts while the real SDK session has an incompatible mode", async () => {
+		const tempDir = makeTempDir();
+
+		const { session } = await createAgentSession({
+			...baseOptions(tempDir),
+		});
+
+		try {
+			session.setPlanModePaused(true);
+			const goalTool = session.agent.state.tools.find(tool => tool.name === "goal");
+			expect(goalTool).toBeDefined();
+
+			for (const op of ["create", "set", "resume"] as const) {
+				await expect(
+					goalTool!.execute(`goal-${op}`, {
+						op,
+						objective: "Must not start during a paused plan.",
+					}),
+				).rejects.toThrow(/plan mode/i);
+			}
+
+			session.setPlanModePaused(false);
+			session.setVibeModeState({ enabled: true });
+			for (const op of ["create", "set", "resume"] as const) {
+				await expect(
+					goalTool!.execute(`goal-vibe-${op}`, {
+						op,
+						objective: "Must not start during vibe mode.",
+					}),
+				).rejects.toThrow(/vibe mode/i);
+			}
+			expect(session.getGoalModeState()).toBeUndefined();
+		} finally {
+			await session.dispose();
+		}
+	});
+
+	it("force-includes the goal tool into explicit toolNames lists", async () => {
+		const tempDir = makeTempDir();
+
+		const { session } = await createAgentSession({
+			...baseOptions(tempDir),
+			toolNames: ["read"],
+		});
+
+		try {
+			expect(session.getActiveToolNames()).toEqual(expect.arrayContaining(["read", "goal"]));
+		} finally {
+			await session.dispose();
+		}
+	});
+
+	it("does not force-activate a defaultInactive extension tool shadowing goal", async () => {
+		const tempDir = makeTempDir();
+
+		const { session } = await createAgentSession({
+			...baseOptions(tempDir),
+			extensions: [shadowGoalExtension],
+			toolNames: ["read"],
+		});
+
+		try {
+			expect(session.getAllToolNames()).toContain("goal");
+			expect(session.getActiveToolNames()).toContain("read");
+			expect(session.getActiveToolNames()).not.toContain("goal");
+			expect(session.systemPrompt.join("\n")).not.toContain("shadow goal");
+		} finally {
+			await session.dispose();
+		}
+	});
+
+	it("preserves an active extension tool shadowing goal in plan mode", async () => {
+		const tempDir = makeTempDir();
+		const { session } = await createAgentSession({
+			...baseOptions(tempDir),
+			extensions: [shadowGoalExtension],
+			toolNames: ["read", "goal"],
+		});
+		await Settings.init({ inMemory: true, cwd: tempDir });
+		initTheme();
+		const mode = new InteractiveMode(session, "test");
+
+		try {
+			expect(session.hasBuiltInTool("goal")).toBe(false);
+			expect(session.getActiveToolNames()).toContain("goal");
+
+			await mode.handlePlanModeCommand();
+
+			expect(mode.planModeEnabled).toBe(true);
+			expect(session.getActiveToolNames()).toContain("goal");
+		} finally {
+			mode.stop();
+			await session.dispose();
+			resetSettingsForTest();
 		}
 	});
 
@@ -1679,7 +1918,7 @@ describe("createAgentSession defaultInactive tool activation", () => {
 		}
 	});
 
-	it("does not force write into the registry when neither a deferrable tool nor plan mode needs it", async () => {
+	it("keeps an idle device-only write out of the active tool set", async () => {
 		const tempDir = makeTempDir();
 
 		const settings = Settings.isolated();
@@ -1692,7 +1931,14 @@ describe("createAgentSession defaultInactive tool activation", () => {
 		});
 
 		try {
-			expect(session.getToolByName("write")).toBeUndefined();
+			// The dormant transport remains registered for later xd:// discovery,
+			// but does not add an inert schema to a pure read-only surface.
+			expect(session.getActiveToolNames()).not.toContain("write");
+			const write = session.getToolByName("write");
+			expect(write).toBeDefined();
+			await expect(
+				write!.execute("device-only-fs", { path: path.join(tempDir, "nope.txt"), content: "x" }),
+			).rejects.toThrow("Filesystem writes are not available");
 		} finally {
 			await session.dispose();
 		}
@@ -1713,7 +1959,7 @@ describe("createAgentSession defaultInactive tool activation", () => {
 		}
 	});
 
-	it("preserves write explicitly selected by a runtime caller", async () => {
+	it("upgrades write explicitly selected by a runtime caller to filesystem access", async () => {
 		const tempDir = makeTempDir();
 		const { session } = await createAgentSession({
 			...baseOptions(tempDir),
@@ -1724,6 +1970,11 @@ describe("createAgentSession defaultInactive tool activation", () => {
 			await session.setActiveToolsByName(["read", "write"]);
 			await session.refreshMCPTools([]);
 			expect(session.getActiveToolNames()).toContain("write");
+			const write = session.getToolByName("write");
+			expect(write).toBeDefined();
+			const filePath = path.join(tempDir, "runtime-write.txt");
+			await write!.execute("runtime-full-write", { path: filePath, content: "runtime\n" });
+			expect(await Bun.file(filePath).text()).toBe("runtime\n");
 		} finally {
 			await session.dispose();
 		}
@@ -1852,472 +2103,104 @@ describe("createAgentSession defaultInactive tool activation", () => {
 		}
 	});
 
-	it("keeps the stable MCP tool-name collision winner during SDK startup and warns", async () => {
+	it("includes reportable built-in custom tools in the Auto QA schema", async () => {
 		const tempDir = makeTempDir();
-		const warn = vi.spyOn(logger, "warn").mockImplementation(() => {});
-		const createMcpTool = (serverName: string, label: string): CustomTool => ({
-			name: "mcp__foo_bar_lookup",
-			label,
-			description: `Lookup from ${serverName}`,
-			parameters: type({}),
-			mcpServerName: serverName,
-			mcpToolName: "lookup",
-			async execute() {
-				return { content: [{ type: "text", text: serverName }] };
-			},
-		});
+		const settings = Settings.isolated({ "dev.autoqa": true });
 
 		const { session } = await createAgentSession({
 			...baseOptions(tempDir),
-			customTools: [createMcpTool("foo.bar", "foo.bar/lookup"), createMcpTool("foo_bar", "foo_bar/lookup")],
-		});
-
-		try {
-			expect(session.getToolByName("mcp__foo_bar_lookup")?.label).toBe("foo.bar/lookup");
-			expect(warn).toHaveBeenCalledWith("MCP tool name collision; keeping stable winner", {
-				name: "mcp__foo_bar_lookup",
-				keptServer: "foo.bar",
-				keptTool: "lookup",
-				ignoredServer: "foo_bar",
-				ignoredTool: "lookup",
-			});
-		} finally {
-			await session.dispose();
-		}
-	});
-
-	it("keeps restricted host tool lists isolated from configured custom capabilities", async () => {
-		const restrictedDir = makeTempDir();
-		const normalDir = makeTempDir();
-		const configuredSettings = () =>
-			Settings.isolated({
-				"providers.imageOrder": ["openai"],
-				"generate_image.enabled": true,
-				"speechgen.enabled": true,
-				"memory.backend": "hindsight",
-				"autolearn.enabled": true,
-			});
-
-		const inheritedManager = {
-			getServerInstructions: () => new Map([["private-server", "must not reach restricted child"]]),
-		} as unknown as MCPManager;
-
-		const restrictedLateExtension: ExtensionFactory = pi => {
-			pi.on("session_start", async () => {
-				await Promise.resolve();
-				pi.registerTool({
-					name: "restricted_late_extension_tool",
-					label: "Restricted Late Extension Tool",
-					description: "Must not enter a caller-restricted session.",
-					parameters: type({}),
-					async execute() {
-						return { content: [{ type: "text", text: "restricted late" }] };
-					},
-				});
-			});
-		};
-
-		const { session: restricted } = await createAgentSession({
-			...baseOptions(restrictedDir),
-			settings: configuredSettings(),
-			extensions: [toolActivationExtension, restrictedLateExtension],
-			customTools: [sdkCustomTool],
-			toolNames: ["read", "lsp", "hub"],
-			requireYieldTool: true,
-			restrictToolNames: true,
-			enableMCP: true,
-			mcpManager: inheritedManager,
-			enableLsp: true,
-			enableIrc: true,
-		});
-
-		try {
-			await initializeExtensions(restricted, {
-				reportSendError: vi.fn(),
-				reportRuntimeError: vi.fn(),
-			});
-			expect(restricted.getAllToolNames()).toEqual(["read", "lsp", "yield"]);
-			expect(restricted.getActiveToolNames()).toEqual(["read", "lsp", "yield"]);
-			for (const name of [
-				"generate_image",
-				"tts",
-				"recall",
-				"retain",
-				"reflect",
-				"learn",
-				"manage_skill",
-				"default_active_tool",
-				"default_inactive_tool",
-				"sdk_custom_tool",
-				"restricted_late_extension_tool",
-				"hub",
-			]) {
-				expect(restricted.getToolByName(name)).toBeUndefined();
-			}
-			expect(restricted.getXdevToolEntries()).toEqual([]);
-			expect(restricted.systemPrompt.join("\n")).not.toContain("private-server");
-			expect(restricted.systemPrompt.join("\n")).not.toContain("MCP Server Instructions");
-		} finally {
-			await restricted.dispose();
-		}
-
-		const { session: normal } = await createAgentSession({
-			...baseOptions(normalDir),
-			settings: configuredSettings(),
+			settings,
 			extensions: [toolActivationExtension],
-			customTools: [sdkCustomTool],
-			toolNames: ["read", "generate_image"],
-			requireYieldTool: true,
-			restrictToolNames: false,
 		});
 
 		try {
-			const activeToolNames = normal.getActiveToolNames();
-			expect(activeToolNames).toEqual(
-				expect.arrayContaining([
-					"read",
-					"yield",
-					"generate_image",
-					"learn",
-					"manage_skill",
-					"tts",
-					"default_active_tool",
-					"sdk_custom_tool",
-				]),
-			);
-			// Without a granted write tool the session allocates no xd:// state;
-			// SDK custom and extension capabilities surface top-level instead.
-			expect(activeToolNames).not.toContain("write");
-			expect(normal.getXdevToolEntries()).toEqual([]);
-			expect(normal.getAllToolNames()).toEqual(
-				expect.arrayContaining([
-					"generate_image",
-					"read",
-					"yield",
-					"tts",
-					"default_active_tool",
-					"sdk_custom_tool",
-					"recall",
-					"retain",
-					"reflect",
-				]),
-			);
-		} finally {
-			await normal.dispose();
-		}
-	});
+			expect(session.getActiveToolNames()).toContain("generate_image");
+			expect(session.getActiveToolNames()).toContain("default_active_tool");
 
-	it("permits only explicitly named SDK custom tools when a restricted caller opts in", async () => {
-		const tempDir = makeTempDir();
-		const { session } = await createAgentSession({
-			...baseOptions(tempDir),
-			customTools: [sdkCustomTool],
-			toolNames: ["read", "sdk_custom_tool"],
-			restrictToolNames: true,
-			allowRestrictedCustomTools: true,
-		});
-
-		try {
-			expect(session.getAllToolNames()).toEqual(["read", "sdk_custom_tool"]);
-			expect(session.getActiveToolNames()).toEqual(["read", "sdk_custom_tool"]);
+			const reportTool = session.agent.state.tools.find(tool => tool.name === "report_tool_issue");
+			if (!reportTool) throw new Error("expected report_tool_issue");
+			const parameters = type(reportTool.parameters);
+			expect(
+				parameters({
+					tool: "generate_image",
+					report: "A schema-valid image generation request failed before reaching the provider.",
+				}) instanceof type.errors,
+			).toBe(false);
+			expect(
+				parameters({
+					tool: "report_tool_issue",
+					report: "The reporting tool itself rejected a valid report.",
+				}) instanceof type.errors,
+			).toBe(false);
+			expect(
+				parameters({
+					tool: "default_active_tool",
+					report: "Extension tool names must not be collected by Auto QA.",
+				}) instanceof type.errors,
+			).toBe(true);
 		} finally {
 			await session.dispose();
 		}
 	});
 
-	it("renders report-issue guidance only for unrestricted sessions", async () => {
-		const normalDir = makeTempDir();
-		const restrictedDir = makeTempDir();
-		const { session: normal } = await createAgentSession({
-			...baseOptions(normalDir),
-			settings: Settings.isolated({ "dev.autoqa": true }),
-		});
-		const { session: restricted } = await createAgentSession({
-			...baseOptions(restrictedDir),
-			settings: Settings.isolated({ "dev.autoqa": true }),
-			toolNames: ["read"],
-			restrictToolNames: true,
-		});
-
-		try {
-			expect(normal.systemPrompt.join("\n")).toContain("xd://report_issue");
-			expect(restricted.systemPrompt.join("\n")).not.toContain("xd://report_issue");
-		} finally {
-			await Promise.all([normal.dispose(), restricted.dispose()]);
-		}
-	});
-
-	it("ignores an inherited MCP manager when MCP is disabled", async () => {
+	it("preserves an extension override of report_tool_issue when Auto QA is enabled", async () => {
 		const tempDir = makeTempDir();
-		const inheritedManager = {
-			getServerInstructions: () => new Map([["private-server", "must not reach restricted child"]]),
-		} as unknown as MCPManager;
+		const settings = Settings.isolated({ "dev.autoqa": true });
 
 		const { session } = await createAgentSession({
 			...baseOptions(tempDir),
-			enableMCP: false,
-			mcpManager: inheritedManager,
-		});
-
-		try {
-			expect(session.systemPrompt.join("\n")).not.toContain("private-server");
-			expect(session.systemPrompt.join("\n")).not.toContain("MCP Server Instructions");
-		} finally {
-			await session.dispose();
-		}
-	});
-
-	// Hashline `edit` stays in the registry on Cursor so the model can still
-	// call it as MCP. Native StrReplace arrives as `editToolCall` and is
-	// materialized via exec read/write; `pi_edit` still uses the replace-mode
-	// instance from `getEditReplaceTool`. The roster is built once at creation.
-	// These two cover both directions of that wiring: the granted session must
-	// still reach a replace-mode instance for `pi_edit` (whose `old_string` /
-	// `new_string` args do not validate against the default `hashline` schema),
-	// and the restricted one must still be refused.
-	//
-	// The handlers are internal to the session; `streamFn` is where they are
-	// handed to the provider, which is the externally observable seam.
-	const captureCursorExecHandlers = async (session: AgentSession, cursorModel: Model): Promise<CursorExecHandlers> => {
-		let handlers: CursorExecHandlers | undefined;
-		const streamFn: StreamFn = (_model, _context, options) => {
-			// The session installs the concrete class; the provider option is
-			// typed as the wire-level interface, whose `piEdit` answers a proto
-			// result rather than the tool result the class returns.
-			handlers = options?.cursorExecHandlers as CursorExecHandlers | undefined;
-			throw new Error("captured");
-		};
-		vi.spyOn(session.agent, "streamFn").mockImplementation(streamFn);
-
-		await session.setModel(cursorModel);
-		// Not wrapped in a catch: `prompt` resolves even when the turn fails (the
-		// loop records the stream error), so a rejection here is a genuine setup
-		// failure and must surface rather than be mistaken for the capture.
-		await session.prompt("hi");
-		if (!handlers) throw new Error("no exec handlers reached the provider");
-		return handlers;
-	};
-
-	// `setModel` and `prompt` both refuse a provider with no configured auth.
-	// Granted on the suite's isolated storage rather than through the provider's
-	// env var — an env mutation would outlive this file — and removed after,
-	// since the storage is shared by every test here.
-	const withProviderAuth = async (providers: string[], run: () => Promise<void>): Promise<void> => {
-		for (const provider of providers) modelRegistry.authStorage.setRuntimeApiKey(provider, "test-key");
-		try {
-			await run();
-		} finally {
-			for (const provider of providers) modelRegistry.authStorage.removeRuntimeApiKey(provider);
-		}
-	};
-
-	it("answers a native pi_edit after a session switches onto Cursor", async () => {
-		const tempDir = makeTempDir();
-		const cursorModel = getBundledModel("cursor", "composer-1.5");
-		if (!cursorModel) throw new Error("expected bundled Cursor model");
-		const target = path.join(tempDir, "sample.txt");
-		fs.writeFileSync(target, "alpha\nbeta\n");
-
-		await withProviderAuth(["cursor"], async () => {
-			const { session } = await createAgentSession(baseOptions(tempDir));
-			try {
-				const handlers = await captureCursorExecHandlers(session, cursorModel);
-				const result = await handlers.piEdit({
-					toolCallId: "sdk-switch-1",
-					args: { path: target, edits: [{ oldText: "beta", newText: "gamma" }] },
-				} as never);
-
-				expect(result.isError).toBeFalsy();
-				expect(fs.readFileSync(target, "utf8")).toBe("alpha\ngamma\n");
-			} finally {
-				await session.dispose();
-			}
-		});
-	});
-
-	it("keeps hashline edit advertised when the session starts on Cursor", async () => {
-		const tempDir = makeTempDir();
-		const cursorModel = getBundledModel("cursor", "composer-1.5");
-		if (!cursorModel) throw new Error("expected bundled Cursor model");
-
-		await withProviderAuth(["cursor"], async () => {
-			const { session } = await createAgentSession({
-				...baseOptions(tempDir),
-				model: cursorModel,
-			});
-			try {
-				expect(session.getActiveToolNames()).toContain("edit");
-			} finally {
-				await session.dispose();
-			}
-		});
-	});
-
-	it("refuses a native pi_edit after a read-only session switches onto Cursor", async () => {
-		// The bridge instance is constructed, not looked up, so building it for
-		// a roster that was never granted `edit` would hand a read-only session
-		// a mutating tool the native frames reach regardless of the advertised
-		// catalog (issue #5680). Making the construction provider-independent
-		// must not widen it.
-		const tempDir = makeTempDir();
-		const cursorModel = getBundledModel("cursor", "composer-1.5");
-		if (!cursorModel) throw new Error("expected bundled Cursor model");
-		const target = path.join(tempDir, "sample.txt");
-		fs.writeFileSync(target, "alpha\nbeta\n");
-
-		await withProviderAuth(["cursor"], async () => {
-			const { session } = await createAgentSession({ ...baseOptions(tempDir), toolNames: ["read"] });
-			try {
-				const handlers = await captureCursorExecHandlers(session, cursorModel);
-				const result = await handlers.piEdit({
-					toolCallId: "sdk-switch-2",
-					args: { path: target, edits: [{ oldText: "beta", newText: "gamma" }] },
-				} as never);
-
-				expect(result.isError).toBe(true);
-				expect(fs.readFileSync(target, "utf8")).toBe("alpha\nbeta\n");
-			} finally {
-				await session.dispose();
-			}
-		});
-	});
-
-	it("resolves bridge frame paths through the session's live cwd", async () => {
-		// The bridge is built once, at session creation, while the session's cwd
-		// moves under it (`/cd`, resume, branch restore). The path-confining
-		// frames — the native `delete`, and a `download_path` resource read —
-		// resolve a relative path against whichever cwd the bridge was handed, so
-		// a startup snapshot means acting on the workspace the session has left
-		// while reporting success for the path the server named.
-		const tempDir = makeTempDir();
-		const movedDir = makeTempDir();
-		const cursorModel = getBundledModel("cursor", "composer-1.5");
-		if (!cursorModel) throw new Error("expected bundled Cursor model");
-		const staleTarget = path.join(tempDir, "obsolete.txt");
-		const liveTarget = path.join(movedDir, "obsolete.txt");
-		fs.writeFileSync(staleTarget, "preserve me");
-		fs.writeFileSync(liveTarget, "remove me");
-
-		await withProviderAuth(["cursor"], async () => {
-			const sessionManager = SessionManager.inMemory();
-			const { session } = await createAgentSession({ ...baseOptions(tempDir), sessionManager });
-			try {
-				const handlers = await captureCursorExecHandlers(session, cursorModel);
-				await sessionManager.moveTo(movedDir);
-
-				const result = await handlers.delete({ toolCallId: "sdk-cwd-1", path: "obsolete.txt" } as never);
-
-				expect(result.isError).toBe(false);
-				expect(fs.existsSync(liveTarget)).toBe(false);
-				expect(fs.existsSync(staleTarget)).toBe(true);
-			} finally {
-				await session.dispose();
-			}
-		});
-	});
-
-	it("does not execute an unadvertised edit call through the fallback resolver", async () => {
-		// One resolver serves two roles: the session's device resolver is passed
-		// to the bridge as `getTool` AND installed as the agent loop's
-		// `resolveFallbackTool`, which runs for ANY call the advertised set does
-		// not contain. It must stay device-only: routing `edit` through it would
-		// execute a replace-mode edit for a call the model was never offered —
-		// a hallucinated one, or a tool the session deselected after startup.
-		// `pi_edit` gets its instance from `getEditReplaceTool` instead.
-		const tempDir = makeTempDir();
-		const target = path.join(tempDir, "sample.txt");
-		fs.writeFileSync(target, "alpha\nbeta\n");
-
-		await withProviderAuth(["openai"], async () => {
-			// Granted at startup, so an `edit` instance exists to leak, then
-			// deselected — the exact state that makes the fallback dangerous.
-			const { session } = await createAgentSession(baseOptions(tempDir));
-			try {
-				await session.setActiveToolsByName(session.getActiveToolNames().filter(name => name !== "edit"));
-				expect(session.getActiveToolNames()).not.toContain("edit");
-
-				// A real mock provider, not a hand-rolled stream: the loop builds
-				// the assistant message from the full event sequence, and an
-				// incomplete one is dropped before tool dispatch ever runs.
-				const toolCallId = "unadvertised-edit-1";
-				const mock = createMockModel({
-					responses: [
-						{
-							content: [
-								{
-									type: "toolCall",
-									id: toolCallId,
-									name: "edit",
-									arguments: { path: target, old_string: "beta", new_string: "gamma" },
-								},
-							],
+			settings,
+			extensions: [
+				pi => {
+					pi.registerTool({
+						name: "report_tool_issue",
+						label: "Custom Report Tool",
+						description: "Record a report through the extension override.",
+						parameters: type({}),
+						async execute() {
+							return { content: [{ type: "text", text: "custom report handled" }] };
 						},
-						{ content: [{ type: "text", text: "done" }] },
-					],
-				});
-				vi.spyOn(session.agent, "streamFn").mockImplementation(mock.stream);
-
-				await session.prompt("hi");
-
-				// The surfaced result, not just the file: an unchanged file alone
-				// would also pass if the fallback HAD resolved the tool and the
-				// edit then failed validation or approval. Only "not found"
-				// proves the resolver refused to hand one over.
-				const result = session.messages.find(
-					(message): message is ToolResultMessage =>
-						message.role === "toolResult" && message.toolCallId === toolCallId,
-				);
-				expect(result?.isError).toBe(true);
-				expect(JSON.stringify(result?.content)).toContain("Tool edit not found");
-				expect(fs.readFileSync(target, "utf8")).toBe("alpha\nbeta\n");
-			} finally {
-				await session.dispose();
-			}
+					});
+				},
+			],
 		});
+
+		try {
+			const reportTool = session.getToolByName("report_tool_issue");
+			if (!reportTool) throw new Error("expected report_tool_issue override");
+
+			const result = await reportTool.execute("call-custom-report", {});
+			expect(result.content).toEqual([{ type: "text", text: "custom report handled" }]);
+		} finally {
+			await session.dispose();
+		}
 	});
 
-	it("runs advisor tools through the approval gate", async () => {
-		// The advisor's tools are built straight from `BUILTIN_TOOLS`, outside
-		// the registry loop that wraps everything else. Its own loop and its
-		// Cursor exec bridge (`piWrite`/`piBash`) run those instances directly,
-		// so an unwrapped one executes whatever it is handed regardless of the
-		// user's `tools.approval.<tool>` policy — the gate lives in
-		// `ExtensionToolWrapper`, not in either caller.
+	it("keeps discovery-all built-ins reportable even when hidden from the initial active set", async () => {
 		const tempDir = makeTempDir();
-		const target = path.join(tempDir, "advisor-write.txt");
+		const settings = Settings.isolated({ "dev.autoqa": true, "tools.discoveryMode": "all" });
 
-		// An advisor only builds once a model resolves for it, and both the
-		// explicit override and the `advisor` role chain resolve against
-		// `modelRegistry.getAvailable()` — the models this machine holds auth
-		// for. Grant the suite's isolated storage a key and name the model
-		// outright, or the roster silently resolves to `no_model` wherever no
-		// provider is configured (CI) while passing on a developer box whose
-		// environment happens to carry provider keys.
-		await withProviderAuth(["openai"], async () => {
-			const { session } = await createAgentSession({
-				...baseOptions(tempDir),
-				settings: Settings.isolated({ "advisor.enabled": true, "tools.approval": { write: "deny" } }),
-			});
-			try {
-				// The default advisor roster is read-only (read/grep/glob); the
-				// reviewed hole needs one actually granted a mutating tool.
-				session.applyAdvisorConfigs([{ name: "writer", tools: ["write"], model: "gpt-4o-mini" }], undefined);
-				const advisor = session.getAdvisorAgent();
-				if (!advisor) throw new Error("expected an advisor agent");
-				const writeTool = advisor.state.tools?.find(tool => tool.name === "write");
-				if (!writeTool) throw new Error("expected the advisor to hold a write tool");
-
-				// The gate rejects rather than returning an error result — that throw
-				// IS the refusal, and it only happens when the instance is wrapped.
-				await expect(
-					writeTool.execute("advisor-w1", { path: target, content: "written" }, undefined, undefined, {
-						settings: session.settings,
-					} as never),
-				).rejects.toThrow(/blocked by user policy/);
-				expect(fs.existsSync(target)).toBe(false);
-			} finally {
-				await session.dispose();
-			}
+		const { session } = await createAgentSession({
+			...baseOptions(tempDir),
+			settings,
 		});
+
+		try {
+			// discovery-all hides discoverable built-ins from the initial active set.
+			expect(session.getActiveToolNames()).not.toContain("grep");
+			expect(session.getAllToolNames()).toContain("grep");
+
+			const reportTool = session.agent.state.tools.find(tool => tool.name === "report_tool_issue");
+			if (!reportTool) throw new Error("expected report_tool_issue");
+			const parameters = type(reportTool.parameters);
+			expect(
+				parameters({
+					tool: "grep",
+					report: "A discoverable built-in returned output inconsistent with its schema.",
+				}) instanceof type.errors,
+			).toBe(false);
+		} finally {
+			await session.dispose();
+		}
 	});
 });

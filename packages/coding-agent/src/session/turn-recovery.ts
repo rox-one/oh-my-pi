@@ -197,6 +197,7 @@ export class TurnRecovery {
 	readonly #host: TurnRecoveryHost;
 	#retryAbortController: AbortController | undefined;
 	#retryAttempt = 0;
+	#currentModelRetryAttempt = 0;
 	#retryPromise: Promise<void> | undefined;
 	#retryResolve: (() => void) | undefined;
 	#activeRetryFallback: ActiveRetryFallbackState | undefined;
@@ -250,6 +251,11 @@ export class TurnRecovery {
 	/** Current automatic retry attempt. */
 	get attempt(): number {
 		return this.#retryAttempt;
+	}
+
+	#resetRetryAttempts(): void {
+		this.#retryAttempt = 0;
+		this.#currentModelRetryAttempt = 0;
 	}
 
 	/** Promise settled when the active retry saga finishes. */
@@ -381,14 +387,14 @@ export class TurnRecovery {
 			retryErrors,
 		});
 		this.#clearPendingRetryErrors();
-		this.#retryAttempt = 0;
+		this.#resetRetryAttempts();
 	}
 
 	/** Closes a failed retry saga when no compaction continuation took ownership. */
 	async onErrorSettledWithoutRetry(message: AssistantMessage, compaction: RecoveryCompactionResult): Promise<void> {
 		if (message.stopReason !== "error" || this.#retryAttempt === 0 || compaction.continuationScheduled) return;
 		const attempt = this.#retryAttempt;
-		this.#retryAttempt = 0;
+		this.#resetRetryAttempts();
 		await this.#host.emitSessionEvent({
 			type: "auto_retry_end",
 			success: false,
@@ -718,7 +724,7 @@ export class TurnRecovery {
 				finalError,
 			});
 			this.#clearPendingRetryErrors();
-			this.#retryAttempt = 0;
+			this.#resetRetryAttempts();
 			this.resolveRetry();
 			// A turn with no actionable output carries no transcript value, while its
 			// provider usage can anchor the next prompt at the full failed-request size
@@ -1947,10 +1953,6 @@ export class TurnRecovery {
 		// (every rotation sets switchedCredential and skips it), so without
 		// this last resort a provider-wide usage cap never fails over to the
 		// configured chain.
-		const maxRetries = this.#isBoundedThinkingStreamClose(message)
-			? Math.min(retrySettings.maxRetries, 1)
-			: retrySettings.maxRetries;
-		const retryBudgetExhausted = this.#retryAttempt > maxRetries;
 
 		const errorMessage = message.errorMessage || "Unknown error";
 		const id = this.#classifyRetryMessage(message);
@@ -1961,6 +1963,11 @@ export class TurnRecovery {
 		const rateLimitReason = parseRateLimitReason(errorMessage);
 		const staleOpenAIResponsesReplayError = AIError.is(id, AIError.Flag.StaleResponsesItem);
 		const accountPolicyDenial = AIError.is(id, AIError.Flag.AccountPolicy);
+		const openRouterThinkingStreamClose = this.#isOpenRouterThinkingStreamClose(message);
+		const maxRetries = openRouterThinkingStreamClose
+			? Math.min(retrySettings.maxRetries, 1)
+			: retrySettings.maxRetries;
+		let retryBudgetExhausted = this.#retryAttempt > maxRetries;
 		const recordedUsageLimitOutcome = await this.#usageLimitOutcomes.get(message);
 		const parsedRetryAfterMs = this.#parseRetryAfterMsFromError(errorMessage);
 		let delayMs = staleOpenAIResponsesReplayError
@@ -2025,6 +2032,10 @@ export class TurnRecovery {
 			}
 		}
 
+		if (usageLimitWaitMs === undefined && parsedRetryAfterMs !== undefined && parsedRetryAfterMs > delayMs) {
+			delayMs = parsedRetryAfterMs;
+		}
+
 		const allowModelFallback = options?.allowModelFallback !== false;
 		const currentModel = this.#host.model();
 		const currentSelector = currentModel
@@ -2046,13 +2057,51 @@ export class TurnRecovery {
 		// contents, not model health (issue #8760). Keep it on the same model; the
 		// retry budget still bounds a genuinely stuck stream.
 		const thinkingLoop = AIError.is(id, AIError.Flag.ThinkingLoop);
+		const sameModelRetriesBeforeFallback = retrySettings.retryCurrentModelBeforeFallback
+			? Math.min(maxRetries, Math.max(0, Math.floor(retrySettings.retriesBeforeModelFallback)))
+			: 0;
+		if (
+			retryBudgetExhausted &&
+			this.#currentModelRetryAttempt < sameModelRetriesBeforeFallback &&
+			this.#activeRetryFallback &&
+			!classifierRefusal &&
+			!accountPolicyDenial &&
+			!openRouterThinkingStreamClose &&
+			!options?.hardErrorFallback
+		) {
+			this.#retryAttempt = 1;
+			retryBudgetExhausted = false;
+		}
+		const maxDelayMs = retrySettings.maxDelayMs;
+		const delayExceedsCap = maxDelayMs > 0 && delayMs > maxDelayMs;
+		const delayConfiguredFallback =
+			!options?.hardErrorFallback &&
+			!classifierRefusal &&
+			!accountPolicyDenial &&
+			!delayExceedsCap &&
+			this.#currentModelRetryAttempt < sameModelRetriesBeforeFallback;
 		if (!staleOpenAIResponsesReplayError && !switchedCredential && currentSelector) {
 			// A refusal chain stops at the retry budget: the exhausted-attempt
 			// last resort is for provider failures, not classifier decisions.
+			// When the provider explicitly asked for a wait (retry-after header
+			// surfaced as `retry-after-ms=` in the error message), honor it on
+			// the same model/credential instead of drilling to a cold
+			// cross-provider fallback (cache bust + billed request) mid-window.
+			// The chain still engages after the budget exhausts.
+			//
+			// Capacity errors are the exception. A 429 quota window clears on its
+			// own and the same model is worth waiting for; a 503 "no capacity" or
+			// "hosted inference unavailable" is the route being down, and its
+			// retry-after is a guess at when that ends. Parking on it spends the
+			// whole budget on a model that cannot serve — a live outage burned ten
+			// attempts on `runinfra/deepseek-v4-pro` this way, with retry-after
+			// windows up to 38895ms, and never reached the OpenRouter leg.
+			const capacityUnavailable = rateLimitReason === "MODEL_CAPACITY_EXHAUSTED";
 			if (
 				allowModelFallback &&
 				retrySettings.modelFallback &&
 				!thinkingLoop &&
+				!delayConfiguredFallback &&
 				!(retryBudgetExhausted && classifierRefusal)
 			) {
 				if (!classifierRefusal) {
@@ -2071,8 +2120,7 @@ export class TurnRecovery {
 			}
 			if (switchedModel) {
 				delayMs = 0;
-			} else if (usageLimitWaitMs === undefined && parsedRetryAfterMs && parsedRetryAfterMs > delayMs) {
-				delayMs = parsedRetryAfterMs;
+				this.#currentModelRetryAttempt = 0;
 			}
 		}
 
@@ -2090,13 +2138,14 @@ export class TurnRecovery {
 					retryErrors,
 				});
 				this.#clearPendingRetryErrors();
-				this.#retryAttempt = 0;
+				this.#resetRetryAttempts();
 				this.resolveRetry(); // Resolve so waitForRetry() completes
 				return false;
 			}
-			// A fallback model gets a fresh retry budget. Credential rotation
-			// instead keeps the cumulative attempt count while bypassing the
-			// same-route budget: every distinct account must be tried first.
+			// A fallback model gets a fresh retry budget. Keep attempt 1 for the
+			// switch that is about to run so retry progress remains one-based;
+			// if that request fails, its first same-model retry is governed by
+			// the per-model counter instead of the exhausted prior route.
 			if (switchedModel) this.#retryAttempt = 1;
 		}
 		if ((classifierRefusal || accountPolicyDenial) && !switchedCredential && !switchedModel) {
@@ -2117,7 +2166,7 @@ export class TurnRecovery {
 				});
 				this.#clearPendingRetryErrors();
 			}
-			this.#retryAttempt = 0;
+			this.#resetRetryAttempts();
 			this.resolveRetry();
 			return false;
 		}
@@ -2142,7 +2191,7 @@ export class TurnRecovery {
 				});
 				this.#clearPendingRetryErrors();
 			}
-			this.#retryAttempt = 0;
+			this.#resetRetryAttempts();
 			this.resolveRetry();
 			return false;
 		}
@@ -2154,11 +2203,10 @@ export class TurnRecovery {
 		// subagent (or interactive session) silently hung. The original
 		// assistant error message is preserved in agent state so the caller
 		// can act on it.
-		const maxDelayMs = retrySettings.maxDelayMs;
 		if (maxDelayMs > 0 && delayMs > maxDelayMs && !switchedCredential && !switchedModel) {
 			await this.persistTerminalEmptyErrorTurn(message);
 			const attempt = this.#retryAttempt;
-			this.#retryAttempt = 0;
+			this.#resetRetryAttempts();
 			await this.#host.emitSessionEvent({
 				type: "auto_retry_end",
 				success: false,
@@ -2168,6 +2216,9 @@ export class TurnRecovery {
 			this.#clearPendingRetryErrors();
 			this.resolveRetry();
 			return false;
+		}
+		if (!switchedCredential && !switchedModel) {
+			this.#currentModelRetryAttempt++;
 		}
 
 		await this.#recordPendingRetryError(message, id, { switchedCredential, switchedModel, delayMs });
@@ -2205,7 +2256,7 @@ export class TurnRecovery {
 			}
 			// Aborted during sleep - emit end event so UI can clean up
 			const attempt = this.#retryAttempt;
-			this.#retryAttempt = 0;
+			this.#resetRetryAttempts();
 			this.#retryAbortController = undefined;
 			await this.#host.emitSessionEvent({
 				type: "auto_retry_end",
@@ -2276,7 +2327,7 @@ export class TurnRecovery {
 	async #failRetryAfterLocalContinueError(message: AssistantMessage, error: unknown): Promise<void> {
 		if (this.#retryAttempt === 0) return;
 		const attempt = this.#retryAttempt;
-		this.#retryAttempt = 0;
+		this.#resetRetryAttempts();
 		const localError = error instanceof Error ? error.message : String(error);
 		await this.persistTerminalEmptyErrorTurn(message);
 		await this.#host.emitSessionEvent({
@@ -2399,7 +2450,7 @@ export class TurnRecovery {
 		}
 
 		// Reset retry budget for a fresh attempt
-		this.#retryAttempt = 0;
+		this.#resetRetryAttempts();
 
 		// Re-attempt the turn
 		this.#host.scheduleAgentContinue({ delayMs: 1 });

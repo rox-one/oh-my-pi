@@ -3,9 +3,56 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { getTerminalId } from "@oh-my-pi/pi-tui";
 import { getSessionsDir, getTerminalSessionsDir, isEnoent, logger, resolveEquivalentPath } from "@oh-my-pi/pi-utils";
+import { resolveWorkspaceStorageIdentity, type WorkspaceIdentifierMode } from "../utils/workspace-storage-identifier";
 import type { SessionStorage } from "./session-storage";
 
 const migratedSessionRoots = new Set<string>();
+const RESOURCE_PATH_KEYS: Record<string, true> = {
+	linkPath: true,
+	outputPath: true,
+	patchPath: true,
+	sessionFile: true,
+};
+const RESOURCE_PATH_ARRAY_KEYS: Record<string, true> = {
+	outputPaths: true,
+};
+
+/** Rebase one absolute path only when it is inside `oldRoot`. */
+export function rebasePathWithinRoot(filePath: string, oldRoot: string, newRoot: string): string {
+	const relative = path.relative(path.resolve(oldRoot), path.resolve(filePath));
+	if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) return filePath;
+	return path.join(newRoot, relative);
+}
+
+/**
+ * Rebase persisted/render metadata without touching arbitrary user strings.
+ * Only the dedicated file-target keys participate, and only below `oldRoot`.
+ */
+export function rebaseResourcePathMetadata(value: unknown, oldRoot: string, newRoot: string): void {
+	const seen = new Set<object>();
+	const visit = (candidate: unknown): void => {
+		if (!candidate || typeof candidate !== "object" || seen.has(candidate)) return;
+		seen.add(candidate);
+		if (Array.isArray(candidate)) {
+			for (const item of candidate) visit(item);
+			return;
+		}
+		if (Object.getPrototypeOf(candidate) !== Object.prototype && Object.getPrototypeOf(candidate) !== null) return;
+		const record = candidate as Record<string, unknown>;
+		for (const [key, item] of Object.entries(record)) {
+			if (Object.hasOwn(RESOURCE_PATH_KEYS, key) && typeof item === "string") {
+				record[key] = rebasePathWithinRoot(item, oldRoot, newRoot);
+			} else if (Object.hasOwn(RESOURCE_PATH_ARRAY_KEYS, key) && Array.isArray(item)) {
+				record[key] = item.map(pathItem =>
+					typeof pathItem === "string" ? rebasePathWithinRoot(pathItem, oldRoot, newRoot) : pathItem,
+				);
+			} else {
+				visit(item);
+			}
+		}
+	};
+	visit(value);
+}
 
 /**
  * Merge or rename a legacy session directory into its canonical target.
@@ -168,13 +215,32 @@ function migrateHashedSessionDir(hashedDirName: string, sessionDir: string, sess
 	}
 }
 
-export function resolveManagedSessionRoot(sessionDir: string, cwd: string): string | undefined {
+export function resolveManagedSessionRoot(
+	sessionDir: string,
+	cwd: string,
+	mode: WorkspaceIdentifierMode = "path",
+): string | undefined {
 	const currentDirName = path.basename(sessionDir);
-	const { encodedDirName } = getDefaultSessionDirName(cwd);
-	if (currentDirName !== encodedDirName && currentDirName !== encodeLegacyAbsoluteSessionDirName(cwd)) {
+	const { encodedDirName, resolvedCwd } = getDefaultSessionDirName(cwd);
+	const identity = resolveWorkspaceStorageIdentity(resolvedCwd, mode, encodedDirName);
+	if (currentDirName !== identity.segment && currentDirName !== encodeLegacyAbsoluteSessionDirName(cwd)) {
 		return undefined;
 	}
 	return path.dirname(sessionDir);
+}
+
+/**
+ * Whether a session file lives under the managed sessions root as a bucket
+ * child (`<sessionsRoot>/<encoded-cwd>/<file>.jsonl`) — the only on-disk layout
+ * that id-resolution can rediscover, since `resolveResumableSession` and
+ * `listAllSessions` enumerate bucket files exactly one level below the root. A
+ * path-resumed foreign file (e.g. a pi transcript under `~/.pi/agent/sessions`)
+ * stays at its original location, so a `--resume <id>` hint built from it can
+ * never match (issue #9544).
+ */
+export function isManagedSessionFile(sessionFile: string, sessionsRoot: string = getSessionsDir()): boolean {
+	const bucket = path.dirname(path.resolve(sessionFile));
+	return path.dirname(bucket) === path.resolve(sessionsRoot);
 }
 
 /**
@@ -186,12 +252,18 @@ export function computeDefaultSessionDir(
 	cwd: string,
 	storage: SessionStorage,
 	sessionsRoot: string = getSessionsDir(),
+	mode: WorkspaceIdentifierMode = "path",
 ): string {
-	const { encodedDirName, hashedDirName, resolvedCwd } = getDefaultSessionDirName(cwd);
-	migrateHomeSessionDirs(sessionsRoot);
-	const sessionDir = path.join(sessionsRoot, encodedDirName);
-	migrateLegacyAbsoluteSessionDir(resolvedCwd, sessionDir, sessionsRoot);
-	migrateHashedSessionDir(hashedDirName, sessionDir, sessionsRoot);
+	const options: SessionDirectoryOptions =
+		typeof sessionsRootOrOptions === "string"
+			? { sessionsRoot: sessionsRootOrOptions }
+			: (sessionsRootOrOptions ?? {});
+	const { sessionsRoot = getSessionsDir(), identifierMode = "path" } = options;
+	const { encodedDirName, resolvedCwd } = getDefaultSessionDirName(cwd);
+	const identity = resolveWorkspaceStorageIdentity(resolvedCwd, mode, encodedDirName);
+	if (identity.mode === "path") migrateHomeSessionDirs(sessionsRoot);
+	const sessionDir = path.join(sessionsRoot, identity.segment);
+	if (identity.mode === "path") migrateLegacyAbsoluteSessionDir(resolvedCwd, sessionDir, sessionsRoot);
 	storage.ensureDirSync(sessionDir);
 	return sessionDir;
 }

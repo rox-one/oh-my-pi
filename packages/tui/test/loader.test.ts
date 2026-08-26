@@ -178,7 +178,7 @@ describe("Loader component", () => {
 
 	it("reuses the wrapped layout across static spinner frames without re-measuring", () => {
 		vi.useFakeTimers();
-		const ui = { synchronizedOutput: true, requestComponentRender: vi.fn() };
+		const ui = { synchronizedOutput: true, requestDirectWrite: vi.fn(), requestComponentRender: vi.fn() };
 		const loader = new Loader(
 			ui as unknown as TUI,
 			s => s,
@@ -204,7 +204,7 @@ describe("Loader component", () => {
 
 	it("rewraps custom spinner frames when their display widths differ", () => {
 		vi.useFakeTimers();
-		const ui = { synchronizedOutput: true, requestComponentRender: vi.fn() };
+		const ui = { synchronizedOutput: true, requestDirectWrite: vi.fn(), requestComponentRender: vi.fn() };
 		const loader = new Loader(
 			ui as unknown as TUI,
 			s => s,

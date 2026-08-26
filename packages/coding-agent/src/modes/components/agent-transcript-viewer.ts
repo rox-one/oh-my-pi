@@ -21,14 +21,13 @@ import type { KeyId } from "../../config/keybindings";
 import type { MessageRenderer } from "../../extensibility/extensions/types";
 import type { AgentLifecycleManager } from "../../registry/agent-lifecycle";
 import type { AgentRegistry, AgentStatus } from "../../registry/agent-registry";
-import type { FileEntry, SessionMessageEntry } from "../../session/session-entries";
+import type { FileEntry } from "../../session/session-entries";
 import { parseSessionEntries } from "../../session/session-loader";
-import { replaceTabs, shortenPath, truncateToWidth } from "../../tools/render-utils";
+import { SessionTranscriptPresenter, sanitizeErrorLine } from "../presentation/shared-transcript";
 import type { ObservableSession, SessionObserverRegistry } from "../session-observer-registry";
 import { getEditorTheme, theme } from "../theme/theme";
 import { matchesSelectDown, matchesSelectUp } from "../utils/keybinding-matchers";
 import type { AgentHubRemote } from "./agent-hub";
-import { ChatTranscriptBuilder } from "./chat-transcript-builder";
 import { DynamicBorder } from "./dynamic-border";
 import { formatContextUsage } from "./status-line/context-thresholds";
 
@@ -63,18 +62,6 @@ export interface AgentTranscriptViewerDeps {
 const POLL_MS = 250;
 
 const SENTINEL_BYTES = 4096;
-
-/** Sanitize wire-delivered error text for a single TUI row: tabs → spaces,
- *  newlines collapsed, absolute paths shortened, truncated to `maxWidth`.
- *  `#remoteError` arrives as `String(err)` from the host — it can carry
- *  multi-line stacks and absolute host paths that would break the frame's
- *  1-row accounting and leak host filesystem layout to guests. */
-function sanitizeErrorLine(text: string, maxWidth: number): string {
-	const singleLine = replaceTabs(text)
-		.replace(/[\r\n]+/g, " ")
-		.replace(/\/[^\s'")\]]+/g, p => shortenPath(p));
-	return truncateToWidth(singleLine, Math.max(10, maxWidth));
-}
 
 interface LocalTranscriptSentinel {
 	offset: number;
@@ -138,7 +125,7 @@ function statusBadge(status: AgentStatus): string {
 }
 
 export class AgentTranscriptViewer implements Component {
-	#builder: ChatTranscriptBuilder;
+	#presenter: SessionTranscriptPresenter;
 	#scrollView: ScrollView;
 	#followBottom = true;
 	#editor: Editor | undefined;
@@ -155,12 +142,11 @@ export class AgentTranscriptViewer implements Component {
 	#remoteError = "";
 	#hasRemoteData = false;
 
-	#model: string | undefined;
 	#pollTimer: NodeJS.Timeout | undefined;
 	#disposed = false;
 
 	constructor(private readonly deps: AgentTranscriptViewerDeps) {
-		this.#builder = new ChatTranscriptBuilder({
+		this.#presenter = new SessionTranscriptPresenter({
 			ui: deps.ui,
 			getTool: deps.getTool,
 			isBuiltInTool: deps.isBuiltInTool,
@@ -196,7 +182,7 @@ export class AgentTranscriptViewer implements Component {
 		this.#disposed = true;
 		this.#stopPolling();
 		this.#remoteToken++;
-		this.#builder.dispose();
+		this.#presenter.dispose();
 	}
 
 	#stopPolling(): void {
@@ -243,7 +229,7 @@ export class AgentTranscriptViewer implements Component {
 		if (!this.#localState && this.#localUnavailable === reason) return;
 		this.#localState = undefined;
 		this.#localUnavailable = reason;
-		this.#model = undefined;
+		this.#presenter.setModel(undefined);
 		this.#rebuild([]);
 	}
 
@@ -303,8 +289,8 @@ export class AgentTranscriptViewer implements Component {
 			pending,
 			sentinels: sentinelsFromBuffer(data),
 		};
-		this.#model = undefined;
-		this.#rebuild(this.#extractMessages(parseSessionEntries(complete)));
+		this.#presenter.setModel(undefined);
+		this.#rebuild(parseSessionEntries(complete));
 	}
 
 	#appendLocal(sessionFile: string, stat: fs.Stats, state: LocalTranscriptState): void {
@@ -319,8 +305,8 @@ export class AgentTranscriptViewer implements Component {
 		const combined = state.pending + chunk;
 		const lastNewline = combined.lastIndexOf("\n");
 		const complete = lastNewline >= 0 ? combined.slice(0, lastNewline + 1) : "";
-		const previousModel = this.#model;
-		const parsed = complete ? this.#extractMessages(parseSessionEntries(complete)) : [];
+		const previousModel = this.#presenter.model;
+		const parsed = complete ? parseSessionEntries(complete) : [];
 		let sentinels: LocalTranscriptSentinel[];
 		try {
 			sentinels = sentinelsFromFile(sessionFile, stat.size);
@@ -341,7 +327,7 @@ export class AgentTranscriptViewer implements Component {
 		};
 		if (parsed.length > 0) {
 			this.#append(parsed);
-		} else if (this.#model !== previousModel) {
+		} else if (this.#presenter.model !== previousModel) {
 			this.deps.requestRender();
 		}
 	}
@@ -380,7 +366,7 @@ export class AgentTranscriptViewer implements Component {
 					this.#remoteBytes = 0;
 					this.#remoteError = "";
 					this.#hasRemoteData = false;
-					this.#model = undefined;
+					this.#presenter.setModel(undefined);
 					this.#rebuild([]);
 					this.#fetchRemote();
 					return;
@@ -393,13 +379,13 @@ export class AgentTranscriptViewer implements Component {
 				if (lastNewline >= 0) {
 					const completeChunk = result.text.slice(0, lastNewline + 1);
 					this.#remoteBytes = fromByte + Buffer.byteLength(completeChunk, "utf-8");
-					const previousModel = this.#model;
-					const parsed = this.#extractMessages(parseSessionEntries(completeChunk));
+					const previousModel = this.#presenter.model;
+					const parsed = parseSessionEntries(completeChunk);
 					if (parsed.length > 0) {
 						this.#append(parsed);
 						return;
 					}
-					if (this.#model !== previousModel) {
+					if (this.#presenter.model !== previousModel) {
 						this.deps.requestRender();
 						return;
 					}
@@ -413,27 +399,13 @@ export class AgentTranscriptViewer implements Component {
 			});
 	}
 
-	/** Filter to message entries, tracking the model from the first assistant / a model_change. */
-	#extractMessages(entries: FileEntry[]): SessionMessageEntry[] {
-		const messages: SessionMessageEntry[] = [];
-		for (const entry of entries) {
-			if (entry.type === "message") {
-				messages.push(entry);
-				if (!this.#model && entry.message.role === "assistant") this.#model = entry.message.model;
-			} else if (entry.type === "model_change") {
-				this.#model = entry.model;
-			}
-		}
-		return messages;
-	}
-
-	#rebuild(entries: SessionMessageEntry[]): void {
-		this.#builder.rebuild(entries);
+	#rebuild(entries: FileEntry[]): void {
+		this.#presenter.rebuildFromRaw(entries);
 		this.deps.requestRender();
 	}
 
-	#append(entries: SessionMessageEntry[]): void {
-		this.#builder.append(entries);
+	#append(entries: FileEntry[]): void {
+		this.#presenter.appendFromRaw(entries);
 		this.deps.requestRender();
 	}
 
@@ -476,7 +448,7 @@ export class AgentTranscriptViewer implements Component {
 		for (const key of this.deps.expandKeys) {
 			if (matchesKey(data, key)) {
 				this.#expanded = !this.#expanded;
-				this.#builder.setExpanded(this.#expanded);
+				this.#presenter.setExpanded(this.#expanded);
 				this.deps.requestRender();
 				return;
 			}
@@ -566,7 +538,7 @@ export class AgentTranscriptViewer implements Component {
 		const footerLines = this.#footerLines();
 		const noticeLine = this.#notice
 			? ` ${theme.fg("error", sanitizeErrorLine(this.#notice, innerWidth))}`
-			: this.#remoteError && !this.#builder.isEmpty
+			: this.#remoteError && !this.#presenter.isEmpty
 				? ` ${theme.fg("error", sanitizeErrorLine(this.#remoteError, innerWidth))}`
 				: undefined;
 		const editorLines = this.#editor ? this.#editor.render(innerWidth) : [];
@@ -575,9 +547,9 @@ export class AgentTranscriptViewer implements Component {
 		const chrome = headerLines.length + 2 + editorLines.length + footerLines.length + (noticeLine ? 1 : 0) + 1;
 		const viewportHeight = Math.max(3, termHeight - chrome);
 
-		const contentLines = this.#builder.isEmpty
+		const contentLines = this.#presenter.isEmpty
 			? [` ${theme.fg("dim", this.#placeholder(Math.max(10, contentWidth - 1)))}`]
-			: this.#builder.container.render(contentWidth);
+			: this.#presenter.container.render(contentWidth);
 		this.#scrollView.setLines(contentLines);
 		this.#scrollView.setHeight(viewportHeight);
 		if (this.#followBottom) this.#scrollView.scrollToBottom();
@@ -598,7 +570,7 @@ export class AgentTranscriptViewer implements Component {
 		const lines = [theme.fg("accent", `Agent Hub ${theme.sep.dot} ${this.deps.agentId}`)];
 		if (status && kind) {
 			const kindTag = theme.fg("dim", ` ${parentId ? `${kind} ${theme.sep.dot} of ${parentId}` : kind}`);
-			const modelLabel = this.#model ? theme.fg("muted", `${theme.sep.dot}${this.#model}`) : "";
+			const modelLabel = this.#presenter.model ? theme.fg("muted", `${theme.sep.dot}${this.#presenter.model}`) : "";
 			lines.push(`${theme.bold(this.deps.agentId)} ${statusBadge(status)}${kindTag}${modelLabel}`);
 		}
 		return lines;

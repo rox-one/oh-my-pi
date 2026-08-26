@@ -394,6 +394,11 @@ export class SessionMaintenance {
 		return run.armed ? "armed" : "running";
 	}
 
+	/** Completion of the current speculative pass, used to resume maintenance skipped during its handoff. */
+	get speculationCompletion(): Promise<void> | undefined {
+		return this.#speculation?.promise;
+	}
+
 	/** Abort and discard any in-flight or armed speculative compaction. */
 	cancelSpeculation(): void {
 		const run = this.#speculation;
@@ -2311,7 +2316,7 @@ export class SessionMaintenance {
 			return Math.min(
 				snapcompact.MAX_FRAMES_DEFAULT,
 				snapcompact.maxFramesForDataBudget(),
-				snapcompact.providerFrameBudget(this.#model?.provider),
+				snapcompact.providerFrameBudget(this.#model?.provider, this.#model?.id),
 			);
 		}
 		const reserve = effectiveReserveTokens(ctxWindow, settings);
@@ -2354,7 +2359,7 @@ export class SessionMaintenance {
 			Math.floor(frameBudget / snapcompact.FRAME_TOKEN_ESTIMATE),
 			snapcompact.MAX_FRAMES_DEFAULT,
 			snapcompact.maxFramesForDataBudget(),
-			snapcompact.providerFrameBudget(this.#model?.provider),
+			snapcompact.providerFrameBudget(this.#model?.provider, this.#model?.id),
 		);
 	}
 
@@ -2635,7 +2640,7 @@ export class SessionMaintenance {
 			return Math.min(
 				snapcompact.MAX_FRAMES_DEFAULT,
 				snapcompact.maxFramesForDataBudget(),
-				snapcompact.providerFrameBudget(this.#model?.provider),
+				snapcompact.providerFrameBudget(this.#model?.provider, this.#model?.id),
 			);
 		}
 		const thresholdTokens = resolveThresholdTokens(ctxWindow, settings);
@@ -2655,7 +2660,7 @@ export class SessionMaintenance {
 			Math.floor(frameBudget / snapcompact.FRAME_TOKEN_ESTIMATE),
 			snapcompact.MAX_FRAMES_DEFAULT,
 			snapcompact.maxFramesForDataBudget(),
-			snapcompact.providerFrameBudget(this.#model?.provider),
+			snapcompact.providerFrameBudget(this.#model?.provider, this.#model?.id),
 		);
 	}
 

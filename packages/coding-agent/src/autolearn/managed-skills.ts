@@ -10,8 +10,9 @@
 import { constants as fsConstants, type Stats } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { getAgentDir, isEnoent } from "@oh-my-pi/pi-utils";
+import { CONFIG_DIR_NAME, getAgentDir, isEnoent } from "@oh-my-pi/pi-utils";
 import { YAML } from "bun";
+import { repo } from "../utils/git";
 
 /** Provider id stamped on discovered managed skills (distinguishes them from authored). */
 export const MANAGED_SKILLS_PROVIDER_ID = "omp-managed";
@@ -24,6 +25,44 @@ const SKILL_NAME_PATTERN = /^[a-z0-9][a-z0-9-]{0,63}$/;
 /** Resolve the isolated managed-skills directory (`~/.omp/agent/managed-skills`). */
 export function getManagedSkillsDir(agentDir: string = getAgentDir()): string {
 	return path.join(agentDir, "managed-skills");
+}
+
+/**
+ * Resolve the project skills root (`<primaryRoot>/.omp/skills`) used when
+ * `autolearn.skillLocation` is `"project"`. Anchors at the repo's primary
+ * checkout so a skill minted from a linked worktree lives with the project;
+ * falls back to `cwd` outside a repository.
+ */
+export async function resolveProjectSkillsDir(cwd: string): Promise<string> {
+	const root = (await repo.primaryRoot(cwd).catch(() => null)) ?? cwd;
+	return path.join(root, CONFIG_DIR_NAME, "skills");
+}
+
+/**
+ * Resolve the skills root a managed-skill mutation should target for the
+ * configured `autolearn.skillLocation`. `"global"` returns `undefined` (the
+ * default managed dir). `"project"` returns the project `.omp/skills` dir —
+ * except for update/delete of a skill that only exists globally, which follow
+ * the existing copy instead of failing or silently relocating it.
+ */
+export async function resolveSkillWriteRoot(
+	cwd: string,
+	location: "global" | "project",
+	name?: string,
+): Promise<string | undefined> {
+	if (location !== "project") return undefined;
+	const projectRoot = await resolveProjectSkillsDir(cwd);
+	if (!name) return projectRoot;
+	let safe: string;
+	try {
+		safe = sanitizeSkillName(name);
+	} catch {
+		return projectRoot;
+	}
+	const inProject = await fs.stat(path.join(projectRoot, safe)).catch(() => null);
+	if (inProject) return projectRoot;
+	const inGlobal = await fs.stat(path.join(getManagedSkillsDir(), safe)).catch(() => null);
+	return inGlobal ? undefined : projectRoot;
 }
 
 /**
@@ -86,6 +125,11 @@ export interface WriteManagedSkillInput {
 	name: string;
 	description: string;
 	body: string;
+	/**
+	 * Skills root to write under. Defaults to the global managed-skills dir;
+	 * `autolearn.skillLocation: "project"` passes the project `.omp/skills` dir.
+	 */
+	rootDir?: string;
 }
 
 /**
@@ -114,8 +158,8 @@ function serializeSkillMutation<T>(name: string, op: () => Promise<T>): Promise<
  * valid name write/delete outside the isolated directory (e.g. onto authored
  * skills). Checked before composing any child path.
  */
-async function assertManagedRootSafe(): Promise<void> {
-	const rootStat = await fs.lstat(getManagedSkillsDir()).catch(err => {
+async function assertManagedRootSafe(root: string): Promise<void> {
+	const rootStat = await fs.lstat(root).catch(err => {
 		if (isEnoent(err)) return null;
 		throw err;
 	});
@@ -172,8 +216,9 @@ export async function writeManagedSkill(input: WriteManagedSkillInput): Promise<
 		);
 	}
 	return serializeSkillMutation(name, async () => {
-		await assertManagedRootSafe();
-		const dir = path.join(getManagedSkillsDir(), name);
+		const root = input.rootDir ?? getManagedSkillsDir();
+		await assertManagedRootSafe(root);
+		const dir = path.join(root, name);
 		const file = path.join(dir, "SKILL.md");
 		// Reject a symlinked skill directory: an intermediate symlink would let the
 		// write escape the isolated managed root. lstat does not follow the final
@@ -230,11 +275,12 @@ export async function writeManagedSkill(input: WriteManagedSkillInput): Promise<
 }
 
 /** Delete a managed skill directory. Throws when it does not exist. */
-export async function deleteManagedSkill(name: string): Promise<void> {
+export async function deleteManagedSkill(name: string, rootDir?: string): Promise<void> {
 	const safe = sanitizeSkillName(name);
 	await serializeSkillMutation(safe, async () => {
-		await assertManagedRootSafe();
-		const dir = path.join(getManagedSkillsDir(), safe);
+		const root = rootDir ?? getManagedSkillsDir();
+		await assertManagedRootSafe(root);
+		const dir = path.join(root, safe);
 		// Refuse to follow a symlinked skill directory (rm would delete the target).
 		const dirStat = await fs.lstat(dir).catch(err => {
 			if (isEnoent(err)) return null;

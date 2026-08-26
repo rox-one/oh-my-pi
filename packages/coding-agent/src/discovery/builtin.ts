@@ -24,6 +24,7 @@ import { type SystemPrompt, systemPromptCapability } from "../capability/system-
 import { type CustomTool, toolCapability } from "../capability/tool";
 import type { LoadContext, LoadResult } from "../capability/types";
 import { expandTilde } from "../tools/path-utils";
+import { repo } from "../utils/git";
 import {
 	buildRuleFromMarkdown,
 	createSourceMeta,
@@ -190,6 +191,7 @@ async function loadMCPServers(ctx: LoadContext): Promise<LoadResult<MCPServer>> 
 							redirectUri?: string;
 							callbackPort?: number;
 							callbackPath?: string;
+							scopes?: string;
 							prompt?: string;
 					  }
 					| undefined,
@@ -290,6 +292,22 @@ async function loadSkills(ctx: LoadContext): Promise<LoadResult<Skill>> {
 			requireDescription: true,
 		}),
 	);
+
+	// Linked worktrees are not ancestors of the primary checkout, so a project
+	// skill committed at the primary root (e.g. by `autolearn.skillLocation:
+	// "project"`) would be invisible here. Scan it explicitly unless the
+	// ancestor walk already covers it.
+	const primaryRoot = await repo.primaryRoot(ctx.cwd).catch(() => null);
+	if (primaryRoot && !ancestors.some(({ dir }) => path.resolve(dir) === path.resolve(primaryRoot))) {
+		projectScans.push(
+			scanSkillsFromDir(ctx, {
+				dir: path.join(primaryRoot, PATHS.projectDir, "skills"),
+				providerId: PROVIDER_ID,
+				level: "project",
+				requireDescription: true,
+			}),
+		);
+	}
 
 	// User-level scan from ~/.omp/agent/skills/
 	const userScan = scanSkillsFromDir(ctx, {

@@ -41,24 +41,7 @@ export const isKimiK26ModelId = memo((modelId: string): boolean => {
 	return /(^|\/)kimi-k2(?:\.6|p6)(?:[-:]|$)/i.test(modelId);
 });
 
-/**
- * Kimi K3 in any namespace form (`kimi-k3`, `kimi-k3.1`, `kimi-k3-turbo`,
- * `moonshotai/kimi-k3`). K3 always reasons and drives thinking via OpenAI-style
- * `reasoning_effort: "max"`, not the K2.x binary `thinking: { type }` block —
- * see the moonshot discovery mapper and `buildOpenAICompat`.
- */
-export const isKimiK3ModelId = memo((modelId: string): boolean => {
-	return /(^|\/)kimi-k3(?:\.\d+)?(?:[-.:_]|$)/i.test(modelId);
-});
-
-/**
- * Claude ids in any namespace form: bare (`claude-*`), path-namespaced
- * (`anthropic/claude.x`), or dot-prefixed (`us.anthropic.claude-…`,
- * `global.anthropic.claude-…`, `au.anthropic.claude-…` — Bedrock cross-region
- * inference profiles). Necessary because {@link parseAnthropicModel} only
- * classifies kinds enumerated in its regex, so any dotted profile whose kind
- * (e.g. `haiku`) is not enumerated would otherwise slip past this fallback.
- */
+/** Claude ids in plain, slash-namespaced, or dotted provider forms (`claude-*`, `vendor/claude.x`, `anthropic.claude-*`). */
 export const isClaudeModelId = memo((modelId: string): boolean => {
 	return /(^|[/.])claude[-.]/i.test(modelId);
 });
@@ -281,6 +264,25 @@ const O_SERIES_REASONING_RE = /(^|\/)o[134](?:[-.]|$)/i;
 export const isOpenAISamplingRestrictedModelId = memo((modelId: string): boolean => {
 	const bare = bareModelId(modelId);
 	return isOpenAIWireGen5Plus(modelId) || O_SERIES_REASONING_RE.test(bare);
+});
+
+/**
+ * OpenAI Codex models that accept `reasoning.summary` in the request.
+ *
+ * The field is universally honored across gpt-5/o-series Responses ids EXCEPT
+ * `gpt-5.3-codex-spark`, which rejects it with
+ * `Unsupported parameter: 'reasoning.summary' is not supported with the
+ * 'gpt-5.3-codex-spark' model` and aborts the turn (no retry — the fallback
+ * matrix in `openai-reasoning-effort-fallback.test.ts` treats unrelated
+ * `reasoning.summary` errors as terminal). Sibling to
+ * `supportsAllTurnsReasoningContext`. Gated narrowly to the `codex-spark`
+ * variant — non-Spark Codex ids are unaffected; widen if another id is
+ * observed rejecting the field.
+ */
+export const supportsReasoningSummary = memo((modelId: string): boolean => {
+	const parsed = parseOpenAIModel(bareModelId(modelId));
+	if (!parsed) return true;
+	return parsed.variant !== "codex-spark";
 });
 
 /**

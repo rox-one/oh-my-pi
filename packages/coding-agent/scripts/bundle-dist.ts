@@ -31,6 +31,51 @@ const ALWAYS_EXTERNAL = [
 // bundled).
 const RUNTIME_EXTERNAL = ["puppeteer-core", "@babel/parser"];
 
+const nativeAssetRoot = path.join(packageDir, "bin");
+const fastembedOrtNapiVersion = "napi-v3";
+
+export interface FastembedNativeAssetPaths {
+	sourceDir: string;
+	outputDir: string;
+}
+
+async function findPackageRoot(startDir: string): Promise<string> {
+	let dir = startDir;
+	while (true) {
+		try {
+			await fs.stat(path.join(dir, "package.json"));
+			return dir;
+		} catch (err) {
+			if (!isEnoent(err)) throw err;
+		}
+		const parent = path.dirname(dir);
+		if (parent === dir) throw new Error(`Package root not found from ${startDir}`);
+		dir = parent;
+	}
+}
+
+/** Resolve the ONNX native assets fastembed's bundled loader requires after Bun bundling. */
+export async function resolveFastembedNativeAssetPaths(
+	rootDir: string = packageDir,
+): Promise<FastembedNativeAssetPaths> {
+	const fastembedEntry = Bun.resolveSync("fastembed", packageDir);
+	const fastembedRoot = await findPackageRoot(path.dirname(fastembedEntry));
+	const ortEntry = Bun.resolveSync("onnxruntime-node", fastembedRoot);
+	const ortRoot = await findPackageRoot(path.dirname(ortEntry));
+	return {
+		sourceDir: path.join(ortRoot, "bin", fastembedOrtNapiVersion),
+		outputDir: path.join(rootDir, "bin", fastembedOrtNapiVersion),
+	};
+}
+
+/** Copy fastembed's nested ONNX binding tree to the path its bundled require resolves. */
+export async function copyFastembedNativeAssets(rootDir: string = packageDir): Promise<FastembedNativeAssetPaths> {
+	const paths = await resolveFastembedNativeAssetPaths(rootDir);
+	await fs.rm(paths.outputDir, { recursive: true, force: true });
+	await fs.cp(paths.sourceDir, paths.outputDir, { recursive: true });
+	return paths;
+}
+
 async function runCommand(command: string[]): Promise<void> {
 	const proc = Bun.spawn(command, {
 		cwd: packageDir,
@@ -54,14 +99,13 @@ function formatBytes(bytes: number): string {
 }
 
 async function cleanBundleOutputs(): Promise<void> {
-	// dist/ is shared with the dev binary (dist/omp); only remove assets
-	// emitted by this script.
-	let entries: string[];
+	// dist/ is shared with the dev binary (dist/omp); only remove this
+	// script's own outputs (entry bundle + copied native assets).
+	let entries: string[] = [];
 	try {
 		entries = await fs.readdir(outDir);
 	} catch (err) {
-		if (isEnoent(err)) return;
-		throw err;
+		if (!isEnoent(err)) throw err;
 	}
 	await Promise.all(
 		entries
@@ -76,6 +120,7 @@ async function cleanBundleOutputs(): Promise<void> {
 			)
 			.map(entry => fs.rm(path.join(outDir, entry), { force: true })),
 	);
+	await fs.rm(nativeAssetRoot, { recursive: true, force: true });
 }
 
 async function main(): Promise<void> {
@@ -119,6 +164,8 @@ async function main(): Promise<void> {
 	} finally {
 		await runCommand(["bun", "--cwd=../stats", "run", "gen:stats:reset"]);
 	}
+	await copyFastembedNativeAssets();
+	await ensureShebang();
 	const stat = await fs.stat(cliPath);
 	const elapsedMs = (Bun.nanoseconds() - start) / 1_000_000;
 	process.stdout.write(
@@ -126,4 +173,6 @@ async function main(): Promise<void> {
 	);
 }
 
-await main();
+if (import.meta.main) {
+	await main();
+}

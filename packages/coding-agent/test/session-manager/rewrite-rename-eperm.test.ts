@@ -59,16 +59,13 @@ describe("SessionManager rewrite EPERM replacement fallback", () => {
 		const sessionFile = session.getSessionFile();
 		if (!sessionFile) throw new Error("Expected session file");
 
-		// setSessionName now overlays the title slot in place; force a full rewrite
-		// (as compaction/shake do) so the tmp→jsonl replace of the existing file
-		// hits EPERM and exercises the atomic-write fallback.
-		await expect(session.setSessionName("renamed session", "user")).resolves.toBe(true);
+		session.appendMessage({ role: "user", content: "rewrite after EPERM", timestamp: Date.now() });
 		storage.failNextSessionReplace = true;
 		await expect(session.rewriteEntries()).resolves.toBeUndefined();
 
 		const rewritten = await storage.readText(sessionFile);
-		expect(rewritten).toContain('"title":"renamed session"');
-		const backupPath = storage.backupPath;
+		expect(rewritten).toContain("rewrite after EPERM");
+		const backupPath = storage.backupCleanupPath;
 		if (!backupPath) throw new Error("Expected EPERM fallback to create a rollback backup");
 		expect(storage.existsSync(backupPath)).toBe(false);
 
@@ -119,6 +116,7 @@ describe("SessionManager rewrite EPERM rollback failure", () => {
 
 		let thrown: Error | undefined;
 		try {
+			session.appendMessage({ role: "user", content: "doomed", timestamp: Date.now() });
 			await session.rewriteEntries();
 		} catch (err) {
 			thrown = err as Error;

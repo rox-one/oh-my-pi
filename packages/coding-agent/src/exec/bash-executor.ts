@@ -30,7 +30,7 @@ export interface BashExecutorOptions {
 	/** Run supported user shells (zsh/fish) on a headless PTY; requires `useUserShell`. */
 	pty?: BashPtyOptions;
 	/** Artifact path/id for full output storage */
-	artifactPath?: string;
+	artifactPath?: string | (() => string | undefined);
 	artifactId?: string;
 	/**
 	 * Invoked when the native minimizer rewrote the command's output, giving

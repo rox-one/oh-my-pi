@@ -6,7 +6,7 @@
 import type { AgentToolUpdateCallback } from "@oh-my-pi/pi-agent-core";
 import type { ImageContent, TextContent, TSchema } from "@oh-my-pi/pi-ai";
 import { normalizeSchemaForMCP } from "@oh-my-pi/pi-ai/utils/schema";
-import { logger, untilAborted } from "@oh-my-pi/pi-utils";
+import { logger, untilAborted, withTimeout } from "@oh-my-pi/pi-utils";
 import { INTENT_FIELD } from "@oh-my-pi/pi-wire";
 import type { SourceMeta } from "../capability/types";
 import type {
@@ -29,7 +29,9 @@ import type {
 	MCPToolCallParams,
 	MCPToolCallResult,
 	MCPToolDefinition,
+	MCPUrlElicitation,
 } from "./types";
+import { MCPRequestError } from "./types";
 
 /** Reconnect callback: tears down a stale connection, optionally authorizing first. */
 export type MCPReconnect = (options?: { authChallenge?: MCPAuthChallenge }) => Promise<MCPServerConnection | null>;
@@ -179,8 +181,13 @@ export interface MCPToolDetails {
 	mcpToolName: string;
 	/** Whether the call resulted in an error */
 	isError?: boolean;
-	/** Raw content from MCP response */
-	rawContent?: MCPContent[];
+	/**
+	 * Shape of the MCP response content — one entry per block, in order. The
+	 * payload itself is NOT copied here: every byte already lives in
+	 * `result.content`, and duplicating it doubled the bytes persisted per MCP
+	 * call (issue #9646). Renderers read the content; this is for diagnostics.
+	 */
+	contentBlocks?: MCPContentBlockMeta[];
 	/** Structured metadata from the MCP response */
 	mcpMeta?: Record<string, unknown>;
 	/** Provider ID (e.g., "claude", "mcp-json") */
@@ -190,6 +197,42 @@ export interface MCPToolDetails {
 	/** Structured output metadata (set by the spill wrapper when output is truncated to an artifact). */
 	meta?: OutputMeta;
 }
+
+/** Per-block descriptor of an MCP response: kind, size, and any resource identity. */
+export interface MCPContentBlockMeta {
+	type: MCPContent["type"];
+	/** Byte length of the block's payload (text, base64 image data, or resource text/blob). */
+	bytes: number;
+	/** MIME type, for image and resource blocks that declare one. */
+	mimeType?: string;
+	/** Resource URI, for resource blocks. */
+	uri?: string;
+}
+
+/** Describe each response block without copying its payload. */
+export function summarizeMCPContent(content: readonly MCPContent[]): MCPContentBlockMeta[] {
+	const out: MCPContentBlockMeta[] = [];
+	for (const item of content) {
+		if (item.type === "text") {
+			out.push({ type: item.type, bytes: Buffer.byteLength(item.text, "utf8") });
+			continue;
+		}
+		if (item.type === "image") {
+			out.push({ type: item.type, bytes: Buffer.byteLength(item.data, "utf8"), mimeType: item.mimeType });
+			continue;
+		}
+		const payload = item.resource.text ?? item.resource.blob ?? "";
+		const summary: MCPContentBlockMeta = {
+			type: item.type,
+			bytes: Buffer.byteLength(payload, "utf8"),
+			uri: item.resource.uri,
+		};
+		if (item.resource.mimeType) summary.mimeType = item.resource.mimeType;
+		out.push(summary);
+	}
+	return out;
+}
+
 /**
  * Convert MCP content to agent content while retaining image payloads.
  */
@@ -214,13 +257,15 @@ function formatMCPContent(content: MCPContent[]): Array<TextContent | ImageConte
 				flushText();
 				blocks.push(item);
 				break;
-			case "resource":
+			case "resource": {
+				const payload = item.resource.text ?? item.resource.blob;
 				appendText(
-					item.resource.text
-						? `[Resource: ${item.resource.uri}]\n${item.resource.text}`
-						: `[Resource: ${item.resource.uri}]`,
+					payload === undefined
+						? `[Resource: ${item.resource.uri}]`
+						: `[Resource: ${item.resource.uri}]\n${payload}`,
 				);
 				break;
+			}
 		}
 	}
 	flushText();
@@ -240,7 +285,7 @@ function buildResult(
 		serverName,
 		mcpToolName,
 		isError: result.isError,
-		rawContent: result.content,
+		contentBlocks: summarizeMCPContent(result.content),
 		mcpMeta: result._meta,
 		provider,
 		providerName,
@@ -288,6 +333,43 @@ function getMcpAuthChallenge(result: MCPToolCallResult): MCPAuthChallenge | unde
 	const wwwAuthenticate = values.filter((value): value is string => typeof value === "string" && value.trim() !== "");
 	return wwwAuthenticate.length > 0 ? { wwwAuthenticate } : undefined;
 }
+const URL_ELICITATION_REQUIRED_CODE = -32042;
+const URL_ELICITATION_TIMEOUT_ENV = "OMP_MCP_URL_ELICITATION_TIMEOUT_MS";
+const DEFAULT_URL_ELICITATION_WAIT_TIMEOUT_MS = 300_000;
+
+function resolveUrlElicitationWaitTimeoutMs(): number {
+	const configured = Number.parseInt(process.env[URL_ELICITATION_TIMEOUT_ENV] ?? "", 10);
+	return Number.isFinite(configured) && configured > 0 ? configured : DEFAULT_URL_ELICITATION_WAIT_TIMEOUT_MS;
+}
+
+function getUrlElicitations(error: unknown): MCPUrlElicitation[] | undefined {
+	if (!(error instanceof MCPRequestError) || error.code !== URL_ELICITATION_REQUIRED_CODE) return undefined;
+	if (typeof error.data !== "object" || error.data === null || !("elicitations" in error.data)) return undefined;
+	const values = (error.data as { elicitations?: unknown }).elicitations;
+	if (!Array.isArray(values) || values.length === 0) return undefined;
+	const requests: MCPUrlElicitation[] = [];
+	for (const value of values) {
+		if (typeof value !== "object" || value === null) return undefined;
+		const item = value as Record<string, unknown>;
+		if (item.mode !== "url" || typeof item.elicitationId !== "string" || item.elicitationId.length === 0) {
+			return undefined;
+		}
+		if (typeof item.url !== "string" || typeof item.message !== "string") return undefined;
+		try {
+			const parsed = new URL(item.url);
+			if (parsed.protocol !== "https:" || parsed.username !== "" || parsed.password !== "") return undefined;
+		} catch {
+			return undefined;
+		}
+		requests.push({
+			mode: "url",
+			elicitationId: item.elicitationId,
+			url: item.url,
+			message: item.message,
+		});
+	}
+	return requests;
+}
 
 async function callToolWithAuthRetry(
 	connection: MCPServerConnection,
@@ -317,6 +399,72 @@ async function callToolWithAuthRetry(
 	} catch (error) {
 		rethrowIfAborted(error, signal);
 		return { connection: newConnection, error };
+	}
+}
+
+async function callToolWithUrlElicitationRetry(
+	connection: MCPServerConnection,
+	toolName: string,
+	args: MCPToolArgs,
+	reconnect: MCPReconnect | undefined,
+	signal?: AbortSignal,
+): Promise<MCPToolCallAttempt> {
+	try {
+		return await callToolWithAuthRetry(connection, toolName, args, reconnect, signal);
+	} catch (error) {
+		rethrowIfAborted(error, signal);
+		const elicitations = getUrlElicitations(error);
+		const handler = connection.urlElicitationHandler;
+		if (!elicitations || !handler) throw error;
+		const deadline = Date.now() + resolveUrlElicitationWaitTimeoutMs();
+		const waitForCompletion = connection.waitForUrlElicitationCompletion;
+		for (const elicitation of elicitations) {
+			// Register before prompting: a fast server may complete while the
+			// consent UI is still open. The manager also buffers early events.
+			const completionController = waitForCompletion ? new AbortController() : undefined;
+			const completionSignal = completionController
+				? signal
+					? AbortSignal.any([signal, completionController.signal])
+					: completionController.signal
+				: signal;
+			const completionPromise = waitForCompletion
+				? waitForCompletion(elicitation.elicitationId, completionSignal)
+				: undefined;
+			try {
+				const response = await handler(connection.name, elicitation);
+				if (response.action !== "accept") {
+					return {
+						connection,
+						error: new Error(
+							`MCP server "${connection.name}" URL authorization was ${response.action} for tool "${toolName}".`,
+						),
+					};
+				}
+				if (completionPromise) {
+					const remaining = deadline - Date.now();
+					if (remaining > 0) {
+						try {
+							await withTimeout(
+								completionPromise,
+								remaining,
+								"Timed out waiting for MCP URL elicitation completion",
+								signal,
+							);
+						} catch (waitError) {
+							rethrowIfAborted(waitError, signal);
+							// Completion is optional; retry once after the deadline.
+						}
+					}
+				}
+			} finally {
+				completionController?.abort();
+				await completionPromise?.catch(() => {});
+			}
+		}
+
+		// Deliberately call the non-recursive auth wrapper: a second -32042 is
+		// surfaced to the caller instead of opening an unbounded consent loop.
+		return await callToolWithAuthRetry(connection, toolName, args, reconnect, signal);
 	}
 }
 
@@ -537,7 +685,13 @@ export class MCPTool implements CustomTool<TSchema, MCPToolDetails> {
 		const providerName = this.connection._source?.providerName;
 
 		try {
-			const attempt = await callToolWithAuthRetry(this.connection, this.tool.name, args, this.reconnect, signal);
+			const attempt = await callToolWithUrlElicitationRetry(
+				this.connection,
+				this.tool.name,
+				args,
+				this.reconnect,
+				signal,
+			);
 			if (attempt.error !== undefined) {
 				return buildErrorResult(attempt.error, this.connection.name, this.tool.name, provider, providerName);
 			}
@@ -660,7 +814,13 @@ export class DeferredMCPTool implements CustomTool<TSchema, MCPToolDetails> {
 			const connection = await untilAborted(signal, () => this.getConnection());
 			throwIfAborted(signal);
 			try {
-				const attempt = await callToolWithAuthRetry(connection, this.tool.name, args, this.reconnect, signal);
+				const attempt = await callToolWithUrlElicitationRetry(
+					connection,
+					this.tool.name,
+					args,
+					this.reconnect,
+					signal,
+				);
 				if (attempt.error !== undefined) {
 					return buildErrorResult(
 						attempt.error,

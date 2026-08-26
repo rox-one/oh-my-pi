@@ -2,10 +2,11 @@ import { afterEach, describe, expect, it, spyOn, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { AgentBusyError } from "@oh-my-pi/pi-agent-core";
 import type { Model } from "@oh-my-pi/pi-ai";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import type { ExtensionUIContext } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
+import type { GoalModeState } from "@oh-my-pi/pi-coding-agent/goals/state";
 import { resolveLocalUrlToPath } from "@oh-my-pi/pi-coding-agent/internal-urls";
 import {
 	ACP_BOOTSTRAP_RACE_GUARD_MS,
@@ -40,6 +41,7 @@ import type {
 	Validator,
 } from "@oh-my-pi/pi-utils/acp";
 import {
+	RequestError,
 	zForkSessionResponse,
 	zLoadSessionResponse,
 	zNewSessionResponse,
@@ -121,6 +123,7 @@ class FakeAgentSession {
 	sessionManager: SessionManager;
 	sessionId: string;
 	agent: { sessionId: string; waitForIdle: () => Promise<void> };
+	constructedCwd: string;
 	model: Model | undefined;
 	thinkingLevel: string | undefined;
 	customCommands: [] = [];
@@ -131,6 +134,8 @@ class FakeAgentSession {
 	disposed = false;
 	fastMode = false;
 	forcedToolChoice: string | undefined;
+	activeToolNames: string[] = [];
+	enabledToolNames: string[] = [];
 	get settings(): Settings {
 		return Settings.instance;
 	}
@@ -144,6 +149,11 @@ class FakeAgentSession {
 		this.refreshSkillsCalls++;
 	}
 	planModeState: PlanModeState | undefined;
+	goalModeState: GoalModeState | undefined;
+	activeToolNames: string[] = [];
+	setActiveToolsError: Error | undefined;
+	setActiveToolsBlocker: ((toolNames: string[]) => Promise<void>) | undefined;
+	builtInToolNames = new Set<string>();
 	waitForIdleCalls = 0;
 	waitForIdleBlocker: (() => Promise<void>) | undefined;
 	asyncJobDrain: ((options?: { timeoutMs?: number }) => Promise<boolean>) | undefined;
@@ -156,7 +166,13 @@ class FakeAgentSession {
 		cwd: string,
 		private readonly models: Model[] = TEST_MODELS,
 	) {
-		this.sessionManager = SessionManager.create(cwd);
+		this.constructedCwd = cwd;
+		this.sessionManager = SessionManager.create(
+			cwd,
+			undefined,
+			undefined,
+			Settings.instance.get("workspace.identifier"),
+		);
 		this.sessionId = this.sessionManager.getSessionId();
 		this.agent = {
 			sessionId: this.sessionId,
@@ -330,14 +346,25 @@ class FakeAgentSession {
 	}
 
 	getActiveToolNames(): string[] {
-		return [];
+		return [...this.activeToolNames];
+	}
+	getEnabledToolNames(): string[] {
+		return [...this.activeToolNames];
 	}
 
 	getAllToolNames(): string[] {
-		return [];
+		return [...this.activeToolNames];
 	}
 
-	setActiveToolsByName(_toolNames: string[]): void {}
+	hasBuiltInTool(name: string): boolean {
+		return this.builtInToolNames.has(name);
+	}
+
+	async setActiveToolsByName(toolNames: string[]): Promise<void> {
+		await this.setActiveToolsBlocker?.(toolNames);
+		if (this.setActiveToolsError) throw this.setActiveToolsError;
+		this.activeToolNames = [...toolNames];
+	}
 
 	setClientBridge(_bridge: unknown): void {}
 
@@ -347,6 +374,10 @@ class FakeAgentSession {
 
 	setPlanModeState(state: PlanModeState | undefined): void {
 		this.planModeState = state;
+	}
+
+	getGoalModeState(): GoalModeState | undefined {
+		return this.goalModeState;
 	}
 
 	planProposalHandler: ((title: string) => Promise<unknown> | unknown) | undefined;
@@ -550,10 +581,73 @@ async function createHarness(
 	};
 }
 
-/** Fire `#scheduleBootstrapUpdates`'s guard without paying wall-clock time. */
-async function advanceBootstrapGuard(): Promise<void> {
-	vi.advanceTimersByTime(ACP_BOOTSTRAP_RACE_GUARD_MS);
-	await Promise.resolve();
+async function createLinkedWorktree(root: string): Promise<{ repoCwd: string; worktreeCwd: string }> {
+	const repoCwd = path.join(root, "repo");
+	const worktreeCwd = path.join(root, "repo-linked");
+	await runGit(root, ["init", repoCwd]);
+	await runGit(repoCwd, ["config", "user.email", "test@example.com"]);
+	await runGit(repoCwd, ["config", "user.name", "Test User"]);
+	await Bun.write(path.join(repoCwd, "README.md"), "fixture\n");
+	await runGit(repoCwd, ["add", "README.md"]);
+	await runGit(repoCwd, ["-c", "commit.gpgsign=false", "commit", "-m", "initial"]);
+	await runGit(repoCwd, ["remote", "add", "origin", "git@github.com:owner/project.git"]);
+	await runGit(repoCwd, ["worktree", "add", "-b", "linked", worktreeCwd]);
+	return { repoCwd, worktreeCwd };
+}
+
+async function runGit(cwd: string, args: readonly string[]): Promise<string> {
+	const child = Bun.spawn(["git", ...args], {
+		cwd,
+		env: {
+			...process.env,
+			GIT_CONFIG_GLOBAL: "/dev/null",
+			GIT_CONFIG_NOSYSTEM: "1",
+			GIT_CONFIG_SYSTEM: "/dev/null",
+			GIT_OPTIONAL_LOCKS: "0",
+		},
+		stdout: "pipe",
+		stderr: "pipe",
+	});
+	const [stdout, stderr, exitCode] = await Promise.all([
+		new Response(child.stdout as ReadableStream<Uint8Array>).text(),
+		new Response(child.stderr as ReadableStream<Uint8Array>).text(),
+		child.exited,
+	]);
+	if (exitCode !== 0) {
+		throw new Error(`git ${args.join(" ")} failed (${exitCode}): ${stderr || stdout}`);
+	}
+	return stdout;
+}
+
+async function rewriteSessionHeaderCwd(sessionFile: string, cwd: string): Promise<void> {
+	const lines = (await Bun.file(sessionFile).text()).split("\n");
+	const headerIndex = lines.findIndex(line => {
+		if (!line.trim()) {
+			return false;
+		}
+		try {
+			const value: unknown = JSON.parse(line);
+			return typeof value === "object" && value !== null && (value as { type?: unknown }).type === "session";
+		} catch {
+			return false;
+		}
+	});
+	if (headerIndex < 0) {
+		throw new Error(`Session header not found in ${sessionFile}`);
+	}
+	const header = JSON.parse(lines[headerIndex]!) as Record<string, unknown>;
+	header.cwd = cwd;
+	lines[headerIndex] = JSON.stringify(header);
+	await Bun.write(sessionFile, lines.join("\n"));
+}
+
+/**
+ * Wait until `#scheduleBootstrapUpdates`'s timer has fired and the
+ * session-lifetime subscription is installed. 30 ms of slack absorbs
+ * `setTimeout` drift without slowing tests meaningfully.
+ */
+async function waitForBootstrapGuard(): Promise<void> {
+	await Bun.sleep(ACP_BOOTSTRAP_RACE_GUARD_MS + 150);
 }
 
 describe("ACP agent", () => {
@@ -600,6 +694,14 @@ describe("ACP agent", () => {
 		firstSession?.sessionManager.appendMessage({ role: "user", content: "fork me", timestamp: Date.now() });
 		await firstSession?.sessionManager.flush();
 
+		await expect(
+			harness.agent.unstable_forkSession({
+				sessionId: first.sessionId,
+				cwd: harness.cwdB,
+				mcpServers: [],
+			}),
+		).rejects.toThrow(`already loaded for ${harness.cwdA}, not ${harness.cwdB}`);
+
 		const forked = await harness.agent.unstable_forkSession({
 			sessionId: first.sessionId,
 			cwd: harness.cwdA,
@@ -633,9 +735,11 @@ describe("ACP agent", () => {
 		expect(initialModeConfig?.currentValue).toBe("default");
 		expect(initialModeConfig?.options?.map(option => option.value)).toEqual(["default", "plan"]);
 
-		await harness.agent.setSessionMode({ sessionId: created.sessionId, modeId: "plan" });
-
 		const session = harness.findSession(created.sessionId)!;
+		session.activeToolNames = ["read", "goal"];
+		session.builtInToolNames.add("goal");
+		await harness.agent.setSessionMode({ sessionId: created.sessionId, modeId: "plan" });
+		expect(session.activeToolNames).toEqual(["read"]);
 		expect(session.planModeState).toEqual(
 			expect.objectContaining({ enabled: true, planFilePath: "local://PLAN.md", workflow: "parallel" }),
 		);
@@ -672,11 +776,98 @@ describe("ACP agent", () => {
 		await harness.agent.setSessionMode({ sessionId: created.sessionId, modeId: "default" });
 		expect(session.planModeState).toBeUndefined();
 		expect(session.planProposalHandler).toBeUndefined();
+		expect(session.activeToolNames).toEqual(["read", "goal"]);
 
 		harness.abortController.abort();
 		await Bun.sleep(0);
 	});
 
+	it("serializes overlapping plan and default mode transitions", async () => {
+		const harness = await createHarness();
+		Settings.instance.set("plan.enabled", true);
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const session = harness.findSession(created.sessionId)!;
+		session.activeToolNames = ["read", "goal"];
+		session.builtInToolNames.add("goal");
+		const planRebuild = Promise.withResolvers<void>();
+		const planRebuildStarted = Promise.withResolvers<void>();
+		session.setActiveToolsBlocker = async toolNames => {
+			if (toolNames.length === 1 && toolNames[0] === "read") {
+				planRebuildStarted.resolve();
+				await planRebuild.promise;
+			}
+		};
+
+		const enterPlan = harness.agent.setSessionMode({ sessionId: created.sessionId, modeId: "plan" });
+		await planRebuildStarted.promise;
+		const enterDefault = harness.agent.setSessionMode({ sessionId: created.sessionId, modeId: "default" });
+		planRebuild.resolve();
+		await Promise.all([enterPlan, enterDefault]);
+
+		expect(session.planModeState).toBeUndefined();
+		expect(session.planProposalHandler).toBeUndefined();
+		expect(session.activeToolNames).toEqual(["read", "goal"]);
+		harness.abortController.abort();
+		await Bun.sleep(0);
+	});
+
+	it("restores plan approval when default-mode tool restoration fails", async () => {
+		const harness = await createHarness();
+		Settings.instance.set("plan.enabled", true);
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const session = harness.findSession(created.sessionId)!;
+		session.activeToolNames = ["read", "goal"];
+		session.builtInToolNames.add("goal");
+		await harness.agent.setSessionMode({ sessionId: created.sessionId, modeId: "plan" });
+		session.setActiveToolsError = new Error("tool rebuild failed");
+
+		await expect(harness.agent.setSessionMode({ sessionId: created.sessionId, modeId: "default" })).rejects.toThrow(
+			"tool rebuild failed",
+		);
+		expect(session.planModeState?.enabled).toBe(true);
+		expect(typeof session.planProposalHandler).toBe("function");
+		expect(session.activeToolNames).toEqual(["read"]);
+
+		harness.abortController.abort();
+		await Bun.sleep(0);
+	});
+
+	it("rejects plan mode while a goal is active and allows it after completion", async () => {
+		const harness = await createHarness();
+		Settings.instance.set("plan.enabled", true);
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const session = harness.findSession(created.sessionId)!;
+		session.goalModeState = {
+			enabled: true,
+			mode: "active",
+			goal: {
+				id: "goal-1",
+				objective: "finish",
+				status: "active",
+				tokensUsed: 0,
+				timeUsedSeconds: 0,
+				createdAt: Date.now(),
+				updatedAt: Date.now(),
+			},
+		};
+
+		await expect(harness.agent.setSessionMode({ sessionId: created.sessionId, modeId: "plan" })).rejects.toThrow(
+			"Cannot enter plan mode while goal mode is active",
+		);
+		expect(session.planModeState).toBeUndefined();
+		session.goalModeState = {
+			...session.goalModeState!,
+			enabled: false,
+			mode: "exiting",
+			reason: "completed",
+			goal: { ...session.goalModeState!.goal, status: "complete" },
+		};
+		await harness.agent.setSessionMode({ sessionId: created.sessionId, modeId: "plan" });
+		expect(session.planModeState?.enabled).toBe(true);
+
+		harness.abortController.abort();
+		await Bun.sleep(0);
+	});
 	it("plan-proposal handler errors when the plan file is missing", async () => {
 		const harness = await createHarness();
 		Settings.instance.set("plan.enabled", true);
@@ -704,8 +895,9 @@ describe("ACP agent", () => {
 
 		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
 		const session = harness.findSession(created.sessionId)!;
+		session.activeToolNames = ["read", "goal"];
+		session.builtInToolNames.add("goal");
 		await harness.agent.setSessionMode({ sessionId: created.sessionId, modeId: "plan" });
-
 		const localOptions = {
 			getArtifactsDir: () => session.sessionManager.getArtifactsDir(),
 			getSessionId: () => session.sessionManager.getSessionId(),
@@ -730,9 +922,11 @@ describe("ACP agent", () => {
 		expect(result.content[0]?.text).toMatch(/Plan approved/);
 		// Plan file keeps its agent-chosen name — no rename.
 		expect(await Bun.file(planPath).exists()).toBe(true);
-		// Mode + handler are cleared; the agent regains write tools next turn.
+		// Mode + handler are cleared and the original enabled tools are restored.
 		expect(session.planModeState).toBeUndefined();
+		expect(session.activeToolNames).toEqual(["eval"]);
 		expect(session.planProposalHandler).toBeUndefined();
+		expect(session.activeToolNames).toEqual(["read", "goal"]);
 		expect(session.planReferencePath).toBe("local://words-counter-plan.md");
 		const approvalUpdates = harness.updates.slice(updatesBefore);
 		// Mode-change notifications reached the client so Zed's UI and config
@@ -1075,6 +1269,88 @@ describe("ACP agent", () => {
 		await expect(harness.agent.extMethod("omp/sessions/listAll", { limit: 2 })).rejects.toThrow(
 			"Unknown ACP ext method",
 		);
+
+		harness.abortController.abort();
+		await Bun.sleep(0);
+	});
+
+	it("loads a shared git-remote session from its stored linked-worktree cwd", async () => {
+		const harness = await createHarness();
+		Settings.instance.set("workspace.identifier", "git-remote");
+		const { repoCwd, worktreeCwd } = await createLinkedWorktree(path.dirname(harness.cwdA));
+		const stored = new FakeAgentSession(worktreeCwd);
+		harness.sessions.push(stored);
+		stored.sessionManager.appendMessage({ role: "user", content: "from linked worktree", timestamp: Date.now() });
+		await stored.sessionManager.ensureOnDisk();
+		await stored.sessionManager.flush();
+
+		const listed = await harness.agent.listSessions({ cwd: repoCwd });
+		expect(
+			listed.sessions.some(session => session.sessionId === stored.sessionId && session.cwd === worktreeCwd),
+		).toBe(true);
+
+		const loaded = await harness.agent.loadSession({
+			sessionId: stored.sessionId,
+			cwd: repoCwd,
+			mcpServers: [],
+		});
+		expectAcpStructure(zLoadSessionResponse, loaded);
+		const loadedSession = harness.sessions.findLast(session => session.sessionId === stored.sessionId);
+		expect(loadedSession).not.toBe(stored);
+		expect(loadedSession?.constructedCwd).toBe(worktreeCwd);
+		expect(loadedSession?.sessionManager.getCwd()).toBe(worktreeCwd);
+
+		await expect(
+			harness.agent.resumeSession({
+				sessionId: stored.sessionId,
+				cwd: repoCwd,
+				mcpServers: [],
+			}),
+		).resolves.toBeDefined();
+		await expect(
+			harness.agent.loadSession({
+				sessionId: stored.sessionId,
+				cwd: repoCwd,
+				mcpServers: [],
+			}),
+		).resolves.toBeDefined();
+
+		harness.abortController.abort();
+		await Bun.sleep(0);
+	});
+
+	it("rescopes a listed session whose stored cwd no longer exists to the request cwd", async () => {
+		const harness = await createHarness();
+		const removedCwd = path.join(path.dirname(harness.cwdA), "removed-cwd");
+		await fs.promises.mkdir(removedCwd, { recursive: true });
+		const stored = new FakeAgentSession(harness.cwdA);
+		harness.sessions.push(stored);
+		stored.sessionManager.appendMessage({ role: "user", content: "from removed cwd", timestamp: Date.now() });
+		await stored.sessionManager.ensureOnDisk();
+		await stored.sessionManager.flush();
+		const sessionFile = stored.sessionManager.getSessionFile();
+		if (!sessionFile) {
+			throw new Error("expected stored session file");
+		}
+		await rewriteSessionHeaderCwd(sessionFile, removedCwd);
+		await fs.promises.rm(removedCwd, { recursive: true, force: true });
+
+		const listedBefore = await harness.agent.listSessions({ cwd: harness.cwdA });
+		expect(listedBefore.sessions.find(session => session.sessionId === stored.sessionId)?.cwd).toBe(removedCwd);
+
+		const loaded = await harness.agent.loadSession({
+			sessionId: stored.sessionId,
+			cwd: harness.cwdA,
+			mcpServers: [],
+		});
+		expectAcpStructure(zLoadSessionResponse, loaded);
+		const loadedSession = harness.sessions.findLast(session => session.sessionId === stored.sessionId);
+		expect(loadedSession).not.toBe(stored);
+		expect(loadedSession?.constructedCwd).toBe(harness.cwdA);
+		expect(loadedSession?.sessionManager.getCwd()).toBe(harness.cwdA);
+
+		const listedAfter = await harness.agent.listSessions({ cwd: harness.cwdA });
+		expect(listedAfter.sessions.find(session => session.sessionId === stored.sessionId)?.cwd).toBe(harness.cwdA);
 
 		harness.abortController.abort();
 		await Bun.sleep(0);
@@ -2461,6 +2737,33 @@ describe("ACP agent", () => {
 		await Bun.sleep(0);
 	});
 
+	it("maps agent-busy rejections to a typed session_busy error instead of internalError", async () => {
+		const harness = await createHarness();
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const session = harness.findSession(created.sessionId)!;
+		// Autonomous turns stream without an owning ACP promptTurn, so prompt()'s
+		// implicit-cancel guard never fires. Mirror AgentSession's contract: a
+		// bare prompt while streaming throws AgentBusyError.
+		session.isStreaming = true;
+		session.prompt = async (): Promise<boolean> => {
+			if (session.isStreaming) throw new AgentBusyError();
+			return true;
+		};
+
+		const error = await harness.agent
+			.prompt({
+				sessionId: created.sessionId,
+				prompt: [{ type: "text", text: "ping during autonomous turn" }],
+			} as PromptRequest)
+			.catch((reason: unknown) => reason);
+
+		expect(error).toBeInstanceOf(RequestError);
+		const requestError = error as RequestError;
+		expect(requestError.code).toBe(-32003);
+		expect(requestError.message).toContain("already processing");
+		expect(requestError.data).toEqual({ reason: "session_busy", hint: "steer|followUp|wait" });
+	});
+
 	it("keeps closeSession gated while cancel cleanup is pending", async () => {
 		const harness = await createHarness();
 		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
@@ -2949,6 +3252,38 @@ describe("ACP agent", () => {
 			expect(request.requestedSchema).toEqual({
 				type: "object",
 				properties: { value: { type: "string", enum: ["first", "second", "third"] } },
+				required: ["value"],
+			});
+		});
+
+		it("degrades rich select options to label-only enum entries and returns the label", async () => {
+			// The approval gate's session options are `{label, labelHighlight}`
+			// items matched by exact label on return; the elicitation enum must
+			// carry exactly those labels — the TUI-only highlight stays in the
+			// host process — so the client's answer round-trips.
+			const { connection, calls } = createElicitConnection(async () => ({
+				action: "accept",
+				content: { value: "Approve bash Commands for Session" },
+			}));
+			const ctx = createAcpExtensionUiContext(connection, () => "session-select-rich", FORM_CAPABILITIES);
+
+			const result = await ctx.select("Approve?", [
+				"Approve",
+				{
+					label: "Approve bash Commands for Session",
+					labelHighlight: "bash",
+				},
+				"Deny",
+			]);
+
+			expect(result).toBe("Approve bash Commands for Session");
+			const request = calls[0]!;
+			if (!isFormElicitation(request)) throw new Error("expected form elicitation");
+			expect(request.requestedSchema).toEqual({
+				type: "object",
+				properties: {
+					value: { type: "string", enum: ["Approve", "Approve bash Commands for Session", "Deny"] },
+				},
 				required: ["value"],
 			});
 		});

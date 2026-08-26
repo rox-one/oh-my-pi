@@ -91,6 +91,7 @@ import {
 	isOpenAIResponsesProgressEvent,
 	isOpenRouterAnthropicModel,
 	isStrictToolsDisabledForScope,
+	markLatestStableResponsesCacheBreakpoint as markLatestStableResponsesCacheBreakpointShared,
 	type OpenAIPromptCacheOptions,
 	type OpenAIStrictToolsScope,
 	type OpenAIStrictToolsState,
@@ -1066,46 +1067,10 @@ function markLatestStableResponsesCacheBreakpoint(
 	if (statefulBaseline) {
 		if (restoreResponsesCacheBreakpointsFromBaseline(input, statefulBaseline)) return true;
 		// A prior marker whose content no longer matches means chaining will
-		// reset to a full replay. Recompute a fresh boundary for that replay.
-		// Markerless baselines stay markerless so appends do not mutate them.
+		// reset to a full replay. Markerless baselines stay markerless.
 		if (!hasResponsesCacheBreakpoint(statefulBaseline)) return false;
 	}
-
-	let latestInputMessage = -1;
-	for (let i = input.length - 1; i >= 0; i--) {
-		const message = input[i];
-		if (!("role" in message)) continue;
-		if (message.role === "user" || message.role === "developer") {
-			latestInputMessage = i;
-			break;
-		}
-	}
-	if (latestInputMessage <= 0) return false;
-
-	for (let i = latestInputMessage - 1; i >= 0; i--) {
-		const message = input[i];
-		if (isStableStringResponsesInstruction(message)) {
-			const text = message.content;
-			Object.assign(message, {
-				content: [
-					{
-						type: "input_text",
-						text,
-						prompt_cache_breakpoint: { mode: "explicit" },
-					},
-				],
-			});
-			return true;
-		}
-		if (!isResponsesPromptCacheableMessage(message)) continue;
-		for (let j = message.content.length - 1; j >= 0; j--) {
-			const block = message.content[j];
-			if (!isResponsesPromptCacheableContentBlock(block)) continue;
-			Object.assign(block, { prompt_cache_breakpoint: { mode: "explicit" } });
-			return true;
-		}
-	}
-	return false;
+	return markLatestStableResponsesCacheBreakpointShared(input);
 }
 
 function applyOpenAIResponsesPromptCachePolicy(
@@ -1421,17 +1386,18 @@ export function convertTools(
 		}
 		const strict = !NO_STRICT && strictMode && tool.strict !== false;
 		const baseParameters = toolWireSchema(tool);
-		// MFJS must run AFTER the Responses sanitizer: the sanitizer normalizes
-		// `{}` → `true` (issue #1179), and Moonshot's validator rejects boolean
-		// subschemas ("property schema … must be an object"), so the Moonshot
-		// pass re-coerces them last.
-		const sanitized = sanitizeSchemaForOpenAIResponses(baseParameters);
-		const providerParameters = rejectXaiRootObjectUnion ? flattenExclusiveRequiredRootUnion(sanitized) : sanitized;
-		const responseParameters =
+		const responseParameters = sanitizeSchemaForOpenAIResponses(baseParameters);
+		const adapted = adaptSchemaForStrict(responseParameters, strict);
+		const effectiveStrict = adapted.strict;
+		// Moonshot's MFJS validator (native and via OpenRouter) rejects boolean
+		// subschemas and other standard-JSON-Schema constructs the wire pipeline
+		// emits (e.g. `outputSchema: true` from empty-schema widening). Normalize
+		// to MFJS on this transport too — the chat-completions path already does
+		// (#5918).
+		const parameters =
 			model.compat.toolSchemaFlavor === "moonshot-mfjs"
-				? (normalizeSchemaForMoonshot(providerParameters) as Record<string, unknown>)
-				: providerParameters;
-		const { schema: parameters, strict: effectiveStrict } = adaptSchemaForStrict(responseParameters, strict);
+				? (normalizeSchemaForMoonshot(adapted.schema) as Record<string, unknown>)
+				: adapted.schema;
 		// Quarantine a tool whose emitted schema carries a provider-rejecting
 		// enum/const-vs-type contradiction: dropping just that tool keeps the rest
 		// of the request valid instead of letting one bad MCP schema 400 the whole

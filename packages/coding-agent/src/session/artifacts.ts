@@ -37,7 +37,7 @@ function sanitizeToolType(toolType: string): string {
  */
 export class ArtifactManager {
 	#nextId = 0;
-	readonly #dir: string;
+	#dir: string;
 	#dirCreated = false;
 	#initPromise: Promise<void> | null = null;
 
@@ -54,6 +54,13 @@ export class ArtifactManager {
 	 */
 	get dir(): string {
 		return this.#dir;
+	}
+
+	rebaseDirectory(oldRoot: string, newRoot: string): void {
+		const resolvedRoot = path.resolve(oldRoot);
+		const relative = path.relative(resolvedRoot, path.resolve(this.#dir));
+		if (relative.startsWith("..") || path.isAbsolute(relative)) return;
+		this.#dir = path.join(path.resolve(newRoot), relative);
 	}
 
 	async #ensureDir(): Promise<void> {

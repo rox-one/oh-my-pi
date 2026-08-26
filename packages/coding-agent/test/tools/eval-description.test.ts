@@ -5,15 +5,22 @@ import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { EvalTool, getEvalToolDescription } from "@oh-my-pi/pi-coding-agent/tools/eval";
 
-function makeSession(opts: { spawns?: string | null; backends?: Record<string, boolean> }): ToolSession {
+function makeSession(opts: {
+	spawns?: string | null;
+	backends?: Record<string, boolean>;
+	maxRecursionDepth?: number;
+	taskDepth?: number;
+}): ToolSession {
 	const settings = Settings.isolated();
 	for (const [key, value] of Object.entries(opts.backends ?? {})) settings.set(key as never, value);
+	settings.set("task.maxRecursionDepth", opts.maxRecursionDepth ?? 2);
 	return {
 		cwd: "/tmp/eval-test",
 		hasUI: false,
 		getSessionFile: () => null,
 		getSessionSpawns: () => opts.spawns ?? "*",
 		settings,
+		taskDepth: opts.taskDepth,
 	} as unknown as ToolSession;
 }
 
@@ -61,6 +68,13 @@ describe("eval tool description", () => {
 		const denied = new EvalTool(makeSession({ spawns: "" })).description;
 		expect(wildcard).toContain("agent(prompt");
 		expect(denied).not.toContain("agent(prompt");
+	});
+
+	it("omits agent() when recursion depth is exhausted", () => {
+		const disabled = new EvalTool(makeSession({ spawns: "*", maxRecursionDepth: 0 })).description;
+		const nested = new EvalTool(makeSession({ spawns: "*", maxRecursionDepth: 1, taskDepth: 1 })).description;
+		expect(disabled).not.toContain("agent(prompt");
+		expect(nested).not.toContain("agent(prompt");
 	});
 });
 

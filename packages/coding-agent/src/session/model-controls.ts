@@ -138,12 +138,7 @@ export class ModelControls {
 		return this.#scopedModels;
 	}
 
-	/**
-	 * Replace the Ctrl+P cycle scope. Startup resolves the scope before background
-	 * provider discovery runs; the CLI re-pushes the fuller list here once discovery
-	 * completes so a newly-discovered `enabledModels` model joins the cycle and the
-	 * scoped `/models` picker (issue #9220).
-	 */
+	/** Replace the session's cycle scope after late model discovery. */
 	setScopedModels(scopedModels: Array<{ model: Model; thinkingLevel?: ThinkingLevel }>): void {
 		this.#scopedModels = scopedModels;
 	}
@@ -264,7 +259,7 @@ export class ModelControls {
 	async setModelTemporary(
 		model: Model,
 		thinkingLevel?: ConfiguredThinkingLevel,
-		options?: { ephemeral?: boolean },
+		options?: { ephemeral?: boolean; role?: string },
 	): Promise<void> {
 		const previousEditMode = this.#host.resolveActiveEditMode();
 		if (!this.#host.modelRegistry.hasConfiguredAuth(model)) {
@@ -278,7 +273,7 @@ export class ModelControls {
 		await this.#host.setModelWithProviderSessionReset(targetModel);
 		this.#host.sessionManager.appendModelChange(
 			`${targetModel.provider}/${targetModel.id}`,
-			options?.ephemeral ? EPHEMERAL_MODEL_CHANGE_ROLE : "temporary",
+			options?.role ?? (options?.ephemeral ? EPHEMERAL_MODEL_CHANGE_ROLE : "temporary"),
 		);
 		this.#host.settings.getStorage()?.recordModelUsage(`${targetModel.provider}/${targetModel.id}`);
 

@@ -689,6 +689,78 @@ describe("AgentSession retry delay cap", () => {
 		});
 	});
 
+	it("falls back immediately after the last Codex account denies the request by policy", async () => {
+		const primaryModel = getBundledModel("openai-codex", "gpt-5.6-sol");
+		const fallbackModel = getBundledModel("openai", "gpt-5.5");
+		if (!primaryModel || !fallbackModel) {
+			throw new Error("Expected bundled primary and fallback test models to exist");
+		}
+		const providerSessionId = "cyber-policy-fallback-after-rotation";
+
+		registerMockApi(RETRY_CAP_MOCK_API_SOURCE);
+		authStorage.setRuntimeApiKey("openai", "openai-fallback-key");
+		await authStorage.set("openai-codex", [{ type: "api_key", key: "codex-only-key" }]);
+
+		const requestedModels: string[] = [];
+		const primaryMock = createMockModel({
+			id: primaryModel.id,
+			provider: primaryModel.provider,
+			responses: [CYBER_POLICY_FAILURE],
+		});
+		const fallbackMock = createMockModel({
+			id: fallbackModel.id,
+			provider: fallbackModel.provider,
+			responses: [{ content: ["Recovered on policy-compatible fallback"], stopReason: "stop" }],
+		});
+		const agent = new Agent({
+			getApiKey: model => modelRegistry.resolver(model, providerSessionId),
+			sessionId: providerSessionId,
+			initialState: {
+				model: primaryModel,
+				systemPrompt: ["Test"],
+				tools: [],
+				messages: [],
+			},
+			streamFn: (requestedModel, context, options) => {
+				requestedModels.push(`${requestedModel.provider}/${requestedModel.id}`);
+				return requestedModel.provider === primaryModel.provider
+					? aiStream.streamSimple(primaryMock.model, context, options)
+					: aiStream.streamSimple(fallbackMock.model, context, options);
+			},
+		});
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"retry.maxRetries": 3,
+			"retry.modelFallback": true,
+			"retry.retryCurrentModelBeforeFallback": true,
+			"retry.retriesBeforeModelFallback": 3,
+			"retry.fallbackChains": {
+				default: [`${fallbackModel.provider}/${fallbackModel.id}`],
+			},
+		});
+		settings.setModelRole("default", `${primaryModel.provider}/${primaryModel.id}`);
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings,
+			modelRegistry,
+			providerSessionId,
+		});
+
+		await session.prompt("Continue authorized security work");
+		await session.waitForIdle();
+
+		expect(requestedModels).toEqual([
+			`${primaryModel.provider}/${primaryModel.id}`,
+			`${fallbackModel.provider}/${fallbackModel.id}`,
+		]);
+		expect(session.model?.id).toBe(fallbackModel.id);
+		expect(lastAssistant(session).content).toContainEqual({
+			type: "text",
+			text: "Recovered on policy-compatible fallback",
+		});
+	});
+
 	it("tries sibling Codex accounts before advisor model fallback on cyber-policy denials", async () => {
 		const mainModel = getBundledModel("anthropic", "claude-sonnet-4-5");
 		const advisorModel = getBundledModel("openai-codex", "gpt-5.6-sol");
@@ -2169,6 +2241,8 @@ describe("AgentSession retry delay cap", () => {
 			"retry.baseDelayMs": 5,
 			"retry.maxRetries": 10,
 			"retry.modelFallback": false,
+			"retry.retryCurrentModelBeforeFallback": true,
+			"retry.retriesBeforeModelFallback": 3,
 		});
 		settings.setModelRole("default", `${options.model.provider}/${options.model.id}`);
 		session = new AgentSession({

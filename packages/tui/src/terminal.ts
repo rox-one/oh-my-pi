@@ -13,19 +13,25 @@ import {
 import { setKittyProtocolActive } from "./keys";
 import { StdinBuffer } from "./stdin-buffer";
 import {
-	isInsideTerminalMultiplexer,
+	detectTerminalId,
+	isInsideTmux,
 	NotifyProtocol,
 	setCellDimensions,
 	setOsc99Supported,
 	TERMINAL,
 } from "./terminal-capabilities";
-import { isInsideTmux, wrapTmuxPassthrough } from "./tmux";
-import { setHangulCompatibilityJamoWidth } from "./utils";
+import {
+	type HangulCompatibilityJamoWidth,
+	setHangulCompatibilityJamoWidth,
+	setWarpNarrowStatusGlyphsActive,
+} from "./utils";
 
 const TERMINAL_PROGRESS_KEEPALIVE_MS = 1000;
 const TERMINAL_PROGRESS_ACTIVE_SEQUENCE = "\x1b]9;4;3\x07";
 const TERMINAL_PROGRESS_CLEAR_SEQUENCE = "\x1b]9;4;0;\x07";
 const WINDOWS_TERMINAL_OSC11_POLL_MS = 30_000;
+// Settle delay before reading tmux's OSC 11 cache after refreshing it (#7800).
+const TMUX_APPEARANCE_REFRESH_DELAY_MS = 100;
 function shouldEnableModifyOtherKeysFallback(env: NodeJS.ProcessEnv = Bun.env): boolean {
 	if (!env.SSH_CONNECTION && !env.SSH_TTY && !env.SSH_CLIENT) return true;
 	return TERMINAL.id !== "base" && TERMINAL.id !== "trueColor";
@@ -36,6 +42,16 @@ function shouldPollWindowsTerminalAppearance(env: NodeJS.ProcessEnv = Bun.env): 
 	if (!env.WT_SESSION) return false;
 	return !env.TERM_PROGRAM || env.TERM_PROGRAM.toLowerCase() === "windows_terminal";
 }
+/**
+ * Warp renders a handful of status-line glyphs at 1 cell that `Bun.stringWidth`
+ * (and UAX#11) report wider, so the editor's top-border math underfills by the
+ * delta and the renderer truncates the over-Bun-wide line — dropping the right
+ * corner. See {@link setWarpNarrowStatusGlyphsActive} and issue #3885.
+ */
+export function resolveWarpNarrowStatusGlyphsActiveFromTerminalIdentity(env: NodeJS.ProcessEnv = Bun.env): boolean {
+	return detectTerminalId(env) === "warp";
+}
+
 /**
  * Maximum encoded UTF-8 bytes per `process.stdout.write` call on Windows.
  *
@@ -510,11 +526,10 @@ export interface Terminal {
 	/**
 	 * Start a bounded OSC 11 background-color refresh cycle, driving appearance
 	 * callbacks through the same parse/dedup pipeline used at startup and on Mode
-	 * 2031 notifications. Direct terminals need one query; tmux needs a
-	 * passthrough query to update its cache followed by one delayed direct cache
-	 * read. Invoked on the user's explicit display-reset gesture so terminals
-	 * without end-to-end Mode 2031 notifications pick up a light/dark switch
-	 * without a restart. No periodic probes are armed.
+	 * 2031 notifications. Bounded to one refresh per call. Invoked on the
+	 * user's explicit display-reset gesture so terminals that cannot
+	 * deliver end-to-end Mode 2031 notifications still pick up a light/dark switch
+	 * without a restart.
 	 *
 	 * A caller-provided token must be propagated unchanged to callbacks and
 	 * returned when the request is accepted. This lets callers establish ownership
@@ -579,6 +594,44 @@ function isPrivateModeSet(status: string): boolean {
 
 function isPrivateModeSupported(status: string): boolean {
 	return status !== "0" && status !== "4";
+}
+
+/**
+ * Whether the host terminal resets the visible viewport to the top of
+ * scrollback when it receives ED3 (`\x1b[3J`).
+ *
+ * WezTerm, kitty, ghostty, and alacritty honor ECMA-48 ED3 by repositioning
+ * the viewport to the top of the (now-erased) scrollback. They also pin only
+ * on user input (no `scroll_to_bottom_on_output`), so a destructive native
+ * scrollback rebuild during streaming yanks a scrolled-up reader to the top.
+ * Caller uses this to gate the renderer's eager scrollback rebuild: when this
+ * returns true, the eager opt-in no longer overrides the unknown-viewport
+ * deferral and the destructive rebuild is held until the next checkpoint,
+ * where the user's keystroke has already pinned the terminal back to the
+ * bottom. Autocomplete/IME paths that pass `allowUnknownViewportMutation`
+ * explicitly are unaffected — the user is actively typing.
+ *
+ * Pure helper for unit testing; the runtime call site reads `$env` /
+ * `process.platform`. See #1682.
+ */
+export function terminalResetsViewportOnEraseScrollback(
+	env: {
+		WEZTERM_PANE?: string | undefined;
+		KITTY_WINDOW_ID?: string | undefined;
+		GHOSTTY_RESOURCES_DIR?: string | undefined;
+		ALACRITTY_WINDOW_ID?: string | undefined;
+		TERM_PROGRAM?: string | undefined;
+	} = $env,
+	platform: NodeJS.Platform = process.platform,
+): boolean {
+	if (platform === "win32") return false;
+	if (env.WEZTERM_PANE || env.KITTY_WINDOW_ID || env.GHOSTTY_RESOURCES_DIR || env.ALACRITTY_WINDOW_ID) {
+		return true;
+	}
+	const termProgram = env.TERM_PROGRAM?.toLowerCase();
+	return (
+		termProgram === "wezterm" || termProgram === "kitty" || termProgram === "ghostty" || termProgram === "alacritty"
+	);
 }
 
 /**
@@ -672,6 +725,7 @@ export class ProcessTerminal implements Terminal {
 	#reportedRows?: number;
 	#mode2031DebounceTimer?: Timer;
 	#windowsTerminalAppearancePollTimer?: Timer;
+	#tmuxAppearanceRefreshTimer?: Timer;
 	#progressTimer?: Timer;
 
 	get kittyProtocolActive(): boolean {
@@ -731,14 +785,14 @@ export class ProcessTerminal implements Terminal {
 	}
 
 	/**
-	 * Re-query the terminal background through the startup DA1-sentinel FIFO,
-	 * pending/queued gating, parsing, dedup, and appearance callbacks. Inside
-	 * tmux, only this explicit path first passes an OSC 11 query to the outer
-	 * terminal, waits briefly for tmux to consume the response into its cache,
-	 * then reads that cache with a direct query. The outer query deliberately has
-	 * no DA1 sentinel: multiplexers can decode a fragmented DA1 response as a key
-	 * sequence and leak the remaining bytes into the editor. Startup and Mode 2031
-	 * probes remain direct. Suppressed while inactive, headless, or after teardown.
+	 * Re-query the terminal background via an OSC 11 probe. Reuses the startup
+	 * DA1-sentinel FIFO, pending/queued gating, parsing, dedup, and appearance
+	 * callbacks. Inside tmux this explicit path is two-staged (#7800): stage one
+	 * refreshes tmux's own OSC 11 cache by passing the query — but not a DA1
+	 * sentinel — through the passthrough envelope; stage two reads that refreshed
+	 * cache with a direct pane-local probe after a bounded settle delay. Startup
+	 * and Mode 2031 probes remain direct. Suppressed while inactive, headless, or
+	 * after the terminal is torn down.
 	 */
 	refreshAppearance(requestToken?: TerminalAppearanceRequestToken): TerminalAppearanceRequestToken | void {
 		if (!this.#active || this.#headless || this.#dead) return;
@@ -875,9 +929,9 @@ export class ProcessTerminal implements Terminal {
 		// The query handler intercepts input temporarily, then installs the user's handler
 		// See: https://sw.kovidgoyal.net/kitty/keyboard-protocol/
 		this.#queryAndEnableKittyProtocol();
-		// Explicit probes are safe only after their response parser and stdin
-		// data handler are installed. Keep this false throughout temporary stops.
-		this.#active = true;
+		setHangulCompatibilityJamoWidth(resolveHangulCompatibilityJamoWidthFromTerminalIdentity());
+		setWarpNarrowStatusGlyphsActive(resolveWarpNarrowStatusGlyphsActiveFromTerminalIdentity());
+
 		// Query terminal background color via OSC 11 for dark/light detection.
 		// Uses DA1 (Primary Device Attributes) as a sentinel: terminals process
 		// sequences in order, so if DA1 arrives before OSC 11 response,
@@ -1324,22 +1378,27 @@ export class ProcessTerminal implements Terminal {
 	}
 
 	#startOsc11Query(route: Osc11QueryRoute, token?: TerminalAppearanceRequestToken): void {
+		if (route === "tmux") {
+			// Two-stage tmux refresh (#7800). tmux swallows the outer terminal's
+			// OSC 11 reply to update its own background cache, so stage one sends
+			// only the OSC 11 query through the passthrough envelope. The DA1
+			// sentinel is deliberately NOT wrapped: its reply would have to
+			// round-trip through tmux's input parser, where a fragmented
+			// client->tmux DA1 under a low escape-time is misdecoded as a key
+			// press (e.g. ESC[27;3;91~) and the capability bytes leak into the
+			// editor. Stage two reads tmux's now-refreshed cache with a direct
+			// pane-local probe whose DA1 sentinel tmux answers itself.
+			this.#safeWrite(wrapTmuxPassthrough("\x1b]11;?\x07"));
+			clearTimeout(this.#tmuxAppearanceRefreshTimer);
+			this.#tmuxAppearanceRefreshTimer = setTimeout(() => {
+				this.#tmuxAppearanceRefreshTimer = undefined;
+				this.#queryBackgroundColor("direct", token);
+			}, TMUX_APPEARANCE_REFRESH_DELAY_MS);
+			return;
+		}
 		this.#osc11Pending = true;
 		this.#osc11ActiveToken = token;
 		this.#osc11ResponseBuffer = "";
-		if (route === "tmux") {
-			this.#safeWrite(wrapTmuxPassthrough("\x1b]11;?\x07"));
-			this.#osc11TmuxRefreshTimer = setTimeout(() => {
-				this.#osc11TmuxRefreshTimer = undefined;
-				if (this.#dead || !this.#osc11Pending) return;
-				this.#startDirectOsc11Query();
-			}, TMUX_OSC11_CACHE_REFRESH_DELAY_MS);
-			return;
-		}
-		this.#startDirectOsc11Query();
-	}
-
-	#startDirectOsc11Query(): void {
 		this.#da1SentinelOwners.push({ kind: "osc11" });
 		this.#safeWrite("\x1b]11;?\x07"); // OSC 11 query (BEL terminated)
 		this.#safeWrite("\x1b[c"); // DA1 sentinel
@@ -1678,9 +1737,9 @@ export class ProcessTerminal implements Terminal {
 			clearTimeout(this.#mode2031DebounceTimer);
 			this.#mode2031DebounceTimer = undefined;
 		}
-		if (this.#osc11TmuxRefreshTimer) {
-			clearTimeout(this.#osc11TmuxRefreshTimer);
-			this.#osc11TmuxRefreshTimer = undefined;
+		if (this.#tmuxAppearanceRefreshTimer) {
+			clearTimeout(this.#tmuxAppearanceRefreshTimer);
+			this.#tmuxAppearanceRefreshTimer = undefined;
 		}
 		this.#appearanceCallbacks = [];
 		this.#appearanceReportCallbacks = [];

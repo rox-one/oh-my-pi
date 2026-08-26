@@ -6,26 +6,16 @@ import { imageReferenceHyperlink } from "../image-references";
 import { highlightMagicKeywords } from "../magic-keywords";
 
 // OSC 133 shell integration: marks prompt zones for terminal multiplexers.
-//
-// The zone must be *closed* within the same render. `133;B` sets a sticky
-// cursor semantic of `.input` in Ghostty (and Ghostty-derived terminals such
-// as cmux) that only a command-start marker clears; leaving it latched makes
-// `cursorIsAtPrompt()` permanently true and tags every subsequently painted
-// cell as `.input`. Combined with `cursor-click-to-move = true` (Ghostty's
-// default) that turns every left-click inside the pane into a burst of
-// synthesized arrow keys on omp's pty, slamming the editor caret to column 0
-// (#8030, #6115).
-//
-// `133;C` is therefore emitted immediately followed by `133;D;0` at the end of
-// the bubble. That clears the input state without reintroducing the grouping
-// problem the marker was originally omitted to avoid: the command zone opens
-// and finishes inside this component, so later assistant/tool output can never
-// be grouped under the first submitted prompt.
+// Per the FinalTerm/OSC 133 spec the markers are A=prompt-start,
+// B=command-input-start, C=command-output-start, D=command-finished. We wrap
+// each user bubble in A…B and MUST close it with C: C is the "output starts
+// here" marker terminals group the following assistant/tool output under, and
+// — critically — it clears the sticky `.input` cursor semantic that B sets in
+// Ghostty-family terminals. Omitting C leaves the cursor permanently "inside
+// prompt input", so Ghostty's default cursor-click-to-move injects arrow-key
+// bursts into the pty on every left-click (#8030).
 const OSC133_ZONE_START = "\x1b]133;A\x07";
-const OSC133_ZONE_END = "\x1b]133;B\x07";
-const OSC133_COMMAND_START = "\x1b]133;C\x07";
-const OSC133_COMMAND_DONE = "\x1b]133;D;0\x07";
-const OSC133_ZONE_CLOSE = OSC133_ZONE_END + OSC133_COMMAND_START + OSC133_COMMAND_DONE;
+const OSC133_ZONE_END = "\x1b]133;B\x07\x1b]133;C\x07";
 
 /**
  * Component that renders a user message

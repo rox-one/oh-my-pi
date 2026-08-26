@@ -205,6 +205,19 @@ export const TINY_MEMORY_MODEL_OPTIONS = [
 	})),
 ] satisfies ReadonlyArray<{ value: TinyMemoryModelKey; label: string; description: string }>;
 
+export const HEURISTIC_UNEXPECTED_STOP_MODEL_KEY = "heuristic";
+export const UNEXPECTED_STOP_MODEL_VALUES = [HEURISTIC_UNEXPECTED_STOP_MODEL_KEY, ...TINY_MEMORY_MODEL_VALUES] as const;
+export type UnexpectedStopModelKey = (typeof UNEXPECTED_STOP_MODEL_VALUES)[number];
+
+export const UNEXPECTED_STOP_MODEL_OPTIONS = [
+	{
+		value: HEURISTIC_UNEXPECTED_STOP_MODEL_KEY,
+		label: "Local heuristic",
+		description: "Use deterministic local rules only. No remote model request and no local model download.",
+	},
+	...TINY_MEMORY_MODEL_OPTIONS,
+] satisfies ReadonlyArray<{ value: UnexpectedStopModelKey; label: string; description: string }>;
+
 export function isTinyMemoryLocalModelKey(value: string): value is TinyMemoryLocalModelKey {
 	return TINY_MEMORY_LOCAL_MODELS.some(model => model.key === value);
 }

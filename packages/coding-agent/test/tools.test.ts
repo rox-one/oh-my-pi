@@ -2170,6 +2170,41 @@ function b() {
 			expect(getTextOutput(result)).toContain("Command exited with code 1");
 		});
 
+		it("should not link short async bash output before an artifact exists", async () => {
+			const artifactPath = path.join(testDir, "async-bash-output.log");
+			const asyncJobManager = new AsyncJobManager({
+				onJobComplete: async () => {},
+			});
+			const asyncBashTool = wrapToolWithMetaNotice(
+				new BashTool(
+					createTestToolSession(
+						testDir,
+						Settings.isolated({
+							"async.enabled": true,
+						}),
+						{
+							asyncJobManager,
+							allocateOutputArtifact: async () => ({ id: "async-bash-output", path: artifactPath }),
+						},
+					),
+				),
+			);
+
+			const result = await asyncBashTool.execute("test-call-9-async-link", { command: "printf hi", async: true });
+			const jobId = result.details?.async?.jobId;
+			if (!jobId) {
+				throw new Error("expected an async bash job id");
+			}
+
+			const job = asyncJobManager.getJob(jobId);
+			expect(job).toBeDefined();
+			await job?.promise;
+
+			expect(asyncJobManager.getJob(jobId)?.linkPath).toBeUndefined();
+			expect(fs.existsSync(artifactPath)).toBe(false);
+			await asyncJobManager.dispose();
+		});
+
 		it("should keep short commands inline when auto-background is enabled", async () => {
 			const deliveries: string[] = [];
 			const asyncJobManager = new AsyncJobManager({

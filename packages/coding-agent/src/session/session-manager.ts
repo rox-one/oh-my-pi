@@ -9,7 +9,7 @@ import type {
 	Usage,
 } from "@oh-my-pi/pi-ai";
 import {
-	directoryExists,
+	directoryIsEnterable,
 	getBlobsDir,
 	getProjectDir,
 	getSessionsDir,
@@ -18,7 +18,7 @@ import {
 	stringifyJson,
 	toError,
 } from "@oh-my-pi/pi-utils";
-import type { StructuredSubagentSchemaMode } from "../task/types";
+import type { WorkspaceIdentifierMode } from "../utils/workspace-storage-identifier";
 import { ArtifactManager } from "./artifacts";
 import { type BlobPutOptions, type BlobPutResult, BlobStore } from "./blob-store";
 import type { CompactionMethod } from "./compaction-methods";
@@ -71,6 +71,8 @@ import { generateId, migrateToCurrentVersion } from "./session-migrations";
 import {
 	computeDefaultSessionDir,
 	readTerminalBreadcrumbEntry,
+	rebasePathWithinRoot,
+	rebaseResourcePathMetadata,
 	resolveManagedSessionRoot,
 	writeTerminalBreadcrumb,
 } from "./session-paths";
@@ -260,102 +262,37 @@ class SessionEntryIndex {
 		if (bucket) bucket.push(entry);
 		else this.#children.set(entry.parentId, [entry]);
 
-		if (entry.type === "label") {
-			if (entry.label) this.#labels.set(entry.targetId, entry.label);
-			else this.#labels.delete(entry.targetId);
-		}
-
-		addUsage(this.#usage, entryUsage(entry));
+/** Lists session model strings to try when restoring, in fallback order. */
+export function getRestorableSessionModels(
+	models: Readonly<Record<string, string>>,
+	lastModelChangeRole: string | undefined,
+): string[] {
+	const defaultModel = models.default;
+	if (!lastModelChangeRole || lastModelChangeRole === "default" || lastModelChangeRole === "temporary") {
+		return defaultModel ? [defaultModel] : [];
 	}
 
-	has(id: string): boolean {
-		return this.#entriesById.has(id);
-	}
+	const roleModel = models[lastModelChangeRole];
+	if (!roleModel) return defaultModel ? [defaultModel] : [];
+	if (!defaultModel || roleModel === defaultModel) return [roleModel];
+	return [roleModel, defaultModel];
+}
 
-	get(id: string): SessionEntry | undefined {
-		return this.#entriesById.get(id);
-	}
-
-	/**
-	 * The live id→entry map. Read-only for callers (lookups + `generateId`
-	 * collision checks); never mutate it directly — go through `insert`/`rebuild`.
-	 */
-	entriesById(): Map<string, SessionEntry> {
-		return this.#entriesById;
-	}
-
-	leafId(): string | null {
-		return this.#leaf;
-	}
-
-	leafEntry(): SessionEntry | undefined {
-		return this.#leaf ? this.#entriesById.get(this.#leaf) : undefined;
-	}
-
-	setLeaf(id: string | null): void {
-		this.#leaf = id;
-	}
-
-	childrenOf(parentId: string): SessionEntry[] {
-		return [...(this.#children.get(parentId) ?? [])];
-	}
-
-	labelFor(id: string): string | undefined {
-		return this.#labels.get(id);
-	}
-
-	labelsInEffect(): IterableIterator<[string, string]> {
-		return this.#labels.entries();
-	}
-
-	usageSnapshot(): UsageStatistics {
-		return { ...this.#usage };
-	}
-
-	pathTo(id: string | null | undefined = this.#leaf): SessionEntry[] {
-		const branch: SessionEntry[] = [];
-		const seen = new Set<string>();
-		let cursor = id ? this.#entriesById.get(id) : undefined;
-
-		while (cursor && !seen.has(cursor.id)) {
-			seen.add(cursor.id);
-			branch.push(cursor);
-			cursor = cursor.parentId ? this.#entriesById.get(cursor.parentId) : undefined;
-		}
-		branch.reverse();
-		return branch;
-	}
-
-	tree(entries: readonly SessionEntry[]): SessionTreeNode[] {
-		const nodes = new Map<string, SessionTreeNode>();
-		const roots: SessionTreeNode[] = [];
-
-		for (const entry of entries) {
-			nodes.set(entry.id, { entry, children: [], label: this.#labels.get(entry.id) });
-		}
-
-		for (const entry of entries) {
-			const node = nodes.get(entry.id)!;
-			const parentId = entry.parentId;
-			if (parentId === null || parentId === entry.id) {
-				roots.push(node);
-				continue;
-			}
-
-			const parent = nodes.get(parentId);
-			if (parent) parent.children.push(node);
-			else roots.push(node);
-		}
-
-		const stack = [...roots];
-		while (stack.length > 0) {
-			const node = stack.pop()!;
-			node.children.sort(orderedByTimestamp);
-			stack.push(...node.children);
-		}
-
-		return roots;
-	}
+export interface SessionInfo {
+	path: string;
+	id: string;
+	/** Working directory where the session was started. Empty string for old sessions. */
+	cwd: string;
+	title?: string;
+	/** Path to the parent session (if this session was forked). */
+	parentSessionPath?: string;
+	created: Date;
+	modified: Date;
+	messageCount: number;
+	/** File size in bytes on disk; used for compact list rendering. */
+	size: number;
+	firstMessage: string;
+	allMessagesText: string;
 }
 
 export type ReadonlySessionManager = Pick<
@@ -414,6 +351,14 @@ interface AtomicEntryBatch {
 	externalLeafId: string | null;
 }
 
+export interface SessionMoveOptions {
+	/**
+	 * Rebase live artifact metadata, including writer destinations, immediately
+	 * before the tree is renamed. Invoked with reversed roots if the rename fails.
+	 */
+	rebaseLiveArtifactResources?: (oldRoot: string, newRoot: string) => void;
+}
+
 /**
  * The storage may have published a write that rejected, and an authoritative
  * repair could not be proven durable. Callers must fail closed until recovery.
@@ -464,6 +409,7 @@ export class SessionManager {
 	#sessionDir: string;
 	readonly #persist: boolean;
 	readonly #storage: SessionStorage;
+	readonly #workspaceIdentifierMode: WorkspaceIdentifierMode;
 	readonly #blobs: BlobStore;
 
 	#sessionId = "";
@@ -552,11 +498,18 @@ export class SessionManager {
 	#sessionNameChangedCallbacks = new Set<() => void>();
 	#persistenceErrorCallbacks = new Set<(error: Error) => void>();
 
-	private constructor(cwd: string, sessionDir: string, persist: boolean, storage: SessionStorage) {
+	private constructor(
+		cwd: string,
+		sessionDir: string,
+		persist: boolean,
+		storage: SessionStorage,
+		workspaceIdentifierMode: WorkspaceIdentifierMode = "path",
+	) {
 		this.#cwd = cwd;
 		this.#sessionDir = sessionDir;
 		this.#persist = persist;
 		this.#storage = storage;
+		this.#workspaceIdentifierMode = workspaceIdentifierMode;
 		this.#blobs = new BlobStore(getBlobsDir());
 
 		if (persist && sessionDir) this.#storage.ensureDirSync(sessionDir);
@@ -1294,9 +1247,11 @@ export class SessionManager {
 			onDisk: this.#fileIsCurrent,
 			needsRewrite: this.#rewriteRequired,
 			draftOnlySessionCleanupArmed: this.#draftOnlySessionCleanupArmed,
-			// Snapshot header + entries by reference: switch/reload replaces the
-			// active header/array wholesale, so rollback needs no deep clone.
-			header: this.#header,
+			// Entries are snapshotted by reference (switch/reload replaces the
+			// array wholesale). The header is cloned: moveTo mutates it in place
+			// (cwd, additionalDirectories), so a by-reference capture would let
+			// a rollback observe the move it is undoing.
+			header: structuredClone(this.#header),
 			entries: [...this.#entries],
 		};
 	}
@@ -1377,14 +1332,16 @@ export class SessionManager {
 		// loadEntriesFromFile guarantees entries[0] is a valid session header.
 		const header = fileEntries[0] as SessionHeader;
 
-		// Adopt the loaded session's working directory. Sessions live in a dir
-		// keyed by their cwd, so resuming a session from another project must
-		// re-point cwd/sessionDir at that project — unless that project directory
-		// no longer exists on disk, in which case adopting it (and the process
-		// chdir interactive mode then performs) would fail with ENOENT. Keep the
-		// current cwd so the resumed session stays where the user already is.
+		// Adopt the loaded session's working directory only when it is verifiably
+		// accessible. Sessions live in a dir keyed by their cwd, so resuming a
+		// session from another project must re-point cwd/sessionDir at that
+		// project — but a deleted OR permission-blocked directory (macOS TCC
+		// denial) must not be adopted: callers without a cwd-change callback
+		// (extension UI, RPC) would otherwise track a directory the process
+		// cannot enter. Keep the current cwd so the session stays where the
+		// user already is.
 		const headerCwd = header.cwd ? path.resolve(header.cwd) : undefined;
-		if (headerCwd && headerCwd !== path.resolve(this.#cwd) && (await directoryExists(headerCwd))) {
+		if (headerCwd && headerCwd !== path.resolve(this.#cwd) && (await directoryIsEnterable(headerCwd))) {
 			this.#cwd = headerCwd;
 			this.#sessionDir = path.dirname(resolvedSessionFile);
 			this.#rememberBreadcrumb(this.#cwd, resolvedSessionFile);
@@ -1463,10 +1420,22 @@ export class SessionManager {
 	}
 
 	/**
+	 * Adopt a session file that moved because an ancestor artifact directory
+	 * was relocated. `moveTo` closes any live writer before switching paths, so
+	 * a later append cannot recreate the old tree.
+	 */
+	async rebaseMovedSessionFile(oldRoot: string, newRoot: string): Promise<void> {
+		if (!this.#sessionFile) return;
+		const rebasedFile = rebasePathWithinRoot(this.#sessionFile, oldRoot, newRoot);
+		if (rebasedFile === this.#sessionFile) return;
+		await this.moveTo(this.#cwd, path.dirname(rebasedFile));
+	}
+
+	/**
 	 * Move the session to a new working directory: relocate the session file and
 	 * artifacts on disk, update internal references, and rewrite the header cwd.
 	 */
-	async moveTo(newCwd: string, targetSessionDir?: string): Promise<void> {
+	async moveTo(newCwd: string, targetSessionDir?: string, options?: SessionMoveOptions): Promise<void> {
 		const resolvedCwd = path.resolve(newCwd);
 		const resolvedTargetDir = targetSessionDir ? path.resolve(targetSessionDir) : undefined;
 		if (
@@ -1476,12 +1445,15 @@ export class SessionManager {
 			return;
 		}
 
-		const managedRoot = resolveManagedSessionRoot(this.#sessionDir, this.#cwd);
+		const managedRoot = resolveManagedSessionRoot(this.#sessionDir, this.#cwd, this.#workspaceIdentifierMode);
 		const nextSessionDir =
 			resolvedTargetDir ??
 			(managedRoot
-				? computeDefaultSessionDir(resolvedCwd, this.#storage, managedRoot)
-				: computeDefaultSessionDir(resolvedCwd, this.#storage));
+				? computeDefaultSessionDir(resolvedCwd, this.#storage, {
+						sessionsRoot: managedRoot,
+						identifierMode: this.#workspaceIdentifierMode,
+					})
+				: computeDefaultSessionDir(resolvedCwd, this.#storage, { identifierMode: this.#workspaceIdentifierMode }));
 
 		let sessionFileExisted = false;
 		// Track source+dest for concurrent completed appends during relocation
@@ -1514,6 +1486,7 @@ export class SessionManager {
 
 				let sessionMoved = false;
 				let artifactsMoved = false;
+				let artifactWritersRebased = false;
 
 				try {
 					if (sessionFileExisted && sessionPathChanged) {
@@ -1522,25 +1495,42 @@ export class SessionManager {
 					}
 
 					if (artifactPathChanged) {
+						let artifactStat: fs.Stats | undefined;
 						try {
-							const artifactStat = await fs.promises.stat(oldArtifactsDir);
-							if (artifactStat.isDirectory()) {
-								await fs.promises.rename(oldArtifactsDir, newArtifactsDir);
-								artifactsMoved = true;
-							}
+							artifactStat = fs.statSync(oldArtifactsDir);
 						} catch (err) {
 							if (!isEnoent(err)) throw err;
+						}
+						options?.rebaseLiveArtifactResources?.(oldArtifactsDir, newArtifactsDir);
+						this.#artifactManager?.rebaseDirectory(oldArtifactsDir, newArtifactsDir);
+						this.#adoptedArtifactManager?.rebaseDirectory(oldArtifactsDir, newArtifactsDir);
+						artifactWritersRebased = true;
+						if (artifactStat?.isDirectory()) {
+							// Keep the destination switch and directory rename in one
+							// synchronous turn so a running sink cannot open either
+							// stale root in between them.
+							fs.renameSync(oldArtifactsDir, newArtifactsDir);
+							artifactsMoved = true;
 						}
 					}
 				} catch (err) {
 					if (artifactsMoved && oldArtifactsDir && newArtifactsDir) {
 						try {
-							await fs.promises.rename(newArtifactsDir, oldArtifactsDir);
+							fs.renameSync(newArtifactsDir, oldArtifactsDir);
+							options?.rebaseLiveArtifactResources?.(newArtifactsDir, oldArtifactsDir);
+							this.#artifactManager?.rebaseDirectory(newArtifactsDir, oldArtifactsDir);
+							this.#adoptedArtifactManager?.rebaseDirectory(newArtifactsDir, oldArtifactsDir);
+							artifactWritersRebased = false;
 						} catch (rollbackErr) {
 							throw new Error(
 								`Failed to move artifacts and rollback: ${rollbackErr instanceof Error ? rollbackErr.message : String(rollbackErr)}`,
 							);
 						}
+					} else if (artifactWritersRebased) {
+						options?.rebaseLiveArtifactResources?.(newArtifactsDir, oldArtifactsDir);
+						this.#artifactManager?.rebaseDirectory(newArtifactsDir, oldArtifactsDir);
+						this.#adoptedArtifactManager?.rebaseDirectory(newArtifactsDir, oldArtifactsDir);
+						artifactWritersRebased = false;
 					}
 
 					if (sessionMoved) {
@@ -1562,9 +1552,9 @@ export class SessionManager {
 					];
 				}
 
+				rebaseResourcePathMetadata(this.#entries, oldArtifactsDir, newArtifactsDir);
 				this.#sessionFile = newSessionFile;
-				this.#artifactManager = null;
-				this.#artifactManagerSessionFile = null;
+				if (this.#artifactManager) this.#artifactManagerSessionFile = newSessionFile;
 				// Path is repointed; hot-path appends may use `#sessionFile` again.
 				this.#sessionFileRelocating = null;
 			}
@@ -2401,10 +2391,27 @@ export class SessionManager {
 	 * model change has been recorded.
 	 */
 	getLastModelChangeRole(): string | undefined {
-		const branch = this.getBranch();
-		for (let index = branch.length - 1; index >= 0; index--) {
-			const entry = branch[index];
-			if (entry.type === "model_change") return entry.role ?? "default";
+		return this.#getLastModelChangeRole();
+	}
+
+	/**
+	 * Get the most recent non-temporary model role from the current session path.
+	 * Temporary model changes are transient fallbacks and must not be restored.
+	 */
+	getLastRestorableModelChangeRole(): string | undefined {
+		return this.#getLastModelChangeRole({ skipTemporary: true });
+	}
+
+	#getLastModelChangeRole(options?: { skipTemporary?: boolean }): string | undefined {
+		let current = this.getLeafEntry();
+		while (current) {
+			if (current.type === "model_change") {
+				const role = current.role ?? "default";
+				if (!options?.skipTemporary || role !== "temporary") {
+					return role;
+				}
+			}
+			current = current.parentId ? this.#byId.get(current.parentId) : undefined;
 		}
 		return undefined;
 	}
@@ -2623,8 +2630,9 @@ export class SessionManager {
 		cwd: string,
 		agentDir?: string,
 		storage: SessionStorage = new FileSessionStorage(),
+		mode: WorkspaceIdentifierMode = "path",
 	): string {
-		return computeDefaultSessionDir(cwd, storage, getSessionsDir(agentDir));
+		return computeDefaultSessionDir(cwd, storage, { sessionsRoot: getSessionsDir(agentDir), identifierMode: mode });
 	}
 
 	/**
@@ -2632,9 +2640,14 @@ export class SessionManager {
 	 * @param cwd Working directory (stored in the session header)
 	 * @param sessionDir Optional session directory; defaults to the cwd-derived dir.
 	 */
-	static create(cwd: string, sessionDir?: string, storage: SessionStorage = new FileSessionStorage()): SessionManager {
-		const dir = sessionDir ?? SessionManager.getDefaultSessionDir(cwd, undefined, storage);
-		const manager = new SessionManager(cwd, dir, true, storage);
+	static create(
+		cwd: string,
+		sessionDir?: string,
+		storage: SessionStorage = new FileSessionStorage(),
+		mode: WorkspaceIdentifierMode = "path",
+	): SessionManager {
+		const dir = sessionDir ?? SessionManager.getDefaultSessionDir(cwd, undefined, storage, mode);
+		const manager = new SessionManager(cwd, dir, true, storage, mode);
 		manager.#resetToNewSession();
 		return manager;
 	}
@@ -2675,10 +2688,15 @@ export class SessionManager {
 		cwd: string,
 		sessionDir?: string,
 		storage: SessionStorage = new FileSessionStorage(),
-		options?: { copyArtifacts?: boolean; suppressBreadcrumb?: boolean; sessionFile?: string },
+		options?: {
+			suppressBreadcrumb?: boolean;
+			sessionFile?: string;
+			workspaceIdentifierMode?: WorkspaceIdentifierMode;
+		},
 	): Promise<SessionManager> {
-		const dir = sessionDir ?? SessionManager.getDefaultSessionDir(cwd, undefined, storage);
-		const manager = new SessionManager(cwd, dir, true, storage);
+		const mode = options?.workspaceIdentifierMode ?? "path";
+		const dir = sessionDir ?? SessionManager.getDefaultSessionDir(cwd, undefined, storage, mode);
+		const manager = new SessionManager(cwd, dir, true, storage, mode);
 		manager.#suppressBreadcrumb = options?.suppressBreadcrumb === true;
 
 		const sourceEntries = structuredClone(await loadEntriesFromFile(sourcePath, storage)) as FileEntry[];
@@ -2723,24 +2741,29 @@ export class SessionManager {
 		filePath: string,
 		sessionDir?: string,
 		storage: SessionStorage = new FileSessionStorage(),
-		options?: { initialCwd?: string; suppressBreadcrumb?: boolean },
+		options?: {
+			initialCwd?: string;
+			suppressBreadcrumb?: boolean;
+			workspaceIdentifierMode?: WorkspaceIdentifierMode;
+		},
 	): Promise<SessionManager> {
-		const loaded = await loadSessionFile(filePath, storage);
-		const header = loaded.entries.find(entry => entry.type === "session") as SessionHeader | undefined;
+		const mode = options?.workspaceIdentifierMode ?? "path";
+		const loaded = await loadEntriesFromFile(filePath, storage);
+		const header = loaded.find(entry => entry.type === "session") as SessionHeader | undefined;
 		// Resume into the session's recorded cwd only when that directory still
 		// exists. A deleted project dir would make the constructor's #cwd — and the
 		// `setProjectDir` chdir interactive mode runs next — point at (and fail on)
 		// a missing path, so fall back to the launch cwd and anchor /new and /branch
 		// there too, keeping the resumed session where the user already is.
 		const recordedCwd = header?.cwd;
-		const recordedCwdUsable = !!recordedCwd && (await directoryExists(recordedCwd));
+		const recordedCwdUsable = !!recordedCwd && (await directoryIsEnterable(recordedCwd));
 		const cwd = recordedCwdUsable ? recordedCwd : (options?.initialCwd ?? getProjectDir());
 		const dir =
 			sessionDir ??
 			(recordedCwd && !recordedCwdUsable
-				? SessionManager.getDefaultSessionDir(cwd, undefined, storage)
+				? SessionManager.getDefaultSessionDir(cwd, undefined, storage, mode)
 				: path.dirname(path.resolve(filePath)));
-		const manager = new SessionManager(cwd, dir, true, storage);
+		const manager = new SessionManager(cwd, dir, true, storage, mode);
 		manager.#suppressBreadcrumb = options?.suppressBreadcrumb === true;
 		await manager.#setSessionFile(filePath, loaded);
 		return manager;
@@ -2766,6 +2789,7 @@ export class SessionManager {
 			agent?: string;
 			modelRole?: string;
 			resolvedModel?: string;
+			readOnly?: boolean;
 			outputSchema?: unknown;
 			outputSchemaMode?: StructuredSubagentSchemaMode;
 			restrictToolNames?: boolean;
@@ -2782,6 +2806,7 @@ export class SessionManager {
 			agent?: string;
 			modelRole?: string;
 			resolvedModel?: string;
+			readOnly?: boolean;
 			outputSchema?: unknown;
 			outputSchemaMode?: StructuredSubagentSchemaMode;
 			restrictToolNames?: boolean;
@@ -2802,6 +2827,7 @@ export class SessionManager {
 					agent: entry.agent,
 					modelRole: entry.modelRole,
 					resolvedModel: entry.resolvedModel,
+					readOnly: entry.readOnly,
 					outputSchema: entry.outputSchema,
 					outputSchemaMode: entry.outputSchemaMode,
 					restrictToolNames: entry.restrictToolNames,
@@ -2827,8 +2853,9 @@ export class SessionManager {
 		cwd: string,
 		sessionDir?: string,
 		storage: SessionStorage = new FileSessionStorage(),
+		mode: WorkspaceIdentifierMode = "path",
 	): Promise<SessionManager> {
-		const dir = sessionDir ?? SessionManager.getDefaultSessionDir(cwd, undefined, storage);
+		const dir = sessionDir ?? SessionManager.getDefaultSessionDir(cwd, undefined, storage, mode);
 		const resolvedCwd = path.resolve(cwd);
 		const breadcrumb = await readTerminalBreadcrumbEntry();
 		let chosenSession: string | null | undefined;
@@ -2865,7 +2892,7 @@ export class SessionManager {
 				let currentProjectAlreadyHasSession = false;
 
 				if (breadcrumbCwdMissing && newestIsBreadcrumb) {
-					const localSession = (await SessionManager.list(cwd, dir, storage)).find(
+					const localSession = (await SessionManager.list(cwd, dir, storage, mode)).find(
 						session =>
 							path.resolve(session.path) !== breadcrumbFile &&
 							session.cwd &&
@@ -2887,6 +2914,7 @@ export class SessionManager {
 					// recorded cwd, which would no-op moveTo when it equals `cwd`.
 					const manager = await SessionManager.open(breadcrumb.sessionFile, undefined, storage, {
 						initialCwd: breadcrumbCwd,
+						workspaceIdentifierMode: mode,
 					});
 					await manager.moveTo(cwd, sessionDir);
 					return manager;
@@ -2898,7 +2926,7 @@ export class SessionManager {
 
 		if (chosenSession === undefined) chosenSession = await findMostRecentSession(dir, storage);
 
-		const manager = new SessionManager(cwd, dir, true, storage);
+		const manager = new SessionManager(cwd, dir, true, storage, mode);
 		if (chosenSession) await manager.setSessionFile(chosenSession);
 		else manager.#resetToNewSession();
 		return manager;
@@ -2909,7 +2937,7 @@ export class SessionManager {
 		cwd: string = getProjectDir(),
 		storage: SessionStorage = new MemorySessionStorage(),
 	): SessionManager {
-		const manager = new SessionManager(cwd, "", false, storage);
+		const manager = new SessionManager(cwd, "", false, storage, "path");
 		manager.#resetToNewSession();
 		return manager;
 	}
@@ -2922,10 +2950,10 @@ export class SessionManager {
 		cwd: string,
 		sessionDir?: string,
 		storage: SessionStorage = new FileSessionStorage(),
+		mode: WorkspaceIdentifierMode = "path",
 	): Promise<SessionInfo[]> {
-		const dir = sessionDir ?? SessionManager.getDefaultSessionDir(cwd, undefined, storage);
-		const sessions = await listSessions(dir, storage);
-		return sortPinnedFirst(sessions, await loadPinnedSessionIds());
+		const dir = sessionDir ?? SessionManager.getDefaultSessionDir(cwd, undefined, storage, mode);
+		return listSessions(dir, storage);
 	}
 
 	/** List all sessions across all project directories, pinned sessions first. */

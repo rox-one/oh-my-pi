@@ -8,6 +8,7 @@ export { z } from "@oh-my-pi/omptype/zod";
 export { Container, Markdown, Spacer, Text } from "@oh-my-pi/pi-tui";
 // Logging
 export { getAgentDir, logger, VERSION } from "@oh-my-pi/pi-utils";
+export * from "./cli/secret-input";
 export * from "./config/keybindings";
 export * from "./config/model-registry";
 // Prompt templates
@@ -28,6 +29,7 @@ export * from "./extensibility/extensions";
 export * from "./extensibility/skills";
 // Slash commands
 export { type FileSlashCommand, loadSlashCommands as discoverSlashCommands } from "./extensibility/slash-commands";
+export * from "./live/activity-events";
 export type * from "./lsp";
 // Main entry point
 export * from "./main";

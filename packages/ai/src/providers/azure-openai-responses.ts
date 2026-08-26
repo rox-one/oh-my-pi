@@ -37,6 +37,7 @@ import {
 	createInitialResponsesAssistantMessage,
 	getOpenAIPromptCacheKey,
 	isOpenAIResponsesProgressEvent,
+	markLatestStableResponsesCacheBreakpoint,
 	parseAzureDeploymentNameMap,
 	processResponsesStream,
 } from "./openai-shared";
@@ -51,8 +52,10 @@ function resolveDeploymentName(model: Model<"azure-openai-responses">, options?:
 	if (options?.azureDeploymentName) {
 		return options.azureDeploymentName;
 	}
-	const mappedDeployment = parseAzureDeploymentNameMap($env.AZURE_OPENAI_DEPLOYMENT_NAME_MAP).get(model.id);
-	return mappedDeployment ?? model.id;
+	const deploymentMap = parseAzureDeploymentNameMap($env.AZURE_OPENAI_DEPLOYMENT_NAME_MAP);
+	const mappedDeployment =
+		deploymentMap.get(model.id) ?? (model.requestModelId ? deploymentMap.get(model.requestModelId) : undefined);
+	return mappedDeployment ?? model.requestModelId ?? model.id;
 }
 
 // Azure OpenAI Responses-specific options
@@ -84,11 +87,6 @@ export const streamAzureOpenAIResponses: StreamFunction<"azure-openai-responses"
 	context: Context,
 	options?: AzureOpenAIResponsesOptions,
 ): AssistantMessageEventStream => {
-	if (options?.promptCache?.mode === "explicit" && resolveCacheRetention(options.cacheRetention) !== "none") {
-		throw new AIError.ConfigurationError(
-			`OpenAI explicit prompt caching is unsupported for ${model.provider}/${model.id}; Azure Responses does not emit explicit cache controls.`,
-		);
-	}
 	const stream = new AssistantMessageEventStream();
 
 	// Start async processing
@@ -371,19 +369,23 @@ function buildParams(
 		preserveAssistantMessageIds: true,
 	});
 
+	const promptCache = options?.promptCache;
+	const cacheEnabled = promptCache && resolveCacheRetention(options?.cacheRetention) !== "none";
 	const params: AzureOpenAIResponsesSamplingParams = {
 		model: deploymentName,
 		input: messages,
 		stream: true,
 		prompt_cache_key: getOpenAIPromptCacheKey(options),
+		...(cacheEnabled ? { prompt_cache_options: { mode: promptCache.mode, ttl: promptCache.ttl ?? "30m" } } : {}),
 		// Encrypted reasoning replay (applyResponsesReasoningParams) requires
 		// stateless responses, matching the openai provider.
 		store: false,
 	};
-
+	if (cacheEnabled && promptCache.mode === "explicit" && promptCache.breakpoint !== "none") {
+		markLatestStableResponsesCacheBreakpoint(messages);
+	}
 	applyCommonResponsesSamplingParams(params, options, model);
 	if (options?.include?.length) params.include = Array.from(new Set(options.include));
-
 	if (context.tools) {
 		const serializedTools: NonNullable<AzureOpenAIResponsesSamplingParams["tools"]> = [];
 		for (const tool of context.tools) {

@@ -13,6 +13,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { expandPromptTemplate, type PromptTemplate } from "@oh-my-pi/pi-coding-agent/config/prompt-templates";
 import { expandSlashCommand, type FileSlashCommand } from "@oh-my-pi/pi-coding-agent/extensibility/slash-commands";
+import { loadBundledCommands } from "@oh-my-pi/pi-coding-agent/task/commands";
 import { parseCommandArgs, substituteArgs } from "@oh-my-pi/pi-coding-agent/utils/command-args";
 import { prompt } from "@oh-my-pi/pi-utils";
 
@@ -281,6 +282,24 @@ describe("template expansion fallback", () => {
 		{ name: "prompt template", invocation: "/test-template none", expand: expandPrompt },
 	] as const;
 
+	test("expands bundled init with the active task reference", () => {
+		const command = loadBundledCommands().find(candidate => candidate.name === "init");
+		if (!command) throw new Error("Expected bundled init command");
+
+		const expanded = expandSlashCommand(
+			"/init",
+			[
+				{
+					name: command.name,
+					description: command.description,
+					content: command.instructions,
+					source: "bundled",
+				},
+			],
+			{ toolRefs: { task: "tool.task" } },
+		);
+		expect(expanded).toContain("`tool.task` research agents");
+	});
 	test("should append trailing inline args for slash command without placeholders", () => {
 		const result = expandSlash("/test-command sample input text", "Do something.");
 		expect(result).toBe("Do something.\n\nsample input text");

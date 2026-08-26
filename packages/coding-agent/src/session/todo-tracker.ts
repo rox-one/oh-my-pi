@@ -8,6 +8,7 @@ import midRunTodoNudgePrompt from "../prompts/system/mid-run-todo-nudge.md" with
 import { getLatestTodoPhasesFromEntries, isTodoPhase, type TodoItem, type TodoPhase } from "../tools/todo";
 import { buildNamedToolChoice } from "../utils/tool-choice";
 import type { AgentSessionEvent } from "./agent-session-events";
+import { formatCodeModeToolReference } from "./code-mode";
 import type { SessionManager } from "./session-manager";
 
 const MID_RUN_NUDGE_MUTATION_THRESHOLD = 12;
@@ -317,12 +318,22 @@ export class TodoTracker {
 	}
 
 	#buildEagerPreludeContext(): { toolRefs: Record<string, string>; taskBatch: boolean } {
-		const wireName = (name: string): string => {
-			const tool = this.#host.toolRegistry().get(name);
-			return typeof tool?.customWireName === "string" ? tool.customWireName : name;
-		};
+		const directToolNames = new Set(this.#host.getActiveToolNames());
+		const toolRefs: Record<string, string> = Object.fromEntries(
+			(["task", "todo"] as const).map(name => {
+				const tool = this.#host.toolRegistry().get(name);
+				return [
+					name,
+					formatCodeModeToolReference({
+						name,
+						wireName: tool?.customWireName,
+						direct: directToolNames.has(name),
+					}),
+				];
+			}),
+		);
 		return {
-			toolRefs: { task: wireName("task"), todo: wireName("todo") },
+			toolRefs,
 			taskBatch: this.#host.settings.get("task.batch"),
 		};
 	}

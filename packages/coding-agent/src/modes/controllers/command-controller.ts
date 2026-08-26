@@ -1103,13 +1103,26 @@ export class CommandController {
 			return;
 		}
 
+		const previousState = this.ctx.sessionManager.captureState();
 		try {
 			await this.ctx.session.moveSession(resolvedPath);
 		} catch (err) {
 			this.ctx.showError(`Move failed: ${err instanceof Error ? err.message : String(err)}`);
 			return;
 		}
-		await this.ctx.applyCwdChange(resolvedPath);
+		if (!(await this.ctx.applyCwdChange(resolvedPath))) {
+			// moveTo already renamed the session and artifacts into the target
+			// bucket, so an in-memory restore alone orphans the transcript on
+			// disk. Invert the relocation with an explicit session dir, then
+			// restore the captured metadata (additional roots, header cwd).
+			try {
+				await this.ctx.session.moveSession(previousState.cwd, previousState.sessionDir);
+				this.ctx.sessionManager.restoreState(previousState);
+			} catch (err) {
+				this.ctx.showError(`Failed to roll back move: ${err instanceof Error ? err.message : String(err)}`);
+			}
+			return;
+		}
 
 		this.ctx.updateEditorBorderColor();
 		await this.ctx.reloadTodos();
@@ -1200,7 +1213,7 @@ export class CommandController {
 	}
 
 	async #moveInteractiveCwd(resolvedPath: string): Promise<void> {
-		await this.ctx.sessionManager.moveTo(resolvedPath);
+		await this.ctx.session.moveSession(resolvedPath);
 		await this.ctx.applyCwdChange(resolvedPath);
 		this.ctx.updateEditorBorderColor();
 		await this.ctx.reloadTodos();

@@ -32,6 +32,12 @@ export interface GitRepository {
 	headPath: string;
 	repoRoot: string;
 	isReftable?: boolean;
+	remotes?: GitRemote[];
+}
+
+export interface GitRemote {
+	name: string;
+	fetchUrl: string;
 }
 
 export interface GitStatusSummary {
@@ -550,6 +556,29 @@ async function git(cwd: string, args: readonly string[], options: CommandOptions
 	return await collectSubprocessResult("git", commandArgs, child, options);
 }
 
+function gitSync(cwd: string, args: readonly string[], options: CommandOptions = {}): GitCommandResult {
+	const commandArgs = withShortLivedGitConfig(options.readOnly ? withNoOptionalLocks(args) : [...args]);
+	const result = Bun.spawnSync(["git", ...commandArgs], {
+		cwd,
+		env: options.env ? { ...process.env, GIT_OPTIONAL_LOCKS: "0", ...options.env } : undefined,
+		signal: options.signal,
+		stdin: normalizeStdin(options.stdin),
+		stdout: "pipe",
+		stderr: "pipe",
+		windowsHide: true,
+	});
+
+	if (!result.stdout || !result.stderr) {
+		throw new Error("Failed to capture git command output.");
+	}
+
+	return {
+		exitCode: result.exitCode ?? 0,
+		stdout: result.stdout.toString(),
+		stderr: result.stderr.toString(),
+	};
+}
+
 function withNoOptionalLocks(args: readonly string[]): string[] {
 	if (args.includes(NO_OPTIONAL_LOCKS)) return [...args];
 	return [NO_OPTIONAL_LOCKS, ...args];
@@ -1046,6 +1075,17 @@ function stripGitConfigComments(line: string): string {
 	return clean.trim();
 }
 
+function unquoteGitConfigValue(value: string): string {
+	const trimmed = value.trim();
+	if (!trimmed.startsWith('"') || !trimmed.endsWith('"')) return trimmed;
+	try {
+		const parsed = JSON.parse(trimmed) as unknown;
+		return typeof parsed === "string" ? parsed : trimmed;
+	} catch {
+		return trimmed;
+	}
+}
+
 function parseGitConfigHasReftable(content: string): boolean {
 	let inExtensions = false;
 	for (const line of content.split("\n")) {
@@ -1087,6 +1127,51 @@ async function isReftableRepo(repository: GitRepository): Promise<boolean> {
 	const content = await readOptionalText(configPath);
 	repository.isReftable = content ? parseGitConfigHasReftable(content) : false;
 	return repository.isReftable;
+}
+
+function parseGitConfigRemotes(content: string): GitRemote[] {
+	const remotes: GitRemote[] = [];
+	let remoteName: string | null = null;
+	for (const line of content.split("\n")) {
+		const trimmed = stripGitConfigComments(line);
+		if (trimmed.startsWith("[") && trimmed.endsWith("]")) {
+			remoteName = null;
+			const section = trimmed.slice(1, -1).trim();
+			const remoteSection = /^remote\s+(.+)$/i.exec(section);
+			if (remoteSection) {
+				const name = remoteSection[1].trim();
+				remoteName = unquoteGitConfigValue(name);
+			}
+			continue;
+		}
+
+		if (remoteName === null) continue;
+		const eqIndex = trimmed.indexOf("=");
+		if (eqIndex === -1) continue;
+		const key = trimmed.slice(0, eqIndex).trim().toLowerCase();
+		if (key !== "url") continue;
+		remotes.push({
+			name: remoteName,
+			fetchUrl: unquoteGitConfigValue(trimmed.slice(eqIndex + 1)),
+		});
+	}
+	return remotes;
+}
+
+function getRepoRemotesSync(repository: GitRepository): GitRemote[] {
+	if (repository.remotes !== undefined) return repository.remotes;
+	const configPath = path.join(repository.commonDir, "config");
+	const content = readOptionalTextSync(configPath);
+	repository.remotes = content ? parseGitConfigRemotes(content) : [];
+	return repository.remotes;
+}
+
+async function getRepoRemotes(repository: GitRepository): Promise<GitRemote[]> {
+	if (repository.remotes !== undefined) return repository.remotes;
+	const configPath = path.join(repository.commonDir, "config");
+	const content = await readOptionalText(configPath);
+	repository.remotes = content ? parseGitConfigRemotes(content) : [];
+	return repository.remotes;
 }
 
 async function resolveHeadStateReftable(repository: GitRepository, signal?: AbortSignal): Promise<GitHeadState | null> {
@@ -2512,6 +2597,26 @@ export const head = {
 };
 
 // ════════════════════════════════════════════════════════════════════════════
+// API: root
+// ════════════════════════════════════════════════════════════════════════════
+
+export const root = {
+	/** Initial root commit SHA that lead to the current HEAD. */
+	shaSync(cwd: string, signal?: AbortSignal): string | null {
+		const result = gitSync(cwd, ["rev-list", "--max-parents=0", "HEAD"], { readOnly: true, signal });
+		if (result.exitCode !== 0) return null;
+		return result.stdout.trim() || null;
+	},
+
+	/** Initial root commit SHA that lead to the current HEAD. */
+	async sha(cwd: string, signal?: AbortSignal): Promise<string | null> {
+		const result = await git(cwd, ["rev-list", "--max-parents=0", "HEAD"], { readOnly: true, signal });
+		if (result.exitCode !== 0) return null;
+		return result.stdout.trim() || null;
+	},
+};
+
+// ════════════════════════════════════════════════════════════════════════════
 // API: repo
 // ════════════════════════════════════════════════════════════════════════════
 
@@ -2583,6 +2688,27 @@ export const repo = {
 	/** Check if the repository uses the reftable reference storage format. */
 	isReftable(repository: GitRepository): Promise<boolean> {
 		return isReftableRepo(repository);
+	},
+
+	/** Return the configured remotes for the repository. */
+	getRemotesSync(repository: GitRepository): GitRemote[] {
+		return getRepoRemotesSync(repository);
+	},
+
+	/** Return the configured remotes for the repository. */
+	getRemotes(repository: GitRepository): Promise<GitRemote[]> {
+		return getRepoRemotes(repository);
+	},
+
+	isShallowRepositorySync(cwd: string): boolean {
+		const result = gitSync(cwd, ["rev-parse", "--is-shallow-repository"], { readOnly: true });
+		return result.stdout.trim() === "true";
+	},
+
+	/** Return whether the directory is inside a shallow cloned repository. */
+	async isShallowRepository(cwd: string): Promise<boolean> {
+		const result = await git(cwd, ["rev-parse", "--is-shallow-repository"], { readOnly: true });
+		return result.stdout.trim() === "true";
 	},
 };
 

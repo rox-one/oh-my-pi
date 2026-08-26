@@ -235,7 +235,18 @@ export async function loadCustomTools(
  * @param configuredPaths - Explicit paths from settings.json and CLI --tool flags
  * @param cwd - Current working directory
  */
-export async function discoverCustomToolPaths(configuredPaths: string[], cwd: string): Promise<ToolPathWithSource[]> {
+export async function discoverAndLoadCustomTools(
+	configuredPaths: string[],
+	cwd: string,
+	builtInToolNames: string[],
+	pushPendingAction?: (action: {
+		label: string;
+		sourceToolName: string;
+		apply(reason: string): Promise<AgentToolResult<unknown>>;
+		reject?(reason: string): Promise<AgentToolResult<unknown> | undefined>;
+	}) => void,
+	agentDir?: string,
+) {
 	const allPathsWithSources: ToolPathWithSource[] = [];
 	const seen = new Set<string>();
 
@@ -249,7 +260,7 @@ export async function discoverCustomToolPaths(configuredPaths: string[], cwd: st
 	};
 
 	// 1. Discover tools via capability system (user + project from all providers)
-	const discoveredTools = await loadCapability<CustomTool>(toolCapability.id, { cwd });
+	const discoveredTools = await loadCapability<CustomTool>(toolCapability.id, { cwd, agentDir });
 	for (const tool of discoveredTools.items) {
 		addPath(tool.path, {
 			provider: tool._source.provider,

@@ -4,13 +4,13 @@
  * Commands are embedded at build time via Bun's import with { type: "text" }.
  */
 import * as path from "node:path";
-import { parseFrontmatter, prompt } from "@oh-my-pi/pi-utils";
+import { parseFrontmatter } from "@oh-my-pi/pi-utils";
 import { type SlashCommand, slashCommandCapability } from "../capability/slash-command";
 import { loadCapability } from "../discovery";
 // Embed command markdown files at build time
 import initMd from "../prompts/agents/init.md" with { type: "text" };
 
-const EMBEDDED_COMMANDS: { name: string; content: string }[] = [{ name: "init.md", content: prompt.render(initMd) }];
+const EMBEDDED_COMMANDS: { name: string; content: string }[] = [{ name: "init.md", content: initMd }];
 
 export const EMBEDDED_COMMAND_TEMPLATES: ReadonlyArray<{ name: string; content: string }> = EMBEDDED_COMMANDS;
 
@@ -67,11 +67,11 @@ export function loadBundledCommands(): WorkflowCommand[] {
  *
  * Precedence (highest wins): .omp > .pi > .claude (project before user), then bundled
  */
-export async function discoverCommands(cwd: string): Promise<WorkflowCommand[]> {
+export async function discoverCommands(cwd: string, agentDir?: string): Promise<WorkflowCommand[]> {
 	const resolvedCwd = path.resolve(cwd);
 
 	// Load slash commands from capability API
-	const result = await loadCapability<SlashCommand>(slashCommandCapability.id, { cwd: resolvedCwd });
+	const result = await loadCapability<SlashCommand>(slashCommandCapability.id, { cwd: resolvedCwd, agentDir });
 
 	const commands: WorkflowCommand[] = [];
 	const seen = new Set<string>();

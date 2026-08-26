@@ -36,8 +36,8 @@ const providerCapabilities = new Map<string, Set<string>>();
 /** Provider display metadata (shared across capabilities) */
 const providerMeta = new Map<string, { displayName: string; description: string }>();
 
-/** Disabled providers (by ID) */
-const disabledProviders = new Set<string>();
+/** Disabled extension providers (by ID). Controls capability-registry loading only. */
+const disabledExtensionProviders = new Set<string>();
 
 /** Settings manager for persistence (if set) */
 let settings: Settings | null = null;
@@ -235,8 +235,17 @@ async function loadImpl<T>(
 /**
  * Filter providers based on options and disabled state.
  */
-function filterProviders<T>(capability: Capability<T>, options: LoadOptions<T>): Provider<T>[] {
-	let providers = (capability.providers as Provider<T>[]).filter(p => !disabledProviders.has(p.id));
+function syncDisabledExtensionProvidersFromSettings(cwd?: string): void {
+	if (!settings) return;
+	disabledExtensionProviders.clear();
+	for (const id of settings.disabledExtensionProvidersForCwd(cwd)) {
+		disabledExtensionProviders.add(id);
+	}
+}
+
+function filterProviders<T>(capability: Capability<T>, options: LoadOptions): Provider<T>[] {
+	syncDisabledExtensionProvidersFromSettings(options.cwd);
+	let providers = (capability.providers as Provider<T>[]).filter(p => !disabledExtensionProviders.has(p.id));
 
 	if (options.providers) {
 		const allowed = new Set(options.providers);
@@ -265,7 +274,9 @@ export async function loadCapability<T>(
 	const cwd = options.cwd ?? getProjectDir();
 	const home = os.homedir();
 	const repoRoot = await findRepoRoot(cwd);
-	const ctx: LoadContext = { cwd, home, repoRoot };
+	const ctx: LoadContext = options.agentDir
+		? { cwd, home, repoRoot, agentDir: options.agentDir }
+		: { cwd, home, repoRoot };
 	const providers = filterProviders(capability, options);
 
 	return await loadImpl(capability, providers, ctx, options);
@@ -278,65 +289,97 @@ export async function loadCapability<T>(
 /**
  * Initialize capability system with settings manager for persistence.
  * Call this once on startup to enable persistent provider state.
+ *
+ * Reads the extension-provider disable list from `disabledExtensionProviders`
+ * (added in this change to decouple the `/extensions` provider toggle from the
+ * model/login `disabledProviders` list). For legacy configs where only the
+ * older `disabledProviders` key is set, its value is copied into the new list
+ * so users who set `disabledProviders: [cursor]` intending "hide all cursor
+ * stuff" keep the joint behavior; toggles from the `/extensions` UI then only
+ * mutate the new key.
  */
 export function initializeWithSettings(activeSettings: Settings): void {
 	settings = activeSettings;
-	// Load disabled providers from settings
-	const disabled = settings.get("disabledProviders");
-	disabledProviders.clear();
-	for (const id of disabled) {
-		disabledProviders.add(id);
-	}
+	// Legacy read-through: fall back to `disabledProviders` ONLY when the new
+	// key has never been configured. An explicitly-empty configured value is a
+	// deliberate "extension list is empty" signal (e.g. the user re-enabled
+	// the last provider from `/extensions`) and must NOT roll back to the
+	// model-side list on the next boot.
+	syncDisabledExtensionProvidersFromSettings();
 }
 
 /**
- * Persist current disabled providers to settings.
+ * Persist current disabled extension providers to settings.
  */
-function persistDisabledProviders(): void {
+function persistDisabledExtensionProviders(cwd?: string): void {
 	if (settings) {
-		settings.set("disabledProviders", Array.from(disabledProviders));
+		settings.setDisabledExtensionProviders(Array.from(disabledExtensionProviders), cwd);
 	}
 }
 
 /**
- * Disable a provider globally (across all capabilities).
+ * Disable an extension provider (hides its capability contributions from
+ * `/extensions` and everywhere `loadCapability` runs). Does not affect model
+ * discovery or `/login`; those honor the separate `disabledProviders` list.
+ *
+ * `cwd` selects the workspace whose path-scoped `disabledExtensionProviders`
+ * rules are read and written; omit it for the active session scope. Toggles for
+ * a different workspace (ACP `_omp/extensions/toggle`) MUST pass the target cwd
+ * so the sync and the persisted edit both land in that project.
  */
-export function disableProvider(providerId: string): void {
-	disabledProviders.add(providerId);
-	persistDisabledProviders();
+export function disableProvider(providerId: string, cwd?: string): void {
+	syncDisabledExtensionProvidersFromSettings(cwd);
+	disabledExtensionProviders.add(providerId);
+	persistDisabledExtensionProviders(cwd);
 }
 
 /**
- * Enable a previously disabled provider.
+ * Re-enable a previously disabled extension provider, resolved against `cwd`
+ * (defaults to the active session scope).
  */
-export function enableProvider(providerId: string): void {
-	disabledProviders.delete(providerId);
-	persistDisabledProviders();
+export function enableProvider(providerId: string, cwd?: string): void {
+	syncDisabledExtensionProvidersFromSettings(cwd);
+	disabledExtensionProviders.delete(providerId);
+	persistDisabledExtensionProviders(cwd);
 }
 
 /**
- * Check if a provider is enabled.
+ * Check if an extension provider is enabled (capability-registry scope).
+ *
+ * `cwd` selects the workspace whose path-scoped `disabledExtensionProviders`
+ * rules apply; omit it for the active session scope. Display paths that load a
+ * different workspace (`loadAllExtensions`, ACP `_omp/extensions`) MUST pass the
+ * loaded cwd so labels match the target project, not the live singleton.
  */
-export function isProviderEnabled(providerId: string): boolean {
-	return !disabledProviders.has(providerId);
+export function isProviderEnabled(providerId: string, cwd?: string): boolean {
+	syncDisabledExtensionProvidersFromSettings(cwd);
+	return !disabledExtensionProviders.has(providerId);
 }
 
 /**
- * Get list of all disabled provider IDs.
+ * Get list of all disabled extension provider IDs, resolved against `cwd`
+ * (defaults to the active session scope).
  */
-export function getDisabledProviders(): string[] {
-	return Array.from(disabledProviders);
+export function getDisabledProviders(cwd?: string): string[] {
+	syncDisabledExtensionProvidersFromSettings(cwd);
+	return Array.from(disabledExtensionProviders);
 }
 
 /**
- * Set disabled providers from a list (replaces current set).
+ * Set disabled extension providers from a list (replaces current set).
  */
 export function setDisabledProviders(providerIds: string[]): void {
-	disabledProviders.clear();
+	disabledExtensionProviders.clear();
 	for (const id of providerIds) {
-		disabledProviders.add(id);
+		disabledExtensionProviders.add(id);
 	}
-	persistDisabledProviders();
+	persistDisabledExtensionProviders();
+}
+
+/** Reset provider disable state for tests that tear down the Settings singleton. */
+export function resetProviderStateForTests(): void {
+	settings = null;
+	disabledExtensionProviders.clear();
 }
 
 // =============================================================================
@@ -358,11 +401,13 @@ export function listCapabilities(): string[] {
 }
 
 /**
- * Get capability info for UI display.
+ * Get capability info for UI display, resolved against `cwd` (defaults to the
+ * active session scope).
  */
-export function getCapabilityInfo(capabilityId: string): CapabilityInfo | undefined {
+export function getCapabilityInfo(capabilityId: string, cwd?: string): CapabilityInfo | undefined {
 	const capability = capabilities.get(capabilityId);
 	if (!capability) return undefined;
+	syncDisabledExtensionProvidersFromSettings(cwd);
 
 	return {
 		id: capability.id,
@@ -373,25 +418,27 @@ export function getCapabilityInfo(capabilityId: string): CapabilityInfo | undefi
 			displayName: p.displayName,
 			description: p.description,
 			priority: p.priority,
-			enabled: !disabledProviders.has(p.id),
+			enabled: !disabledExtensionProviders.has(p.id),
 		})),
 	};
 }
 
 /**
- * Get all capabilities info for UI display.
+ * Get all capabilities info for UI display, resolved against `cwd`.
  */
-export function getAllCapabilitiesInfo(): CapabilityInfo[] {
-	return listCapabilities().map(id => getCapabilityInfo(id)!);
+export function getAllCapabilitiesInfo(cwd?: string): CapabilityInfo[] {
+	return listCapabilities().map(id => getCapabilityInfo(id, cwd)!);
 }
 
 /**
- * Get provider info for UI display.
+ * Get provider info for UI display, resolved against `cwd` (defaults to the
+ * active session scope).
  */
-export function getProviderInfo(providerId: string): ProviderInfo | undefined {
+export function getProviderInfo(providerId: string, cwd?: string): ProviderInfo | undefined {
 	const meta = providerMeta.get(providerId);
 	const caps = providerCapabilities.get(providerId);
 	if (!meta || !caps) return undefined;
+	syncDisabledExtensionProvidersFromSettings(cwd);
 
 	// Find priority from first capability's provider list
 	let priority = 0;
@@ -410,18 +457,19 @@ export function getProviderInfo(providerId: string): ProviderInfo | undefined {
 		description: meta.description,
 		priority,
 		capabilities: Array.from(caps),
-		enabled: !disabledProviders.has(providerId),
+		enabled: !disabledExtensionProviders.has(providerId),
 	};
 }
 
 /**
- * Get all providers info for UI display (deduplicated across capabilities).
+ * Get all providers info for UI display (deduplicated across capabilities),
+ * resolved against `cwd`.
  */
-export function getAllProvidersInfo(): ProviderInfo[] {
+export function getAllProvidersInfo(cwd?: string): ProviderInfo[] {
 	const providers: ProviderInfo[] = [];
 
 	for (const providerId of providerMeta.keys()) {
-		const info = getProviderInfo(providerId);
+		const info = getProviderInfo(providerId, cwd);
 		if (info) {
 			providers.push(info);
 		}

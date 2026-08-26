@@ -14,12 +14,13 @@
  * - agent://<id>/<path> - JSON extraction via path form (fallback when no
  *   nested output matches the path)
  * - agent://<id>?q=<query> - JSON extraction via query form
+ * - agent://<id>?lease=<scope> - Full output from one temporary artifact lease
  */
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { isEnoent } from "@oh-my-pi/pi-utils";
 import { applyQuery, pathToQuery } from "./json-query";
-import { artifactsDirsFromRegistry } from "./registry-helpers";
+import { artifactsDirForScope, artifactsDirsFromRegistry } from "./registry-helpers";
 import type { InternalResource, InternalUrl, ProtocolHandler, UrlCompletion } from "./types";
 
 /**
@@ -47,7 +48,12 @@ export class AgentProtocolHandler implements ProtocolHandler {
 			throw new Error("agent:// URL cannot combine path extraction with ?q=");
 		}
 
-		const dirs = artifactsDirsFromRegistry();
+		const leaseScope = url.searchParams.get("lease");
+		const scopedDir = leaseScope === null ? undefined : artifactsDirForScope(leaseScope);
+		if (leaseScope !== null && !scopedDir) {
+			throw new Error("Artifact lease unavailable");
+		}
+		const dirs = scopedDir ? [scopedDir] : artifactsDirsFromRegistry();
 		if (dirs.length === 0) {
 			throw new Error("No session - agent outputs unavailable");
 		}

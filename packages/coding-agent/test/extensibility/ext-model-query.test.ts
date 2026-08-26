@@ -3,7 +3,7 @@ import type { Api, Model } from "@oh-my-pi/pi-ai";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import type { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import type { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import { createExtensionModelQuery } from "../../src/extensibility/extensions/model-api";
+import { createExtensionModelQuery, setExtensionModelAlias } from "../../src/extensibility/extensions/model-api";
 
 function model(id: string, name: string, provider: string): Model<"anthropic-messages"> {
 	return buildModel({
@@ -30,6 +30,8 @@ const available = [claude, gpt] as Model<Api>[];
 function registry(): ModelRegistry {
 	return {
 		getAvailable: () => available,
+		getAll: () => available,
+		hasConfiguredAuth: (candidate: Model<Api>) => available.includes(candidate),
 	} as unknown as ModelRegistry;
 }
 
@@ -61,6 +63,267 @@ describe("createExtensionModelQuery", () => {
 		} as unknown as Settings;
 		const q = createExtensionModelQuery(registry(), settings, () => undefined);
 		expect(q.resolve("@slow")).toBe(claude);
+	});
+
+	test("listAliases() exposes effective built-in and custom role resolution", () => {
+		const unavailable = model("claude-haiku-4-5", "Claude Haiku 4.5", "anthropic");
+		const settings = {
+			get: (path: string) => {
+				if (path === "cycleOrder") return ["smol", "default", "slow"];
+				if (path === "modelTags") return {};
+				return undefined;
+			},
+			getModelRole: (role: string) =>
+				({
+					slow: "anthropic/claude-opus-4-8:high",
+					unavailable: "anthropic/claude-haiku-4-5",
+					missing: "anthropic/not-in-catalog",
+				})[role],
+			getModelRoles: () => ({
+				slow: "anthropic/claude-opus-4-8:high",
+				unavailable: "anthropic/claude-haiku-4-5",
+				missing: "anthropic/not-in-catalog",
+			}),
+		} as unknown as Settings;
+		const q = createExtensionModelQuery(
+			{
+				getAvailable: () => available,
+				getAll: () => [...available, unavailable],
+				hasConfiguredAuth: (candidate: Model<Api>) => available.includes(candidate),
+			} as unknown as ModelRegistry,
+			settings,
+			() => claude,
+		);
+
+		const aliases = q.listAliases();
+		expect(aliases.find(alias => alias.name === "slow")).toMatchObject({
+			status: "resolved",
+			model: claude,
+			explicitThinkingLevel: true,
+		});
+		expect(aliases.find(alias => alias.name === "unavailable")).toMatchObject({
+			status: "unavailable",
+			model: unavailable,
+		});
+		expect(aliases.find(alias => alias.name === "missing")).toMatchObject({
+			status: "unresolved",
+		});
+		expect(aliases.find(alias => alias.name === "missing")).not.toHaveProperty("model");
+	});
+	test("listAliases() falls back to the active model for an unconfigured default role", () => {
+		const settings = {
+			get: (path: string) => (path === "cycleOrder" ? ["default"] : path === "modelTags" ? {} : undefined),
+			getModelRole: () => undefined,
+			getModelRoles: () => ({}),
+		} as unknown as Settings;
+		const q = createExtensionModelQuery(registry(), settings, () => claude);
+		expect(q.listAliases().find(alias => alias.name === "default")).toMatchObject({
+			status: "resolved",
+			model: claude,
+		});
+	});
+
+	test("listAliases() treats explicitly authenticated catalog models as resolved", () => {
+		const settings = {
+			get: (path: string) => (path === "cycleOrder" ? ["slow"] : path === "modelTags" ? {} : undefined),
+			getModelRole: (role: string) => (role === "slow" ? "anthropic/claude-opus-4-8" : undefined),
+			getModelRoles: () => ({ slow: "anthropic/claude-opus-4-8" }),
+		} as unknown as Settings;
+		const q = createExtensionModelQuery(
+			{
+				getAvailable: () => [],
+				getAll: () => [claude],
+				hasConfiguredAuth: () => true,
+			} as unknown as ModelRegistry,
+			settings,
+			() => undefined,
+		);
+		expect(q.listAliases().find(alias => alias.name === "slow")).toMatchObject({
+			status: "resolved",
+			model: claude,
+		});
+	});
+	test("listAliases() checks later authenticated fallback patterns", () => {
+		const unavailable = model("claude-haiku-4-5", "Claude Haiku 4.5", "anthropic");
+		const explicit = model("grok-4", "Grok 4", "xai-oauth");
+		const settings = {
+			get: (path: string) => (path === "cycleOrder" ? ["slow"] : path === "modelTags" ? {} : undefined),
+			getModelRole: (role: string) => (role === "slow" ? "anthropic/claude-haiku-4-5, xai-oauth/grok-4" : undefined),
+			getModelRoles: () => ({ slow: "anthropic/claude-haiku-4-5, xai-oauth/grok-4" }),
+		} as unknown as Settings;
+		const q = createExtensionModelQuery(
+			{
+				getAvailable: () => [],
+				getAll: () => [unavailable, explicit],
+				hasConfiguredAuth: (candidate: Model<Api>) => candidate === explicit,
+			} as unknown as ModelRegistry,
+			settings,
+			() => undefined,
+		);
+
+		expect(q.listAliases().find(alias => alias.name === "slow")).toMatchObject({
+			status: "resolved",
+			model: explicit,
+		});
+	});
+	test("listAliases() preserves pattern order across selectable providers", () => {
+		const explicitFirst = model("grok-4", "Grok 4", "xai-oauth");
+		const normalSecond = claude;
+		const settings = {
+			get: (path: string) => (path === "cycleOrder" ? ["slow"] : path === "modelTags" ? {} : []),
+			getModelRole: (role: string) => (role === "slow" ? "xai-oauth/grok-4, anthropic/claude-opus-4-8" : undefined),
+			getModelRoles: () => ({ slow: "xai-oauth/grok-4, anthropic/claude-opus-4-8" }),
+		} as unknown as Settings;
+		const q = createExtensionModelQuery(
+			{
+				getAvailable: () => [normalSecond],
+				getAll: () => [explicitFirst, normalSecond],
+				hasConfiguredAuth: () => true,
+			} as unknown as ModelRegistry,
+			settings,
+			() => undefined,
+		);
+
+		expect(q.listAliases().find(alias => alias.name === "slow")).toMatchObject({
+			status: "resolved",
+			model: explicitFirst,
+		});
+	});
+	test("listAliases() keeps disabled authenticated providers unavailable", () => {
+		const settings = {
+			get: (path: string) =>
+				path === "cycleOrder"
+					? ["slow"]
+					: path === "modelTags"
+						? {}
+						: path === "disabledProviders"
+							? ["anthropic"]
+							: [],
+			getModelRole: (role: string) => (role === "slow" ? "anthropic/claude-opus-4-8" : undefined),
+			getModelRoles: () => ({ slow: "anthropic/claude-opus-4-8" }),
+		} as unknown as Settings;
+		const q = createExtensionModelQuery(
+			{
+				getAvailable: () => [],
+				getAll: () => [claude],
+				hasConfiguredAuth: () => true,
+			} as unknown as ModelRegistry,
+			settings,
+			() => undefined,
+		);
+
+		expect(q.listAliases().find(alias => alias.name === "slow")).toMatchObject({
+			status: "unavailable",
+			model: claude,
+		});
+	});
+	test("listAliases() keeps a disabled active model unavailable for default fallback", () => {
+		const settings = {
+			get: (path: string) =>
+				path === "cycleOrder"
+					? ["default"]
+					: path === "modelTags"
+						? {}
+						: path === "disabledProviders"
+							? ["anthropic"]
+							: [],
+			getModelRole: () => undefined,
+			getModelRoles: () => ({}),
+		} as unknown as Settings;
+		const q = createExtensionModelQuery(
+			{
+				getAvailable: () => [],
+				getAll: () => [claude],
+				hasConfiguredAuth: () => true,
+			} as unknown as ModelRegistry,
+			settings,
+			() => claude,
+		);
+
+		expect(q.listAliases().find(alias => alias.name === "default")).toMatchObject({
+			status: "unavailable",
+			model: claude,
+		});
+	});
+	test("listAliases() keeps an unauthenticated active model unavailable for default fallback", async () => {
+		const settings = {
+			get: (path: string) => (path === "cycleOrder" ? ["default"] : path === "modelTags" ? {} : []),
+			getModelRole: () => undefined,
+			getModelRoles: () => ({}),
+		} as unknown as Settings;
+		const unauthenticatedRegistry = {
+			getAvailable: () => [],
+			getAll: () => [claude],
+			hasConfiguredAuth: () => false,
+		} as unknown as ModelRegistry;
+		const q = createExtensionModelQuery(unauthenticatedRegistry, settings, () => claude);
+		expect(q.listAliases().find(alias => alias.name === "default")).toMatchObject({
+			status: "unavailable",
+			model: claude,
+		});
+
+		const result = await setExtensionModelAlias("default", unauthenticatedRegistry, settings, claude, async () => {
+			throw new Error("must not switch");
+		});
+		expect(result).toEqual({ ok: false, alias: "default", reason: "unavailable_alias" });
+	});
+
+	test("listAliases() marks the reserved fallback role as unselectable", async () => {
+		const settings = {
+			get: (path: string) => (path === "cycleOrder" ? ["fallback"] : path === "modelTags" ? {} : []),
+			getModelRole: (role: string) => (role === "fallback" ? "anthropic/claude-opus-4-8" : undefined),
+			getModelRoles: () => ({ fallback: "anthropic/claude-opus-4-8" }),
+		} as unknown as Settings;
+		const q = createExtensionModelQuery(registry(), settings, () => undefined);
+		expect(q.listAliases().find(alias => alias.name === "fallback")).toMatchObject({
+			status: "reserved",
+			model: claude,
+		});
+
+		const result = await setExtensionModelAlias("fallback", registry(), settings, undefined, async () => {
+			throw new Error("must not switch");
+		});
+		expect(result).toEqual({ ok: false, alias: "fallback", reason: "reserved_alias" });
+	});
+
+	test("listAliases() returns no aliases without settings", () => {
+		const q = createExtensionModelQuery(registry(), undefined, () => undefined);
+		expect(q.listAliases()).toEqual([]);
+	});
+	test("setModelAlias() applies a resolved alias to the current session", async () => {
+		const settings = {
+			get: (path: string) => (path === "cycleOrder" ? ["slow"] : path === "modelTags" ? {} : undefined),
+			getModelRole: (role: string) => (role === "slow" ? "anthropic/claude-opus-4-8:high" : undefined),
+			getModelRoles: () => ({ slow: "anthropic/claude-opus-4-8:high" }),
+		} as unknown as Settings;
+		let switched: { model: Model<Api>; thinkingLevel: unknown; options: unknown } | undefined;
+		const result = await setExtensionModelAlias(
+			"slow",
+			registry(),
+			settings,
+			undefined,
+			async (model, thinkingLevel, options) => {
+				switched = { model, thinkingLevel, options };
+			},
+		);
+
+		expect(result).toMatchObject({ ok: true, scope: "session" });
+		expect(switched).toEqual({ model: claude, thinkingLevel: "high", options: { role: "slow" } });
+	});
+
+	test("setModelAlias() refuses unresolved aliases without switching", async () => {
+		const settings = {
+			get: (path: string) => (path === "cycleOrder" ? ["missing"] : path === "modelTags" ? {} : undefined),
+			getModelRole: (role: string) => (role === "missing" ? "anthropic/not-in-catalog" : undefined),
+			getModelRoles: () => ({ missing: "anthropic/not-in-catalog" }),
+		} as unknown as Settings;
+		let switched = false;
+		const result = await setExtensionModelAlias("missing", registry(), settings, undefined, async () => {
+			switched = true;
+		});
+
+		expect(result).toEqual({ ok: false, alias: "missing", reason: "unresolved_alias" });
+		expect(switched).toBe(false);
 	});
 
 	test("family() groups a vendor's point releases and separates vendors", () => {

@@ -39,7 +39,6 @@ import rootLicense from "./tools/browser/relay/extension-assets/LICENSE.txt" wit
 import thirdPartyNotices from "./tools/browser/relay/extension-assets/THIRD-PARTY-NOTICES.txt" with { type: "text" };
 import { COMPUTER_WORKER_ARG } from "./tools/computer/protocol";
 import { smokeTestComputerWorker } from "./tools/computer/supervisor";
-import { startComputerWorker } from "./tools/computer/worker-entry";
 
 if (Bun.semver.order(Bun.version, MIN_BUN_VERSION) < 0) {
 	process.stderr.write(
@@ -179,6 +178,7 @@ async function runWorkerEntrypoint(arg: string | undefined): Promise<boolean> {
 	}
 	if (arg === COMPUTER_WORKER_ARG) {
 		if (parentPort) installWorkerInbox(parentPort);
+		const { startComputerWorker } = await import("./tools/computer/worker-entry");
 		startComputerWorker();
 		return true;
 	}
@@ -435,8 +435,10 @@ export async function runCli(argv: string[]): Promise<void> {
 		// Intentional exception to the static-import convention: this latency boundary
 		// keeps the TUI graph out of worker, subcommand, help, and version launches.
 		// Loading it statically would erase the measured cold-start improvement.
-		const { beginStartupComposer, stopPendingStartupComposer } = await import("./modes/startup-composer");
-		beginStartupComposer({ version: VERSION });
+		const { beginStartupComposer, STARTUP_COMPOSER_DEFAULTS, stopPendingStartupComposer } = await import(
+			"./modes/startup-composer"
+		);
+		beginStartupComposer(STARTUP_COMPOSER_DEFAULTS);
 		stopStartupComposer = stopPendingStartupComposer;
 	}
 

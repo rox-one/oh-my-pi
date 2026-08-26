@@ -26,7 +26,7 @@ import taskSummaryTemplate from "../prompts/tools/task-summary.md" with { type: 
 import { TASK_EFFORTS, type TaskEffort } from "../thinking";
 import { truncateForPrompt } from "../tools/approval";
 import { isIrcEnabled } from "../tools/hub";
-import { formatBytes, formatDuration } from "../tools/render-utils";
+import { formatDuration } from "../tools/render-utils";
 import { isReadOnlyAgent } from "./read-only-policy";
 import { isScoutSpawnable, resolveSpawnPolicy } from "./spawn-policy";
 import {
@@ -46,6 +46,7 @@ import type { AsyncJobManager } from "../async";
 import { hasResolvableTranscript } from "../internal-urls/registry-helpers";
 import { AgentRegistry } from "../registry/agent-registry";
 import { type DiscoveryResult, discoverAgents } from "./discovery";
+import { spawnedAgentSessionLinkPath } from "./link-path";
 import { generateTaskName } from "./name-generator";
 import { AgentOutputManager } from "./output-manager";
 import { mapWithConcurrencyLimitAllSettled, Semaphore } from "./parallel";
@@ -142,6 +143,8 @@ interface TaskDescriptionOptions {
 	asyncEnabled: boolean;
 	ircEnabled: boolean;
 	parentSpawns: string;
+	maxRecursionDepth: number;
+	taskDepth: number;
 }
 
 /** Render the tool description from a cached agent list and current settings. */
@@ -164,7 +167,12 @@ function renderDescription(options: TaskDescriptionOptions): string {
 		readOnly: isReadOnlyAgent(agent),
 		blocking: agent.blocking === true,
 	}));
-	const scoutAvailable = isScoutSpawnable(options.disabledAgents, options.parentSpawns);
+	const scoutAvailable = isScoutSpawnable(
+		options.disabledAgents,
+		options.parentSpawns,
+		options.maxRecursionDepth,
+		options.taskDepth,
+	);
 	return prompt.render(taskDescriptionTemplate, {
 		agents: renderedAgents,
 		scoutAvailable,
@@ -611,6 +619,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			asyncEnabled: this.session.settings.get("async.enabled"),
 			ircEnabled: isIrcEnabled(this.session.settings, this.session.taskDepth ?? 0),
 			parentSpawns: this.session.getSessionSpawns() ?? "*",
+			maxRecursionDepth: this.session.settings.get("task.maxRecursionDepth") ?? 2,
+			taskDepth: this.session.taskDepth ?? 0,
 		});
 	}
 	private constructor(
@@ -752,6 +762,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						scoutAvailable: isScoutSpawnable(
 							this.session.settings.get("task.disabledAgents") as string[] | undefined,
 							this.session.getSessionSpawns?.() ?? "*",
+							this.session.settings.get("task.maxRecursionDepth") ?? 2,
+							this.session.taskDepth ?? 0,
 						),
 					});
 			const result = await this.#executeSyncFanout(
@@ -789,6 +801,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					scoutAvailable: isScoutSpawnable(
 						this.session.settings.get("task.disabledAgents") as string[] | undefined,
 						this.session.getSessionSpawns?.() ?? "*",
+						this.session.settings.get("task.maxRecursionDepth") ?? 2,
+						this.session.taskDepth ?? 0,
 					),
 				});
 		// Returns a fresh result (copied content array, copied text part) rather
@@ -840,6 +854,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			const policy = policies[index]!;
 			const agentSource = policy.agent.source;
 			const agentId = await outputManager.allocate(item.name?.trim() || generateTaskName());
+			const sessionFile = spawnedAgentSessionLinkPath(this.session.getSessionFile(), agentId);
 			const assignment = (item.task ?? "").trim();
 			spawns.push({
 				agentId,
@@ -852,6 +867,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					agent: agentType,
 					agentSource,
 					modelRole: policy.modelRole,
+					sessionFile,
 					status: "pending",
 					task: renderSubagentUserPrompt(assignment),
 					assignment,
@@ -887,7 +903,11 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			totalDurationMs: Date.now() - callStartedAt,
 			usage: syncUsage,
 			outputPaths: syncOutputPaths,
-			progress: spawns.map(spawn => ({ ...spawn.progress })),
+			progress: spawns.map(spawn => ({
+				...spawn.progress,
+				sessionFile:
+					spawnedAgentSessionLinkPath(this.session.getSessionFile(), spawn.agentId) ?? spawn.progress.sessionFile,
+			})),
 			async: {
 				state: settledCount < asyncSpawns.length ? "running" : failedCount > 0 ? "failed" : "completed",
 				jobId: primaryJobId,
@@ -1089,7 +1109,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		return manager.register(
 			"task",
 			agentId,
-			async ({ signal: runSignal, reportProgress, markRunning }) => {
+			async ({ jobId, signal: runSignal, reportProgress, markRunning }) => {
 				const startedAt = Date.now();
 				const semaphore = this.#getSpawnSemaphore();
 				let semaphoreHeld = false;
@@ -1139,6 +1159,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 							progress.resolvedModel = nextProgress.resolvedModel;
 							progress.resolvedModelIsFallback =
 								nextProgress.resolvedModelIsFallback ?? progress.resolvedModelIsFallback;
+							progress.sessionFile = nextProgress.sessionFile;
 							progress.tokens = nextProgress.tokens;
 							progress.requests = nextProgress.requests;
 							progress.contextTokens = nextProgress.contextTokens;
@@ -1156,6 +1177,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 							update.content.find(part => part.type === "text")?.text ?? `Running background task ${agentId}...`;
 						await reportProgress(updateText, buildDetails() as unknown as Record<string, unknown>);
 					};
+					let artifactCleanup: (() => Promise<void>) | undefined;
 					const result = await this.#executeSync(
 						toolCallId,
 						spawnParams,
@@ -1165,9 +1187,13 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 						progress.index,
 						true,
 						{ invokedAt: startedAt, acquiredAt },
+						release => {
+							artifactCleanup = release;
+						},
 					);
 					const finalText = result.content.find(part => part.type === "text")?.text ?? "(no output)";
 					const singleResult = result.details?.results[0];
+					if (singleResult) manager.setTaskArtifactOutcome(jobId, singleResult, artifactCleanup);
 					// A missing result means the sync path failed at the tool level
 					// (results: []) — treat it as a failure, not success.
 					const resultFailed = !singleResult || (singleResult.aborted ?? false) || singleResult.exitCode !== 0;
@@ -1222,6 +1248,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				agentId,
 				queued: true,
 				ownerId: this.session.getAgentId?.() ?? undefined,
+				linkPath: progress.sessionFile,
 				onProgress: text => {
 					onUpdate?.({ content: [{ type: "text", text }], details: buildDetails() });
 				},
@@ -1395,8 +1422,19 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		spawnIndex = 0,
 		detached = false,
 		launchTiming?: { invokedAt: number; acquiredAt: number },
+		onRetainedArtifactLease?: (release: () => Promise<void>) => void,
 	): Promise<AgentToolResult<TaskToolDetails>> {
-		return this.#runSpawn(toolCallId, params, signal, onUpdate, preAllocatedId, spawnIndex, detached, launchTiming);
+		return this.#runSpawn(
+			toolCallId,
+			params,
+			signal,
+			onUpdate,
+			preAllocatedId,
+			spawnIndex,
+			detached,
+			launchTiming,
+			onRetainedArtifactLease,
+		);
 	}
 
 	/** Spawn a fresh subagent and run it to completion. */
@@ -1409,6 +1447,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		spawnIndex = 0,
 		detached = false,
 		launchTiming?: { invokedAt: number; acquiredAt: number },
+		onRetainedArtifactLease?: (release: () => Promise<void>) => void,
 	): Promise<AgentToolResult<TaskToolDetails>> {
 		const startTime = Date.now();
 		const assignment = (params.task ?? "").trim();
@@ -1432,6 +1471,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				detached,
 				invokedAt: launchTiming?.invokedAt,
 				acquiredAt: launchTiming?.acquiredAt,
+				onRetainedArtifactLease,
 				...("isolated" in params ? { isolation: { requested: params.isolated } } : {}),
 				blockedAgent: this.#blockedAgent,
 				enableLsp: (this.session.enableLsp ?? true) && this.session.settings.get("task.enableLsp"),
@@ -1509,12 +1549,15 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			resumable,
 			preview,
 			truncated,
-			meta: result.outputMeta
+			artifact: result.outputMeta
 				? {
+						uri: result.outputMeta.uri,
+						sha256: result.outputMeta.sha256,
+						bytes: result.outputMeta.bytes,
 						lineCount: result.outputMeta.lineCount,
-						charSize: formatBytes(result.outputMeta.charCount),
 					}
 				: undefined,
+			artifactError: result.artifactError,
 			mergeSummary,
 		});
 

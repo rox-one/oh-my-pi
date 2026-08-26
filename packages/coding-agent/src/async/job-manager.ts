@@ -1,4 +1,5 @@
 import { logger } from "@oh-my-pi/pi-utils";
+import { rebasePathWithinRoot, rebaseResourcePathMetadata } from "../session/session-paths";
 
 const DELIVERY_RETRY_BASE_MS = 500;
 const DELIVERY_RETRY_MAX_MS = 30_000;
@@ -32,18 +33,36 @@ interface PollEscalationState {
 /** Kind of work a managed job runs; drives job-row badges and delivery labels. */
 export type AsyncJobType = "bash" | "task" | "eval";
 
-export interface AsyncJob {
+/** Receipt for task output that the executor verified before publication. */
+export interface AsyncJobArtifactReceipt {
+	uri: string;
+	sha256: string;
+	bytes: number;
+	lineCount: number;
+	charCount: number;
+}
+
+/** Artifact publication outcome retained with a task job until eviction. */
+export interface AsyncJobArtifactOutcome {
+	outputMeta?: AsyncJobArtifactReceipt;
+	artifactError?: string;
+}
+
+export interface AsyncJob extends AsyncJobArtifactOutcome {
 	id: string;
 	type: AsyncJobType;
 	status: "running" | "completed" | "failed" | "cancelled";
 	startTime: number;
 	label: string;
+	linkPath?: string;
 	abortController: AbortController;
 	promise: Promise<void>;
 	resultText?: string;
 	errorText?: string;
 	/** Latest tool-render details reported by the running job. */
 	latestDetails?: Record<string, unknown>;
+	/** Removes a temporary artifact lease when this job leaves retention. */
+	artifactCleanup?: () => Promise<void>;
 	/**
 	 * Registry id of the agent that registered the job (e.g. "Main",
 	 * "AuthLoader"). Used by scoped cancel/list APIs so a subagent's teardown
@@ -111,6 +130,8 @@ export interface AsyncJobRegisterOptions {
 	ownerId?: string;
 	/** Registry id of the subagent this job runs; see {@link AsyncJob.agentId}. */
 	agentId?: string;
+	/** File-backed target rendered as the job's OSC 8 hyperlink. */
+	linkPath?: string;
 	onProgress?: (text: string, details?: Record<string, unknown>) => void | Promise<void>;
 	/** Register the job in queued state; see {@link AsyncJob.queued}. */
 	queued?: boolean;
@@ -174,6 +195,14 @@ export class AsyncJobManager {
 		this.#retentionMs = Math.max(0, Math.floor(options.retentionMs ?? DEFAULT_RETENTION_MS));
 	}
 
+	/** Keep retained and running job resource paths valid after an artifact tree moves. */
+	rebaseResourcePaths(oldRoot: string, newRoot: string): void {
+		for (const job of this.#jobs.values()) {
+			if (job.linkPath) job.linkPath = rebasePathWithinRoot(job.linkPath, oldRoot, newRoot);
+			rebaseResourcePathMetadata(job.latestDetails, oldRoot, newRoot);
+		}
+	}
+
 	/** True when the running-job count has reached the configured cap. */
 	get atCapacity(): boolean {
 		if (this.#disposed) return true;
@@ -194,6 +223,10 @@ export class AsyncJobManager {
 			reportProgress: (text: string, details?: Record<string, unknown>) => Promise<void>;
 			/** Clear the queued flag once the job actually starts executing. */
 			markRunning: () => void;
+			/** Attach a file-backed result target once the running job allocates one. */
+			setLinkPath: (linkPath: string | undefined) => void;
+			/** Read the job's current file-backed target after session moves rebase it. */
+			getLinkPath: () => string | undefined;
 		}) => Promise<string>,
 		options?: AsyncJobRegisterOptions,
 	): string {
@@ -227,6 +260,7 @@ export class AsyncJobManager {
 			promise: Promise.resolve(),
 			ownerId: options?.ownerId,
 			agentId: options?.agentId,
+			linkPath: options?.linkPath,
 			queued: options?.queued === true,
 		};
 
@@ -242,6 +276,11 @@ export class AsyncJobManager {
 				});
 			}
 		};
+		const setLinkPath = (linkPath: string | undefined): void => {
+			job.linkPath = linkPath;
+		};
+		const getLinkPath = (): string | undefined => job.linkPath;
+
 		job.promise = (async () => {
 			try {
 				const text = await run({
@@ -251,6 +290,8 @@ export class AsyncJobManager {
 					markRunning: () => {
 						job.queued = false;
 					},
+					setLinkPath,
+					getLinkPath,
 				});
 				if (job.status === "cancelled") {
 					job.resultText = text;
@@ -297,6 +338,33 @@ export class AsyncJobManager {
 
 	getJob(id: string): AsyncJob | undefined {
 		return this.#jobs.get(id);
+	}
+
+	/** Retain a task artifact outcome only when its receipt names this job's agent. */
+	setTaskArtifactOutcome(id: string, outcome: AsyncJobArtifactOutcome, artifactCleanup?: () => Promise<void>): void {
+		const job = this.#jobs.get(id);
+		if (job?.type !== "task") {
+			this.#runArtifactCleanup(id, artifactCleanup);
+			return;
+		}
+
+		const receipt = outcome.outputMeta;
+		const agentId = job.agentId ?? job.id;
+		const expectedUri = `agent://${agentId}`;
+		const scopedPrefix = `${expectedUri}?lease=`;
+		const receiptMatchesAgent =
+			!receipt ||
+			receipt.uri === expectedUri ||
+			(receipt.uri.startsWith(scopedPrefix) && receipt.uri.length > scopedPrefix.length);
+		if (!receiptMatchesAgent) {
+			job.outputMeta = undefined;
+			job.artifactError = outcome.artifactError ?? `artifact receipt does not match ${agentId}`;
+			this.#runArtifactCleanup(job.id, artifactCleanup);
+			return;
+		}
+		job.outputMeta = receipt;
+		job.artifactError = outcome.artifactError;
+		if (artifactCleanup) job.artifactCleanup = artifactCleanup;
 	}
 
 	getRunningJobs(filter?: AsyncJobFilter): AsyncJob[] {
@@ -607,6 +675,11 @@ export class AsyncJobManager {
 		const jobsSettled = await this.#waitForAllUntil(deadline);
 		const drained = await this.drainDeliveries({ timeoutMs: Math.max(deadline - Date.now(), 0) });
 		this.#clearEvictionTimers();
+		for (const job of this.#jobs.values()) {
+			const cleanup = job.artifactCleanup;
+			job.artifactCleanup = undefined;
+			this.#runArtifactCleanup(job.id, cleanup);
+		}
 		this.#jobs.clear();
 		this.#deliveries.length = 0;
 		this.#notifyDeliveryQueueChanged();
@@ -644,11 +717,28 @@ export class AsyncJobManager {
 	}
 
 	#evictJob(jobId: string): boolean {
+		const job = this.#jobs.get(jobId);
 		clearTimeout(this.#evictionTimers.get(jobId));
 		this.#evictionTimers.delete(jobId);
 		this.#suppressedDeliveries.delete(jobId);
 		this.#watchedJobs.delete(jobId);
+		if (job) {
+			const cleanup = job.artifactCleanup;
+			job.artifactCleanup = undefined;
+			this.#runArtifactCleanup(job.id, cleanup);
+		}
 		return this.#jobs.delete(jobId);
+	}
+
+	#runArtifactCleanup(jobId: string, cleanup: (() => Promise<void>) | undefined): void {
+		if (!cleanup) return;
+		try {
+			void cleanup().catch(error => {
+				logger.warn("Async job artifact cleanup failed", { jobId, error: String(error) });
+			});
+		} catch (error) {
+			logger.warn("Async job artifact cleanup failed", { jobId, error: String(error) });
+		}
 	}
 
 	#scheduleEviction(jobId: string): void {

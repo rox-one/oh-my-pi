@@ -2,7 +2,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { Message } from "@oh-my-pi/pi-ai";
 import { getAgentDir as getDefaultAgentDir, logger, parseJsonlLenient, toError } from "@oh-my-pi/pi-utils";
-import { LRUCache } from "@oh-my-pi/pi-utils/lru";
+import type { WorkspaceIdentifierMode } from "../utils/workspace-storage-identifier";
 import { computeDefaultSessionDir } from "./session-paths";
 import { FileSessionStorage, type SessionStorage, type SessionStorageStat } from "./session-storage";
 import { lookupSessionTitle, recordSessionTitle } from "./title-index";
@@ -736,12 +736,16 @@ export async function resolveResumableSession(
 	sessionArg: string,
 	cwd: string,
 	sessionDir?: string,
-	storageOrOptions: SessionStorage | ResolveResumableSessionOptions = new FileSessionStorage(),
-	options: ResolveResumableSessionOptions = {},
+	storage: SessionStorage = new FileSessionStorage(),
+	mode: WorkspaceIdentifierMode = "path",
 ): Promise<ResolvedSessionMatch | undefined> {
 	const storage = isSessionStorage(storageOrOptions) ? storageOrOptions : new FileSessionStorage();
 	const resolvedOptions = isSessionStorage(storageOrOptions) ? options : storageOrOptions;
-	const localSessionDir = sessionDir ?? computeDefaultSessionDir(cwd, storage);
+	const localSessionDir =
+		sessionDir ??
+		computeDefaultSessionDir(cwd, storage, {
+			identifierMode: resolvedOptions.identifierMode,
+		});
 	const localSessions = await listSessions(localSessionDir, storage);
 	const localMatch = localSessions.find(session => sessionMatchesResumeArg(session, sessionArg));
 	if (localMatch) {

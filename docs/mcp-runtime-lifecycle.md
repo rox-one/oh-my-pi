@@ -147,6 +147,14 @@ Server and tool name components are lowercased and sanitized to letters/undersco
 
 Both return structured tool output and convert remaining transport/tool errors into `MCP error: ...` tool content (abort remains abort).
 
+### URL elicitation
+
+The client advertises MCP URL-mode elicitation (`capabilities.elicitation.url`) on every initialize handshake. This capability declaration is unconditional: when no consent handler is installed (including headless/SDK sessions), an incoming `elicitation/create` request is answered with `decline` rather than being left unsupported. Interactive sessions install a URL handler on the manager; the handler receives `(serverName, request)` and is the only path that can accept or cancel the user-visible consent prompt.
+
+When a tool call returns the MCP URL-elicitation-required error (`-32042`), the tool bridge prompts once per unique `serverName + elicitationId`, accepts only an explicit `accept`, waits for the optional `notifications/elicitation/complete` notification when a completion waiter is available, and retries the tool once. Completion may arrive before the waiter is registered; that early completion is consumed by the subsequent wait. The wait has a bounded configurable deadline, and caller cancellation or deadline expiry aborts the retry instead of leaving the tool call pending. A second elicitation-required error is surfaced rather than recursively prompting.
+
+URL elicitation is intentionally interactive-only in this runtime. Headless/SDK sessions advertise the protocol capability for interoperability but have no consent UI and therefore decline requests. URL values are redacted from transport logs; elicitation payloads may be held transiently in bounded in-memory completion and listener buffers, but are not written to durable persistence.
+
 ## Refresh/reload paths (startup vs live reload)
 
 ### Initial startup path

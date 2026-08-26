@@ -8,13 +8,13 @@ import { getDialectDefinition } from "./factory";
  * 3: a replayed unsigned `thought` part is schema-accepted but silently
  * discarded — neither recalled nor influencing generation).
  *
- * The Anthropic/Claude dialect is the primary exception: Anthropic's
- * `reasoning_extraction` classifier blocks requests that replay prior
- * reasoning inside `<thinking>` / `antml:thinking` tags — it reads the
- * wrapped chain-of-thought as an attempt to duplicate model outputs and
- * refuses (Fable) or leaks it as visible reasoning (Opus / Sonnet / Haiku /
- * Mythos). Every Anthropic-dialect Claude model therefore receives prior
- * reasoning as bare assistant prose: no tag, no wrapper, no trailing newline.
+ * The Anthropic dialect (all Claude models: Opus, Sonnet, Haiku, Fable, Mythos,
+ * etc.) is an exception: Anthropic's `reasoning_extraction` classifier blocks
+ * requests that replay prior reasoning inside `<thinking>` / `antml:thinking`
+ * tags OR the older `_Hmm. …_` italic envelope — it reads the wrapped
+ * chain-of-thought as an attempt to duplicate model outputs and refuses the
+ * whole turn. Claude models therefore always receive prior reasoning as bare
+ * assistant prose: no tag, no `_Hmm.` wrapper, no trailing newline.
  * Heat is cumulative (block count and early-conversation position also raise
  * it), so this lowers per-block signal but does not license unbounded replay.
  *

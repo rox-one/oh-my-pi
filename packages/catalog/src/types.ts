@@ -303,6 +303,13 @@ export interface OpenAICompat {
 	 * Default: auto-detected (DeepSeek reasoning models).
 	 */
 	disableReasoningOnToolChoice?: boolean;
+	/**
+	 * Drop reasoning fields for any request that advertises tools. Use for
+	 * providers/models that route reasoning requests to a backend that cannot
+	 * call tools even when the transport accepts the `tools` array.
+	 * Default: auto-detected (direct DeepSeek reasoning models).
+	 */
+	disableReasoningWhenToolsPresent?: boolean;
 	/** OpenRouter-specific routing preferences. Only used when baseUrl points to OpenRouter. */
 	openRouterRouting?: OpenRouterRouting;
 	/** Vercel AI Gateway routing preferences. Only used when baseUrl points to Vercel AI Gateway. */
@@ -404,7 +411,13 @@ export interface OpenAICompat {
 	 * alternate view as `compat.whenThinking`; handlers pointer-swap, never
 	 * spread. Default: auto-detected (OpenCode gateways, #1071/#1484).
 	 */
-	whenThinking?: Partial<Omit<OpenAICompat, "whenThinking">>;
+	whenThinking?: Partial<Omit<OpenAICompat, "whenThinking" | "whenReasoningDisabled">>;
+	/**
+	 * Compat deltas applied when a request explicitly suppresses reasoning.
+	 * Use this to disable thinking-mode history replay fields alongside
+	 * top-level reasoning params. Default: auto-detected (direct DeepSeek tools).
+	 */
+	whenReasoningDisabled?: Partial<Omit<OpenAICompat, "whenThinking" | "whenReasoningDisabled">>;
 }
 
 /**
@@ -644,7 +657,12 @@ export interface ResolvedOpenAISharedCompat {
 	openRouterRouting?: OpenAICompat["openRouterRouting"];
 	/** Provider-specific wire model-id transform applied to the base id. */
 	wireModelIdMode: "raw" | "firepass" | "fireworks" | "openrouter";
-	/** See {@link OpenAICompat.toolSchemaFlavor}. Read by both wire paths when converting tools. */
+	/**
+	 * Tool-schema dialect the endpoint validates `tools.function.parameters`
+	 * against. `"moonshot-mfjs"` triggers Moonshot Flavored JSON Schema
+	 * normalization. Shared across the chat-completions and Responses transports
+	 * so OpenRouter-routed Moonshot/Kimi models sanitize on either path (#5918).
+	 */
 	toolSchemaFlavor?: OpenAICompat["toolSchemaFlavor"];
 }
 
@@ -663,7 +681,6 @@ export type ResolvedOpenAICompat = ResolvedOpenAISharedCompat &
 			| "reasoningEffortMap"
 			| "supportsReasoningParams"
 			| "supportsSamplingParams"
-			| "supportsPenaltyAndStopParams"
 			| "thinkingFormat"
 			| "kimiApiFormat"
 			| "reasoningDisableMode"
@@ -681,7 +698,6 @@ export type ResolvedOpenAICompat = ResolvedOpenAISharedCompat &
 			| "allowsSyntheticReasoningContentForToolCalls"
 			| "replayReasoningContent"
 			| "qwenPreserveThinking"
-			| "qwenTemplateReasoningEffort"
 			| "requiresThinkingAsText"
 			| "requiresMistralToolIds"
 			| "requiresToolResultName"
@@ -693,8 +709,6 @@ export type ResolvedOpenAICompat = ResolvedOpenAISharedCompat &
 			| "emptyLengthFinishIsContextError"
 			| "usesOpenAIToolCallIdLimit"
 			| "promptCacheSessionHeader"
-			| "supportsPromptCacheBreakpoints"
-			| "promptCacheBreakpointTtl"
 			| "openRouterRouting"
 			| "isOpenRouterHost"
 			| "supportsStrictMode"
@@ -705,12 +719,12 @@ export type ResolvedOpenAICompat = ResolvedOpenAISharedCompat &
 			| "extraBody"
 			| "toolStrictMode"
 			| "toolSchemaFlavor"
-			| "streamFirstEventTimeoutMs"
 			| "streamIdleTimeoutMs"
 			| "cacheControlFormat"
 			| "thinkingKeep"
 			| "strictResponsesPairing"
 			| "supportsImageDetailOriginal"
+			| "enableGeminiThinkingLoopGuard"
 			| "whenThinking"
 		>
 	> & {
@@ -901,9 +915,9 @@ export interface Model<TApi extends Api = Api> {
 	requestModelId?: string;
 	/**
 	 * `reasoning.mode` to send on OpenAI Responses-family requests. Set on
-	 * generated pro aliases (`gpt-5.6-*-pro` on `openai`/`openai-codex`) that
-	 * pair a base wire id (`requestModelId`) with OpenAI's pro reasoning
-	 * serving path. Absent everywhere else; providers omit the wire field.
+	 * generated pro aliases (`gpt-5.6-*-pro` on first-party OpenAI Responses
+	 * providers) that pair a base wire id (`requestModelId`) with pro reasoning
+	 * execution. Absent everywhere else; providers omit the wire field.
 	 */
 	reasoningMode?: "pro";
 	name: string;

@@ -2,14 +2,27 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import { TERMINAL } from "@oh-my-pi/pi-tui";
-import { formatDuration, formatNumber, getProjectDir, pathIsWithin, relativePathWithinRoot } from "@oh-my-pi/pi-utils";
-import { type Theme, type ThemeColor, theme } from "../../../modes/theme/theme";
+import {
+	formatDuration,
+	formatNumber,
+	getActiveProfile,
+	getProjectDir,
+	pathIsWithin,
+	relativePathWithinRoot,
+} from "@oh-my-pi/pi-utils";
+import { type ThemeColor, theme } from "../../../modes/theme/theme";
 import { shortenPath, TRUNCATE_LENGTHS, truncateToWidth } from "../../../tools/render-utils";
 import { fileHyperlink } from "../../../tui/hyperlink";
 import { getSessionAccentAnsi, getSessionAccentHex } from "../../../utils/session-color";
 import { sanitizeStatusText } from "../../shared";
 import { formatContextUsage, getContextUsageLevel, getContextUsageThemeColor } from "./context-thresholds";
-import type { RenderedSegment, SegmentContext, StatusLineSegment, StatusLineSegmentId } from "./types";
+import type {
+	RenderedSegment,
+	SegmentContext,
+	StatusLineSegment,
+	StatusLineSegmentId,
+	StatusLineSegmentRef,
+} from "./types";
 
 export type { SegmentContext } from "./types";
 
@@ -66,6 +79,14 @@ function formatAdvisorSpend(amount: number, usingSubscription: boolean, uiTheme:
 		return `${icon} ${spend}`;
 	}
 	return `${spend} (adv)`;
+}
+
+export function formatCompactContextPercent(percent: number | null | undefined): string {
+	if (percent === null || percent === undefined) return "?";
+	if (percent === 0) return "0%";
+	if (percent > 0 && percent < 1) return `${percent.toFixed(1)}%`;
+	if (Number.isInteger(percent)) return `${percent}%`;
+	return `${percent.toFixed(1)}%`;
 }
 
 const SCRATCH_ROOTS: readonly string[] = (() => {
@@ -331,6 +352,18 @@ const pathSegment: StatusLineSegment = {
 	},
 };
 
+const profileSegment: StatusLineSegment = {
+	id: "profile",
+	render(_ctx) {
+		const profile = getActiveProfile();
+		if (!profile) return { content: "", visible: false };
+
+		const label = truncateToWidth(sanitizeStatusText(profile), TRUNCATE_LENGTHS.SHORT - 2);
+		const content = `p:${label}`;
+		return { content: theme.fg("accent", content), visible: true };
+	},
+};
+
 const gitSegment: StatusLineSegment = {
 	id: "git",
 	render(ctx) {
@@ -399,6 +432,17 @@ const subagentsSegment: StatusLineSegment = {
 	},
 };
 
+const subagentCostSegment: StatusLineSegment = {
+	id: "subagent_cost",
+	render(ctx) {
+		if (!Number.isFinite(ctx.subagentCost) || ctx.subagentCost <= 0) {
+			return { content: "", visible: false };
+		}
+		const content = withIcon(theme.icon.agents, `$${ctx.subagentCost.toFixed(2)}`);
+		return { content: theme.fg("statusLineSubagents", content), visible: true };
+	},
+};
+
 const tokenInSegment: StatusLineSegment = {
 	id: "token_in",
 	render(ctx) {
@@ -427,10 +471,27 @@ const tokenTotalSegment: StatusLineSegment = {
 		// Excludes cacheRead: that field re-reads the full cached context every
 		// turn, making the cumulative sum N×context_size. Orchestration cache read
 		// follows the same rule; orchestration input/output remain in the total so
-		// provider-side service work is preserved without labeling it prompt input.
+		// provider-side service work is preserved (surfaced under its own orch:
+		// label in the breakdown rather than folded into in:/out:).
 		const { input, output, cacheWrite, orchestrationInput, orchestrationOutput } = ctx.usageStats;
 		const total = input + output + cacheWrite + orchestrationInput + orchestrationOutput;
 		if (!total) return { content: "", visible: false };
+
+		if (ctx.options.token_total?.breakdown === true) {
+			// Keep orchestration out of the in:/out: labels: SessionManager and
+			// /usage track it separately from prompt input/output, so folding it in
+			// would inflate the labeled traffic. Surface it under its own orch:
+			// label instead, preserving it in the visible total.
+			const inTotal = input + cacheWrite;
+			const outTotal = output;
+			const orchTotal = orchestrationInput + orchestrationOutput;
+			const parts: string[] = [];
+			if (inTotal > 0) parts.push(`in:${formatNumber(inTotal)}`);
+			if (outTotal > 0) parts.push(`out:${formatNumber(outTotal)}`);
+			if (orchTotal > 0) parts.push(`orch:${formatNumber(orchTotal)}`);
+			if (parts.length === 0) return { content: "", visible: false };
+			return { content: theme.fg("statusLineSpend", parts.join(" ")), visible: true };
+		}
 
 		const content = withIcon(theme.icon.tokens, formatNumber(total));
 		return { content: theme.fg("statusLineSpend", content), visible: true };
@@ -487,24 +548,14 @@ const contextPctSegment: StatusLineSegment = {
 		const pct = ctx.contextPercent;
 		const window = ctx.contextWindow;
 
+		const autoIcon = ctx.autoCompactEnabled && theme.icon.auto ? ` ${theme.icon.auto}` : "";
 		const color = getContextUsageThemeColor(getContextUsageLevel(pct ?? 0, window));
-		// Async-compaction indicator: pulse the auto icon while a background
-		// speculation runs, hold it in accent once a result is armed.
-		let autoIcon = "";
-		if (ctx.autoCompactEnabled && theme.icon.auto) {
-			const speculation = ctx.compactionSpeculation;
-			const iconColor =
-				speculation === "running"
-					? ctx.speculationBlinkOn
-						? "accent"
-						: "muted"
-					: speculation === "armed"
-						? "accent"
-						: color;
-			autoIcon = ` ${theme.fg(iconColor, theme.icon.auto)}`;
-		}
-		const text = theme.fg(color, formatContextUsage(pct, window, ctx.contextTokens));
-		const content = withIcon(theme.icon.context, `${text}${autoIcon}`);
+		const compact = ctx.options.context_pct?.compact === true;
+		const display = compact
+			? `ctx:${formatCompactContextPercent(pct)}`
+			: formatContextUsage(pct, window, ctx.contextTokens);
+		const text = theme.fg(color, `${display}${autoIcon}`);
+		const content = compact ? text : withIcon(theme.icon.context, text);
 
 		return { content, visible: true };
 	},
@@ -567,7 +618,7 @@ const sessionSegment: StatusLineSegment = {
 	render(ctx) {
 		const sessionManager = ctx.session.sessionManager;
 		const sessionId = sessionManager?.getSessionId?.();
-		const display = sessionId?.slice(0, 8) || "new";
+		const display = sessionId?.slice(0, Math.max(1, ctx.options.session?.length ?? 13)) || "new";
 
 		return { content: withIcon(theme.icon.session, display), visible: true };
 	},
@@ -732,10 +783,12 @@ export const SEGMENTS: Record<StatusLineSegmentId, StatusLineSegment> = {
 	pi: piSegment,
 	model: modelSegment,
 	mode: modeSegment,
+	profile: profileSegment,
 	path: pathSegment,
 	git: gitSegment,
 	pr: prSegment,
 	subagents: subagentsSegment,
+	subagent_cost: subagentCostSegment,
 	token_in: tokenInSegment,
 	token_out: tokenOutSegment,
 	token_total: tokenTotalSegment,
@@ -755,12 +808,34 @@ export const SEGMENTS: Record<StatusLineSegmentId, StatusLineSegment> = {
 	collab: collabSegment,
 };
 
-export function renderSegment(id: StatusLineSegmentId, ctx: SegmentContext): RenderedSegment {
-	const segment = SEGMENTS[id];
-	if (!segment) {
-		return { content: "", visible: false };
-	}
-	return segment.render(ctx);
+function toExtensionStatusLineSegmentContext(ctx: SegmentContext): ExtensionStatusLineSegmentContext {
+	return {
+		width: ctx.width,
+		usage: {
+			inputTokens: ctx.usageStats.input,
+			outputTokens: ctx.usageStats.output,
+			cacheReadTokens: ctx.usageStats.cacheRead,
+			cacheWriteTokens: ctx.usageStats.cacheWrite,
+			totalTokens: ctx.usageStats.totalTokens,
+			cost: ctx.usageStats.cost,
+			tokensPerSecond: ctx.usageStats.tokensPerSecond,
+		},
+		contextPercent: ctx.contextPercent,
+		contextTokens: ctx.contextTokens,
+		contextWindow: ctx.contextWindow,
+		git: { branch: ctx.git.branch },
+		activeMs: ctx.activeMs,
+	};
+}
+
+export function renderSegment(id: StatusLineSegmentRef, ctx: SegmentContext): RenderedSegment {
+	const renderBase = (): RenderedSegment => {
+		const segment = SEGMENTS[id as StatusLineSegmentId];
+		return segment?.render(ctx) ?? { content: "", visible: false };
+	};
+	const extensionRunner = ctx.session.extensionRunner;
+	if (!extensionRunner?.hasStatusLineSegment(id)) return renderBase();
+	return extensionRunner.renderStatusLineSegment(id, toExtensionStatusLineSegmentContext(ctx), theme, renderBase);
 }
 
 export const ALL_SEGMENT_IDS: StatusLineSegmentId[] = Object.keys(SEGMENTS) as StatusLineSegmentId[];

@@ -158,3 +158,66 @@ describe("/compact dispatch (TUI)", () => {
 		expect(h.showWarning).toHaveBeenCalled();
 	});
 });
+
+describe("/compact background dispatch (RPC)", () => {
+	it("leaves the command queue free while compaction runs", async () => {
+		// `/compact` is provider-backed, so RPC must get its prompt response back
+		// immediately; otherwise the serialized command queue stays blocked for the
+		// whole model round-trip and a follow-up `abort` can never be dequeued.
+		const compactStarted = Promise.withResolvers<void>();
+		const compactFinished = Promise.withResolvers<void>();
+		const h = acpRuntime();
+		h.compact.mockImplementation(async () => {
+			compactStarted.resolve();
+			await compactFinished.promise;
+		});
+		const backgroundTasks: Promise<void>[] = [];
+		h.runtime.runCommandInBackground = task => {
+			backgroundTasks.push(task());
+		};
+
+		const result = await executeAcpBuiltinSlashCommand("/compact", h.runtime);
+		await compactStarted.promise;
+		expect(result).toEqual({ consumed: true });
+		expect(h.output).not.toHaveBeenCalled();
+
+		compactFinished.resolve();
+		await Promise.all(backgroundTasks);
+		expect(h.output).toHaveBeenCalledWith("Compaction complete.");
+	});
+
+	it("keeps the inline await when the host has no background hook", async () => {
+		const h = acpRuntime();
+		const result = await executeAcpBuiltinSlashCommand("/compact", h.runtime);
+		expect(result).toEqual({ consumed: true });
+		expect(h.output).toHaveBeenCalledWith("Compaction complete.");
+	});
+
+	it("surfaces compaction failures raised on the background path", async () => {
+		const h = acpRuntime();
+		h.compact.mockImplementation(async () => {
+			throw new Error("No model selected");
+		});
+		const backgroundTasks: Promise<void>[] = [];
+		h.runtime.runCommandInBackground = task => {
+			backgroundTasks.push(task());
+		};
+		const result = await executeAcpBuiltinSlashCommand("/compact", h.runtime);
+		expect(result).toEqual({ consumed: true });
+		await Promise.all(backgroundTasks);
+		expect(h.output).toHaveBeenCalledWith("Compaction failed: No model selected");
+	});
+
+	it("keeps argument validation on the prompt response path", async () => {
+		// Validation belongs to the response that carried the bad arguments, so it
+		// must not be deferred into the background task.
+		const h = acpRuntime();
+		const backgroundTasks: Promise<void>[] = [];
+		h.runtime.runCommandInBackground = task => {
+			backgroundTasks.push(task());
+		};
+		await executeAcpBuiltinSlashCommand("/compact snapcompact keep the diffs", h.runtime);
+		expect(backgroundTasks).toHaveLength(0);
+		expect(h.compact).not.toHaveBeenCalled();
+	});
+});

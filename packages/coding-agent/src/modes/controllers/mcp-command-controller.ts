@@ -55,6 +55,8 @@ import type {
 	MCPConfigFile,
 	MCPServerConfig,
 	MCPServerConnection,
+	MCPUrlElicitation,
+	MCPUrlElicitationResponse,
 } from "../../mcp/types";
 import { shortenPath } from "../../tools/render-utils";
 import { urlHyperlinkAlways } from "../../tui";
@@ -750,6 +752,7 @@ export class MCPCommandController {
 									callbackPath: finalConfig.oauth?.callbackPath,
 									redirectUri: finalConfig.oauth?.redirectUri,
 									prompt: finalConfig.oauth?.prompt,
+									scopeOverride: finalConfig.oauth?.scopes,
 									registrationUrl: oauth.registrationUrl,
 									serverUrl: finalConfig.url,
 									resource: oauthResource,
@@ -829,6 +832,11 @@ export class MCPCommandController {
 		opts?: {
 			callbackPort?: number;
 			callbackPath?: string;
+			/**
+			 * Configured `oauth.scopes`, which outranks both `scopes` and any
+			 * `scope` embedded in the authorization URL. `""` sends no scope.
+			 */
+			scopeOverride?: string;
 			redirectUri?: string;
 			prompt?: string;
 			serverUrl?: string;
@@ -901,6 +909,7 @@ export class MCPCommandController {
 					clientId: resolvedClientId,
 					clientSecret: resolvedClientSecret,
 					scopes: scopes || undefined,
+					scopeOverride: opts?.scopeOverride,
 					prompt: opts?.prompt,
 					redirectUri: opts?.redirectUri,
 					callbackPort: opts?.callbackPort,
@@ -1919,6 +1928,32 @@ export class MCPCommandController {
 		}
 	}
 
+	/** Present URL-mode MCP consent in the interactive selector. */
+	async handleMCPUrlElicitation(serverName: string, request: MCPUrlElicitation): Promise<MCPUrlElicitationResponse> {
+		let host = "unknown host";
+		try {
+			const parsed = new URL(request.url);
+			host = parsed.host || parsed.protocol.replace(/:$/, "") || host;
+		} catch {
+			// Keep malformed URLs out of the consent text; the opener still receives the original request on accept.
+		}
+		const choice = await this.ctx.showHookSelector(
+			`Open URL requested by MCP server "${serverName}"?\nHost: ${host}\n${request.message}`,
+			[
+				{ label: "Accept", description: `Open ${host} in your browser` },
+				{ label: "Decline", description: `Do not open ${host}` },
+				"Cancel",
+			],
+		);
+		if (choice === "Accept") {
+			this.ctx.openInBrowser(request.url);
+			this.ctx.showStatus(`Opened URL requested by MCP server "${serverName}" (${host}).`);
+			return { action: "accept" };
+		}
+		if (choice === "Decline") return { action: "decline" };
+		return { action: "cancel" };
+	}
+
 	/** Reauthorize a server after a tool-level OAuth challenge. */
 	async handleMCPAuthChallenge(name: string, challenge: MCPAuthChallenge): Promise<MCPServerConfig | undefined> {
 		return this.#handleReauth(name, { silent: true, reload: false, authChallenge: challenge });
@@ -1994,6 +2029,7 @@ export class MCPCommandController {
 					callbackPath: found.config.oauth?.callbackPath,
 					redirectUri: found.config.oauth?.redirectUri,
 					prompt: found.config.oauth?.prompt,
+					scopeOverride: runtimeBaseConfig.oauth?.scopes,
 					registrationUrl: oauth.registrationUrl,
 					serverUrl,
 					resource: oauthResource,

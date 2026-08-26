@@ -1,6 +1,42 @@
 # Changelog
 
 ## [Unreleased]
+- Added opt-in implicit and explicit 30-minute prompt caching for Azure OpenAI GPT-5.6+ Responses requests, including stable-history breakpoint markers, while preserving the existing prompt-cache key.
+### Fixed
+
+- Fixed OpenAI-compatible thinking streams from Chinese-origin models normalizing stray ` .` punctuation artifacts across reasoning fields and MiniMax `<think>` tags. ([#1688](https://github.com/can1357/oh-my-pi/issues/1688))
+- Fixed Cursor provider requests failing with `Cannot send empty user message to Cursor API` after tool-result history by selecting the latest user/developer turn instead of assuming the final context message is the active user turn.
+
+### Fixed
+
+- Fixed Cursor rejecting resumed/forked sessions whose history came from a Responses-family provider (e.g. Codex) with an opaque `resource_exhausted` by sanitizing composite `callId|itemId` tool-call ids before replay ([#9754](https://github.com/can1357/oh-my-pi/issues/9754)).
+- Fixed auth-gateway OpenAI Responses requests rejecting multimodal function-call outputs containing input text, images, or files; inline data images are now preserved as tool-result content.
+- Fixed auth-gateway OpenAI Responses requests rejecting multimodal function-call outputs containing input text and images; inline, remote, and OpenAI file-backed images are now preserved as tool-result content.
+
+## [18.0.5] - 2026-08-25
+
+### Breaking Changes
+
+- Renamed the exported stream-retry helper from `withEmptyCompletionRetry` to `withReplaySafeStreamRetry` and added retry policy options for empty completions and provider errors. Consumers using the old helper must migrate.
+
+### Added
+
+- Added browser-based Sign in with OpenRouter using OAuth PKCE, while retaining support for pasted OpenRouter API keys and redirect URLs for remote sessions.
+- Added `/login` API-key authentication for DeepInfra and Yolo-Auto, including validation against each provider before the credentials are accepted.
+
+### Fixed
+
+- Fixed DeepSeek vision models from losing image input while keeping image parts stripped for text-only DeepSeek endpoints.
+- Fixed OpenAI-compatible gateways that report uppercase completion reasons such as `STOP` or `MAX_TOKENS`; these are now classified correctly, including mapping `MAX_TOKENS` to a length limit.
+- Fixed provider message-count limit errors being treated as unrecoverable payload errors instead of recoverable context overflows.
+- Improved Codex WebSocket continuations so rate limits, throttling, and compatible mode changes preserve valid response continuations instead of unnecessarily replaying the full context.
+- Fixed Codex WebSocket cleanup failures caused by already-closed sockets.
+- Added safe retries for transient mid-stream socket closures across OpenAI Responses, Chat Completions, Azure OpenAI Responses, and Codex SSE when no replay-unsafe output has been emitted.
+- Fixed usage and cost reporting for OpenAI-compatible gateways backed by Vertex AI or Gemini by recognizing cached prompt tokens reported through `cachedContentTokenCount`.
+- Fixed DeepSeek's official vision model `deepseek-v4-flash-vision-exp` having every image stripped from outbound Chat Completions requests: `isTextOnlyDeepSeek` (vision guard, introduced for legacy DeepSeek endpoints that reject `image_url` with HTTP 400) now exempts model IDs/names carrying the official `vision` marker, so images reach `api.deepseek.com` instead of being replaced by the non-vision placeholder. Text-only DeepSeek models with a misconfigured `input: [text, image]` remain scrubbed.
+### Fixed
+
+- Fixed auth-gateway OpenAI Responses requests rejecting multimodal function-call outputs containing input text, images, or files; inline data images are now preserved as tool-result content.
 
 ## [18.0.4] - 2026-08-24
 
@@ -31,6 +67,7 @@
 
 ### Fixed
 
+- Fixed `applyOpenAIExtraBody` re-enabling reasoning on a disabled turn when a model's `extraBody` carries conflicting top-level or `chat_template_kwargs` dialect controls; those controls are now stripped while unrelated configuration is preserved, and a `constructor`/`toString`-named `extraBody` key no longer reads as an inherited truthy match.
 - Captured bounded Devin Connect trailer details and request-shape evidence for diagnosing intermittent `invalid_argument` stream rejections ([#4218](https://github.com/can1357/oh-my-pi/issues/4218)).
 - Fixed abandoned `auth-broker-snapshot.enc.*.tmp` files accumulating in the cache directory when a process exited mid-write; stale temp files are now swept on each cache write.
 - Fixed Cursor GPT effort models failing with `not_found` on accounts that require the discovered effort-specific model id ([#9287](https://github.com/can1357/oh-my-pi/issues/9287)).
@@ -104,6 +141,9 @@
 - Fixed tool-argument repair applying lossy transformations (such as stringifying objects or stripping unrecognized keys) when validating union schemas (`anyOf`/`oneOf`), preventing corrupted tool call and subagent payloads
 - Fixed 400 errors when communicating with local OpenAI-compatible inference servers that reject `chat_template_kwargs.reasoning_effort` by improving reasoning effort parameter fallback and compatibility handling
 - Fixed DeepSeek-family models on hosts like Fireworks losing reasoning whenever tools were offered: a redundant `tool_choice: "auto"` is now omitted so the provider keeps thinking enabled; forced and `"none"` selectors still take priority ([#1207](https://github.com/can1357/oh-my-pi/issues/1207))
+### Fixed
+
+- Fixed Azure OpenAI Responses variants ignoring catalog `requestModelId` and `reasoningMode`, so GPT-5.6 pro aliases target the deployed base model and serialize `reasoning.mode: "pro"`.
 
 ## [17.3.8] - 2026-08-19
 
@@ -157,6 +197,9 @@
 - Fixed Alibaba DashScope/Bailian transient per-minute rate limits being misclassified as full quota exhaustion, causing unnecessary long backoffs instead of quick retries.
 - Fixed Anthropic-compatible streams dropping thinking content, which broke replay of prior reasoning.
 - Updated the Alibaba Coding Plan China login flow to point to the current Bailian API-key management console.
+### Added
+
+- Added Antigravity's authoritative Gemini and shared Claude/GPT five-hour and weekly quota windows to `omp usage`, with compatibility fallback to legacy model quotas ([#8061](https://github.com/can1357/oh-my-pi/pull/8061) by [@paolomazzitti](https://github.com/paolomazzitti)).
 
 ## [17.3.4] - 2026-08-14
 
@@ -319,6 +362,9 @@
 - Fixed an issue where Codex Responses dropped native image-generation results from assistant content and replays due to stale `generating` statuses.
 - Fixed Anthropic stream truncation handling where unexpected connection closures were incorrectly treated as clean stops, causing the agent loop to halt silently mid-sentence.
 - Optimized Anthropic prompt caching to prevent unnecessary cache invalidation of the entire system prefix when volatile project footer details (such as current working directory, date, or workspace tree) change.
+### Added
+
+- Added a reusable configured authorization-code OAuth provider backed by `oauth4webapi`, with PKCE, localhost callbacks, standard token validation, and refresh support.
 
 ## [17.2.4] - 2026-08-01
 
@@ -634,6 +680,10 @@
 - Made Kimi device-id persistence best-effort: a missing or unwritable `~/.omp/agent` directory no longer throws during Kimi header construction, which silently nulled every `kimi-code` usage probe on fresh installs.
 - Coerced boolean tool-schema subschemas to MFJS object forms for native Moonshot/Kimi endpoints, preventing the task tool's `outputSchema` field from causing HTTP 400 responses ([#5952](https://github.com/can1357/oh-my-pi/issues/5952)).
 
+### Fixed
+
+- Fixed Moonshot/Kimi rejecting every request carrying the built-in `task` tool with HTTP 400 (`tools.function.parameters is not a valid moonshot flavored json schema … property schema for 'outputSchema' must be an object`). The tool's `outputSchema` (`z.unknown()`) serialized as the boolean JSON Schema `true` (empty-schema widening, #1179), which Moonshot's MFJS validator rejects. `normalizeSchemaForMoonshot` now coerces boolean subschemas to their object equivalents (`true` → `{}`, `false` → `{ not: {} }`, both accepted by Moonshot in every subschema slot — the latter also fixes third-party closed-tuple schemas like `{ prefixItems: [...], items: false }`), the Moonshot schema flavor is detected for Kimi models routed via OpenRouter, and the `openai-responses` transport (used for OpenRouter) now runs MFJS normalization. ([#5918](https://github.com/can1357/oh-my-pi/issues/5918))
+
 ## [17.0.3] - 2026-07-17
 
 ### Fixed
@@ -800,6 +850,10 @@
 - Fixed xai-oauth/grok-4.5 Responses requests to omit the unsupported reasoning.summary field while preserving the reasoning.effort payload.
 - Fixed Codex OAuth credential selection to re-check blocked accounts during ranking and clear stale usage-limit blocks once live usage indicates recovery.
 - Fixed sequential-cutoff reasoning summaries duplicating section headers across Codex reasoning items by tracking the cumulative summary response-globally, so replayed sections and replay-only items no longer re-emit text earlier thinking blocks already streamed.
+
+### Fixed
+
+- Fixed xAI OAuth Responses continuations replaying OpenAI-only `custom_tool_call`/`custom_tool_call_output` history and `input_image.detail: "original"` frames; replay now downgrades those to xAI-compatible function calls and `detail: "auto"`. ([#5002](https://github.com/can1357/oh-my-pi/issues/5002))
 
 ## [16.3.15] - 2026-07-09
 
@@ -1022,6 +1076,14 @@
 - Fixed a bug where tool calls with empty or missing IDs were not detected as malformed, causing API validation failures (e.g., 400 errors with Anthropic) on subsequent requests
 - Raised Gemini header runaway threshold to prevent premature interruption of complex reasoning loops
 - Fixed leaked ` ```thinking ` fences with nested language-tagged Markdown code blocks so inner fences remain inside structured thinking instead of leaking as visible reply text.
+### Fixed
+
+- Fixed GitLab Duo Agent using the inline `ambient` workflow definition as the outer GitLab.com route. The provider now creates and connects workflows through the `chat` route while still sending OMP's isolated inline `ambient` flowConfig and bare MCP tool names, matching the GitLab.com shape that exposes real MCP actions.
+- Fixed GitLab Duo Agent treating terminal DWS checkpoints with no visible assistant output as successful empty assistant turns; the provider now classifies them as stalled, restarts on a fresh workflow, and only surfaces the bounded stall error if recovery also produces no visible output.
+- Fixed GitLab Duo Agent dropping or corrupting long streamed outputs (and the trailing tool call after them) because it treated every checkpoint's `ui_chat_log` as a full snapshot while the `incremental_streaming` capability makes DWS send only the changed tail slice per checkpoint. On long documents the per-slice byte length shrank and varied, so the stall detector falsely flagged a non-advancing workflow and restarted it — discarding the in-flight tool call — while the per-message diff re-emitted or swallowed text. The provider now accumulates the full `ui_chat_log` per workflow by merging each incremental slice by `message_id` (mirroring the official GitLab LSP `mergeIncrementalChatLog`), so entry diffing, stall byte-length comparison, dedup, and the empty-terminal guard all operate on a complete snapshot again. The accumulator persists across the resume that reuses the socket and resets when a fresh workflow seeds a new session.
+- Fixed GitLab Duo Agent killing healthy long tool-call generations: the provider replaced the 90s read-silence deadline with GitLab's official keepalive pattern (WS ping every 45s + app heartbeat every 60s), keeping the socket alive across the multi-minute, zero-frame windows DWS spends assembling a large `write`/`edit` payload, while a connect timeout still guards the handshake. Keepalives also stay active across resume/replay sockets, and the connect timer is skipped for already-open resumes, so a long post-tool generation is not closed as `timeout`.
+- Fixed GitLab Duo Agent compaction summarization requests sending the entire serialized history verbatim as the goal, which routinely exceeded the goal byte budget and made compaction requests larger than ordinary turns. The provider now detects a summarization request (a lone `<conversation>…</conversation>` user turn) and shakes it down by eliding ONLY the tool-I/O blocks from oldest to newest, one block at a time, stopping as soon as the goal fits the soft byte budget. The block matcher covers the `xml` dialect that every Duo model id actually resolves to (`<invoke …>…</invoke>` calls and `<tool_response>…</tool_response>` results) as well as the `anthropic`/`minimax` `<function_calls>` / `<function_results>` forms, and anchors each block's close to its transcript segment boundary so a tool result whose own raw output embeds a literal block opener (`<tool_response>` / `<invoke`) or close (`</tool_response>` / `</invoke>`) is still captured and elided whole. User prompts and assistant reasoning/text are never shaken, and the trailing summarization instructions plus any `<previous-summary>` block are preserved verbatim — all in a single render with no per-step re-request.
+- Fixed Codex Responses unconditionally attaching `reasoning.summary` for `gpt-5.3-codex-spark`, which the ChatGPT backend rejects with `Unsupported parameter: 'reasoning.summary' is not supported with this model`, aborting the agent turn ([#3928](https://github.com/can1357/oh-my-pi/issues/3928)).
 
 ## [16.2.9] - 2026-06-30
 
@@ -1559,6 +1621,10 @@
 - Fixed `validateToolArguments` silently accepting JSON-encoded array strings (e.g. `'["a","b"]'`) against `union(string, array<string>)` schemas — providers that double-serialize tool-call arguments (Z.AI / GLM) caused tools like `search` to receive the literal `["a","b"]` as a single path, producing zero matches (single element) or glob parse errors (multi-element). A new pre-validation pass parses JSON-array-shaped strings when the schema explicitly accepts both shapes. ([#1788](https://github.com/can1357/oh-my-pi/issues/1788))
 - Fixed Anthropic thinking summaries that arrive wrapped in literal `<thinking>` tags so advisor/raw transcript dumps do not render nested thinking tags ([#2695](https://github.com/can1357/oh-my-pi/issues/2695)).
 
+### Fixed
+
+- Fixed direct DeepSeek V4 tool requests to suppress reasoning payload fields when tools are present, so advisor-style calls can reach the tool-capable backend instead of spending output on text. ([#2690](https://github.com/can1357/oh-my-pi/issues/2690))
+
 ## [16.0.0] - 2026-06-15
 
 ### Breaking Changes
@@ -1837,6 +1903,10 @@
 - Hardened strict tool-schema handling beyond the optional-union case: `enforceStrictSchema` now splices natively nested pure unions into the parent `anyOf` (only when the inner node carries no constraining siblings, since sibling keywords are conjunctive with `anyOf`), so source schemas with nested unions no longer produce type-less `anyOf` branches that strict upstream validators reject. ([#2270](https://github.com/can1357/oh-my-pi/issues/2270))
 - Made the openai-completions non-strict retry reachable for `"mixed"` strict mode (previously gated to `all_strict`, i.e. Cerebras only) and taught it to recognize upstream tool-schema validation 400s (`Invalid tool parameters schema …`, `Invalid schema for function …`). A matching rejection now retries the request with base (non-strict) schemas and persists `strictToolsDisabled` on the provider session, so later requests skip the doomed strict attempt instead of paying a 400 + retry round-trip each turn. ([#2270](https://github.com/can1357/oh-my-pi/issues/2270))
 - Cross-model `anthropic-messages → anthropic-messages` continuations now preserve prior assistant turns' reasoning chains end-to-end: every prior `thinking`/`redactedThinking` block survives (not just the latest surviving assistant), and third-party ↔ third-party replays keep their signatures intact so the reasoning chain stays signed for the next turn. Signatures are stripped (and any `redacted_thinking` sibling without a native landing spot is dropped) only when an official Anthropic endpoint is on either end of the replay — official Anthropic cryptographically binds reasoning signatures to its key+session+model, while compatible reasoning endpoints (Z.AI, DeepSeek, custom anthropic-messages providers configured via `models.yaml`) treat them as opaque continuation hints. Source-side official detection uses the canonical catalog provider id `"anthropic"` (assistant messages carry no `baseUrl`); target-side detection reuses the baked `compat.officialEndpoint` flag. Latest-turn byte-for-byte behavior (Anthropic's "thinking blocks in the latest assistant message cannot be modified" rule) and existing aborted/errored last-block sanitization are unchanged. ([#2257](https://github.com/can1357/oh-my-pi/issues/2257), [#2265](https://github.com/can1357/oh-my-pi/issues/2265))
+
+### Fixed
+
+- Fixed prior-turn reasoning blocks being demoted to text (or dropped, for `redactedThinking`) on `anthropic-messages` continuation requests whenever the conversation crossed a provider/model boundary — e.g. custom providers configured via `models.yaml`, or any session that switched between two anthropic-messages endpoints. `transformMessages` only preserved thinking content on the latest surviving assistant turn; every earlier turn fell through to the cross-API text-demotion path and lost its reasoning chain. Anthropic-compatible source/target combinations now keep all `thinking`/`redactedThinking` blocks across every prior turn (Anthropic's all-or-none replay contract), with cross-model signatures stripped so the downstream encoder applies the correct `replayUnsignedThinking` policy ([#2257](https://github.com/can1357/oh-my-pi/issues/2257)).
 
 ## [15.10.12] - 2026-06-10
 

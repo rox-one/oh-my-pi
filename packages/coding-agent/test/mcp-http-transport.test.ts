@@ -50,6 +50,86 @@ async function withPendingGuard<T>(promise: Promise<T>, label: string): Promise<
 	]);
 }
 
+async function captureElicitationResponse(
+	mode: "url" | "form" | "credentials",
+	handler?: (
+		serverName: string,
+		request: { mode: "url"; elicitationId: string; url: string; message: string },
+	) => Promise<{ action: "accept" | "decline" | "cancel" }>,
+): Promise<Record<string, unknown>> {
+	let streamController: ReadableStreamDefaultController<Uint8Array> | undefined;
+	let resolveResponse!: (body: Record<string, unknown>) => void;
+	const responsePromise = new Promise<Record<string, unknown>>(resolve => {
+		resolveResponse = resolve;
+	});
+	server = Bun.serve({
+		port: 0,
+		async fetch(req) {
+			if (req.method === "GET") {
+				const request = {
+					jsonrpc: "2.0",
+					id: 99,
+					method: "elicitation/create",
+					params:
+						mode === "url"
+							? {
+									mode: "url",
+									elicitationId: "request-1",
+									url: "https://gateway.example/authorize",
+									message: "Authorize the gateway",
+								}
+							: mode === "credentials"
+								? {
+										mode: "url",
+										elicitationId: "request-1",
+										url: "https://user:secret@gateway.example/authorize",
+										message: "Authorize the gateway",
+									}
+								: { mode: "form", elicitationId: "request-1", message: "Not supported here" },
+				};
+				return new Response(
+					new ReadableStream<Uint8Array>({
+						start(controller) {
+							streamController = controller;
+							controller.enqueue(encoder.encode(`event: message\ndata: ${JSON.stringify(request)}\n\n`));
+						},
+					}),
+					{ headers: { "Content-Type": "text/event-stream" } },
+				);
+			}
+			if (req.method === "DELETE") return new Response(null, { status: 204 });
+			const body = (await req.json()) as Record<string, unknown>;
+			if (body.method === "initialize") {
+				return Response.json({
+					jsonrpc: "2.0",
+					id: body.id,
+					result: {
+						protocolVersion: "2025-11-25",
+						capabilities: {},
+						serverInfo: { name: "elicitation-test", version: "1.0.0" },
+					},
+				});
+			}
+			if (body.id !== undefined) resolveResponse(body);
+			return new Response(null, { status: 202 });
+		},
+	});
+
+	const connection = await connectToServer(
+		"elicitation-test",
+		{
+			type: "http",
+			url: `http://127.0.0.1:${server.port}/mcp`,
+			timeout: GUARD_TIMEOUT_MS,
+		},
+		handler ? { urlElicitationHandler: handler } : undefined,
+	);
+	const response = await responsePromise;
+	await connection.transport.close();
+	streamController?.close();
+	return response;
+}
+
 describe("MCP Streamable HTTP initialization", () => {
 	it("sends initialized before opening the optional GET SSE stream", async () => {
 		const requests: string[] = [];
@@ -99,6 +179,86 @@ describe("MCP Streamable HTTP initialization", () => {
 
 		expect(requests).toEqual(["initialize", "notifications/initialized", "GET"]);
 		await connection.transport.close();
+	});
+});
+
+describe("MCP URL elicitation capability", () => {
+	it("advertises URL elicitation without a handler", async () => {
+		let initializeCapabilities: unknown;
+		server = Bun.serve({
+			port: 0,
+			async fetch(req) {
+				if (req.method === "GET") return new Response(null, { status: 405 });
+				if (req.method === "DELETE") return new Response(null, { status: 204 });
+				const body = (await req.json()) as {
+					id?: string | number;
+					method: string;
+					params?: { capabilities?: unknown };
+				};
+				if (body.method === "initialize") {
+					initializeCapabilities = body.params?.capabilities;
+					return Response.json({
+						jsonrpc: "2.0",
+						id: body.id,
+						result: {
+							protocolVersion: "2025-11-25",
+							capabilities: {},
+							serverInfo: { name: "url-elicitation", version: "1.0.0" },
+						},
+					});
+				}
+				return new Response(null, { status: 202 });
+			},
+		});
+
+		const connection = await connectToServer("url-elicitation", {
+			type: "http",
+			url: `http://127.0.0.1:${server.port}/mcp`,
+			timeout: GUARD_TIMEOUT_MS,
+		});
+
+		expect(initializeCapabilities).toMatchObject({ elicitation: { url: {} } });
+		await connection.transport.close();
+	});
+
+	it("declines URL requests without a handler", async () => {
+		const response = await captureElicitationResponse("url");
+
+		expect(response).toMatchObject({ id: 99, result: { action: "decline" } });
+		expect(response).not.toHaveProperty("error");
+	});
+
+	it("rejects URL credentials before invoking a handler", async () => {
+		const response = await captureElicitationResponse("credentials");
+
+		expect(response).toMatchObject({ id: 99, error: { code: -32602 } });
+		expect(response).not.toHaveProperty("result");
+	});
+
+	it("passes server name and request to the connection-level handler", async () => {
+		let received: { serverName: string; request: unknown } | undefined;
+		const response = await captureElicitationResponse("url", async (serverName, request) => {
+			received = { serverName, request };
+			return { action: "decline" };
+		});
+
+		expect(received).toEqual({
+			serverName: "elicitation-test",
+			request: {
+				mode: "url",
+				elicitationId: "request-1",
+				url: "https://gateway.example/authorize",
+				message: "Authorize the gateway",
+			},
+		});
+		expect(response).toMatchObject({ id: 99, result: { action: "decline" } });
+	});
+
+	it("rejects form requests instead of routing them through URL elicitation", async () => {
+		const response = await captureElicitationResponse("form");
+
+		expect(response).toMatchObject({ id: 99, error: { code: -32601 } });
+		expect(response).not.toHaveProperty("result");
 	});
 });
 
@@ -234,6 +394,40 @@ describe("MCP Streamable HTTP transport timeouts", () => {
 		await expect(withPendingGuard(transport.request<ToolList>("tools/list"), "request")).resolves.toEqual({
 			tools: [{ name: "fast", inputSchema: { type: "object" } }],
 		});
+	});
+});
+
+it("preserves structured JSON-RPC error data", async () => {
+	server = Bun.serve({
+		port: 0,
+		fetch() {
+			return Response.json({
+				jsonrpc: "2.0",
+				id: 1,
+				error: {
+					code: -32042,
+					message: "URL elicitation required",
+					data: {
+						elicitations: [
+							{
+								mode: "url",
+								elicitationId: "test-id",
+								url: "https://gateway.example/authorize",
+								message: "Authorize the gateway",
+							},
+						],
+					},
+				},
+			});
+		},
+	});
+	const transport = await connectedTransport();
+
+	await expect(transport.request("tools/call")).rejects.toMatchObject({
+		code: -32042,
+		data: {
+			elicitations: [{ elicitationId: "test-id", url: "https://gateway.example/authorize" }],
+		},
 	});
 });
 

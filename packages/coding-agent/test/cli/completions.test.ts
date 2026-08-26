@@ -1,7 +1,48 @@
-import { describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
 import { buildSpec, type CompletionSpec, generateCompletion } from "@oh-my-pi/pi-coding-agent/cli/completion-gen";
-import { generateLiveCompletion } from "@oh-my-pi/pi-coding-agent/commands/completions";
+import { resolveWorkspaceIdentifierModeForCompletion } from "@oh-my-pi/pi-coding-agent/config/workspace-identifier-mode";
+import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import type { CliConfig, CommandCtor } from "@oh-my-pi/pi-utils/cli";
+
+const repoRoot = path.resolve(import.meta.dir, "..", "..", "..", "..");
+const cliEntry = path.join(repoRoot, "packages", "coding-agent", "src", "cli.ts");
+
+const cleanupRoots: string[] = [];
+
+async function makeTempWorkspace(name: string): Promise<{ root: string; cwd: string; agentDir: string }> {
+	const root = await fs.mkdtemp(path.join(os.tmpdir(), `${name}-`));
+	cleanupRoots.push(root);
+	const cwd = path.join(root, "project");
+	const agentDir = path.join(root, "agent");
+	await fs.mkdir(cwd, { recursive: true });
+	await fs.mkdir(agentDir, { recursive: true });
+	return { root, cwd, agentDir };
+}
+
+async function writeText(file: string, content: string): Promise<void> {
+	await Bun.write(file, content);
+}
+
+afterEach(async () => {
+	const roots = cleanupRoots.splice(0);
+	await Promise.all(roots.map(root => fs.rm(root, { recursive: true, force: true })));
+});
+
+function completionSpawnEnv(extra: Record<string, string> = {}): Record<string, string> {
+	const env: Record<string, string> = {};
+	for (const [key, value] of Object.entries(process.env)) {
+		if (typeof value === "string") env[key] = value;
+	}
+	env.NO_COLOR = "1";
+	env.PI_NO_TITLE = "1";
+	Object.assign(env, extra);
+	delete env.OMP_PROFILE;
+	delete env.PI_PROFILE;
+	return env;
+}
 
 // A compact synthetic spec exercising every value-source kind and an aliased
 // subcommand. The generators are pure functions of this shape, so pinning their
@@ -185,9 +226,81 @@ describe("buildSpec", () => {
 	});
 });
 
-describe("live completion surface", () => {
-	it("generates a zsh script reflecting the registered commands and flags", async () => {
-		const stdout = await generateLiveCompletion("zsh");
+describe("resolveWorkspaceIdentifierModeForCompletion", () => {
+	it("defaults to path when config files do not mention the setting", async () => {
+		const { cwd, agentDir } = await makeTempWorkspace("omp-completion-mode-default");
+		await writeText(path.join(agentDir, "config.yml"), "model: smol\n");
+		await writeText(path.join(cwd, ".omp", "settings.json"), JSON.stringify({ model: "slow" }));
+
+		await expect(resolveWorkspaceIdentifierModeForCompletion({ cwd, agentDir })).resolves.toBe("path");
+	});
+
+	it("uses a non-default mode from global YAML", async () => {
+		const { cwd, agentDir } = await makeTempWorkspace("omp-completion-mode-global");
+		await writeText(path.join(agentDir, "config.yml"), "workspace:\n  identifier: git-remote\n");
+
+		await expect(resolveWorkspaceIdentifierModeForCompletion({ cwd, agentDir })).resolves.toBe("git-remote");
+	});
+
+	it("lets project config override global config", async () => {
+		const { cwd, agentDir } = await makeTempWorkspace("omp-completion-mode-project");
+		await writeText(path.join(agentDir, "config.yml"), "workspace:\n  identifier: git-root\n");
+		await writeText(path.join(cwd, ".omp", "config.yml"), "workspace:\n  identifier: git-remote\n");
+
+		await expect(resolveWorkspaceIdentifierModeForCompletion({ cwd, agentDir })).resolves.toBe("git-remote");
+	});
+
+	it("ignores malformed files and invalid values", async () => {
+		const { cwd, agentDir } = await makeTempWorkspace("omp-completion-mode-invalid");
+		await writeText(path.join(agentDir, "config.yml"), "workspace:\n  identifier: [\n");
+		await writeText(path.join(cwd, ".omp", "settings.json"), JSON.stringify({ workspace: { identifier: "branch" } }));
+
+		await expect(resolveWorkspaceIdentifierModeForCompletion({ cwd, agentDir })).resolves.toBe("path");
+	});
+
+	it("accepts dotted workspace.identifier keys", async () => {
+		const { cwd, agentDir } = await makeTempWorkspace("omp-completion-mode-dotted");
+		await writeText(path.join(cwd, "opencode.json"), JSON.stringify({ "workspace.identifier": "git-root" }));
+
+		await expect(resolveWorkspaceIdentifierModeForCompletion({ cwd, agentDir })).resolves.toBe("git-root");
+	});
+
+	it("falls back to path when configured for git-root but git is missing from the current PATH", async () => {
+		const { root, cwd, agentDir } = await makeTempWorkspace("omp-completion-mode-no-git");
+		const emptyBin = path.join(root, "empty-bin");
+		await fs.mkdir(emptyBin);
+		await writeText(path.join(agentDir, "config.yml"), "workspace:\n  identifier: git-root\n");
+
+		await expect(resolveWorkspaceIdentifierModeForCompletion({ cwd, agentDir })).resolves.toBe("git-root");
+
+		const originalPath = process.env.PATH;
+		process.env.PATH = emptyBin;
+		try {
+			await expect(resolveWorkspaceIdentifierModeForCompletion({ cwd, agentDir })).resolves.toBe("path");
+		} finally {
+			if (originalPath === undefined) {
+				delete process.env.PATH;
+			} else {
+				process.env.PATH = originalPath;
+			}
+		}
+	});
+});
+
+describe("omp completions (integration / drift)", () => {
+	it("emits a zsh script reflecting the live command + flag surface", async () => {
+		const proc = Bun.spawn([process.execPath, cliEntry, "completions", "zsh"], {
+			cwd: repoRoot,
+			stdout: "pipe",
+			stderr: "pipe",
+			env: completionSpawnEnv(),
+		});
+		const [stdout, , exitCode] = await Promise.all([
+			new Response(proc.stdout).text(),
+			new Response(proc.stderr).text(),
+			proc.exited,
+		]);
+		expect(exitCode).toBe(0);
 
 		// Real top-level flags from launch's static `flags` table. Flags with a
 		// short char render as `{-r,--resume}`, so only assert the bracket form for
@@ -210,5 +323,56 @@ describe("live completion surface", () => {
 		// Hidden/default commands must NOT surface as completable subcommands.
 		expect(stdout).not.toContain("_omp_cmd_launch");
 		expect(stdout).not.toContain("_omp_cmd___complete");
-	}, 30_000);
+	}, 15_000);
+
+	it("lists sessions from the configured non-path workspace mode only", async () => {
+		const { agentDir } = await makeTempWorkspace("omp-completion-sessions-mode");
+		await writeText(path.join(agentDir, "config.yml"), "workspace:\n  identifier: git-root\n");
+
+		const gitRootSessionId = "mode-completion-gitroot";
+		const pathSessionId = "mode-completion-path";
+		const gitRootSessionDir = SessionManager.getDefaultSessionDir(repoRoot, agentDir, undefined, "git-root");
+		const pathSessionDir = SessionManager.getDefaultSessionDir(repoRoot, agentDir, undefined, "path");
+		expect(gitRootSessionDir).not.toBe(pathSessionDir);
+
+		await writeText(
+			path.join(gitRootSessionDir, `2026-01-01T00-00-00-000Z_${gitRootSessionId}.jsonl`),
+			`${JSON.stringify({
+				type: "session",
+				version: 1,
+				id: gitRootSessionId,
+				timestamp: "2026-01-01T00:00:00.000Z",
+				cwd: repoRoot,
+				title: "Git Root Completion Session",
+			})}\n`,
+		);
+		await writeText(
+			path.join(pathSessionDir, `2026-01-01T00-00-01-000Z_${pathSessionId}.jsonl`),
+			`${JSON.stringify({
+				type: "session",
+				version: 1,
+				id: pathSessionId,
+				timestamp: "2026-01-01T00:00:01.000Z",
+				cwd: repoRoot,
+				title: "Path Completion Session",
+			})}\n`,
+		);
+
+		const proc = Bun.spawn([process.execPath, cliEntry, "__complete", "sessions", "--", "mode-completion"], {
+			cwd: repoRoot,
+			stdout: "pipe",
+			stderr: "pipe",
+			env: completionSpawnEnv({ PI_CODING_AGENT_DIR: agentDir }),
+		});
+		const [stdout, stderr, exitCode] = await Promise.all([
+			new Response(proc.stdout).text(),
+			new Response(proc.stderr).text(),
+			proc.exited,
+		]);
+
+		expect(exitCode).toBe(0);
+		expect(stderr).toBe("");
+		expect(stdout).toContain(`${gitRootSessionId}\tGit Root Completion Session`);
+		expect(stdout).not.toContain(pathSessionId);
+	}, 15_000);
 });

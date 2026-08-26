@@ -66,6 +66,7 @@ import type { AsyncJobSnapshot } from "../../session/agent-session";
 import type { CompactMode } from "../../session/compact-modes";
 import type { CustomMessage, CustomMessagePayload } from "../../session/messages";
 import type { ReadonlySessionManager, SessionManager } from "../../session/session-manager";
+import type { ConfiguredThinkingLevel } from "../../thinking";
 import type {
 	BashToolDetails,
 	BashToolInput,
@@ -131,6 +132,11 @@ export type { AgentToolResult, AgentToolUpdateCallback };
 export interface ExtensionUISelectOption {
 	label: string;
 	description?: string;
+	/** TUI-only display hint: an exact substring of `label` rendered in the
+	 *  theme's success color (e.g. the tool name in the session-approval menu).
+	 *  Never part of the selection contract — non-TUI surfaces and the returned
+	 *  choice use `label` alone. */
+	labelHighlight?: string;
 }
 
 export type ExtensionUISelectItem = string | ExtensionUISelectOption;
@@ -284,6 +290,9 @@ export interface ExtensionUIContext {
 	/** Set status text in the footer/status bar. Pass undefined to clear. */
 	setStatus(key: string, text: string | undefined): void;
 
+	/** Re-render status-line segments after extension-owned state changes. */
+	refreshStatusLine(): void;
+
 	/** Set the working/loading message shown during streaming. Call with no argument to restore default. */
 	setWorkingMessage(message?: string): void;
 
@@ -424,6 +433,29 @@ export interface CompactOptions {
 // access). Field overlap is incidental; merging into a base would require
 // hooks to widen their public contract.
 /**
+ * The effective alias state exposed to extensions.
+ *
+ * `model` is populated for both resolved and unavailable aliases when the
+ * catalog knows the target. An unresolved alias has no matching catalog model.
+ */
+export interface ExtensionModelAlias {
+	name: string;
+	selector?: string;
+	model?: Model;
+	thinkingLevel?: ConfiguredThinkingLevel;
+	explicitThinkingLevel: boolean;
+	status: "resolved" | "unavailable" | "unresolved" | "reserved";
+	warning?: string;
+}
+export type ExtensionModelAliasResult =
+	| { ok: true; alias: ExtensionModelAlias; scope: "session" }
+	| {
+			ok: false;
+			alias: string;
+			reason: "unknown_alias" | "unresolved_alias" | "unavailable_alias" | "reserved_alias";
+	  };
+
+/**
  * Read-only model query facade exposed at `ctx.models`. Lets an extension select a
  * model the same way core does — list authenticated models, read the session model,
  * resolve a model string or role alias, and compare model families — without reaching
@@ -434,6 +466,8 @@ export interface ExtensionModelQuery {
 	list(): Model[];
 	/** The current session model, if one is set. */
 	current(): Model | undefined;
+	/** Effective built-in and custom model-role aliases. */
+	listAliases(): ExtensionModelAlias[];
 	/**
 	 * Resolve a model string (`provider/id`, bare id) or role alias (`@slow`, a
 	 * configured role) to a Model, using the same settings-backed aliases and match
@@ -457,6 +491,8 @@ export interface ExtensionContext {
 	ui: ExtensionUIContext;
 	/** Current run mode. Use `"tui"` to guard terminal-only UI such as custom components. */
 	mode: ExtensionMode;
+	/** Cancellation scoped to the current extension handler invocation. */
+	signal: AbortSignal;
 	/** Get current context usage for the active model. */
 	getContextUsage(): ContextUsage | undefined;
 	/** Get a read-only snapshot of async jobs owned by this session. */
@@ -894,6 +930,22 @@ export interface UserPythonEvent {
 }
 
 // ============================================================================
+// Advisor Context Events
+// ============================================================================
+
+/**
+ * Fired before native Advisor review so extensions can contribute bounded context.
+ * Handlers share a two-second aggregate budget and should stop work when `ctx.signal` aborts.
+ */
+export interface AdvisorContextEvent {
+	type: "advisor_context";
+	/** Stable session scope; opaque to extensions. */
+	scopeKey: string;
+	/** The bounded newest primary transcript updates about to be reviewed. */
+	updates: readonly unknown[];
+}
+
+// ============================================================================
 // Input Events
 // ============================================================================
 
@@ -1096,6 +1148,7 @@ export type ExtensionEvent =
 	| McpNotificationEvent
 	| UserBashEvent
 	| UserPythonEvent
+	| AdvisorContextEvent
 	| InputEvent
 	| ToolCallEvent
 	| ToolResultEvent
@@ -1134,6 +1187,35 @@ export interface UserBashEventResult {
 export interface UserPythonEventResult {
 	/** Full replacement: extension handled execution, use this result */
 	result?: PythonResult;
+}
+
+/**
+ * Exact approved policy text that an extension loaded through the exact-path
+ * `--trusted-extension` allowlist permits the native Advisor to attribute
+ * visibly when it directly causes an `advise()` call.
+ */
+export interface AdvisorContextPolicyAttribution {
+	/** Opaque alias included in private Advisor context; never rendered. */
+	attribution: string;
+	/** User-facing source label, such as "Experience". */
+	source: string;
+	/** Exact approved applicability wording. */
+	condition: string;
+	/** Exact approved behavior wording. */
+	behavior: string;
+}
+
+export interface AdvisorContextEventResult {
+	/** Bounded context appended to the native Advisor review update. */
+	context?: string;
+	/** Policy aliases accepted only from exact-path `--trusted-extension` modules. */
+	policies?: AdvisorContextPolicyAttribution[];
+}
+
+/** Sanitized contribution accepted by the extension runner. */
+export interface AdvisorContextContribution {
+	context: string;
+	policies: AdvisorContextPolicyAttribution[];
 }
 
 export type { ToolResultEventResult } from "../shared-events";
@@ -1177,6 +1259,45 @@ export type AssistantThinkingRenderer = (
 	context: AssistantThinkingRenderContext,
 	theme: Theme,
 ) => Component | undefined;
+// ============================================================================
+// Status Line Segments
+// ============================================================================
+
+export interface StatusLineSegmentUsage {
+	inputTokens: number;
+	outputTokens: number;
+	cacheReadTokens: number;
+	cacheWriteTokens: number;
+	totalTokens: number;
+	cost: number;
+	tokensPerSecond: number | null;
+}
+
+/** Data made available to an extension-registered status-line segment renderer. */
+export interface StatusLineSegmentContext {
+	/** Terminal columns budgeted for the whole status line; segments do not need to truncate to this themselves. */
+	width: number;
+	usage: StatusLineSegmentUsage;
+	/** Context usage percent, or null when unknown (e.g. right after compaction). */
+	contextPercent: number | null;
+	contextTokens: number;
+	contextWindow: number;
+	git: { branch: string | null } | null;
+	/** Active (non-idle) processing time accumulated this session, in ms. */
+	activeMs: number;
+}
+
+export interface StatusLineSegmentResult {
+	content: string;
+	visible: boolean;
+}
+
+/** Synchronous middleware for an extension-registered status-line segment. */
+export type StatusLineSegmentRenderer = (
+	ctx: StatusLineSegmentContext,
+	next: () => StatusLineSegmentResult,
+	theme: Theme,
+) => StatusLineSegmentResult;
 
 // ============================================================================
 // Command Registration
@@ -1228,6 +1349,9 @@ export interface ExtensionAPI {
 
 	/** Injected pi-coding-agent exports for accessing SDK utilities */
 	pi: typeof PiCodingAgent;
+
+	/** Stable runtime host identifier for cross-host extensions. */
+	readonly host: "omp";
 
 	// =========================================================================
 	// Event Subscription
@@ -1289,6 +1413,7 @@ export interface ExtensionAPI {
 	on(event: "tool_result", handler: ExtensionHandler<ToolResultEvent, ToolResultEventResult>): void;
 	on(event: "user_bash", handler: ExtensionHandler<UserBashEvent, UserBashEventResult>): void;
 	on(event: "user_python", handler: ExtensionHandler<UserPythonEvent, UserPythonEventResult>): void;
+	on(event: "advisor_context", handler: ExtensionHandler<AdvisorContextEvent, AdvisorContextEventResult>): void;
 	on(event: "mcp_notification", handler: ExtensionHandler<McpNotificationEvent>): void;
 
 	// =========================================================================
@@ -1412,6 +1537,17 @@ export interface ExtensionAPI {
 	 */
 	registerComposerShape(definition: ComposerShapeDefinition): void;
 
+	/**
+	 * Register a named status-line segment usable from `statusLine.leftSegments` /
+	 * `statusLine.rightSegments` config, alongside the built-in segment ids.
+	 *
+	 * For a built-in id, `next()` renders its built-in segment. For a new id,
+	 * `next()` returns an invisible segment. When multiple extensions register
+	 * the same id, their middleware is composed in load order, with the most
+	 * recently loaded extension outermost.
+	 */
+	registerStatusLineSegment(id: string, renderer: StatusLineSegmentRenderer): void;
+
 	// =========================================================================
 	// Actions
 	// =========================================================================
@@ -1442,6 +1578,7 @@ export interface ExtensionAPI {
 
 	/** Get the list of currently active tool names. */
 	getActiveTools(): string[];
+	getToolReference(name: string): string;
 
 	/** Get all configured tools (built-in + extension tools) with schema and source metadata. */
 	getAllTools(): ToolInfo[];
@@ -1454,6 +1591,8 @@ export interface ExtensionAPI {
 
 	/** Set the current model. Returns false if no API key available. */
 	setModel(model: Model): Promise<boolean>;
+	/** Select a configured model alias for this session without persisting settings. */
+	setModelAlias(name: string): Promise<ExtensionModelAliasResult>;
 
 	/** Get current thinking level. */
 	getThinkingLevel(): ThinkingLevel | undefined;
@@ -1643,6 +1782,7 @@ export type SendMessageHandler = <T = unknown>(
 	 */
 	options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
 ) => void;
+export type SetModelAliasHandler = (name: string) => Promise<ExtensionModelAliasResult>;
 
 export type SendUserMessageHandler = (
 	content: string | (TextContent | ImageContent)[],
@@ -1688,9 +1828,11 @@ export interface ExtensionActions {
 	setLabel: (targetId: string, label: string | undefined) => void;
 	getActiveTools: GetActiveToolsHandler;
 	getAllTools: GetAllToolsHandler;
+	getToolReference?: (name: string) => string;
 	setActiveTools: SetActiveToolsHandler;
 	getCommands: GetCommandsHandler;
 	setModel: SetModelHandler;
+	setModelAlias?: SetModelAliasHandler;
 	getThinkingLevel: GetThinkingLevelHandler;
 	setThinkingLevel: SetThinkingLevelHandler;
 	getServiceTiers?: GetServiceTiersHandler;
@@ -1736,6 +1878,8 @@ export interface ExtensionRuntime extends ExtensionRuntimeState, ExtensionAction
 export interface Extension {
 	path: string;
 	resolvedPath: string;
+	/** Loaded through the exact-path `--trusted-extension` allowlist. */
+	trusted?: boolean;
 	label?: string;
 	handlers: Map<string, HandlerFn[]>;
 	tools: Map<string, RegisteredTool<any, any>>;
@@ -1745,9 +1889,22 @@ export interface Extension {
 	fileDeleteFallbackHandlers: FileDeleteFallbackHandler[];
 	messageRenderers: Map<string, MessageRenderer>;
 	composerShapes: Map<string, ComposerShapeDefinition>;
+	statusLineSegments: Map<string, StatusLineSegmentRenderer>;
 	commands: Map<string, RegisteredCommand>;
 	flags: Map<string, ExtensionFlag>;
 	shortcuts: Map<KeyId, ExtensionShortcut>;
+}
+
+/**
+ * Imported extension factory detached from any session runtime. The same
+ * prepared module may be rebound to multiple session-scoped ExtensionAPI
+ * instances without evaluating its module graph again.
+ */
+export interface PreparedExtension {
+	path: string;
+	resolvedPath: string;
+	factory: ExtensionFactory | null;
+	error: string | null;
 }
 
 /** Result of loading extensions. */
@@ -1755,6 +1912,8 @@ export interface LoadExtensionsResult {
 	extensions: Extension[];
 	errors: Array<{ path: string; error: string }>;
 	runtime: ExtensionRuntime;
+	/** Session-independent imported factories safe to rebind in child sessions. */
+	preparedExtensions?: PreparedExtension[];
 }
 
 // ============================================================================

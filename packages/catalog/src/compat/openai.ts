@@ -136,12 +136,13 @@ function isOfficialOpenAIEndpoint(provider: string, baseUrl: string): boolean {
 }
 
 /**
- * Explicit prompt-cache breakpoints are a GPT-5.6+ first-party contract. Keep
- * this intentionally narrow: compatible gateways and older OpenAI models
- * reject the new request fields unless their catalog compat opts in.
+ * Explicit prompt-cache breakpoints are a GPT-5.6+ first-party OpenAI/Azure contract. Keep
+ * this intentionally narrow: compatible gateways and older models reject the new request
+ * fields unless their catalog compat opts in.
  */
 function supportsOfficialOpenAIPromptCacheBreakpoints(provider: string, modelId: string, baseUrl: string): boolean {
-	if (!isOfficialOpenAIEndpoint(provider, baseUrl)) return false;
+	const isAzure = provider === "azure" || provider === "azure-openai";
+	if (!isAzure && !isOfficialOpenAIEndpoint(provider, baseUrl)) return false;
 	const model = parseOpenAIModel(bareModelId(modelId));
 	return model !== null && semverGte(model.version, "5.6");
 }
@@ -501,10 +502,8 @@ export function buildOpenAICompat(spec: ModelSpec<"openai-completions">): Resolv
 		// every call since the family can otherwise emit very long reasoning traces
 		// before the final answer.
 		alwaysSendMaxTokens: isKimiModel,
-		// Native Kimi K3 always reasons through `reasoning_effort` (never the
-		// K2.x binary `thinking` block that #827's forced-tool-choice conflict is
-		// about), so suppressing its effort would leave K3 in an unsupported mode.
-		disableReasoningOnForcedToolChoice: (isKimiModel && !isMoonshotKimiK3) || isAnthropicModel,
+		disableReasoningOnForcedToolChoice: isKimiModel || isAnthropicModel,
+		disableReasoningWhenToolsPresent: isDirectDeepseekReasoning,
 		disableReasoningOnToolChoice: isDeepseekFamily && Boolean(spec.reasoning) && !isOpenRouter,
 		supportsToolChoice: !isDirectDeepseekReasoning,
 		// DeepSeek reasoning models on OpenCode Zen/Go 400 with
@@ -613,12 +612,13 @@ export function buildOpenAICompat(spec: ModelSpec<"openai-completions">): Resolv
 		supportsStrictMode: detectStrictModeSupport(provider, baseUrl),
 		extraBody: undefined,
 		toolStrictMode: isCerebras ? "all_strict" : "mixed",
-		// Kimi-family ids trigger MFJS on any host, not just native base URLs:
-		// proxies (OpenRouter, custom gateways) forward `tools.function.parameters`
-		// to Moonshot verbatim, which 400s on non-MFJS constructs.
-		toolSchemaFlavor:
-			isMoonshotNative || isKimiModel ? "moonshot-mfjs" : isLocalOpenAICompatBackend ? "grammar" : undefined,
-		streamFirstEventTimeoutMs: isLocalServingBackend ? 0 : undefined,
+		// Moonshot's MFJS validator also sits behind OpenRouter's Kimi routing
+		// (Moonshot AI is the primary `moonshotai/kimi-*` endpoint) and rejects
+		// boolean subschemas + other standard-JSON-Schema constructs. MFJS
+		// normalization only ever narrows to a valid standard schema, so it is
+		// safe even when OpenRouter routes a Kimi id to a non-Moonshot backend
+		// (#5918).
+		toolSchemaFlavor: isMoonshotNative || (isKimiModel && isOpenRouter) ? "moonshot-mfjs" : undefined,
 		streamIdleTimeoutMs,
 		stripDeepseekSpecialTokens:
 			isDeepseekModelIdOrName(spec.id) && (provider === "nvidia" || provider === "deepseek"),
@@ -658,6 +658,15 @@ export function buildOpenAICompat(spec: ModelSpec<"openai-completions">): Resolv
 	}
 	mergeModelReasoningEffortMap(compat, spec.id, isMimoReasoningEffortModel);
 
+	const whenReasoningDisabledPolicy =
+		spec.compat?.whenReasoningDisabled ??
+		(compat.disableReasoningWhenToolsPresent ? { requiresReasoningContentForToolCalls: false } : undefined);
+	let whenReasoningDisabled: ResolvedOpenAICompat | undefined;
+	if (whenReasoningDisabledPolicy) {
+		whenReasoningDisabled = { ...compat };
+		applyCompatOverrides(whenReasoningDisabled, whenReasoningDisabledPolicy);
+	}
+
 	const whenThinkingPolicy =
 		spec.compat?.whenThinking ??
 		(isDirectDeepseekReasoning
@@ -678,6 +687,9 @@ export function buildOpenAICompat(spec: ModelSpec<"openai-completions">): Resolv
 		}
 		mergeModelReasoningEffortMap(variant, spec.id, isMimoReasoningEffortModel);
 		compat.whenThinking = variant;
+	}
+	if (whenReasoningDisabled) {
+		compat.whenReasoningDisabled = whenReasoningDisabled;
 	}
 
 	return compat;
@@ -807,6 +819,10 @@ export function buildOpenAIResponsesCompat(spec: OpenAIResponsesSpecLike): Resol
 		streamIdleTimeoutMs: isLocalServingBackend
 			? LOCAL_OPENAI_COMPAT_STREAM_IDLE_TIMEOUT_MS
 			: spec.compat?.streamIdleTimeoutMs,
+		// Kimi/Moonshot on a Responses endpoint (OpenRouter routes to Moonshot's
+		// MFJS validator) rejects boolean subschemas and other standard-JSON
+		// constructs; normalize tool parameters to MFJS (#5918).
+		toolSchemaFlavor: isKimiModel && isOpenRouter ? "moonshot-mfjs" : undefined,
 	};
 	applyCompatOverrides(compat, spec.compat);
 	if (isXaiHost) {

@@ -247,46 +247,6 @@ function isAnthropicMessagesModel(model: Model): model is Model<"anthropic-messa
 }
 
 /**
- * Targets that have proven they read unsigned foreign thinking when replayed
- * natively. This is a semantic-carry allowlist only: OpenAI-compatible
- * `reasoning_content` schema requirements and llama.cpp cache-prefix replay are
- * handled by their encoders and MUST NOT make foreign thinking look meaningful.
- */
-function targetReadsForeignThinking(model: Model, compat: Model["compat"]): boolean {
-	if (compat === undefined) return false;
-	if (model.api === "anthropic-messages") {
-		return "replayUnsignedThinking" in compat && compat.replayUnsignedThinking === true;
-	}
-	if (model.api !== "openai-completions") return false;
-	if (!("thinkingFormat" in compat)) return false;
-	if (compat.requiresThinkingAsText) return false;
-	return model.reasoning && compat.thinkingFormat === "zai";
-}
-
-const ANTHROPIC_TOOL_CALL_ID_PATTERN = /^[a-zA-Z0-9_-]{1,64}$/;
-
-function isValidAnthropicToolCallId(id: string): boolean {
-	return ANTHROPIC_TOOL_CALL_ID_PATTERN.test(id);
-}
-
-function fallbackAnthropicToolCallId(originalId: string): string {
-	return `toolu_${Bun.hash(originalId).toString(36)}`;
-}
-
-function normalizeAnthropicTargetToolCallId<TApi extends Api>(
-	id: string,
-	model: Model<TApi>,
-	source: AssistantMessage,
-	normalizeToolCallId?: (id: string, model: Model<TApi>, source: AssistantMessage) => string,
-): string {
-	if (isValidAnthropicToolCallId(id)) return id;
-	const normalized =
-		normalizeToolCallId?.(id, model, source) ?? id.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, MAX_TOOL_CALL_ID_LENGTH);
-	if (isValidAnthropicToolCallId(normalized)) return normalized;
-	return fallbackAnthropicToolCallId(id);
-}
-
-/**
  * Normalize tool call ID for cross-provider compatibility.
  * OpenAI Responses API generates IDs that are 450+ chars with special characters like `|`.
  * Anthropic APIs require IDs matching ^[a-zA-Z0-9_-]+$ (max 64 chars).
@@ -503,11 +463,162 @@ export function transformMessages<TApi extends Api>(
 			return msg;
 		}
 
-		// Handle toolResult messages - normalize toolCallId if we have a mapping
-		if (msg.role === "toolResult") {
-			const normalizedId = toolCallIdMap.get(msg.toolCallId);
-			if (normalizedId && normalizedId !== msg.toolCallId) {
-				return { ...msg, toolCallId: normalizedId };
+			// Handle toolResult messages - normalize toolCallId if we have a mapping
+			if (msg.role === "toolResult") {
+				const normalizedId = toolCallIdMap.get(msg.toolCallId);
+				if (normalizedId && normalizedId !== msg.toolCallId) {
+					return { ...msg, toolCallId: normalizedId };
+				}
+				return msg;
+			}
+
+			// Assistant messages need transformation check
+			if (msg.role === "assistant") {
+				const assistantMsg = msg as AssistantMessage;
+				const isSameModel =
+					assistantMsg.provider === model.provider &&
+					assistantMsg.api === model.api &&
+					assistantMsg.model === model.id;
+
+				const isAnthropicTarget = isAnthropicMessagesModel(model);
+				// Anthropic enforces an all-or-none contract on prior-turn thinking
+				// blocks: "if you include thinking blocks in prior assistant turns,
+				// you must include ALL thinking blocks (including redacted ones)".
+				// As long as both the source and target speak `anthropic-messages`
+				// AND the target can replay unsigned thinking natively, every prior
+				// assistant turn's thinking chain must reach the wire as native
+				// `thinking`/`redacted_thinking` blocks — even across model/provider
+				// boundaries (custom providers configured via `models.yaml`, switching
+				// between two anthropic-compatible endpoints, etc.). For official
+				// Anthropic targets, unsigned cross-model thinking is demoted to text
+				// downstream, so matching redacted siblings must be dropped instead of
+				// sent as lone native `redacted_thinking` blocks.
+				const isAnthropicReplay = isAnthropicTarget && assistantMsg.api === "anthropic-messages";
+				const replaysUnsignedAnthropicThinking = isAnthropicTarget && model.compat.replayUnsignedThinking;
+				const isLatestSurvivingAssistant = index === latestSurvivingAssistantIndex;
+				// Thinking signatures can be untrustworthy for two distinct reasons with very
+				// different blast radii:
+				//
+				// 1. Aborted/errored turns: the stream stopped mid-block, so only the block
+				//    that was streaming at the abort point — always the FINAL content block —
+				//    can carry a partially-streamed (invalid) signature. Every earlier block
+				//    completed: Anthropic delivers a block's signature at its
+				//    `content_block_stop`, which necessarily fired before the next block began,
+				//    so those signatures are whole and valid. Stripping them would needlessly
+				//    discard a replayable thinking chain — e.g. interrupting during the visible
+				//    text output after thinking already finished leaves a fully-signed thinking
+				//    block that must be kept, or Anthropic rejects the replay with HTTP 400
+				//    "Invalid `signature` in `thinking` block".
+				//
+				// 2. Abandoned tool-use turns: a turn that carries toolCall blocks but did NOT
+				//    request tool execution (stopReason !== "toolUse" — e.g. adaptive-thinking
+				//    Opus emitting tool calls and then ending on `end_turn`/`stop`). The agent
+				//    loop pairs those calls with placeholder tool_results to keep the
+				//    tool_use/tool_result contract valid. The turn completed cleanly, but its
+				//    signatures are end_turn-bound and cannot be replayed in that synthesized
+				//    continuation, so EVERY thinking signature is stripped.
+				//
+				// Latest abandoned turns are exempt because Anthropic requires thinking blocks
+				// from its most recent response to remain byte-for-byte unmodified.
+				const invalidStopReason = assistantMsg.stopReason === "aborted" || assistantMsg.stopReason === "error";
+				const abandonedToolUse =
+					!invalidStopReason &&
+					assistantMsg.stopReason !== "toolUse" &&
+					assistantMsg.content.some(b => b.type === "toolCall");
+				const lastBlockIndex = assistantMsg.content.length - 1;
+
+				const transformedContent = assistantMsg.content.flatMap((block, blockIndex) => {
+					if (block.type === "thinking") {
+						// Only an aborted/errored turn's final (mid-stream) block can hold a
+						// partial signature; abandoned tool-use turns strip all. Drop the
+						// untrustworthy signature so the encoder can downgrade the block to text.
+						const signatureUntrustworthy =
+							abandonedToolUse || (invalidStopReason && blockIndex === lastBlockIndex);
+						let sanitized: typeof block =
+							signatureUntrustworthy && block.thinkingSignature
+								? { ...block, thinkingSignature: undefined }
+								: block;
+						if (isAnthropicReplay) {
+							// Latest abandoned turn: Anthropic's byte-for-byte rule forbids
+							// even stripping a signature on the latest message.
+							if (isLatestSurvivingAssistant && abandonedToolUse) return block;
+							// Cross-model prior turns: the source provider's signature is
+							// not trusted by the new target. Strip it so the downstream
+							// encoder applies its `replayUnsignedThinking` policy
+							// (unsigned thinking is emitted natively on Anthropic-compatible
+							// reasoning endpoints and demoted to text on official Anthropic).
+							if (!isLatestSurvivingAssistant && !isSameModel && sanitized.thinkingSignature) {
+								sanitized = { ...sanitized, thinkingSignature: undefined };
+							}
+							// Drop blocks with neither a signature anchor nor any text —
+							// nothing for the next turn to replay.
+							if (!sanitized.thinkingSignature && (!sanitized.thinking || sanitized.thinking.trim() === "")) {
+								return [];
+							}
+							return sanitized;
+						}
+						// Cross-API target: keep the existing text-demotion fallback.
+						// For same model: keep thinking blocks with signatures (needed for replay)
+						// even if the thinking text is empty (OpenAI encrypted reasoning)
+						if (isSameModel && sanitized.thinkingSignature) return sanitized;
+						// Skip empty thinking blocks, convert others to plain text
+						if (!sanitized.thinking || sanitized.thinking.trim() === "") return [];
+						if (isSameModel) return sanitized;
+						return {
+							type: "text" as const,
+							text: sanitized.thinking,
+						};
+					}
+
+					if (block.type === "redactedThinking") {
+						// Redacted thinking is native-only. Keep it for same-model
+						// signed replay, the latest byte-for-byte Anthropic turn, or
+						// compatible targets that will also emit sibling unsigned
+						// thinking natively. Drop it when the visible thinking was
+						// cross-model stripped and will be demoted to text.
+						if (isAnthropicReplay) {
+							if (isSameModel || isLatestSurvivingAssistant || replaysUnsignedAnthropicThinking) return block;
+							return [];
+						}
+						if (isSameModel) return block;
+						return [];
+					}
+
+					if (block.type === "text") {
+						if (isSameModel) return block;
+						return {
+							type: "text" as const,
+							text: block.text,
+						};
+					}
+
+					if (block.type === "toolCall") {
+						const toolCall = block as ToolCall;
+						let normalizedToolCall: ToolCall = toolCall;
+
+						if (!isSameModel && toolCall.thoughtSignature) {
+							normalizedToolCall = { ...toolCall };
+							delete (normalizedToolCall as { thoughtSignature?: string }).thoughtSignature;
+						}
+
+						if (!isSameModel && normalizeToolCallId) {
+							const normalizedId = normalizeToolCallId(toolCall.id, model, assistantMsg);
+							if (normalizedId !== toolCall.id) {
+								toolCallIdMap.set(toolCall.id, normalizedId);
+								normalizedToolCall = { ...normalizedToolCall, id: normalizedId };
+							}
+						}
+
+						return normalizedToolCall;
+					}
+
+					return block;
+				});
+
+				return {
+					...assistantMsg,
+					content: transformedContent,
+				};
 			}
 			return msg;
 		}
@@ -598,7 +709,7 @@ export function transformMessages<TApi extends Api>(
 			const anthropicVisibleThinkingSurvivesReplay = (
 				candidate: AssistantMessage["content"][number],
 				candidateIndex: number,
-			): boolean => {
+			) => {
 				if (candidate.type !== "thinking") return false;
 				if (!isAnthropicReplay) return false;
 				if (isLatestSurvivingAssistant && abandonedToolUse) return true;
@@ -612,12 +723,12 @@ export function transformMessages<TApi extends Api>(
 				}
 				return true;
 			};
-			const hasVisibleAnthropicThinking = assistantMsg.content.some(candidate => candidate.type === "thinking");
+			const hasVisibleThinking = assistantMsg.content.some(candidate => candidate.type === "thinking");
 			const dropsAllSameModelVisibleThinking =
 				isAnthropicReplay &&
 				isSameModel &&
 				isSigningAnthropicTarget &&
-				hasVisibleAnthropicThinking &&
+				hasVisibleThinking &&
 				!assistantMsg.content.some(anthropicVisibleThinkingSurvivesReplay);
 
 			const transformedContent = assistantMsg.content.flatMap((block, blockIndex) => {
@@ -728,22 +839,14 @@ export function transformMessages<TApi extends Api>(
 
 				if (block.type === "redactedThinking") {
 					// Redacted thinking is native-only. Keep it for same-model
-					// signed replay, for the latest byte-for-byte turn issued by the
-					// target's own provider, or for compatible targets that will
-					// also emit sibling unsigned thinking natively. Drop it when the
-					// matching visible thinking was discarded, or when visible
-					// thinking was stripped and will be demoted to text — a foreign
-					// redacted payload can no more verify on a signing target than a
-					// foreign visible signature can, even on the latest turn.
+					// signed replay, the latest byte-for-byte Anthropic turn, or
+					// compatible targets that will also emit sibling unsigned
+					// thinking natively. Drop it only when every visible thinking
+					// block from this same-model turn was discarded, and when
+					// cross-model stripped visible thinking will be demoted to text.
 					if (isAnthropicReplay) {
 						if (dropsAllSameModelVisibleThinking) return [];
-						if (
-							isSameModel ||
-							(isLatestSurvivingAssistant && assistantMsg.provider === model.provider) ||
-							replaysUnsignedAnthropicThinking
-						) {
-							return block;
-						}
+						if (isSameModel || isLatestSurvivingAssistant || replaysUnsignedAnthropicThinking) return block;
 						return [];
 					}
 					if (isSameModel) return block;

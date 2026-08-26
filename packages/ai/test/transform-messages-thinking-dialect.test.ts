@@ -1,7 +1,8 @@
 import { describe, expect, it } from "bun:test";
 import { getDialectDefinition, renderDemotedThinking } from "@oh-my-pi/pi-ai/dialect";
+import { flattenOpenAICompletionsAssistantTextBlocks } from "@oh-my-pi/pi-ai/providers/openai-completions";
 import { transformMessages } from "@oh-my-pi/pi-ai/providers/transform-messages";
-import type { Api, AssistantMessage, Message, Model, ModelSpec, UserMessage } from "@oh-my-pi/pi-ai/types";
+import type { Api, AssistantMessage, Message, Model, ModelSpec, TextContent, UserMessage } from "@oh-my-pi/pi-ai/types";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 
 /**
@@ -12,13 +13,11 @@ import { buildModel } from "@oh-my-pi/pi-catalog/build";
  * neither recalled nor influences generation). `transformMessages` therefore
  * demotes the reasoning to a `text` block so it survives as conversation
  * context, usually wrapping it in the TARGET model's own canonical
- * thinking-block dialect (e.g. a ```thinking fence for Gemini). The
- * Anthropic/Claude dialect is the exception: every Claude model
- * (Opus / Sonnet / Haiku / Fable / Mythos, etc.) receives bare assistant prose,
- * because Anthropic's `reasoning_extraction` classifier flags `<thinking>` /
- * `antml:thinking` tags in prior turn history — refusing (Fable) or leaking
- * the wrapped chain-of-thought as visible reasoning on the others. Same-model
- * continuations keep the native `thinking` block untouched.
+ * thinking-block dialect (e.g. a ```thinking fence for Gemini). The entire
+ * Anthropic dialect (all Claude models) is an exception: it receives bare
+ * assistant prose so replayed reasoning does not trigger the `reasoning_extraction`
+ * classifier that blocks wrapped reasoning. Same-model continuations keep the
+ * native `thinking` block untouched.
  */
 const REASONING = "The user wants the Paris weather; I will call get_weather with city=Paris.";
 
@@ -130,29 +129,17 @@ describe("transformMessages cross-provider thinking demotion → canonical diale
 		expect(text).toContain(REASONING);
 	});
 
-	it("renders demoted foreign reasoning as bare assistant prose for every Anthropic-dialect Claude target", () => {
-		// The Anthropic reasoning_extraction classifier flags `<thinking>` and
-		// `antml:thinking` tags in prior turn history for the whole Claude family
-		// — Fable refuses outright, Opus/Sonnet/Haiku/Mythos leak the wrapped
-		// chain-of-thought as visible reasoning. Every Anthropic-dialect target
-		// therefore receives bare prose, not the dialect's canonical thinking
-		// tags.
+	it("renders demoted foreign reasoning as bare prose for all Anthropic-dialect Claude models", () => {
 		const targets = [
-			{ name: "Claude Opus", id: "claude-opus-4-8" },
-			{ name: "Claude Sonnet", id: "claude-sonnet-4-6" },
-			{ name: "Claude Haiku", id: "claude-haiku-4-5" },
-			{ name: "Claude Fable", id: "claude-fable-5" },
-			{ name: "Claude Mythos", id: "claude-mythos-5" },
-			// Bedrock cross-region inference profiles. `parseAnthropicModel`
-			// doesn't enumerate `haiku`, so this exercises the isClaudeModelId
-			// dotted-prefix fallback specifically.
-			{ name: "Claude Haiku (Bedrock US)", id: "us.anthropic.claude-haiku-4-5-20251001-v1:0" },
-			{ name: "Claude Haiku (Bedrock EU)", id: "eu.anthropic.claude-haiku-4-5-20251001-v1:0" },
-			{ name: "Claude Opus (Bedrock Global)", id: "global.anthropic.claude-opus-4-8" },
+			{ name: "Claude Opus", id: "claude-opus-4-8", provider: "anthropic" },
+			{ name: "Claude Sonnet", id: "claude-sonnet-5", provider: "anthropic" },
+			{ name: "Claude Fable", id: "claude-fable-5", provider: "anthropic" },
+			{ name: "Claude Mythos", id: "claude-mythos-5", provider: "anthropic" },
+			{ name: "Bedrock Claude Haiku", id: "anthropic.claude-3-5-haiku-20241022-v1:0", provider: "aws-bedrock" },
 		] as const;
 
 		for (const target of targets) {
-			const model = makeModel("anthropic-messages", "anthropic", target.id);
+			const model = makeModel("anthropic-messages", target.provider, target.id);
 			const assistant = transformedAssistant(
 				[user(`weather in Paris for ${target.name}?`), geminiThinkingTurn()],
 				model,
@@ -163,12 +150,11 @@ describe("transformMessages cross-provider thinking demotion → canonical diale
 			const first = assistant.content[0];
 			expect(first?.type).toBe("text");
 			const text = first && first.type === "text" ? first.text : "";
+			// All Anthropic models receive bare reasoning prose with no wrapper tags
+			// to avoid triggering reasoning_extraction classifier
 			expect(text).toBe(REASONING);
-			expect(text).toBe(renderDemotedThinking(target.id, REASONING));
 			expect(text).not.toContain("<thinking>");
 			expect(text).not.toContain("</thinking>");
-			expect(text).not.toContain("<think>");
-			expect(text).not.toContain("</think>");
 			expect(text).not.toContain("_Hmm.");
 
 			const reply = assistant.content[1];
@@ -177,48 +163,16 @@ describe("transformMessages cross-provider thinking demotion → canonical diale
 		}
 	});
 
-	it("trims a demoted block that becomes final after following empty thinking blocks are dropped", () => {
-		const claude = makeModel("anthropic-messages", "anthropic", "claude-sonnet-4-6");
-		const turn: AssistantMessage = {
-			...geminiThinkingTurn(),
-			content: [
-				{ type: "thinking", thinking: `${REASONING}\n`, thinkingSignature: "google-sig" },
-				{ type: "thinking", thinking: " \n\t", thinkingSignature: "" },
-			],
-		};
+	it("preserves a boundary when OpenAI-compatible Claude targets flatten bare demotions", () => {
+		const model = makeModel("openai-completions", "openrouter", "anthropic/claude-sonnet-4-6");
+		const assistant = transformedAssistant(
+			[user("weather in Paris?"), anthropicThinkingTurn(), user("Summarize the result.")],
+			model,
+		);
+		const textBlocks = assistant.content.filter((block): block is TextContent => block.type === "text");
 
-		const assistant = transformedAssistant([user("weather in Paris?"), turn], claude);
-
-		expect(assistant.content).toHaveLength(1);
-		const first = assistant.content[0];
-		expect(first?.type).toBe("text");
-		const text = first && first.type === "text" ? first.text : "";
-		expect(text).toBe(REASONING);
-		expect(/\s$/.test(text)).toBe(false);
-	});
-
-	it("trimEnds trailing whitespace already present in bare Anthropic-dialect demoted thinking", () => {
-		const claude = makeModel("anthropic-messages", "anthropic", "claude-sonnet-4-6");
-		const reasoningWithTrailingWhitespace = "The plan is complete.\n \t";
-		const turn: AssistantMessage = {
-			...geminiThinkingTurn(),
-			content: [
-				{
-					type: "thinking",
-					thinking: reasoningWithTrailingWhitespace,
-					thinkingSignature: "google-sig",
-				},
-			],
-		};
-
-		const assistant = transformedAssistant([user("weather in Paris?"), turn], claude);
-
-		expect(assistant.content).toHaveLength(1);
-		const first = assistant.content[0];
-		expect(first?.type).toBe("text");
-		const text = first && first.type === "text" ? first.text : "";
-		expect(text).toBe("The plan is complete.");
-		expect(/\s$/.test(text)).toBe(false);
+		expect(flattenOpenAICompletionsAssistantTextBlocks(textBlocks)).toBe(`${REASONING}\n\nChecking the forecast.`);
+		expect(flattenOpenAICompletionsAssistantTextBlocks(textBlocks)).not.toBe(`${REASONING}Checking the forecast.`);
 	});
 
 	it("keeps the native thinking block for a same-provider/same-model continuation", () => {

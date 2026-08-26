@@ -867,7 +867,7 @@ function createEventControllerFixture(opts?: { optimisticSkillMessagePending?: b
 		isInitialized: true,
 		init: vi.fn(async () => {}),
 		ui: { requestRender },
-		statusLine: { invalidate: vi.fn() },
+		statusLine: { invalidate: vi.fn(), markActivityStart: vi.fn(), markActivityEnd: vi.fn() },
 		updateEditorTopBorder: vi.fn(),
 		addMessageToChat,
 		updatePendingMessagesDisplay,

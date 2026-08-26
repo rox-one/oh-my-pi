@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import { parseSSE, redactUrlForLog } from "@oh-my-pi/pi-coding-agent/mcp/json-rpc";
+import { MCPRequestError, toJsonRpcError } from "@oh-my-pi/pi-coding-agent/mcp/types";
 
 describe("redactUrlForLog", () => {
 	it("redacts credential-bearing query params but keeps the rest", () => {
@@ -22,5 +23,24 @@ describe("parseSSE", () => {
 
 	it("returns null when nothing parses", () => {
 		expect(parseSSE("data: ping\nnot json either")).toBeNull();
+	});
+});
+
+describe("toJsonRpcError", () => {
+	it("does not serialize arbitrary thrown object data", () => {
+		const error = toJsonRpcError({ code: -32042, message: "elicitation required", data: { secret: "do-not-send" } });
+
+		expect(error).toEqual({ code: -32042, message: "elicitation required" });
+		expect(error).not.toHaveProperty("data");
+	});
+
+	it("preserves data only for MCPRequestError", () => {
+		const data = { elicitations: [{ mode: "url", elicitationId: "id-1" }] };
+
+		expect(toJsonRpcError(new MCPRequestError({ code: -32042, message: "elicitation required", data }))).toEqual({
+			code: -32042,
+			message: "MCP error -32042: elicitation required",
+			data,
+		});
 	});
 });
