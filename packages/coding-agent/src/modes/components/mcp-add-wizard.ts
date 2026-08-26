@@ -71,7 +71,6 @@ interface MCPAddWizardOAuthOptions {
 	abortSignal?: AbortSignal;
 }
 
-
 interface WizardState {
 	name: string;
 	transport: TransportType | null;
@@ -1027,8 +1026,8 @@ export class MCPAddWizard extends OverlayPanel {
 					this.#state.oauthTokenUrl = oauth.tokenUrl;
 					this.#state.oauthRegistrationUrl = oauth.registrationUrl || "";
 					this.#state.oauthClientId = oauth.clientId || "";
-				this.#state.oauthScopes = oauth.scopes || "";
-				this.#state.oauthScopesDiscovered = this.#state.oauthScopes;
+					this.#state.oauthScopes = oauth.scopes || "";
+					this.#state.oauthScopesDiscovered = this.#state.oauthScopes;
 					this.#state.oauthResource = oauth.resource || (this.#state.transport === "stdio" ? "" : this.#state.url);
 					this.#state.authMethod = "oauth";
 
@@ -1389,10 +1388,10 @@ export class MCPAddWizard extends OverlayPanel {
 				};
 			}
 
-		this.#applyOAuthScopeOverride(config);
+			this.#applyOAuthScopeOverride(config);
 
-		return config;
-	}
+			return config;
+		}
 
 		// HTTP or SSE — use concrete type
 		const config: MCPHttpServerConfig | MCPSseServerConfig = {

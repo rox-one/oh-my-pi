@@ -303,81 +303,80 @@ describe("issue #967 vision guard", () => {
 				},
 			],
 		});
-		});
+	});
+});
+
+describe("DeepSeek official vision model exemption", () => {
+	const deepseekVisionModel = buildModel({
+		id: "deepseek-v4-flash-vision-exp",
+		name: "DeepSeek V4 Flash Vision Exp",
+		api: "openai-completions",
+		provider: "deepseek",
+		baseUrl: "https://api.deepseek.com",
+		reasoning: true,
+		input: ["text", "image"],
+		cost: { input: 0.14, output: 0.28, cacheRead: 0.0028, cacheWrite: 0 },
+		contextWindow: 1_000_000,
+		maxTokens: 384_000,
+	} as ModelSpec<"openai-completions">);
+
+	it("keeps image parts for the official deepseek vision model", () => {
+		expect(isOpenAICompletionsVisionSupported(deepseekVisionModel)).toBe(true);
+
+		const context: Context = {
+			messages: [
+				{
+					role: "user",
+					content: [
+						{ type: "text", text: "what is in this image?" },
+						{ type: "image", mimeType: "image/png", data: "ZmFrZQ==" },
+					],
+					timestamp: 1,
+				},
+			],
+		};
+		const messages = convertOpenAICompletionsMessages(deepseekVisionModel, context, compat);
+		expect(countTaggedValues(messages, "image_url")).toBe(1);
+		expect(JSON.stringify(messages)).not.toContain(NON_VISION_IMAGE_PLACEHOLDER);
 	});
 
-	describe("DeepSeek official vision model exemption", () => {
-		const deepseekVisionModel = buildModel({
-			id: "deepseek-v4-flash-vision-exp",
-			name: "DeepSeek V4 Flash Vision Exp",
+	it("still scrubs a text-only DeepSeek model flagged vision by a user override", () => {
+		const overridden = buildModel({
+			id: "deepseek-v4-flash",
+			name: "DeepSeek V4 Flash",
 			api: "openai-completions",
 			provider: "deepseek",
 			baseUrl: "https://api.deepseek.com",
 			reasoning: true,
+			// Misconfigured models.yml override claiming vision for a text-only model.
 			input: ["text", "image"],
 			cost: { input: 0.14, output: 0.28, cacheRead: 0.0028, cacheWrite: 0 },
 			contextWindow: 1_000_000,
 			maxTokens: 384_000,
 		} as ModelSpec<"openai-completions">);
 
-		it("keeps image parts for the official deepseek vision model", () => {
-			expect(isOpenAICompletionsVisionSupported(deepseekVisionModel)).toBe(true);
+		expect(isOpenAICompletionsVisionSupported(overridden)).toBe(false);
 
-			const context: Context = {
-				messages: [
-					{
-						role: "user",
-						content: [
-							{ type: "text", text: "what is in this image?" },
-							{ type: "image", mimeType: "image/png", data: "ZmFrZQ==" },
-						],
-						timestamp: 1,
-					},
-				],
-			};
-			const messages = convertOpenAICompletionsMessages(deepseekVisionModel, context, compat);
-			expect(countTaggedValues(messages, "image_url")).toBe(1);
-			expect(JSON.stringify(messages)).not.toContain(NON_VISION_IMAGE_PLACEHOLDER);
-		});
-
-		it("still scrubs a text-only DeepSeek model flagged vision by a user override", () => {
-			const overridden = buildModel({
-				id: "deepseek-v4-flash",
-				name: "DeepSeek V4 Flash",
-				api: "openai-completions",
-				provider: "deepseek",
-				baseUrl: "https://api.deepseek.com",
-				reasoning: true,
-				// Misconfigured models.yml override claiming vision for a text-only model.
-				input: ["text", "image"],
-				cost: { input: 0.14, output: 0.28, cacheRead: 0.0028, cacheWrite: 0 },
-				contextWindow: 1_000_000,
-				maxTokens: 384_000,
-			} as ModelSpec<"openai-completions">);
-
-			expect(isOpenAICompletionsVisionSupported(overridden)).toBe(false);
-
-			const context: Context = {
-				messages: [
-					{
-						role: "user",
-						content: [
-							{ type: "text", text: "plot summary" },
-							{ type: "image", mimeType: "image/png", data: "ZmFrZQ==" },
-						],
-						timestamp: 1,
-					},
-				],
-			};
-			const messages = convertOpenAICompletionsMessages(overridden, context, compat);
-			expect(countTaggedValues(messages, "image_url")).toBe(0);
-			expect(messages[0]).toMatchObject({
-				role: "user",
-				content: [
-					{ type: "text", text: "plot summary" },
-					{ type: "text", text: NON_VISION_IMAGE_PLACEHOLDER },
-				],
-			});
+		const context: Context = {
+			messages: [
+				{
+					role: "user",
+					content: [
+						{ type: "text", text: "plot summary" },
+						{ type: "image", mimeType: "image/png", data: "ZmFrZQ==" },
+					],
+					timestamp: 1,
+				},
+			],
+		};
+		const messages = convertOpenAICompletionsMessages(overridden, context, compat);
+		expect(countTaggedValues(messages, "image_url")).toBe(0);
+		expect(messages[0]).toMatchObject({
+			role: "user",
+			content: [
+				{ type: "text", text: "plot summary" },
+				{ type: "text", text: NON_VISION_IMAGE_PLACEHOLDER },
+			],
 		});
 	});
-
+});

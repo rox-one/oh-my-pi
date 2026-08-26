@@ -632,7 +632,7 @@ export class MCPOAuthFlow extends OAuthCallbackFlow {
 				token_endpoint_auth_method: "none",
 				application_type: "native",
 			};
-		const scope = (this.config.scopeOverride ?? this.config.scopes)?.trim();
+			const scope = (this.config.scopeOverride ?? this.config.scopes)?.trim();
 			if (scope) {
 				registrationBody.scope = scope;
 			}
