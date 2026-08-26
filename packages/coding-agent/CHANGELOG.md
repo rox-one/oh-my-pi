@@ -4,6 +4,10 @@
 
 ### Fixed
 
+- ACP clients prompting while the agent is mid-turn now receive a typed JSON-RPC error (code -32003, `data.reason: "session_busy"`) instead of an opaque -32603 "Internal error", so prompts no longer appear to vanish when the session is busy.
+
+## [18.0.6] - 2026-08-26
+
 - Stopped Mnemopi retention from overflowing the embedding model's context window: `embed()` now caps each input at `MNEMOPI_EMBEDDING_MAX_INPUT_CHARS` (default 8192 chars) and clips with a head/tail split so a long multi-turn `MnemopiSessionState.retainMessages` transcript can't make llama.cpp's `/embeddings` server reject the request with `request (N tokens) exceeds the available context size` and silently drop vector recall for that memory. The head/tail clip keeps both the opening setup and the most recent turns so later episodes don't collapse onto the same prefix vector, and stored vectors are now stamped with `<model>@chars:<N>` so the next session open rebuilds existing long memories under the new clip instead of leaving them frozen on their pre-cap text ([#3126](https://github.com/can1357/oh-my-pi/issues/3126)).
 
 ## [16.1.7] - 2026-06-20
