@@ -750,6 +750,7 @@ export class MCPCommandController {
 									callbackPath: finalConfig.oauth?.callbackPath,
 									redirectUri: finalConfig.oauth?.redirectUri,
 									prompt: finalConfig.oauth?.prompt,
+									scopeOverride: finalConfig.oauth?.scopes,
 									registrationUrl: oauth.registrationUrl,
 									serverUrl: finalConfig.url,
 									resource: oauthResource,
@@ -829,6 +830,11 @@ export class MCPCommandController {
 		opts?: {
 			callbackPort?: number;
 			callbackPath?: string;
+			/**
+			 * Configured `oauth.scopes`, which outranks both `scopes` and any
+			 * `scope` embedded in the authorization URL. `""` sends no scope.
+			 */
+			scopeOverride?: string;
 			redirectUri?: string;
 			prompt?: string;
 			serverUrl?: string;
@@ -901,6 +907,7 @@ export class MCPCommandController {
 					clientId: resolvedClientId,
 					clientSecret: resolvedClientSecret,
 					scopes: scopes || undefined,
+					scopeOverride: opts?.scopeOverride,
 					prompt: opts?.prompt,
 					redirectUri: opts?.redirectUri,
 					callbackPort: opts?.callbackPort,
@@ -1994,6 +2001,7 @@ export class MCPCommandController {
 					callbackPath: found.config.oauth?.callbackPath,
 					redirectUri: found.config.oauth?.redirectUri,
 					prompt: found.config.oauth?.prompt,
+					scopeOverride: runtimeBaseConfig.oauth?.scopes,
 					registrationUrl: oauth.registrationUrl,
 					serverUrl,
 					resource: oauthResource,

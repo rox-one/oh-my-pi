@@ -3,7 +3,12 @@ import * as path from "node:path";
 import { $which, TempDir } from "@oh-my-pi/pi-utils";
 import { disposeJuliaKernelSessionsByOwner, executeJulia } from "../../src/eval/jl/executor";
 
-const HAS_JULIA = Boolean($which("julia"));
+const HAS_JULIA = (() => {
+	const bin = $which("julia");
+	if (!bin) return false;
+	const probe = Bun.spawnSync([bin, "-e", "1"], { stdout: "ignore", stderr: "ignore", timeout: 3000 });
+	return probe.exitCode === 0 && probe.signalCode == null;
+})();
 const OWNER_ID = "julia-prelude-tests";
 
 describe.skipIf(!HAS_JULIA)("eval Julia prelude helpers", () => {

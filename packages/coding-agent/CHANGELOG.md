@@ -1,6 +1,9 @@
 # Changelog
 
 ## [Unreleased]
+### Fixed
+
+- Focused live task and eval subagent previews on unfinished agents, collapsing settled rows into a status summary ([#8949](https://github.com/can1357/oh-my-pi/issues/8949)).
 
 ### Added
 
@@ -17,12 +20,100 @@
 - Added `s`/`u` shortcuts to stage/unstage files directly from the sidebar
 - Added `space` shortcut as page down in the diff pane
 - Expanded `omp git` keyboard navigation: `alt+↓`/`alt+↑` jump hunks and roll into the adjacent file at the edges, `]`/`[` switch files, `←`/`→` collapse/expand sidebar directories, `enter` opens the selected file, vim motions (`j`/`k`/`h`/`l`/`g`/`G`) work in both panes, `1`–`4` pick a diff view directly, and `c` jumps to the commit form.
+- Clarified the computer tool prompt: `desktop.window()` returns a promise that must be awaited, and `win.ax()` snapshots are textual trees rather than structured node lists.
 
 ### Fixed
 
 - Fixed resize and display replays, ensuring stable rendering and full transcript flushing on agent shutdown
 - Fixed fast tool completions leaving a permanent running summary that blocked transcript retirement and squeezed later tool output.
+- Fixed cold interactive launch clearing native scrollback twice, which duplicated the welcome header (leaving a stale copy in scrollback) on the Windows console host ([#9597](https://github.com/can1357/oh-my-pi/issues/9597))
 - Fixed `omp git` hunk navigation (`alt+↓`/`alt+↑`) appearing to do nothing while the file sidebar had focus: the diff cursor band now stays visible (dimmed) when the pane is unfocused.
+- Commit-message generation errors in the git TUI now remain visible in the status bar instead of disappearing and returning to an idle state.
+- Fixed `omp update` leaving standalone Windows binaries on the old version when stale Bun launcher metadata was present, and preserved launchers installed by a newer concurrent update during binary repair ([#9806](https://github.com/can1357/oh-my-pi/issues/9806)).
+- Quitting `omp git` during commit-message generation now exits cleanly without leaving the process running.
+### Fixed
+
+- Handle denied working-directory changes without crashing resume, move, or startup flows.
+
+### Fixed
+
+- Fixed `omp git` rendering corruption (misalignment, missing elements, flicker) for unstaged files with CRLF line endings on Windows ([#9734](https://github.com/can1357/oh-my-pi/issues/9734)).
+
+### Fixed
+
+- Fixed `--model <id>:<effort>` dropping the effort from the `default` role, so cycling back to `default` with ctrl+p ran at the previous role's reasoning effort. An explicit `--thinking` still wins over the flag's suffix.
+
+### Fixed
+
+- Fixed imported and legacy sessions with missing assistant usage metadata dropping RPC lifecycle events ([#9743](https://github.com/can1357/oh-my-pi/issues/9743)).
+
+### Added
+
+- Added append-only transcript declarations and stable-row APIs for components with immutable history prefixes.
+- Added the `:img` read selector to rasterize local SVG and SVGZ files for vision input.
+- Added side-by-side image and SVG previews to `omp git`, including Git LFS object resolution and clear placeholders for unavailable or unsupported binary content.
+- Added the `omp if-bench` command for zero-tool instruction-following and working-memory benchmarking across models, with live progress and ranked results.
+- Added `q` to quit the git TUI.
+- Added advanced whitespace filtering to the git TUI, including formatting-only changes and import-only changes in TypeScript, JavaScript, Rust, and Go.
+- Improved the git TUI sidebar by compressing single-child directory chains and separating new or untracked files from tracked changes.
+- Added Yolo-Auto to `/login` and documented the `YOLO_AUTO_API_KEY` environment variable.
+- Updated the OpenRouter `/login` flow to support browser-based sign-in and automatic API-key provisioning, while retaining support for pasted `sk-or-…` keys.
+- Added DeepInfra support for the `image_gen` and `tts` tools, including provider selection and MP3 or WAV output for text-to-speech.
+
+### Changed
+
+- Standardized completed edit results with hashline-style paths and numbered previews across edit modes.
+- Improved `omp git` responsiveness with immediate file rendering, progressive syntax highlighting, and deferred large-commit statistics.
+- Documented that `retry.maxDelayMs: 0` permits provider-requested quota waits to continue until automatic retry, rather than enforcing a wait ceiling.
+- Expanded git TUI navigation and file-management shortcuts, including refresh, stage/unstage, directory operations, hunk and file navigation, pane movement, diff-view selection, commit-form access, and paging.
+
+### Fixed
+
+- Fixed race condition where tunnel startup was incorrectly reported as failure on quick process exit
+- Fixed Obsidian theme task instructions and usage-limit text becoming unreadable against dark backgrounds.
+- Fixed marketplace-installed plugins failing to discover their `rules/` directories.
+- Fixed advisor notes in `/tree` displaying internal XML wrappers instead of readable text.
+- Fixed successful agent and subagent results being discarded when cleanup exceeded its deadline.
+- Fixed exiting plan mode mid-turn so the active turn now stops immediately.
+- Fixed Windows workstation context reporting a virtual display adapter instead of the physical GPU.
+- Fixed numbered selector menus such as `/review` ignoring digit-key selection.
+- Fixed the welcome screen failing to reflow after terminal resizing.
+- Fixed transcript layout issues that could clip assistant text, leave stale tool cards, disrupt scrolling, or make large-session rendering and shutdown unreliable.
+- Fixed streamed assistant responses failing when later provider updates revised earlier Markdown.
+- Fixed cache-miss status placement after streamed assistant output.
+- Fixed `/model` role-cycle icons overlapping their ordinal on full-width terminals.
+- Fixed constrained `/collab` QR codes rendering as empty rows; the browser URL hint is now shown instead.
+- Fixed `hub list` and child peer rosters incorrectly including parked agents in model context and restored accurate status counts.
+- Fixed browser relay clients hanging when enabling the Runtime domain on a shared tab.
+- Fixed interactive TTSR interruptions being displayed as errors after successful rule injection.
+- Fixed fast tool completions leaving a persistent running summary that obstructed later output.
+- Fixed the Windows console welcome header being duplicated after cold launch.
+- Fixed git TUI hunk navigation feedback when the sidebar has focus and preserved file selection after staging or unstaging.
+- Fixed long sessions becoming unrecoverable when providers reject histories exceeding message-count limits.
+- Improved `/dump` output with readable system-notice titles and XML-fenced raw payloads.
+- Fixed kernel sessions failing to recover when cancellation was reported by a dead kernel.
+- Applied advisor tool-call loop limits to prevent repeated failing calls from continuing without bound.
+- Fixed `lsp rename_file` incorrectly reporting inaccessible paths as nonexistent and mishandling uncertain destination checks.
+- Fixed LSP clients with different launch or initialization configurations incorrectly sharing one process; reloading now replaces superseded clients.
+- Fixed the browser relay leaving Chrome's debugging infobar attached after the last client released a tab.
+- Fixed auto-retry countdowns appearing frozen during long provider-requested waits.
+- Fixed the Todo HUD becoming stale after viewing a subagent and returning to the main session.
+- Fixed child-task artifact links and duplicate `hub jobs` result bodies.
+- Fixed `omp update` showing a POSIX reinstall command on Windows after a package-rename migration failure.
+- Preserved `thinking.requiresEffort: false` in custom model configuration so supported local Qwen templates can disable thinking explicitly.
+- Fixed project settings from shared capability files being able to replace an entire settings group when a conflicting non-object value is present; the conflicting value is now ignored with a warning.
+- Jina Reader requests now use configured credentials for higher authenticated rate limits while remaining available anonymously.
+- Fixed advisor session persistence and loading performance for repeated retries and unusually large advisor transcripts.
+- Fixed failed `browser.open` calls leaving OMP-spawned application processes running when no tab could be acquired.
+- Improved browser-handle failures with prompt, operation-specific timeout errors instead of waiting for the entire browser cell.
+- Fixed autonomous runs becoming idle after thinking-only length stops during speculative handoff.
+- Fixed completed assistant replies disappearing from the live transcript under viewport pressure.
+- Accelerated SHA-2 and SHA-3 checksums on supported ARM64 hardware.
+- Fixed large MCP tool payloads being stored redundantly on disk.
+
+### Fixed
+
+- Fixed the status-line session segment showing identical IDs for sessions created close together ([#9572](https://github.com/can1357/oh-my-pi/issues/9572)).
 
 ## [18.0.4] - 2026-08-24
 
@@ -55,6 +146,10 @@
 - Fixed Linux startup event loop delays caused by legacy extension cache fsync churn.
 - Fixed subagent advisors abandoning reviews on the final yield turn during session teardown.
 - Fixed `/todo` expand/collapse commands and corrected `/shake thinking` reporting.
+
+### Fixed
+
+- The exit/recovery resume hint now prints the explicit file path for a path-resumed session stored outside the managed sessions bucket (e.g. a pi transcript), instead of an `omp --resume <id>` that id-resolution can never match ([#9544](https://github.com/can1357/oh-my-pi/issues/9544)).
 
 ## [18.0.3] - 2026-08-23
 
@@ -287,6 +382,8 @@
 - Added repeat read warning hints when identical file content is read multiple times.
 - Explicit DAP adapters can now attach without a PID or port when `attachDefaults` provide the target arguments.
 - Added `isProjectTrusted()` compatibility shim to `ExtensionContext` for extensions targeting upstream per-directory trust gates.
+- Added an `oauth.scopes` field to per-server MCP configuration that takes precedence over the scopes discovered from authorization-server or protected-resource metadata (and over a `scope` embedded in the provider's authorization URL), so an MCP server behind a general-purpose corporate IdP can request its own resource-bound scope instead of the tenant-wide `scopes_supported` list the resource rejects; `""` sends no `scope` parameter at all ([#7841](https://github.com/can1357/oh-my-pi/issues/7841))
+- Codex `[mcp_servers.<name>] scopes` and OpenCode `mcp.<name>.oauth.scope` now import into `oauth.scopes` instead of being dropped ([#7841](https://github.com/can1357/oh-my-pi/issues/7841))
 
 ### Changed
 
@@ -305,7 +402,7 @@
 - `/settings` rows can now carry a risk note: a warning glyph on the row plus a warning-colored line above the description. `External Thinking` (`externalThinking`, `--external-thinking`) is the first user — providers have flagged the request shape it produces as abuse, up to account-level enforcement, so both the settings entry and `--help` now say so.
 
 ### Fixed
-
+- Fixed OAuth scopes entered in the `/mcp add` wizard being used for that one authorization and then discarded, so `/mcp reauth` fell back to the discovered scopes the user had replaced; the wizard now records them as `oauth.scopes` ([#7841](https://github.com/can1357/oh-my-pi/issues/7841))
 - Fixed regional HTTP 401 data-residency errors during Codex chat, web search, and image generation requests by passing token residency metadata on requests.
 - Fixed macOS SSH ControlMaster socket creation failures caused by `sun_path` length limits when using named profiles.
 - Fixed an issue where Nix-packaged builds failed to load on-demand native addons (`onnxruntime-node`/`sherpa-onnx`) due to missing shared C++ runtime library paths.
@@ -548,6 +645,26 @@
 - Fixed `read` hashline headers collapsing nested in-workspace paths to the bare basename, which let a same-basename file at the session cwd capture a verbatim follow-up `edit` and deterministically reject it with `hash is not from this session`. Headers now retain the workspace-relative path (e.g. `[src/settings.json#0063]`) ([#8482](https://github.com/can1357/oh-my-pi/issues/8482)).
 
 ## [17.3.1] - 2026-08-13
+### Added
+
+- Added Astral `ty` as a built-in Python primary LSP server (`ty server`), ordered behind `pyright`/`basedpyright`/`pylsp` so it becomes the primary Python LSP only when the existing servers are unavailable. `ruff` remains the Python linter and coexists alongside `ty` ([#4617](https://github.com/can1357/oh-my-pi/issues/4617)).
+- Added first-party Nix support with reproducible source builds for Linux and macOS on x86-64 and ARM64, a pinned development shell, an overlay, NixOS and Home Manager modules, offline Bun dependencies, and lightweight flake evaluation in CI. Nix-managed installs now direct updates back through Nix instead of replacing store-managed executables.
+- `omp update` and the startup version check now follow an `omp.rename` pointer in the published npm manifest, preparing existing installs for the upcoming npm package rename. Migration is transactional: the renamed agent/natives packages are installed first (npm uses `--force` to take over the `omp` bin), so an install failure leaves the old install untouched; the old-name globals are removed only afterwards, and a broken bin link is restored by re-running the idempotent install before verification decides the outcome.
+- Added per-agent advisors: agent definitions accept an `advisor` frontmatter field (`true` = advise with the `advisor`-role model, `"<pattern>"` = an explicit advisor model with optional `:level` suffix), overridable via the `task.agentAdvisor` settings record. An explicit pattern lands on the spawned session's `modelRoles.advisor`, so different agents can be advised by different models; the effective opt-in is persisted in `session_init` and restored on cold revival, and each subagent advisor keeps its own `<session>/<SubId>/__advisor[.<slug>].jsonl` transcript.
+- Redesigned `/agents` as a fullscreen hub in the `/models` idiom: a scope sidebar (All / Project / User / Bundled / New agent), type-to-filter agent rows with effective model/prewalk/advisor annotations, a pinned detail pane, and mouse support. Enter on an agent opens a property chip strip (enable, model, prewalk, advisor); each property is picked — on/off chips, the real model browser, or a raw pattern input — replacing the old `P`/`A`/`N` letter hotkeys.
+
+### Breaking Changes
+
+- Removed the `advisor.subagents` setting; subagent advisors are now configured per agent (frontmatter `advisor` / `task.agentAdvisor`). An existing `advisor.subagents: true` migrates to `task.agentAdvisor: { task: "on" }` — the bundled generic `task` agent keeps its advisor, other agents start unadvised.
+
+### Changed
+
+- `/usage`, `omp usage`, and the status line now show authoritative OpenCode Go quota from the official `GET /zen/go/v1/usage` endpoint — including usage made outside OMP — instead of dollar estimates summed from OMP-observed request costs. The status line renders all three windows (`5h` / `7d` / `mo`), and the per-turn cost recording special case for `opencode-go` sessions is gone along with the "OMP-observed spend only" disclaimer ([#8337](https://github.com/can1357/oh-my-pi/pull/8337) by [@will-bogusz](https://github.com/will-bogusz)).
+- LSP document-symbol queries can now filter a file's symbol tree by name or detail while preserving matching hierarchy, avoiding unrelated symbol output for targeted lookups.
+- Clarified that the production collab relay source and binaries are not currently published, and documented the source-available local protocol relay ([#8165](https://github.com/can1357/oh-my-pi/issues/8165)).
+- Enabled bounded Anthropic prompt-cache refreshes for the main agent loop while keeping advisor and side-channel requests from taking over the shared refresh timer.
+- Fixed snapcompact compaction shipping its redundant frame archive out of `SessionMaintenance.compact()` on both the manual RPC response (which hard-failed protocol v1 with a transport error after the compaction had already persisted) and the `auto_compaction_end` event payload (which forced the shrink ladder on every unattended pass); the archive is now stripped from both exits while the persisted compaction entry keeps it ([#8168](https://github.com/can1357/oh-my-pi/issues/8168)).
+- Fixed the edit tool showing no diff preview in `apply_patch` mode: the built-in `edit` tool presents on the wire as `apply_patch`, but the renderer-provenance gate did not resolve that alias to its built-in owner, so the edit renderer was skipped ([#8184](https://github.com/can1357/oh-my-pi/issues/8184)).
 
 ### Fixed
 
@@ -700,6 +817,10 @@
 - Fixed long-running sessions leaking memory for every completed keep-alive `task`/scout subagent: a disposed (parked) subagent's `AgentSession` stayed pinned through the lifecycle adoption record's reviver closure, and `dispose()` never released the message array, append-only provider transcript, session-manager entries, or the raw-SSE debug buffer, so heavy transcripts and captured provider wire frames accumulated for the process lifetime ([#8003](https://github.com/can1357/oh-my-pi/issues/8003)).
 - Fixed Z.AI web search dropping sources and exposing raw JSON when MCP responses double-encode content text ([#8000](https://github.com/can1357/oh-my-pi/issues/8000)).
 - Fixed `/handoff` masking empty/whitespace-only generation and harness-initiated aborts as "Handoff cancelled"; manual empty generation now surfaces a logged failure, harness aborts preserve their reason (or report "Handoff aborted by session"), and auto-handoff still falls back to context-full compaction ([#7993](https://github.com/can1357/oh-my-pi/issues/7993)).
+
+### Fixed
+
+- Fixed Claude marketplace task agents treating provider-specific model aliases as OMP selectors, allowing them to inherit the parent model ([#7966](https://github.com/can1357/oh-my-pi/issues/7966)).
 
 ## [17.2.11] - 2026-08-07
 
@@ -1136,6 +1257,9 @@
 ### Removed
 
 - Removed the dangling `MCPManager.setOnNotification` single-slot setter, which had no callers in the runtime. Replaced by `MCPManager.addNotificationListener` — multi-listener, per-listener error isolation, returns an unsubscribe function.
+### Added
+
+- Added a reusable confidential terminal-input helper that requires exclusive ownership of a raw-mode TTY, rejects concurrent or shared input consumers, never echoes the entered value, and restores terminal state after submission, cancellation, EOF, or stream failures.
 
 ## [17.1.8] - 2026-07-28
 

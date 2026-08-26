@@ -95,6 +95,90 @@ describe("createSessionManager — cross-project --resume", () => {
 	});
 });
 
+describe("SessionManager.open — recorded cwd adoption", () => {
+	it("keeps the launch cwd when the recorded cwd cannot be probed", async () => {
+		const root = await fsp.mkdtemp(path.join(os.tmpdir(), "omp-xproj-denied-"));
+		const launchProject = path.join(root, "launch");
+		const deniedProject = path.join(root, "denied");
+		await fsp.mkdir(launchProject);
+		const match = buildGlobalMatch(deniedProject);
+		await Bun.write(
+			match.session.path,
+			`${JSON.stringify({
+				type: "session",
+				id: match.session.id,
+				cwd: deniedProject,
+				timestamp: new Date(0).toISOString(),
+			})}\n`,
+		);
+		const realStat = fs.promises.stat.bind(fs.promises) as (
+			path: fs.PathLike,
+			options?: fs.StatOptions,
+		) => Promise<fs.Stats>;
+		const stat = vi.spyOn(fs.promises, "stat").mockImplementation((async (
+			target: fs.PathLike,
+			options?: fs.StatOptions,
+		) => {
+			if (normalizePathForComparison(String(target)) === normalizePathForComparison(deniedProject)) {
+				throw Object.assign(new Error("operation not permitted"), { code: "EACCES" });
+			}
+			return realStat(target, options);
+		}) as typeof fs.promises.stat);
+		try {
+			const manager = await SessionManager.open(match.session.path, undefined, undefined, {
+				initialCwd: launchProject,
+			});
+			try {
+				expect(manager.getCwd()).toBe(launchProject);
+			} finally {
+				await manager.close();
+			}
+		} finally {
+			stat.mockRestore();
+			await fsp.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("keeps the launch cwd when the recorded cwd denies search permission", async () => {
+		const root = await fsp.mkdtemp(path.join(os.tmpdir(), "omp-xproj-noexec-"));
+		const launchProject = path.join(root, "launch");
+		const deniedProject = path.join(root, "denied");
+		await fsp.mkdir(launchProject);
+		await fsp.mkdir(deniedProject);
+		const match = buildGlobalMatch(deniedProject);
+		await Bun.write(
+			match.session.path,
+			`${JSON.stringify({
+				type: "session",
+				id: match.session.id,
+				cwd: deniedProject,
+				timestamp: new Date(0).toISOString(),
+			})}\n`,
+		);
+		const realAccess = fs.promises.access.bind(fs.promises);
+		const access = vi.spyOn(fs.promises, "access").mockImplementation(async (target, mode) => {
+			if (normalizePathForComparison(String(target)) === normalizePathForComparison(deniedProject)) {
+				throw Object.assign(new Error("permission denied"), { code: "EACCES" });
+			}
+			return realAccess(target, mode);
+		});
+
+		try {
+			const manager = await SessionManager.open(match.session.path, undefined, undefined, {
+				initialCwd: launchProject,
+			});
+			try {
+				expect(manager.getCwd()).toBe(launchProject);
+			} finally {
+				await manager.close();
+			}
+		} finally {
+			access.mockRestore();
+			await fsp.rm(root, { recursive: true, force: true });
+		}
+	});
+});
+
 describe("runRootCommand — cross-project --resume", () => {
 	let root: string;
 	let launchProject: string;
@@ -126,6 +210,43 @@ describe("runRootCommand — cross-project --resume", () => {
 		await fsp.rm(root, { recursive: true, force: true });
 	});
 
+	it("rolls back the whole transition when rescoping fails after chdir", async () => {
+		const match = buildGlobalMatch(resumedProject);
+		vi.spyOn(sessionListingModule, "resolveResumableSession").mockResolvedValue(match);
+		const settings = Settings.isolated({ "marketplace.autoUpdate": "off" });
+		const reloadForCwd = vi
+			.spyOn(settings, "reloadForCwd")
+			.mockRejectedValue(new Error("destination config unreadable"));
+		const authStorage = await AuthStorage.create(path.join(root, "auth.db"));
+		const parsed = parseArgs(["--resume", "019e84ed", "--print"]);
+		parsed.noExtensions = true;
+		parsed.noSkills = true;
+		parsed.noRules = true;
+		parsed.noTools = true;
+		parsed.noLsp = true;
+		let resumedManager: SessionManager | undefined;
+
+		try {
+			await runRootCommand(parsed, ["--resume", "019e84ed", "--print"], {
+				discoverAuthStorage: async () => authStorage,
+				settings,
+				createAgentSession: async options => {
+					if (!options) throw new Error("Expected session options");
+					resumedManager = options.sessionManager;
+					throw new Error("stop after session options");
+				},
+			});
+		} catch (error) {
+			if (!(error instanceof Error) || error.message !== "stop after session options") throw error;
+		} finally {
+			reloadForCwd.mockRestore();
+			authStorage.close();
+			await resumedManager?.close();
+		}
+
+		expect(getProjectDir()).toBe(launchProject);
+		expect(resumedManager?.getCwd()).toBe(launchProject);
+	});
 	it("uses the destination cwd and preloads its plugin roots before session creation", async () => {
 		const match = buildGlobalMatch(resumedProject);
 		vi.spyOn(sessionListingModule, "resolveResumableSession").mockResolvedValue(match);
@@ -181,6 +302,82 @@ describe("runRootCommand — cross-project --resume", () => {
 		expect(sessionOptionsCwd).toBe(resumedProject);
 		expect(preloadedDestinationAtCreation).toBe(true);
 	}, 15_000);
+
+	it("rolls back the session manager when the resumed cwd is denied", async () => {
+		const match = buildGlobalMatch(resumedProject);
+		vi.spyOn(sessionListingModule, "resolveResumableSession").mockResolvedValue(match);
+		const settings = Settings.isolated({ "marketplace.autoUpdate": "off" });
+		const authStorage = await AuthStorage.create(path.join(root, "auth.db"));
+		const originalChdir = process.chdir.bind(process);
+		const chdir = vi.spyOn(process, "chdir").mockImplementation(dir => {
+			if (normalizePathForComparison(dir) === normalizePathForComparison(resumedProject)) {
+				throw new Error("operation not permitted");
+			}
+			originalChdir(dir);
+		});
+		const parsed = parseArgs(["--resume", "019e84ed", "--print"]);
+		parsed.noExtensions = true;
+		parsed.noSkills = true;
+		parsed.noRules = true;
+		parsed.noTools = true;
+		parsed.noLsp = true;
+		let resumedManager: SessionManager | undefined;
+
+		try {
+			await runRootCommand(parsed, ["--resume", "019e84ed", "--print"], {
+				discoverAuthStorage: async () => authStorage,
+				settings,
+				createAgentSession: async options => {
+					if (!options) throw new Error("Expected session options");
+					resumedManager = options.sessionManager;
+					throw new Error("stop after session options");
+				},
+			});
+		} catch (error) {
+			if (!(error instanceof Error) || error.message !== "stop after session options") throw error;
+		} finally {
+			chdir.mockRestore();
+			authStorage.close();
+			await resumedManager?.close();
+		}
+
+		expect(getProjectDir()).toBe(launchProject);
+		expect(resumedManager?.getCwd()).toBe(launchProject);
+	});
+
+	it("aborts startup when the resumed cwd rollback fails", async () => {
+		const match = buildGlobalMatch(resumedProject);
+		vi.spyOn(sessionListingModule, "resolveResumableSession").mockResolvedValue(match);
+		const settings = Settings.isolated({ "marketplace.autoUpdate": "off" });
+		const authStorage = await AuthStorage.create(path.join(root, "auth.db"));
+		const originalChdir = process.chdir.bind(process);
+		const chdir = vi.spyOn(process, "chdir").mockImplementation(dir => {
+			if (normalizePathForComparison(dir) === normalizePathForComparison(resumedProject)) {
+				throw new Error("operation not permitted");
+			}
+			originalChdir(dir);
+		});
+		const moveTo = vi.spyOn(SessionManager.prototype, "moveTo").mockRejectedValue(new Error("rollback unavailable"));
+		const parsed = parseArgs(["--resume", "019e84ed", "--print"]);
+		parsed.noExtensions = true;
+		parsed.noSkills = true;
+		parsed.noRules = true;
+		parsed.noTools = true;
+		parsed.noLsp = true;
+
+		try {
+			await expect(
+				runRootCommand(parsed, ["--resume", "019e84ed", "--print"], {
+					discoverAuthStorage: async () => authStorage,
+					settings,
+				}),
+			).rejects.toThrow("failed to restore launch directory");
+		} finally {
+			moveTo.mockRestore();
+			chdir.mockRestore();
+			authStorage.close();
+		}
+	});
 
 	it("re-resolves the model scope from the resumed project's enabledModels after the switch", async () => {
 		const match = buildGlobalMatch(resumedProject);

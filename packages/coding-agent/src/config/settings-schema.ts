@@ -239,6 +239,7 @@ export type StatusLineSegmentId =
 	| "git"
 	| "pr"
 	| "subagents"
+	| "subagent_cost"
 	| "token_in"
 	| "token_out"
 	| "token_total"
@@ -5284,7 +5285,7 @@ export const SETTINGS_SCHEMA = {
 			tab: "providers",
 			group: "Services",
 			label: "Gemini web_search model",
-			description: "Model ID for Gemini Google Search grounding. Defaults to gemini-2.5-flash.",
+			description: "Model ID for Gemini Google Search grounding. Defaults to the rolling gemini-flash-latest alias.",
 		},
 	},
 	"providers.antigravityEndpoint": {

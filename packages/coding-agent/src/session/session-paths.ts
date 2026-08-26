@@ -178,6 +178,20 @@ export function resolveManagedSessionRoot(sessionDir: string, cwd: string): stri
 }
 
 /**
+ * Whether a session file lives under the managed sessions root as a bucket
+ * child (`<sessionsRoot>/<encoded-cwd>/<file>.jsonl`) — the only on-disk layout
+ * that id-resolution can rediscover, since `resolveResumableSession` and
+ * `listAllSessions` enumerate bucket files exactly one level below the root. A
+ * path-resumed foreign file (e.g. a pi transcript under `~/.pi/agent/sessions`)
+ * stays at its original location, so a `--resume <id>` hint built from it can
+ * never match (issue #9544).
+ */
+export function isManagedSessionFile(sessionFile: string, sessionsRoot: string = getSessionsDir()): boolean {
+	const bucket = path.dirname(path.resolve(sessionFile));
+	return path.dirname(bucket) === path.resolve(sessionsRoot);
+}
+
+/**
  * Compute the default session directory for a cwd.
  * Classifies cwd by canonical location so symlink/alias paths resolve to the
  * same home-relative or temp-root directory names as their real targets.

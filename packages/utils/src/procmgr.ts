@@ -82,6 +82,85 @@ export function isPowerShell(shell: string): boolean {
 	return basename === "powershell.exe" || basename === "powershell" || basename === "pwsh.exe" || basename === "pwsh";
 }
 
+/** Shell syntax used to quote command hints pasted into the launching shell. */
+export type HostShellQuoteStyle = "cmd" | "powershell" | "posix";
+
+function classifyHostShell(command: string | undefined): HostShellQuoteStyle | undefined {
+	if (!command) return undefined;
+	if (isPowerShell(command)) return "powershell";
+	if (isCmdShell(command)) return "cmd";
+	const basename = command
+		.replace(/\\/g, "/")
+		.split("/")
+		.pop()
+		?.toLowerCase()
+		.replace(/\.exe$/, "");
+	if (basename === "bash" || basename === "sh" || basename === "zsh" || basename === "fish") return "posix";
+	return undefined;
+}
+
+function getAncestorCommands(): string[] {
+	const commands: string[] = [];
+	const visited = new Set<number>();
+	let pid: number | null = process.ppid;
+	while (pid && pid > 0 && commands.length < 16 && !visited.has(pid)) {
+		visited.add(pid);
+		try {
+			const parent = Process.fromPid(pid);
+			if (!parent) break;
+			const command = parent.args()[0];
+			if (command) commands.push(command);
+			pid = parent.ppid;
+		} catch {
+			break;
+		}
+	}
+	return commands;
+}
+
+/**
+ * Detect the shell that launched the current process for copy-pasteable command
+ * hints. Windows does not export one canonical shell variable, so the nearest
+ * recognized process ancestor wins; inherited env is only a fallback when
+ * ancestry is unavailable. Parameters are injectable for tests.
+ */
+export function detectHostShellQuoteStyle(
+	ancestorCommands: readonly string[] = getAncestorCommands(),
+	env: Record<string, string | undefined> = process.env,
+	platform: NodeJS.Platform = process.platform,
+): HostShellQuoteStyle {
+	if (platform !== "win32") return "posix";
+	for (const command of ancestorCommands) {
+		const style = classifyHostShell(command);
+		if (style) return style;
+	}
+	const envStyle = classifyHostShell(env.SHELL);
+	if (envStyle) return envStyle;
+	if (env.MSYSTEM) return "posix";
+	if (env.PSModulePath || env.PSMODULEPATH || env.psmodulepath || env.POWERSHELL_DISTRIBUTION_CHANNEL) {
+		return "powershell";
+	}
+	return "cmd";
+}
+
+/**
+ * Quote one argument for a command hint pasted into the launching shell.
+ * PowerShell and POSIX shells both have literal single-quote forms but escape
+ * embedded apostrophes differently. cmd.exe groups with double quotes and
+ * expands `%NAME%` / delayed `!NAME!` even inside them, so carets protect `%`,
+ * `!`, and literal carets before cmd parses the argument.
+ */
+export function quoteHostShellArg(value: string, style: HostShellQuoteStyle = detectHostShellQuoteStyle()): string {
+	switch (style) {
+		case "cmd":
+			return `"${value.replace(/[%!^]/g, "^$&").replaceAll('"', '\\"')}"`;
+		case "powershell":
+			return `'${value.replaceAll("'", "''")}'`;
+		case "posix":
+			return `'${value.replaceAll("'", "'\\''")}'`;
+	}
+}
+
 /**
  * Get shell prefix for wrapping commands (profilers, strace, etc.).
  */

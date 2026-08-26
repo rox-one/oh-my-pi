@@ -90,13 +90,33 @@ export async function loadPuppeteer(): Promise<typeof Puppeteer> {
 	const prev = process.cwd();
 	const safeDir = getPuppeteerDir();
 	await Bun.write(path.join(safeDir, "package.json"), "{}");
+	let importSucceeded = false;
+	let failed = false;
+	let failure: unknown;
+	let loaded: typeof Puppeteer | undefined;
 	try {
 		process.chdir(safeDir);
-		puppeteerModule = (await import("puppeteer-core")).default;
-		return puppeteerModule;
+		loaded = (await import("puppeteer-core")).default;
+		puppeteerModule = loaded;
+		importSucceeded = true;
+	} catch (error) {
+		failed = true;
+		failure = error;
 	} finally {
-		process.chdir(prev);
+		try {
+			process.chdir(prev);
+		} catch (restoreError) {
+			if (importSucceeded) {
+				puppeteerModule = undefined;
+				failed = true;
+				failure = restoreError;
+			} else {
+				logger.warn("Could not restore cwd after failed Puppeteer import", { error: String(restoreError) });
+			}
+		}
 	}
+	if (failed) throw failure;
+	return loaded!;
 }
 
 let puppeteerModuleWorker: typeof Puppeteer | undefined;

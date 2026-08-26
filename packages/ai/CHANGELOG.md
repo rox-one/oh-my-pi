@@ -2,6 +2,32 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed Cursor rejecting resumed/forked sessions whose history came from a Responses-family provider (e.g. Codex) with an opaque `resource_exhausted` by sanitizing composite `callId|itemId` tool-call ids before replay ([#9754](https://github.com/can1357/oh-my-pi/issues/9754)).
+
+## [18.0.5] - 2026-08-25
+
+### Breaking Changes
+
+- Renamed the exported stream-retry helper from `withEmptyCompletionRetry` to `withReplaySafeStreamRetry` and added retry policy options for empty completions and provider errors. Consumers using the old helper must migrate.
+
+### Added
+
+- Added browser-based Sign in with OpenRouter using OAuth PKCE, while retaining support for pasted OpenRouter API keys and redirect URLs for remote sessions.
+- Added `/login` API-key authentication for DeepInfra and Yolo-Auto, including validation against each provider before the credentials are accepted.
+
+### Fixed
+
+- Fixed DeepSeek vision models from losing image input while keeping image parts stripped for text-only DeepSeek endpoints.
+- Fixed OpenAI-compatible gateways that report uppercase completion reasons such as `STOP` or `MAX_TOKENS`; these are now classified correctly, including mapping `MAX_TOKENS` to a length limit.
+- Fixed provider message-count limit errors being treated as unrecoverable payload errors instead of recoverable context overflows.
+- Improved Codex WebSocket continuations so rate limits, throttling, and compatible mode changes preserve valid response continuations instead of unnecessarily replaying the full context.
+- Fixed Codex WebSocket cleanup failures caused by already-closed sockets.
+- Added safe retries for transient mid-stream socket closures across OpenAI Responses, Chat Completions, Azure OpenAI Responses, and Codex SSE when no replay-unsafe output has been emitted.
+- Fixed usage and cost reporting for OpenAI-compatible gateways backed by Vertex AI or Gemini by recognizing cached prompt tokens reported through `cachedContentTokenCount`.
+- Fixed DeepSeek's official vision model `deepseek-v4-flash-vision-exp` having every image stripped from outbound Chat Completions requests: `isTextOnlyDeepSeek` (vision guard, introduced for legacy DeepSeek endpoints that reject `image_url` with HTTP 400) now exempts model IDs/names carrying the official `vision` marker, so images reach `api.deepseek.com` instead of being replaced by the non-vision placeholder. Text-only DeepSeek models with a misconfigured `input: [text, image]` remain scrubbed.
+
 ## [18.0.4] - 2026-08-24
 
 ### Fixed
@@ -104,6 +130,9 @@
 - Fixed tool-argument repair applying lossy transformations (such as stringifying objects or stripping unrecognized keys) when validating union schemas (`anyOf`/`oneOf`), preventing corrupted tool call and subagent payloads
 - Fixed 400 errors when communicating with local OpenAI-compatible inference servers that reject `chat_template_kwargs.reasoning_effort` by improving reasoning effort parameter fallback and compatibility handling
 - Fixed DeepSeek-family models on hosts like Fireworks losing reasoning whenever tools were offered: a redundant `tool_choice: "auto"` is now omitted so the provider keeps thinking enabled; forced and `"none"` selectors still take priority ([#1207](https://github.com/can1357/oh-my-pi/issues/1207))
+### Fixed
+
+- Fixed Azure OpenAI Responses variants ignoring catalog `requestModelId` and `reasoningMode`, so GPT-5.6 pro aliases target the deployed base model and serialize `reasoning.mode: "pro"`.
 
 ## [17.3.8] - 2026-08-19
 
@@ -157,6 +186,9 @@
 - Fixed Alibaba DashScope/Bailian transient per-minute rate limits being misclassified as full quota exhaustion, causing unnecessary long backoffs instead of quick retries.
 - Fixed Anthropic-compatible streams dropping thinking content, which broke replay of prior reasoning.
 - Updated the Alibaba Coding Plan China login flow to point to the current Bailian API-key management console.
+### Added
+
+- Added Antigravity's authoritative Gemini and shared Claude/GPT five-hour and weekly quota windows to `omp usage`, with compatibility fallback to legacy model quotas ([#8061](https://github.com/can1357/oh-my-pi/pull/8061) by [@paolomazzitti](https://github.com/paolomazzitti)).
 
 ## [17.3.4] - 2026-08-14
 

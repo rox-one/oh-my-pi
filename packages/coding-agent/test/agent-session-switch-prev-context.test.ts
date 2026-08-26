@@ -1,4 +1,4 @@
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "bun:test";
 import { Agent } from "@oh-my-pi/pi-agent-core";
 import type { Model } from "@oh-my-pi/pi-ai";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
@@ -151,5 +151,66 @@ describe("AgentSession.switchSession previous-context build", () => {
 			{ sessionFile: sessionFile!, transcript: undefined },
 			{ sessionFile: sessionFile!, transcript: undefined },
 		]);
+	});
+
+	it("restores the previous session when cwd adoption is rejected", async () => {
+		const sourceDir = TempDir.createSync("@pi-switch-cwd-source-");
+		const targetDir = TempDir.createSync("@pi-switch-cwd-target-");
+		tempDirs.push(sourceDir, targetDir);
+
+		const { session, sessionManager } = buildSession(sourceDir);
+		sessionManager.appendMessage({ role: "user", content: "source", timestamp: 1 });
+		await sessionManager.flush();
+		const previousSessionFile = sessionManager.getSessionFile();
+		const targetManager = SessionManager.create(targetDir.path(), targetDir.path());
+		targetManager.appendMessage({ role: "user", content: "target", timestamp: 2 });
+		await targetManager.ensureOnDisk();
+		await targetManager.flush();
+		const targetSessionFile = targetManager.getSessionFile();
+		await targetManager.close();
+		expect(previousSessionFile).toBeString();
+		expect(targetSessionFile).toBeString();
+
+		const onCwdChange = vi.fn(async () => false);
+		const switched = await session.switchSession(targetSessionFile!, { onCwdChange });
+
+		expect(switched).toBe(false);
+		expect(onCwdChange).toHaveBeenCalledWith(targetDir.path(), sourceDir.path());
+		expect(sessionManager.getSessionFile()).toBe(previousSessionFile);
+		expect(sessionManager.getCwd()).toBe(sourceDir.path());
+	});
+
+	it("restores cwd when cwd adoption throws after changing it", async () => {
+		const sourceDir = TempDir.createSync("@pi-switch-cwd-error-source-");
+		const targetDir = TempDir.createSync("@pi-switch-cwd-error-target-");
+		tempDirs.push(sourceDir, targetDir);
+
+		const { session, sessionManager } = buildSession(sourceDir);
+		const targetManager = SessionManager.create(targetDir.path(), targetDir.path());
+		targetManager.appendMessage({ role: "user", content: "target", timestamp: 2 });
+		await targetManager.ensureOnDisk();
+		await targetManager.flush();
+		const targetSessionFile = targetManager.getSessionFile();
+		await targetManager.close();
+		expect(targetSessionFile).toBeString();
+
+		let actualCwd = sourceDir.path();
+		let callbackCount = 0;
+		const onCwdChange = vi.fn(async (newCwd: string, _previousCwd: string) => {
+			actualCwd = newCwd;
+			const call = callbackCount++;
+			if (call === 0) throw new Error("settings reload failed");
+			if (call === 1) throw new Error("cwd restore denied");
+			return true;
+		});
+
+		await expect(session.switchSession(targetSessionFile!, { onCwdChange })).rejects.toThrow(
+			/settings reload failed.*cwd restore denied.*process may remain in/,
+		);
+
+		expect(actualCwd).toBe(sourceDir.path());
+		expect(onCwdChange).toHaveBeenCalledTimes(2);
+		expect(onCwdChange).toHaveBeenNthCalledWith(2, sourceDir.path(), targetDir.path());
+		expect(sessionManager.getCwd()).toBe(sourceDir.path());
 	});
 });

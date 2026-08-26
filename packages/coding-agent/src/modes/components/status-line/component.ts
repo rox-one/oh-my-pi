@@ -383,6 +383,7 @@ export class StatusLineComponent implements Component {
 	#speculationBlinkOn = true;
 	#hookStatuses: Map<string, string> = new Map();
 	#subagentCount: number = 0;
+	#subagentCost: number = 0;
 	/**
 	 * Active-processing accounting for the `time_spent` segment, keyed per
 	 * {@link AgentSession} so the focus-controller mid-turn attach path
@@ -561,6 +562,10 @@ export class StatusLineComponent implements Component {
 
 	setSubagentCount(count: number): void {
 		this.#subagentCount = count;
+	}
+
+	setSubagentCost(cost: number): void {
+		this.#subagentCost = cost;
 	}
 
 	/**
@@ -1748,6 +1753,7 @@ export class StatusLineComponent implements Component {
 			compactionSpeculation,
 			speculationBlinkOn: this.#speculationBlinkOn,
 			subagentCount: this.#subagentCount,
+			subagentCost: this.#subagentCost,
 			activeMs: this.getActiveMs(),
 			git: {
 				branch: gitBranch,

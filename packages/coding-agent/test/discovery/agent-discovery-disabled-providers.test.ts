@@ -8,6 +8,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { disableProvider, enableProvider } from "@oh-my-pi/pi-coding-agent/capability";
 import { clearCache as clearFsCache } from "@oh-my-pi/pi-coding-agent/capability/fs";
+import { resolveAgentModelPatterns } from "@oh-my-pi/pi-coding-agent/config/model-resolver";
 import { clearClaudePluginRootsCache } from "@oh-my-pi/pi-coding-agent/discovery/helpers";
 import { discoverAgents } from "@oh-my-pi/pi-coding-agent/task/discovery";
 import { removeSyncWithRetries } from "@oh-my-pi/pi-utils";
@@ -16,6 +17,7 @@ const PLUGIN_AGENT_MD = [
 	"---",
 	"name: simplifier",
 	"description: A code simplifier agent from a Claude plugin",
+	"model: opus",
 	"---",
 	"Simplify code.",
 ].join("\n");
@@ -69,7 +71,14 @@ describe("discoverAgents — claude-plugins disabled provider", () => {
 
 	test("includes plugin agents when claude-plugins is enabled", async () => {
 		const { agents } = await discoverAgents(tempHome, tempHome);
-		expect(agents.map(a => a.name)).toContain("simplifier");
+		const agent = agents.find(candidate => candidate.name === "simplifier");
+		expect(agent).toBeDefined();
+		expect(
+			resolveAgentModelPatterns({
+				agentModel: agent?.model,
+				activeModelPattern: "openai-codex/gpt-5.6-sol",
+			}),
+		).toEqual(["openai-codex/gpt-5.6-sol"]);
 	});
 
 	test("excludes plugin agents when claude-plugins is disabled", async () => {

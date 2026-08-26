@@ -20,6 +20,7 @@ export interface CollabStatus {
 }
 
 export interface StatusLineSegmentOptions {
+	session?: { length?: number };
 	model?: { showThinkingLevel?: boolean };
 	path?: { abbreviate?: boolean; maxLength?: number; stripWorkPrefix?: boolean };
 	git?: { showBranch?: boolean; showStaged?: boolean; showUnstaged?: boolean; showUntracked?: boolean };
@@ -113,6 +114,8 @@ export interface SegmentContext {
 	/** Blink phase for the running-speculation pulse; toggled by the component's timer. */
 	speculationBlinkOn: boolean;
 	subagentCount: number;
+	/** Summed subagent cost in USD: live observer progress plus persisted history. */
+	subagentCost: number;
 	/**
 	 * Active processing time accumulated this session, in ms — the union of
 	 * every `agent_start`→`agent_end` window plus the currently-streaming

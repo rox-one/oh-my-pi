@@ -333,4 +333,31 @@ describe("OpenCode MCP discovery", () => {
 			delete Bun.env.OMP_TEST_MCP_PATH;
 		}
 	});
+
+	test("imports OpenCode oauth.scope as the canonical oauth.scopes override", async () => {
+		await fs.writeFile(
+			path.join(tempDir, "opencode.json"),
+			JSON.stringify({
+				mcp: {
+					gateway: {
+						type: "remote",
+						url: "https://gateway.example.com/mcp",
+						oauth: { clientId: "gateway-client", scope: "https://gateway.example.com/mcp/mcp.invoke openid" },
+					},
+					suppressed: { type: "remote", url: "https://suppressed.example.com/mcp", oauth: { scope: "" } },
+					noauth: { type: "remote", url: "https://plain.example.com/mcp", oauth: false },
+					plain: { type: "remote", url: "https://bare.example.com/mcp" },
+				},
+			}),
+		);
+
+		const servers = await loadOpenCodeMcpConfig(tempDir);
+
+		expect(servers.find(item => item.name === "gateway")?.oauth).toEqual({
+			scopes: "https://gateway.example.com/mcp/mcp.invoke openid",
+		});
+		expect(servers.find(item => item.name === "suppressed")?.oauth).toEqual({ scopes: "" });
+		expect(servers.find(item => item.name === "noauth")?.oauth).toBeUndefined();
+		expect(servers.find(item => item.name === "plain")?.oauth).toBeUndefined();
+	});
 });
