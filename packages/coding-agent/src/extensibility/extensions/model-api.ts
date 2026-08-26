@@ -8,6 +8,7 @@
  */
 import type { Api, Model } from "@oh-my-pi/pi-ai";
 import { modelFamilyToken } from "@oh-my-pi/pi-catalog/identity";
+import { modelsAreEqual } from "@oh-my-pi/pi-catalog/models";
 import type { ModelRegistry } from "../../config/model-registry";
 import { getModelMatchPreferences, resolveModelRoleValue } from "../../config/model-resolver";
 import { getKnownRoleIds } from "../../config/model-roles";
@@ -31,7 +32,7 @@ function resolveAlias(
 	const defaultFallback =
 		unconfiguredDefault &&
 		!disabledProviders.has(unconfiguredDefault.model.provider) &&
-		selectableModels.some(model => model === unconfiguredDefault.model)
+		selectableModels.some(model => modelsAreEqual(model, unconfiguredDefault.model))
 			? unconfiguredDefault
 			: undefined;
 	const available =
