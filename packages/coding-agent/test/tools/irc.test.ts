@@ -573,6 +573,10 @@ describe("IRC", () => {
 			expect(isIrcEnabled(settings, 0)).toBe(false);
 		});
 
+		it("isIrcEnabled returns false when top-level spawn policy denies peers", () => {
+			expect(isIrcEnabled(Settings.isolated(), 0, "")).toBe(false);
+		});
+
 		it("isIrcEnabled returns true while the task tool is available", () => {
 			const settings = Settings.isolated();
 			// Default task.maxRecursionDepth (2) at depth 0: task can spawn, and a

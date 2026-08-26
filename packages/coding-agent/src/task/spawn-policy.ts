@@ -1,3 +1,5 @@
+import { canSpawnAtDepth } from "./types";
+
 /** Default agent used when a session has unrestricted spawning. */
 export const DEFAULT_SPAWN_AGENT = "task";
 
@@ -56,17 +58,38 @@ export function resolveSpawnPolicy(parentSpawns: string | boolean | null | undef
 		allowedPromptText: allowedAgents.map(agent => `\`${agent}\``).join(", "),
 	};
 }
+/** Whether one agent is enabled and permitted by the session spawn policy. */
+export function isAgentAllowedBySpawnPolicy(
+	agent: string,
+	disabledAgents: readonly string[] | undefined,
+	spawns: string | boolean | null | undefined,
+): boolean {
+	if (disabledAgents?.includes(agent)) return false;
+	const policy = resolveSpawnPolicy(spawns);
+	return policy.enabled && (policy.allowedAgents === null || policy.allowedAgents.includes(agent));
+}
+
+/** Whether the session may spawn any subagent under both policy and depth limits. */
+export function canSpawnSubagents(
+	spawns: string | boolean | null | undefined,
+	maxRecursionDepth: number,
+	taskDepth: number,
+): boolean {
+	return canSpawnAtDepth(maxRecursionDepth, taskDepth) && resolveSpawnPolicy(spawns).enabled;
+}
 
 /**
- * Whether the `scout` agent is spawnable in a session: not disabled via
- * `task.disabledAgents`, and permitted by the session spawn policy.
+ * Whether the `scout` agent is spawnable in a session: not disabled, permitted
+ * by the session spawn policy, and within the recursion-depth limit.
  */
 export function isScoutSpawnable(
 	disabledAgents: readonly string[] | undefined,
 	spawns: string | boolean | null | undefined,
+	maxRecursionDepth: number,
+	taskDepth: number,
 ): boolean {
-	if (disabledAgents?.includes("scout")) return false;
-	const policy = resolveSpawnPolicy(spawns);
-	if (!policy.enabled) return false;
-	return policy.allowedAgents === null || policy.allowedAgents.includes("scout");
+	return (
+		canSpawnSubagents(spawns, maxRecursionDepth, taskDepth) &&
+		isAgentAllowedBySpawnPolicy("scout", disabledAgents, spawns)
+	);
 }

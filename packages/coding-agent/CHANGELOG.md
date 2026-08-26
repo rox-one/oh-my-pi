@@ -805,6 +805,10 @@
 - Removed the `resolveAgentModelSource` model-resolver export, whose only use was being fed to `resolveExplicitModelRole`. Replaced by `resolveAgentModelSelection`, which returns the expanded `patterns` and the pre-expansion `role` together so a spawn path cannot derive one without the other ([#7910](https://github.com/can1357/oh-my-pi/pull/7910) by [@enieuwy](https://github.com/enieuwy)).
 - A run is now attributed to the model that actually produced its output, not whichever model the session was last pointed at. A retry fallback that errored on its first request — an exhausted quota, a hard provider error — was credited with the whole run in the Agent Hub row and the settled task result, even when the previous model did every turn. Sessions expose the serving model directly, holding the last model that produced output while a candidate is armed but unproven, and transcript-derived history stops at the newest turn that produced output.
 
+### Fixed
+
+- Stopped `eval`, `glob`, `grep`, and `ast_grep` from advertising subagents after recursion depth or spawn policy disables task spawning. ([#8231](https://github.com/can1357/oh-my-pi/pull/8231)) by [@olegpulatov](https://github.com/olegpulatov)
+
 ## [17.2.12] - 2026-08-08
 
 ### Fixed
@@ -861,6 +865,7 @@
 - Fixed the status-line `session_name` segment to honor the `statusLine.sessionAccent` setting, falling back to the theme's accent color when disabled.
 - Fixed automatic `agent.continue()` paths failing to run context-fit maintenance when reverting to a smaller-context model after a cooldown expiry.
 - Fixed `/handoff` reporting "Handoff cancelled" for actual generation or stream timeout errors, ensuring the real error is surfaced.
+- Added the `advisor.lateConcern` setting (`preserve` | `steer`, default `preserve`): when set to `steer`, an advisor `concern` raised after the agent's final answer wakes the agent to act on it (like a `blocker`) instead of being preserved as a passive card. Aimed at slow advisors whose review reliably lands after the turn completes, so their concerns would otherwise never trigger a turn.
 
 ## [17.2.10] - 2026-08-06
 
@@ -1100,6 +1105,10 @@
 - Fixed ephemeral side turns and native compaction bypassing an explicit or fork-inherited prompt cache key ([#7218](https://github.com/can1357/oh-my-pi/issues/7218)).
 - Fixed the live Ask dialog crashing the whole session with a `replaceTabs` TypeError when a question reached `AskDialogComponent` without a string `question` field; questions are now normalized at dialog entry, mirroring the transcript renderer ([#7211](https://github.com/can1357/oh-my-pi/issues/7211)).
 - Fixed Codex web search collapsing backend errors to `Codex error (): Unknown error`; the SSE error parser now preserves the backend code and message from top-level, nested `error`, and `response.error` envelopes ([#7200](https://github.com/can1357/oh-my-pi/issues/7200)).
+
+### Added
+
+- Added the `advisor.lateConcern` setting (`preserve` | `steer`, default `preserve`): when set to `steer`, an advisor `concern` raised after the agent's final answer wakes the agent to act on it (like a `blocker`) instead of being preserved as a passive card. Aimed at slow advisors whose review reliably lands after the turn completes, so their concerns would otherwise never trigger a turn.
 
 ## [17.2.2] - 2026-07-31
 
