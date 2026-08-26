@@ -143,6 +143,29 @@ describe("createExtensionModelQuery", () => {
 			model: claude,
 		});
 	});
+	test("listAliases() checks later authenticated fallback patterns", () => {
+		const unavailable = model("claude-haiku-4-5", "Claude Haiku 4.5", "anthropic");
+		const explicit = model("grok-4", "Grok 4", "xai-oauth");
+		const settings = {
+			get: (path: string) => (path === "cycleOrder" ? ["slow"] : path === "modelTags" ? {} : undefined),
+			getModelRole: (role: string) => (role === "slow" ? "anthropic/claude-haiku-4-5, xai-oauth/grok-4" : undefined),
+			getModelRoles: () => ({ slow: "anthropic/claude-haiku-4-5, xai-oauth/grok-4" }),
+		} as unknown as Settings;
+		const q = createExtensionModelQuery(
+			{
+				getAvailable: () => [],
+				getAll: () => [unavailable, explicit],
+				hasConfiguredAuth: (candidate: Model<Api>) => candidate === explicit,
+			} as unknown as ModelRegistry,
+			settings,
+			() => undefined,
+		);
+
+		expect(q.listAliases().find(alias => alias.name === "slow")).toMatchObject({
+			status: "resolved",
+			model: explicit,
+		});
+	});
 
 	test("listAliases() returns no aliases without settings", () => {
 		const q = createExtensionModelQuery(registry(), undefined, () => undefined);

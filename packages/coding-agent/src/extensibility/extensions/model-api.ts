@@ -33,14 +33,24 @@ function resolveAlias(
 			settings,
 			matchPreferences,
 		});
-	const catalog = available.model
+	const explicitlyAvailable = available.model
 		? available
+		: resolveModelRoleValue(
+				`@${role}`,
+				allModels.filter(model => modelRegistry.hasConfiguredAuth(model)),
+				{
+					settings,
+					matchPreferences,
+				},
+			);
+	const catalog = explicitlyAvailable.model
+		? explicitlyAvailable
 		: resolveModelRoleValue(`@${role}`, allModels, {
 				settings,
 				matchPreferences,
 			});
-	const explicitlyAvailable = catalog.model !== undefined && modelRegistry.hasConfiguredAuth(catalog.model);
-	const status = available.model || explicitlyAvailable ? "resolved" : catalog.model ? "unavailable" : "unresolved";
+	const status =
+		available.model || explicitlyAvailable.model ? "resolved" : catalog.model ? "unavailable" : "unresolved";
 	const selector = settings.getModelRole(role);
 
 	return {
