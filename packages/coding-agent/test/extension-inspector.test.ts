@@ -389,11 +389,11 @@ describe("tool inspector", () => {
 		expect(text).not.toContain("9 args");
 	});
 
-	test("project list hints work for Windows .omp paths", () => {
+	test("project list hints work for Windows .omr paths", () => {
 		expect(
 			projectListHint({
 				...toolExtension(),
-				path: "C:\\repo\\.omp\\tools\\x.ts",
+				path: "C:\\repo\\.omr\\tools\\x.ts",
 			}),
 		).toBe("repo");
 	});

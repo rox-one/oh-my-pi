@@ -462,7 +462,7 @@ describe("plugin extension discovery", () => {
 				// Side-effect imports — no `from`, no dynamic `import()`. The
 				// regex matchers must walk and rewrite both shapes so the legacy
 				// `@earendil-works` import inside `register.ts` resolves to the
-				// host `@oh-my-rox` package.
+				// host `@oh-my-pi` package.
 				'import "#src/register";',
 				'import "./marker";',
 				"",

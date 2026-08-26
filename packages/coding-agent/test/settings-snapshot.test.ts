@@ -282,14 +282,14 @@ describe("settings snapshot", () => {
 		expect(isSettingPanelVisible("mnemopi.dbPath", activeSettings)).toBe(true);
 	});
 
-	it("omits visibility for an unregistered RPC condition without changing panel behavior", () => {
+	it("omits visibility for a registered RPC condition without changing panel behavior", () => {
 		const settings = Settings.isolated();
 		expect(getUi("providers.unexpectedStopModel")?.condition).toBe("unexpectedStopSmart");
 		const entry = buildSettingsSnapshot(settings).settings.find(
 			item => item.path === "providers.unexpectedStopModel",
 		);
 		expect(entry?.ui).not.toHaveProperty("visible");
-		expect(isSettingPanelVisible("providers.unexpectedStopModel", settings)).toBe(true);
+		expect(isSettingPanelVisible("providers.unexpectedStopModel", settings)).toBe(false);
 	});
 
 	it("does not let redacted visibility dependencies change the RPC snapshot", () => {

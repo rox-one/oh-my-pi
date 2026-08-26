@@ -104,7 +104,7 @@ describe("mcp/startup-events — connection-status cross-module contract", () =>
 	});
 
 	it("sanitizes server names before rendering them in status text", () => {
-		const homePath = `${os.homedir()}/.omp`;
+		const homePath = `${os.homedir()}/.omr`;
 		const message = formatMCPConnectionStatusMessage({
 			pendingServers: [`${homePath}/pending\n${"p".repeat(80)}`],
 			connectedServers: [`${homePath}/connected\tserver`],
