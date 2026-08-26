@@ -1,5 +1,5 @@
 /**
- * Regression for oh-my-pi#4145 (TUI busy loop during long-running eval).
+ * Regression for oh-my-rox#4145 (TUI busy loop during long-running eval).
  *
  * The pre-fix hot path rebuilt the editor's top border synchronously on every
  * session event, even though renders are throttled to ~30 fps. On a busy

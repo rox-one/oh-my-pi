@@ -47,7 +47,7 @@ describe("fromJsonSchema", () => {
 
 	it("validates string formats and patterns", () => {
 		const email = fromJsonSchema({ type: "string", format: "email" });
-		expect(email("a@omp.sh")).toBe("a@omp.sh");
+		expect(email("a@rox.one")).toBe("a@rox.one");
 		expect(email("nope")).toBeInstanceOf(OmpErrors);
 		const patterned = fromJsonSchema({ type: "string", pattern: "^G-[A-Z0-9]+$", minLength: 3 });
 		expect(patterned("G-X1")).toBe("G-X1");

@@ -57,7 +57,7 @@ describe("run() per-command help", () => {
 describe("run() root help", () => {
 	// Contract: root help renders registered metadata without importing command
 	// implementations. Heavy or unavailable optional commands must not make
-	// `omp --help` slow or crash.
+	// `omr --help` slow or crash.
 	it("renders static metadata without loading command modules", async () => {
 		let loads = 0;
 		const commands: CommandEntry[] = [

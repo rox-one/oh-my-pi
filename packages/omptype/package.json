@@ -3,7 +3,7 @@
   "name": "@oh-my-pi/omptype",
   "version": "18.0.4",
   "description": "ArkType-compatible runtime schema validation with lazy JIT compilation",
-  "homepage": "https://omp.sh",
+  "homepage": "https://cli.rox.one",
   "author": "Stencil Labs, Inc.",
   "license": "MIT",
   "repository": {

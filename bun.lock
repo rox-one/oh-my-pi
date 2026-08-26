@@ -3,7 +3,7 @@
   "configVersion": 1,
   "workspaces": {
     "": {
-      "name": "omp",
+      "name": "omr",
       "dependencies": {
         "sherpa-onnx": "1.13.2",
         "sherpa-onnx-darwin-arm64": "1.13.3",
@@ -76,7 +76,7 @@
       "name": "@oh-my-pi/pi-coding-agent",
       "version": "18.0.4",
       "bin": {
-        "omp": "src/cli.ts",
+        "omr": "src/cli.ts",
       },
       "dependencies": {
         "@babel/parser": "catalog:",
@@ -245,7 +245,7 @@
       "name": "@oh-my-pi/omp-stats",
       "version": "18.0.4",
       "bin": {
-        "omp-stats": "./src/index.ts",
+        "omr-stats": "./src/index.ts",
       },
       "dependencies": {
         "@oh-my-pi/pi-ai": "catalog:",

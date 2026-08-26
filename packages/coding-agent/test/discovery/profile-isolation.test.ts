@@ -1,8 +1,8 @@
 /**
  * Regression: OMP-native user-level config discovery must follow the active
- * profile. A profile relocates the agent directory to ~/.omp/profiles/<name>/agent;
+ * profile. A profile relocates the agent directory to ~/.omr/profiles/<name>/agent;
  * the native provider used to read user config (commands, skills, rules, etc.)
- * from the literal home (~/.omp/agent) via `ctx.home`, leaking the default
+ * from the literal home (~/.omr/agent) via `ctx.home`, leaking the default
  * profile's config into every profile. Discovery now resolves the user scope
  * through getAgentDir(), so a profile sees only its own config.
  *
@@ -58,7 +58,7 @@ describe("native user-level config discovery follows the active profile", () => 
 		await writeSkill(path.join(profileAgentDir, "skills"), "profile-skill");
 
 		// Decoy: default profile's config at the literal-home path the old loader read.
-		const defaultAgentDir = path.join(tempHome, ".omp", "agent");
+		const defaultAgentDir = path.join(tempHome, ".omr", "agent");
 		await writeFile(path.join(defaultAgentDir, "commands", "default-cmd.md"), "Default command.\n");
 		await writeSkill(path.join(defaultAgentDir, "skills"), "default-skill");
 	});

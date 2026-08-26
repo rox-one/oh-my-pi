@@ -1,7 +1,7 @@
 /**
  * Shared test isolation for stats Bun tests.
  *
- * The default profile's stats.db is redirected to `$XDG_DATA_HOME/omp/stats.db`
+ * The default profile's stats.db is redirected to `$XDG_DATA_HOME/omr/stats.db`
  * by {@link DirResolver} whenever `agentDirOverride === defaultAgent`. Tests
  * that only set `PI_CONFIG_DIR` + `setAgentDir(<home>/<config>/agent)` resolve
  * to that default and silently share `stats.db` across files when an XDG

@@ -2,7 +2,7 @@
  * `omp install <target>` — top-level convenience over `omp plugin install` /
  * `omp plugin link`.
  *
- * The docs (omp.sh/docs/extension-authoring) advertise
+ * The docs (cli.rox.one/docs/extension-authoring) advertise
  *
  *   omp install ./my-extension
  *

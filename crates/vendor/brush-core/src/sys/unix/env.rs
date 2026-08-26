@@ -20,7 +20,7 @@ mod tests {
 
 	use super::*;
 
-	/// Regression for oh-my-pi #8925: `std::env::vars()` panics on a key or
+	/// Regression for oh-my-rox #8925: `std::env::vars()` panics on a key or
 	/// value that is not valid Unicode (e.g. the corrupt `GHOSTTY_BIN_DIR`
 	/// delivered by cmux/Ghostty, bytes `9d d9 50`). Shells that call this to
 	/// inherit the host environment must skip such entries, never crash.

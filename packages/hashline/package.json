@@ -3,7 +3,7 @@
   "name": "@oh-my-pi/hashline",
   "version": "18.0.4",
   "description": "Hashline: a compact, line-anchored patch language and applier. Pluggable FS/IO so it works over disk, in-memory, or any custom backend.",
-  "homepage": "https://omp.sh",
+  "homepage": "https://cli.rox.one",
   "author": "Stencil Labs, Inc.",
   "license": "MIT",
   "repository": {

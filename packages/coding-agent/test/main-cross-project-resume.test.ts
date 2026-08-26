@@ -418,10 +418,10 @@ describe("runRootCommand — cross-project --resume", () => {
 			await resumedManager?.close();
 		}
 
-		// Launch scope had no patterns, so the only resolution is the post-switch
-		// one; the pre-fix code never recomputed and would not call it at all.
+		// Launch scope had no patterns, so the post-switch resolution uses the
+		// destination settings. HEAD keeps a single discovery-backed pass.
 		expect(resolveModelScope).toHaveBeenCalledTimes(1);
-		expect(resolveModelScope.mock.calls[0]?.[0]).toEqual(["model-resumed"]);
+		expect(resolveModelScope.mock.calls.map(call => call[0])).toEqual([["model-resumed"]]);
 	}, 15_000);
 });
 

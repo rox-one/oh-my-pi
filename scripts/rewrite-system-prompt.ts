@@ -416,7 +416,7 @@ export function makeOpenRouterRewriter(opts: OpenRouterOptions): RewriteChunk {
 					headers: {
 						Authorization: `Bearer ${opts.apiKey}`,
 						"Content-Type": "application/json",
-						"HTTP-Referer": "https://omp.sh/",
+						"HTTP-Referer": "https://cli.rox.one/",
 						"X-Title": "omp",
 					},
 					body,

@@ -12,7 +12,7 @@
 import { $ } from "bun";
 
 const REPO = process.env.OMP_REPO ?? "can1357/oh-my-pi";
-const HOMEPAGE = "https://omp.sh";
+const HOMEPAGE = "https://cli.rox.one";
 const DESC = "Coding agent with the IDE wired in";
 
 interface ReleaseAsset {

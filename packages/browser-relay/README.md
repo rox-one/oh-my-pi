@@ -6,7 +6,7 @@ The companion relay server lives in the omp CLI (`omp browser-relay`, see `packa
 
 ## Setup
 
-1. `omp browser-relay install` — writes the bundled extension to `~/.omp/browser-relay/extension`, then load it via `chrome://extensions` → Developer mode → *Load unpacked*. (Or grab `omp-browser-relay-extension.zip` from GitHub releases.)
+1. `omp browser-relay install` — writes the bundled extension to `~/.omr/browser-relay/extension`, then load it via `chrome://extensions` → Developer mode → *Load unpacked*. (Or grab `omp-browser-relay-extension.zip` from GitHub releases.)
 2. `omp config set browser.relay true` — routes the browser tool through the relay. Per-call `app.relay: true` works without the setting.
 
 That's it: the relay server auto-starts under omp's profile-independent global daemon broker the first time the browser tool needs it. Every relay consumer holds a broker lease, so one project exiting cannot interrupt another; the server stops after the last consumer across all projects exits. The extension badge turns **on** when connected. Run `omp browser-relay` manually only for `--token`, `--no-group`, or a non-default port — a relay already serving the port is adopted, never fought over.

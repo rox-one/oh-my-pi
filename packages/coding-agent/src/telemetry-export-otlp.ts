@@ -48,7 +48,7 @@ import type { TelemetrySignalConfig } from "./telemetry-export";
  */
 const FLUSH_INTERVAL_MS = 30_000;
 
-const SERVICE_NAME = "oh-my-pi";
+const SERVICE_NAME = "oh-my-rox";
 
 type OtelLogLevel = "none" | logger.LogLevel;
 

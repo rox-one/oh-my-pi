@@ -52,7 +52,7 @@ signing or credential failure.
 
 What this means in practice:
 
-- `curl https://omp.sh/install | sh` — `curl` sets no quarantine bit, so
+- `curl https://cli.rox.one/install | sh` — `curl` sets no quarantine bit, so
   Gatekeeper is not consulted.
 - Homebrew **formula** installs — Homebrew does not quarantine formula files, so
   Gatekeeper is not consulted.

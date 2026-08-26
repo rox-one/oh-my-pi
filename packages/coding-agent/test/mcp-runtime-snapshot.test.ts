@@ -29,7 +29,7 @@ function stubCustomTool(name: string): CustomTool {
 const source: SourceMeta = {
 	provider: "native",
 	providerName: "OMP (User)",
-	path: "/home/sf/.omp/agent/mcp.json",
+	path: "/home/sf/.omr/agent/mcp.json",
 	level: "user",
 };
 

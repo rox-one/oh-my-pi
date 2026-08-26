@@ -23,18 +23,21 @@ import type { FetchImpl } from "@oh-my-pi/pi-ai";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
-import type { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
+import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
-import { Snowflake } from "@oh-my-pi/pi-utils";
+import { getConfigRootDir, Snowflake, setAgentDir } from "@oh-my-pi/pi-utils";
 import { createInMemoryAuthStorage } from "./helpers/agent-session-setup";
 
 describe("issue #6162 fresh launch default role from models.yml discovery provider", () => {
 	let tempDir: string;
 	const authStoragesToClose: AuthStorage[] = [];
+	const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
+	const fallbackAgentDir = path.join(getConfigRootDir(), "agent");
 
 	beforeEach(() => {
 		tempDir = path.join(os.tmpdir(), `pi-sdk-default-role-config-${Snowflake.next()}`);
 		fs.mkdirSync(tempDir, { recursive: true });
+		setAgentDir(tempDir);
 	});
 
 	afterEach(() => {
@@ -42,6 +45,8 @@ describe("issue #6162 fresh launch default role from models.yml discovery provid
 			authStorage.close();
 		}
 		authStoragesToClose.length = 0;
+		if (originalAgentDir !== undefined) setAgentDir(originalAgentDir);
+		else setAgentDir(fallbackAgentDir);
 		if (tempDir && fs.existsSync(tempDir)) {
 			fs.rmSync(tempDir, { recursive: true, force: true });
 		}
@@ -116,6 +121,123 @@ describe("issue #6162 fresh launch default role from models.yml discovery provid
 		try {
 			expect(session.model?.provider).toBe("my-provider");
 			expect(session.model?.id).toBe("some-model");
+		} finally {
+			await session.dispose();
+		}
+	});
+
+	test("selects an allowed discovery default without a false enabledModels warning", async () => {
+		const modelsPath = path.join(tempDir, "models.yml");
+		fs.writeFileSync(
+			modelsPath,
+			[
+				"providers:",
+				"  my-provider:",
+				`    baseUrl: ${baseUrl}`,
+				"    api: openai-completions",
+				"    apiKey: MY_API_KEY",
+				"    discovery:",
+				"      type: openai-models-list",
+				"",
+			].join("\n"),
+		);
+
+		const authStorage = await AuthStorage.create(path.join(tempDir, "auth.db"));
+		authStoragesToClose.push(authStorage);
+		authStorage.setRuntimeApiKey("my-provider", "test-provider-key");
+		const modelRegistry = new ModelRegistry(authStorage, modelsPath, {
+			fetch: mockDiscovery(["some-model"]),
+		});
+		const settings = Settings.isolated({ enabledModels: ["my-provider/*"] });
+		settings.setModelRole("default", "my-provider/some-model");
+
+		const { session, modelFallbackMessage } = await createAgentSession({
+			cwd: tempDir,
+			agentDir: tempDir,
+			authStorage,
+			modelRegistry,
+			settings,
+			sessionManager: SessionManager.inMemory(),
+			disableExtensionDiscovery: true,
+			skills: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+			enableMCP: false,
+			enableLsp: false,
+			skipPythonPreflight: true,
+		});
+
+		try {
+			expect(session.model?.provider).toBe("my-provider");
+			expect(session.model?.id).toBe("some-model");
+			expect(modelFallbackMessage).toBeUndefined();
+		} finally {
+			await session.dispose();
+		}
+	});
+
+	test("late discovery selects the configured default when the first pass is empty", async () => {
+		const modelsPath = path.join(tempDir, "models.yml");
+		fs.writeFileSync(
+			modelsPath,
+			[
+				"providers:",
+				"  my-provider:",
+				`    baseUrl: ${baseUrl}`,
+				"    api: openai-completions",
+				"    apiKey: MY_API_KEY",
+				"    discovery:",
+				"      type: openai-models-list",
+				"",
+			].join("\n"),
+		);
+
+		let discoveryCalls = 0;
+		const authStorage = await AuthStorage.create(path.join(tempDir, "auth.db"));
+		authStoragesToClose.push(authStorage);
+		authStorage.setRuntimeApiKey("my-provider", "test-provider-key");
+		const modelRegistry = new ModelRegistry(authStorage, modelsPath, {
+			fetch: async input => {
+				if (String(input) !== `${baseUrl}/models`) return new Response("not found", { status: 404 });
+				discoveryCalls += 1;
+				return Response.json({ data: discoveryCalls === 1 ? [] : [{ id: "some-model" }] });
+			},
+		});
+		const settings = Settings.isolated({ enabledModels: ["my-provider/*"] });
+		settings.setModelRole("default", "my-provider/some-model");
+
+		const { session, modelFallbackMessage } = await createAgentSession({
+			cwd: tempDir,
+			agentDir: tempDir,
+			authStorage,
+			modelRegistry,
+			settings,
+			sessionManager: SessionManager.inMemory(),
+			disableExtensionDiscovery: true,
+			skills: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+			enableMCP: false,
+			enableLsp: false,
+			skipPythonPreflight: true,
+		});
+		expect(modelFallbackMessage).toBeUndefined();
+
+		try {
+			if (!session.model) {
+				await new Promise<void>(resolve => {
+					const unsubscribe = session.subscribe(event => {
+						if (event.type !== "model_changed") return;
+						unsubscribe();
+						resolve();
+					});
+				});
+			}
+			expect(session.model?.provider).toBe("my-provider");
+			expect(session.model?.id).toBe("some-model");
+			expect(session.scopedModels.map(entry => entry.model.id)).toEqual(["some-model"]);
 		} finally {
 			await session.dispose();
 		}

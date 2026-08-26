@@ -10,7 +10,7 @@ const tempDirs: TempDir[] = [];
 
 async function runProbe(cacheRoot: string, script: string = probePath): Promise<string> {
 	const env: Record<string, string | undefined> = { ...process.env, XDG_CACHE_HOME: cacheRoot };
-	for (const key of ["PI_CODING_AGENT_DIR", "OMP_PROFILE", "PI_PROFILE", "PI_CONFIG_DIR"]) {
+	for (const key of ["PI_CODING_AGENT_DIR", "OMR_PROFILE", "PI_PROFILE", "PI_CONFIG_DIR"]) {
 		delete env[key];
 	}
 	const proc = Bun.spawn([process.execPath, script], {
@@ -36,11 +36,11 @@ test("legacy extension analysis persists and reads its SQLite parse cache", asyn
 	const tempDir = TempDir.createSync("@legacy-pi-extension-cache-");
 	tempDirs.push(tempDir);
 	const cacheRoot = tempDir.path();
-	await fs.mkdir(path.join(cacheRoot, "omp"), { recursive: true });
+	await fs.mkdir(path.join(cacheRoot, "omr"), { recursive: true });
 
 	expect(await runProbe(cacheRoot)).toBe('import value from "./dependency.js?mtime=7";\n');
 
-	const cachePath = path.join(cacheRoot, "omp", "cache", "legacy-pi-extension-cache.db");
+	const cachePath = path.join(cacheRoot, "omr", "cache", "legacy-pi-extension-cache.db");
 	const db = new Database(cachePath);
 	const result = db.run(
 		"UPDATE extension_parse_cache SET [references] = '[]' WHERE [references] LIKE '%dependency.js%'",
@@ -57,7 +57,7 @@ test("legacy extension parse cache opens in WAL mode (#9549)", async () => {
 	const tempDir = TempDir.createSync("@legacy-pi-extension-cache-wal-");
 	tempDirs.push(tempDir);
 	const cacheRoot = tempDir.path();
-	await fs.mkdir(path.join(cacheRoot, "omp"), { recursive: true });
+	await fs.mkdir(path.join(cacheRoot, "omr"), { recursive: true });
 
 	await runProbe(cacheRoot);
 
@@ -65,7 +65,7 @@ test("legacy extension parse cache opens in WAL mode (#9549)", async () => {
 	// default delete-journal mode serialized cache writes behind per-entry
 	// journal create/delete + fsync and blocked startup for ~20s under
 	// concurrent omp processes.
-	const cachePath = path.join(cacheRoot, "omp", "cache", "legacy-pi-extension-cache.db");
+	const cachePath = path.join(cacheRoot, "omr", "cache", "legacy-pi-extension-cache.db");
 	const db = new Database(cachePath);
 	try {
 		const mode = db.query<{ journal_mode: string }, []>("PRAGMA journal_mode").get()?.journal_mode;
@@ -79,7 +79,7 @@ test("oversized-cache eviction keeps the parse cache usable when a concurrent pr
 	const tempDir = TempDir.createSync("@legacy-pi-extension-cache-evict-");
 	tempDirs.push(tempDir);
 	const cacheRoot = tempDir.path();
-	const cachePath = path.join(cacheRoot, "omp", "cache", "legacy-pi-extension-cache.db");
+	const cachePath = path.join(cacheRoot, "omr", "cache", "legacy-pi-extension-cache.db");
 	await fs.mkdir(path.dirname(cachePath), { recursive: true });
 
 	// Seed a cache whose main db file exceeds the 8 MiB eviction cap.

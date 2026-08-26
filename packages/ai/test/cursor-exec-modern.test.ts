@@ -281,7 +281,7 @@ describe("Cursor stream teardown", () => {
 						target: {
 							case: "github",
 							value: create(ConnectScmGithubSchema, {
-								repository: create(ConnectScmGithubRepositorySchema, { owner: "can1357", repo: "oh-my-pi" }),
+								repository: create(ConnectScmGithubRepositorySchema, { owner: "can1357", repo: "oh-my-rox" }),
 							}),
 						},
 					}),
@@ -1475,7 +1475,7 @@ describe("Cursor modern exec frames: server-resolved tool calls leave a paired b
 
 	it("reads the connectScm repository out of the target oneof, not a flat field", async () => {
 		const { output, results } = runConnectScm(
-			{ toolCallId: "call-scm-1", repository: { owner: "can1357", repo: "oh-my-pi" } },
+			{ toolCallId: "call-scm-1", repository: { owner: "can1357", repo: "oh-my-rox" } },
 			{ case: "success", value: {} },
 		);
 
@@ -1483,7 +1483,7 @@ describe("Cursor modern exec frames: server-resolved tool calls leave a paired b
 		expect(block).toMatchObject({
 			id: "call-scm-1",
 			name: "connect_scm",
-			arguments: { owner: "can1357", repo: "oh-my-pi" },
+			arguments: { owner: "can1357", repo: "oh-my-rox" },
 		});
 		// Resolved => agent-loop runs no local tool, so the decoder owes the pair.
 		expect(block[kCursorExecResolved]).toBe(true);

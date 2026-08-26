@@ -16,6 +16,7 @@ import {
 	Settings,
 } from "@oh-my-pi/pi-coding-agent/config/settings";
 import * as discovery from "@oh-my-pi/pi-coding-agent/discovery";
+import { getSymbolPresetOverride } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
 import { AUTO_IMAGE_PROVIDER_ORDER } from "@oh-my-pi/pi-coding-agent/tools/image-providers";
 import { SEARCH_PROVIDER_ORDER } from "@oh-my-pi/pi-coding-agent/web/search/types";
@@ -251,9 +252,61 @@ describe("Settings", () => {
 			}
 		});
 
+		it("does not publish or retain a transactional batch when its atomic write fails", async () => {
+			await writeSettings({
+				symbolPreset: "unicode",
+				statusLine: { sessionAccent: true },
+			});
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+			const canonicalConfigPath = await fs.promises.realpath(getConfigPath());
+			const originalSymbolPreset = getSymbolPresetOverride();
+			let effectiveSignals = 0;
+			const unsubscribe = onStatusLineSessionAccentChanged(() => {
+				effectiveSignals += 1;
+			});
+			const rename = fs.promises.rename.bind(fs.promises);
+			const renameReached = Promise.withResolvers<void>();
+			const releaseRename = Promise.withResolvers<void>();
+			vi.spyOn(fs.promises, "rename").mockImplementation(async (source, target) => {
+				if (String(source).endsWith(".tmp") && String(target) === canonicalConfigPath) {
+					renameReached.resolve();
+					await releaseRename.promise;
+					throw new FsCodeError("EIO", "injected transactional write failure");
+				}
+				await rename(source, target);
+			});
+
+			try {
+				const transaction = settings.setPersistedBatch([
+					{ path: "symbolPreset", value: "ascii" },
+					{ path: "statusLine.sessionAccent", value: false },
+				]);
+				await renameReached.promise;
+				expect(settings.get("symbolPreset")).toBe("unicode");
+				expect(settings.get("statusLine.sessionAccent")).toBe(true);
+				expect(effectiveSignals).toBe(0);
+				expect(getSymbolPresetOverride()).toBe(originalSymbolPreset);
+
+				releaseRename.resolve();
+				await expect(transaction).rejects.toThrow("injected transactional write failure");
+				expect(settings.get("symbolPreset")).toBe("unicode");
+				expect(settings.get("statusLine.sessionAccent")).toBe(true);
+				expect(effectiveSignals).toBe(0);
+				expect(getSymbolPresetOverride()).toBe(originalSymbolPreset);
+
+				await settings.flush();
+				expect(await readSettings()).toEqual({
+					symbolPreset: "unicode",
+					statusLine: { sessionAccent: true },
+				});
+			} finally {
+				unsubscribe();
+			}
+		});
+
 		it("backs up a corrupted project config and retains the pending project role for retry", async () => {
 			await writeSettings({});
-			const projectConfigPath = path.join(projectDir, ".omp", "config.yml");
+			const projectConfigPath = path.join(projectDir, ".omr", "config.yml");
 			await Bun.write(
 				projectConfigPath,
 				YAML.stringify({ modelRoles: { default: "keep/default" }, custom: { keep: true } }, null, 2),
@@ -346,7 +399,7 @@ describe("Settings", () => {
 
 		it("leaves an unreadable project config untouched and retains its pending role", async () => {
 			await writeSettings({});
-			const projectConfigPath = path.join(projectDir, ".omp", "config.yml");
+			const projectConfigPath = path.join(projectDir, ".omr", "config.yml");
 			const original = YAML.stringify({ modelRoles: { default: "keep/default" }, custom: { keep: true } }, null, 2);
 			await Bun.write(projectConfigPath, original);
 			const settings = await Settings.init({ cwd: projectDir, agentDir });
@@ -372,7 +425,7 @@ describe("Settings", () => {
 			const malformed = 'modelRoles:\n  default: "unterminated\n';
 			await Promise.all([
 				Bun.write(getConfigPath(), malformed),
-				Bun.write(path.join(projectDir, ".omp", "config.yml"), malformed),
+				Bun.write(path.join(projectDir, ".omr", "config.yml"), malformed),
 			]);
 			const unhandled: unknown[] = [];
 			const onUnhandled = (reason: unknown): void => {
@@ -384,7 +437,7 @@ describe("Settings", () => {
 				expect(unhandled).toEqual([]);
 				expect(fs.readdirSync(agentDir).some(name => name.startsWith("config.yml.broken-"))).toBe(true);
 				expect(
-					fs.readdirSync(path.join(projectDir, ".omp")).some(name => name.startsWith("config.yml.broken-")),
+					fs.readdirSync(path.join(projectDir, ".omr")).some(name => name.startsWith("config.yml.broken-")),
 				).toBe(true);
 			} finally {
 				process.removeListener("unhandledRejection", onUnhandled);
@@ -394,7 +447,7 @@ describe("Settings", () => {
 
 	describe("live persisted reload", () => {
 		it("rejects malformed live configs without moving them aside or replacing effective settings", async () => {
-			const projectConfigPath = path.join(projectDir, ".omp", "config.yml");
+			const projectConfigPath = path.join(projectDir, ".omr", "config.yml");
 			await writeSettings({
 				setupVersion: 1,
 				modelRoles: { global_role: "openai/global" },
