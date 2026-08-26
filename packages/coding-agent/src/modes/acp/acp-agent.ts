@@ -2682,6 +2682,7 @@ export class AcpAgent implements Agent {
 						name,
 						record.session.modelRegistry,
 						record.session.settings,
+						record.session.model,
 						(model, thinkingLevel, options) => record.session.setModelTemporary(model, thinkingLevel, options),
 					),
 				getThinkingLevel: () => record.session.thinkingLevel,

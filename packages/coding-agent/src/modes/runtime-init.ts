@@ -94,8 +94,12 @@ export async function initializeExtensions(session: AgentSession, options: Initi
 			getCommands: () => getSessionSlashCommands(session),
 			setModel: model => runExtensionSetModel(session, model),
 			setModelAlias: name =>
-				setExtensionModelAlias(name, session.modelRegistry, session.settings, (model, thinkingLevel, options) =>
-					session.setModelTemporary(model, thinkingLevel, options),
+				setExtensionModelAlias(
+					name,
+					session.modelRegistry,
+					session.settings,
+					session.model,
+					(model, thinkingLevel, options) => session.setModelTemporary(model, thinkingLevel, options),
 				),
 			getThinkingLevel: () => session.thinkingLevel,
 			setThinkingLevel: level => session.setThinkingLevel(level),

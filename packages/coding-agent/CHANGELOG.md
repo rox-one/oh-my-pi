@@ -587,6 +587,7 @@
 ## [18.0.5] - 2026-08-25
 
 ### Added
+- Added the extension model-alias API: `ctx.models.listAliases()` exposes effective role resolution, and `pi.setModelAlias()` applies a session-only alias with model/thinking-level metadata.
 
 - Added side-by-side image and SVG previews to `omp git`, including local Git LFS object resolution and explicit placeholders for unavailable or unsupported binary content.
 - Added the `omp if-bench` command: a zero-tool instruction-following and working-memory benchmark that drives one cached conversation per model, adding one more glyph array action every turn while a `nya{1,N}` directive moves through the prompt, with a live turn-ladder board and a ranked scoreboard

@@ -3387,6 +3387,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 								name,
 								session.modelRegistry,
 								session.settings,
+								session.model,
 								(model, thinkingLevel, options) => session.setModelTemporary(model, thinkingLevel, options),
 							),
 						getThinkingLevel: () => session.thinkingLevel,

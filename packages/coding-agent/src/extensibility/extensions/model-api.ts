@@ -17,21 +17,30 @@ import type { ExtensionModelAlias, ExtensionModelAliasResult, ExtensionModelQuer
 function resolveAlias(
 	role: string,
 	settings: Settings,
+	modelRegistry: ModelRegistry,
+	currentModel: Model<Api> | undefined,
 	availableModels: Model<Api>[],
 	allModels: Model<Api>[],
 ): ExtensionModelAlias {
 	const matchPreferences = getModelMatchPreferences(settings);
-	const available = resolveModelRoleValue(`@${role}`, availableModels, {
-		settings,
-		matchPreferences,
-	});
+	const defaultFallback =
+		role === "default" && !settings.getModelRole("default") && currentModel
+			? { model: currentModel, thinkingLevel: undefined, explicitThinkingLevel: false, warning: undefined }
+			: undefined;
+	const available =
+		defaultFallback ??
+		resolveModelRoleValue(`@${role}`, availableModels, {
+			settings,
+			matchPreferences,
+		});
 	const catalog = available.model
 		? available
 		: resolveModelRoleValue(`@${role}`, allModels, {
 				settings,
 				matchPreferences,
 			});
-	const status = available.model ? "resolved" : catalog.model ? "unavailable" : "unresolved";
+	const explicitlyAvailable = catalog.model !== undefined && modelRegistry.hasConfiguredAuth(catalog.model);
+	const status = available.model || explicitlyAvailable ? "resolved" : catalog.model ? "unavailable" : "unresolved";
 	const selector = settings.getModelRole(role);
 
 	return {
@@ -49,13 +58,14 @@ export async function setExtensionModelAlias(
 	name: string,
 	modelRegistry: ModelRegistry,
 	settings: Settings,
+	currentModel: Model<Api> | undefined,
 	setModelTemporary: (
 		model: Model,
 		thinkingLevel?: ExtensionModelAlias["thinkingLevel"],
 		options?: { ephemeral?: boolean },
 	) => Promise<void>,
 ): Promise<ExtensionModelAliasResult> {
-	const aliases = createExtensionModelAliases(modelRegistry, settings);
+	const aliases = createExtensionModelAliases(modelRegistry, settings, currentModel);
 	const alias = aliases.find(candidate => candidate.name === name);
 	if (!alias) return { ok: false, alias: name, reason: "unknown_alias" };
 	if (alias.status !== "resolved" || !alias.model) {
@@ -66,17 +76,19 @@ export async function setExtensionModelAlias(
 		};
 	}
 
-	try {
-		await setModelTemporary(alias.model, alias.thinkingLevel, { ephemeral: true });
-		return { ok: true, alias, scope: "session" };
-	} catch {
-		return { ok: false, alias: name, reason: "unavailable_alias" };
-	}
+	await setModelTemporary(alias.model, alias.thinkingLevel);
+	return { ok: true, alias, scope: "session" };
 }
-function createExtensionModelAliases(modelRegistry: ModelRegistry, settings: Settings): ExtensionModelAlias[] {
+function createExtensionModelAliases(
+	modelRegistry: ModelRegistry,
+	settings: Settings,
+	currentModel: Model<Api> | undefined,
+): ExtensionModelAlias[] {
 	const availableModels = modelRegistry.getAvailable();
 	const allModels = modelRegistry.getAll();
-	return getKnownRoleIds(settings).map(role => resolveAlias(role, settings, availableModels, allModels));
+	return getKnownRoleIds(settings).map(role =>
+		resolveAlias(role, settings, modelRegistry, currentModel, availableModels, allModels),
+	);
 }
 
 /**
@@ -91,7 +103,8 @@ export function createExtensionModelQuery(
 	return {
 		list: () => modelRegistry.getAvailable(),
 		current: () => getModel(),
-		listAliases: (): ExtensionModelAlias[] => (settings ? createExtensionModelAliases(modelRegistry, settings) : []),
+		listAliases: (): ExtensionModelAlias[] =>
+			settings ? createExtensionModelAliases(modelRegistry, settings, getModel()) : [],
 		// resolveModelRoleValue expands a role alias (`@slow`) to its full configured
 		// priority list and tries each pattern — the same path core selection uses — so a
 		// fallback model lower in the list still resolves. Plain model strings pass through
