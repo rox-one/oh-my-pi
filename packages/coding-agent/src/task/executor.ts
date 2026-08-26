@@ -30,7 +30,7 @@ import type { ToolPathWithSource } from "../extensibility/custom-tools";
 import type { CustomTool } from "../extensibility/custom-tools/types";
 import { runExtensionCompact, runExtensionSetModel } from "../extensibility/extensions/compact-handler";
 import { getSessionSlashCommands } from "../extensibility/extensions/get-commands-handler";
-import { setExtensionModelAlias } from "../extensibility/extensions/model-api";
+import type { PreparedExtension } from "../extensibility/extensions/types";
 import { buildSkillPromptMessage, type Skill } from "../extensibility/skills";
 import type { HindsightSessionState } from "../hindsight/state";
 import type { LocalProtocolOptions } from "../internal-urls";
@@ -451,8 +451,8 @@ export interface ExecutorOptions {
 	 * extension against its own `ExtensionAPI` (cwd, eventBus, runtime).
 	 */
 	preloadedExtensionPaths?: string[];
-	/** Parent extension paths carrying exact-path trust into this child reload. */
-	preloadedTrustedExtensionPaths?: string[];
+	/** Parent-imported extension factories rebound to the child runtime. */
+	preloadedPreparedExtensions?: readonly PreparedExtension[];
 	/**
 	 * Parent's discovered custom-tool source paths. Forwarded to skip the
 	 * `.omp/tools/` FS scan in the subagent; the subagent then re-binds each
@@ -3208,7 +3208,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				workspaceTree: options.workspaceTree,
 				rules: options.rules,
 				preloadedExtensionPaths: restrictToolNames ? [] : options.preloadedExtensionPaths,
-				preloadedTrustedExtensionPaths: restrictToolNames ? [] : options.preloadedTrustedExtensionPaths,
+				preloadedPreparedExtensions: restrictToolNames ? [] : options.preloadedPreparedExtensions,
 				preloadedCustomToolPaths: restrictToolNames ? [] : options.preloadedCustomToolPaths,
 				customSystemPrompt: subagentPrompt,
 				sessionManager: sessionManagerForRun,

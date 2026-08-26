@@ -12,7 +12,7 @@ import type { Rule } from "@oh-my-pi/pi-coding-agent/capability/rule";
 import type { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { ToolPathWithSource } from "@oh-my-pi/pi-coding-agent/extensibility/custom-tools";
-import type { LoadExtensionsResult } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
+import type { LoadExtensionsResult, PreparedExtension } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import type { MCPManager } from "@oh-my-pi/pi-coding-agent/mcp/manager";
 import type { CreateAgentSessionResult } from "@oh-my-pi/pi-coding-agent/sdk";
 import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
@@ -113,12 +113,20 @@ describe("runSubprocess parent-discovery pass-through (issue #2190)", () => {
 		vi.restoreAllMocks();
 	});
 
-	it("forwards rules, preloadedExtensionPaths, and preloadedCustomToolPaths to createAgentSession", async () => {
+	it("forwards parent discovery and prepared extensions to createAgentSession", async () => {
 		const session = yieldEmittingSession();
 		const spy = vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue(createSessionResult(session));
 
 		const rules: Rule[] = [{ name: "rule-a" } as unknown as Rule];
 		const preloadedExtensionPaths = ["/abs/parent/.omp/extensions/foo.ts"];
+		const preloadedPreparedExtensions: PreparedExtension[] = [
+			{
+				path: preloadedExtensionPaths[0]!,
+				resolvedPath: preloadedExtensionPaths[0]!,
+				factory: () => {},
+				error: null,
+			},
+		];
 		const preloadedCustomToolPaths: ToolPathWithSource[] = [
 			{ path: "tools/x.ts", source: { provider: "config", providerName: "Config", level: "project" } },
 		];
@@ -127,6 +135,7 @@ describe("runSubprocess parent-discovery pass-through (issue #2190)", () => {
 			...baseOptions,
 			rules,
 			preloadedExtensionPaths,
+			preloadedPreparedExtensions,
 			preloadedCustomToolPaths,
 		});
 
@@ -136,6 +145,7 @@ describe("runSubprocess parent-discovery pass-through (issue #2190)", () => {
 		// Identity, not equality: passing a clone would defeat the perf fix.
 		expect(forwarded?.rules).toBe(rules);
 		expect(forwarded?.preloadedExtensionPaths).toBe(preloadedExtensionPaths);
+		expect(forwarded?.preloadedPreparedExtensions).toBe(preloadedPreparedExtensions);
 		expect(forwarded?.preloadedCustomToolPaths).toBe(preloadedCustomToolPaths);
 	});
 

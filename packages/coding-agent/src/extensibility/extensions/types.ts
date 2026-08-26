@@ -1895,11 +1895,25 @@ export interface Extension {
 	shortcuts: Map<KeyId, ExtensionShortcut>;
 }
 
+/**
+ * Imported extension factory detached from any session runtime. The same
+ * prepared module may be rebound to multiple session-scoped ExtensionAPI
+ * instances without evaluating its module graph again.
+ */
+export interface PreparedExtension {
+	path: string;
+	resolvedPath: string;
+	factory: ExtensionFactory | null;
+	error: string | null;
+}
+
 /** Result of loading extensions. */
 export interface LoadExtensionsResult {
 	extensions: Extension[];
 	errors: Array<{ path: string; error: string }>;
 	runtime: ExtensionRuntime;
+	/** Session-independent imported factories safe to rebind in child sessions. */
+	preparedExtensions?: PreparedExtension[];
 }
 
 // ============================================================================

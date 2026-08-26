@@ -510,14 +510,21 @@ describe("structured subagent primitive", () => {
 		mockDiscovery();
 		const mcpManager = {} as NonNullable<ToolSession["mcpManager"]>;
 		const extensionPaths = ["/plugins/example.ts"];
-		const trustedExtensionPaths = ["/plugins/trusted.ts"];
+		const preparedExtensions = [
+			{
+				path: extensionPaths[0]!,
+				resolvedPath: extensionPaths[0]!,
+				factory: () => {},
+				error: null,
+			},
+		] as NonNullable<ToolSession["preparedExtensions"]>;
 		const customToolPaths = [{ path: "/tools/example.ts", source: "project" }] as unknown as NonNullable<
 			ToolSession["customToolPaths"]
 		>;
 		const planSession = session({ planMode: true });
 		Object.assign(planSession, { mcpManager, extensionPaths, trustedExtensionPaths, customToolPaths });
 		const nonPlanSession = session();
-		Object.assign(nonPlanSession, { mcpManager, extensionPaths, trustedExtensionPaths, customToolPaths });
+		Object.assign(nonPlanSession, { mcpManager, extensionPaths, preparedExtensions, customToolPaths });
 		const mcpDisabledSession = session();
 		mcpDisabledSession.enableMCP = false;
 		const restrictedSession = session();
@@ -555,7 +562,7 @@ describe("structured subagent primitive", () => {
 			enableMCP: true,
 			mcpManager,
 			preloadedExtensionPaths: extensionPaths,
-			preloadedTrustedExtensionPaths: trustedExtensionPaths,
+			preloadedPreparedExtensions: preparedExtensions,
 			preloadedCustomToolPaths: customToolPaths,
 		});
 		expect(options[1]?.restrictToolNames).toBe(false);

@@ -583,6 +583,12 @@
 
 - Fixed Code Mode and bundled workflow prompts advertising bridge-only tools as direct provider calls across system, Plan, Goal, Vibe, orchestration, review, init, autoresearch, and security validation flows.
 - Fixed ACP Plan Mode tool reconciliation by restoring the pre-plan enabled selection after approval.
+- Commit-message generation errors in the git TUI now remain visible in the status bar instead of disappearing and returning to an idle state.
+- Fixed `omp update` leaving standalone Windows binaries on the old version when stale Bun launcher metadata was present, and preserved launchers installed by a newer concurrent update during binary repair ([#9806](https://github.com/can1357/oh-my-pi/issues/9806)).
+- Quitting `omp git` during commit-message generation now exits cleanly without leaving the process running.
+### Fixed
+
+- Fixed subagents repeatedly evaluating unchanged extension module graphs, preventing process-wide module-registry memory from growing with every spawned agent.
 
 ## [18.0.5] - 2026-08-25
 
